@@ -11,6 +11,7 @@
 - The new `--relative=DIR` analysis option saves all file names relative
   to `DIR`.  This can be useful to ensure reproducibility of binary
   libraries (#1359).
+- Added `-Werror` analysis option to escalate warnings into errors.
 - Several other minor bugs were resolved (#1237, #1350, #1351, #1353,
   #1366).
 

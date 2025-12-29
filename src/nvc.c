@@ -217,13 +217,14 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
       { "preserve-case",   no_argument,       0, 'p' },
       { "keywords",        required_argument, 0, 'k' },
       { "relative",        required_argument, 0, 'r' },
+      { "warn",            required_argument, 0, 'W' },
       { 0, 0, 0, 0 }
    };
 
    const int next_cmd = scan_cmd(2, argc, argv);
    int c, index = 0, error_limit = 20;
    const char *file_list = NULL;
-   const char *spec = ":D:f:I:";
+   const char *spec = ":D:f:I:W:";
    bool no_save = false;
 
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
@@ -287,6 +288,13 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          break;
       case 'r':
          opt_set_str(OPT_RELATIVE_PATH, optarg);
+         break;
+      case 'W':
+         if (!strcmp(optarg, "error"))
+            opt_set_int(OPT_WARN_IS_ERROR, 1);
+         else
+            errorf("invalid argument $bold$--W%s$$. Did you mean $bold$--Werror$$ ?",
+                   optarg);
          break;
       default:
          should_not_reach_here();
@@ -2216,6 +2224,7 @@ static void usage(void)
            { "--relaxed", "Disable certain pedantic rule checks" },
            { "--single-unit",
              "Treat all Verilog files as a single compilation unit" },
+           { "-Werror", "Turn all analysis warnings into errors." },
         }
       },
       { "Elaboration options",
