@@ -4385,6 +4385,8 @@ static type_t try_solve_attr_ref(nametab_t *tab, tree_t aref)
    case ATTR_LAST_VALUE:
    case ATTR_VALUE:
    case ATTR_DRIVING_VALUE:
+   case ATTR_DRIVER:        // Extension: same type as signal
+   case ATTR_OTHERS:        // Extension: same type as signal
    case ATTR_CONVERSE:
       type = prefix_type;
       break;

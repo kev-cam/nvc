@@ -240,6 +240,8 @@ typedef enum {
    ATTR_LAST_ACTIVE,
    ATTR_DRIVING,
    ATTR_DRIVING_VALUE,
+   ATTR_DRIVER,          // Extension: access signal driver as assignment target
+   ATTR_OTHERS,          // Extension: resolved value excluding local driver(s)
    ATTR_VALUE,
    ATTR_SUCC,
    ATTR_PRED,

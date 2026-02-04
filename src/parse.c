@@ -2316,6 +2316,8 @@ static attr_kind_t parse_predefined_attr(ident_t ident)
       { "TRANSACTION", ATTR_TRANSACTION },
       { "DRIVING_VALUE", ATTR_DRIVING_VALUE },
       { "DRIVING", ATTR_DRIVING },
+      { "DRIVER", ATTR_DRIVER },   // Extension: signal driver as lvalue
+      { "OTHERS", ATTR_OTHERS },   // Extension: resolve excluding local driver(s)
       { "VALUE", ATTR_VALUE },
       { "SUCC", ATTR_SUCC },
       { "PRED", ATTR_PRED },

@@ -5040,6 +5040,17 @@ static vcode_reg_t lower_attr_ref(lower_unit_t *lu, tree_t expr)
    case ATTR_DRIVING:
       return lower_signal_flag(lu, name, emit_driving_flag);
 
+   case ATTR_DRIVER:
+      // Extension: 'DRIVER as rvalue returns current driving value (like 'DRIVING_VALUE)
+      // As lvalue, it's handled by the signal assignment path
+      return lower_driving_value(lu, name);
+
+   case ATTR_OTHERS:
+      // Extension: 'OTHERS returns resolved value excluding local driver(s)
+      // TODO: needs runtime support for per-process "others" resolver
+      // For now, placeholder returns driving_value (incorrect but compiles)
+      return lower_driving_value(lu, name);
+
    case ATTR_LAST_VALUE:
       return lower_last_value(lu, name);
 

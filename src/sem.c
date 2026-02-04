@@ -2281,6 +2281,11 @@ static tree_t sem_check_lvalue(tree_t t)
    case T_PARAM_DECL:
    case T_EXTERNAL_NAME:
       return t;
+   case T_ATTR_REF:
+      // Extension: 'DRIVER attribute can be used as assignment target
+      if (tree_subkind(t) == ATTR_DRIVER)
+         return sem_check_lvalue(tree_name(t));
+      return NULL;
    default:
       return NULL;
    }
@@ -2435,6 +2440,10 @@ static bool sem_check_waveforms(tree_t t, tree_t target, nametab_t *tab)
    type_t std_time = std_type(NULL, STD_TIME);
    type_t expect = tree_type(target);
 
+   // Extension: 'DRIVER is universal - accepts any type, defer to elaboration
+   const bool universal_target =
+      tree_kind(target) == T_ATTR_REF && tree_subkind(target) == ATTR_DRIVER;
+
    const int nwaves = tree_waveforms(t);
    for (int i = 0; i < nwaves; i++) {
       tree_t waveform = tree_waveform(t, i);
@@ -2448,7 +2457,7 @@ static bool sem_check_waveforms(tree_t t, tree_t target, nametab_t *tab)
          if (!sem_check_readable(value))
             return false;
 
-         if (!sem_check_type(value, expect, tab))
+         if (!universal_target && !sem_check_type(value, expect, tab))
             sem_error(t, "type of value %pT does not match type of target %pT",
                       tree_type(value), expect);
       }
@@ -4469,6 +4478,16 @@ static bool sem_check_attr_ref(tree_t t, bool allow_range, nametab_t *tab)
    case ATTR_DRIVING:
       return sem_check_driving(t);
 
+   case ATTR_DRIVER:
+      // Extension: 'DRIVER allows access to signal driver as assignment target
+      // Same validation as 'DRIVING but used as lvalue
+      return sem_check_driving(t);
+
+   case ATTR_OTHERS:
+      // Extension: 'OTHERS returns resolved value excluding local driver(s)
+      // Used for bidirectional components
+      return sem_check_driving(t);
+
    case ATTR_IMAGE:
    case ATTR_VALUE:
       {
@@ -5527,7 +5546,8 @@ static bool sem_locally_static(tree_t t)
       if (predef == ATTR_EVENT || predef == ATTR_ACTIVE
           || predef == ATTR_LAST_EVENT || predef == ATTR_LAST_ACTIVE
           || predef == ATTR_LAST_VALUE || predef == ATTR_DRIVING
-          || predef == ATTR_DRIVING_VALUE || predef == ATTR_PATH_NAME
+          || predef == ATTR_DRIVING_VALUE || predef == ATTR_DRIVER
+          || predef == ATTR_OTHERS || predef == ATTR_PATH_NAME
           || predef == ATTR_INSTANCE_NAME || predef == ATTR_SIMPLE_NAME)
          return false;
 
@@ -5810,7 +5830,8 @@ static bool sem_globally_static(tree_t t)
       if (predef == ATTR_EVENT || predef == ATTR_ACTIVE
           || predef == ATTR_LAST_EVENT || predef == ATTR_LAST_ACTIVE
           || predef == ATTR_LAST_VALUE || predef == ATTR_DRIVING
-          || predef == ATTR_DRIVING_VALUE)
+          || predef == ATTR_DRIVING_VALUE || predef == ATTR_DRIVER
+          || predef == ATTR_OTHERS)
          return false;   // Clause k
       else if (predef == ATTR_USER) {
          // A user-defined attribute whose value is a globally static

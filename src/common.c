@@ -1836,6 +1836,8 @@ static bool is_static(tree_t expr)
          case ATTR_LAST_VALUE:
          case ATTR_DRIVING:
          case ATTR_DRIVING_VALUE:
+         case ATTR_DRIVER:     // Extension: not static
+         case ATTR_OTHERS:     // Extension: not static
          case ATTR_STABLE:
          case ATTR_QUIET:
             return false;
