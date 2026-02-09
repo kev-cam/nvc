@@ -1252,3 +1252,4 @@ logic3d6        normal
 logic3d7        normal
 logic3d8        normal
 logic3d9        normal
+logic3d10       normal
