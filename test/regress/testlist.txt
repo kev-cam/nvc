@@ -1242,3 +1242,10 @@ issue1366       normal,2019
 issue1336       verilog
 vlog29          mixed,2008
 ieee19          normal,2008
+
+logic3d1        normal
+logic3d2        normal
+logic3d3        normal
+logic3d4        normal
+logic3d5        normal,fail
+logic3d6        normal
