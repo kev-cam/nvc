@@ -120,14 +120,15 @@ package logic3d_types_pkg is
     function l3d_nor3(a, b, c : logic3d) return logic3d;
 
     ---------------------------------------------------------------------------
-    -- Utilities
+    -- Utilities - check individual bits, independent of other attributes
     ---------------------------------------------------------------------------
     function to_char(a : logic3d) return character;
-    function is_one(a : logic3d) return boolean;
-    function is_zero(a : logic3d) return boolean;
-    function is_x(a : logic3d) return boolean;
-    function is_z(a : logic3d) return boolean;
-    function is_strong(a : logic3d) return boolean;
+    function is_one(a : logic3d) return boolean;       -- bit 0 = 1
+    function is_zero(a : logic3d) return boolean;      -- bit 0 = 0
+    function is_strong(a : logic3d) return boolean;    -- bit 1 = 1
+    function is_uncertain(a : logic3d) return boolean; -- bit 2 = 1
+    function is_x(a : logic3d) return boolean;         -- uncertain and strong
+    function is_z(a : logic3d) return boolean;         -- uncertain and not strong
 
 end package;
 
@@ -215,42 +216,50 @@ package body logic3d_types_pkg is
     end function;
 
     ---------------------------------------------------------------------------
-    -- Utilities
+    -- Utilities - check individual bits, independent of other attributes
+    -- Encoding: bit2=uncertain, bit1=strength, bit0=value
     ---------------------------------------------------------------------------
     function to_char(a : logic3d) return character is
+        variable val : boolean := (a mod 2) = 1;
+        variable str : boolean := ((a / 2) mod 2) = 1;
+        variable unc : boolean := ((a / 4) mod 2) = 1;
     begin
-        case a is
-            when L3D_0 => return '0';
-            when L3D_1 => return '1';
-            when L3D_Z => return 'Z';
-            when L3D_X => return 'X';
-            when others => return '?';
-        end case;
+        if unc then
+            if str then return 'X'; else return 'Z'; end if;
+        else
+            if val then return '1'; else return '0'; end if;
+        end if;
     end function;
 
     function is_one(a : logic3d) return boolean is
     begin
-        return a = L3D_1;
+        return (a mod 2) = 1;  -- bit 0 = value
     end function;
 
     function is_zero(a : logic3d) return boolean is
     begin
-        return a = L3D_0;
-    end function;
-
-    function is_x(a : logic3d) return boolean is
-    begin
-        return a = L3D_X;
-    end function;
-
-    function is_z(a : logic3d) return boolean is
-    begin
-        return a = L3D_Z;
+        return (a mod 2) = 0;  -- bit 0 = value
     end function;
 
     function is_strong(a : logic3d) return boolean is
     begin
-        return a = L3D_0 or a = L3D_1;
+        return ((a / 2) mod 2) = 1;  -- bit 1 = strength
+    end function;
+
+    function is_uncertain(a : logic3d) return boolean is
+    begin
+        return ((a / 4) mod 2) = 1;  -- bit 2 = uncertain
+    end function;
+
+    -- Convenience aliases
+    function is_x(a : logic3d) return boolean is
+    begin
+        return is_uncertain(a) and is_strong(a);
+    end function;
+
+    function is_z(a : logic3d) return boolean is
+    begin
+        return is_uncertain(a) and not is_strong(a);
     end function;
 
 end package body;
