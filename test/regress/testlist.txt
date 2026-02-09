@@ -1249,3 +1249,6 @@ logic3d3        normal
 logic3d4        normal
 logic3d5        normal,fail
 logic3d6        normal
+logic3d7        normal
+logic3d8        normal
+logic3d9        normal
