@@ -2,6 +2,11 @@
 -- Provides the enum representation for single-bit signals
 -- Vector versions would use ieee.numeric_std.unsigned for bitwise ops
 
+-- Separating the handling of value, certainty and strength makes it easier
+-- to convert between types than with the collapsed enum form (01XZ), logic
+-- values should be consistent regardless of X (certainty state), converting
+-- 1/0 to a Voltage and back doesn't require looking at the X/Z fields.
+
 package logic3d_types_pkg is
 
     ---------------------------------------------------------------------------
