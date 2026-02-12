@@ -4467,6 +4467,7 @@ static bool sem_check_attr_ref(tree_t t, bool allow_range, nametab_t *tab)
       }
 
    case ATTR_TRANSACTION:
+   case ATTR_RECEIVER:
       if (!sem_check_readable(name))
          return false;
       else if (!sem_check_signal_attr(t))
@@ -5707,6 +5708,7 @@ static bool sem_static_name(tree_t t, static_fn_t check_fn)
          case ATTR_STABLE:
          case ATTR_QUIET:
          case ATTR_TRANSACTION:
+         case ATTR_RECEIVER:
             return sem_static_name(tree_name(t), check_fn);
          default:
             return false;

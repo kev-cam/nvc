@@ -2207,6 +2207,7 @@ static void implicit_signal_attribute(tree_t aref)
    case ATTR_TRANSACTION: tb_cat(tb, "transaction"); break;
    case ATTR_STABLE: tb_cat(tb, "stable"); break;
    case ATTR_QUIET: tb_cat(tb, "quiet"); break;
+   case ATTR_RECEIVER: tb_cat(tb, "receiver"); break;
    default: break;
    }
    if (delay != NULL && tree_kind(delay) == T_LITERAL) {
@@ -2225,6 +2226,7 @@ static void implicit_signal_attribute(tree_t aref)
    case ATTR_STABLE: kind = IMPLICIT_STABLE; break;
    case ATTR_QUIET: kind = IMPLICIT_QUIET; break;
    case ATTR_TRANSACTION: kind = IMPLICIT_TRANSACTION; break;
+   case ATTR_RECEIVER: kind = IMPLICIT_RECEIVER; break;
    default:
       fatal_trace("invalid implicit signal attribute");
    }
@@ -2247,7 +2249,7 @@ static void implicit_signal_attribute(tree_t aref)
                 || (delay != NULL && tree_has_delay(value)
                     && same_tree(tree_delay(value), delay)));
       }
-      else if (attr == ATTR_TRANSACTION)
+      else if (attr == ATTR_TRANSACTION || attr == ATTR_RECEIVER)
          match = same_tree(value, prefix);
 
       if (match) {
@@ -2267,6 +2269,10 @@ static void implicit_signal_attribute(tree_t aref)
 
    if (attr == ATTR_TRANSACTION) {
       tree_set_type(imp, std_type(NULL, STD_BIT));
+      tree_set_value(imp, prefix);
+   }
+   else if (attr == ATTR_RECEIVER) {
+      tree_set_type(imp, solve_types(nametab, aref, NULL));
       tree_set_value(imp, prefix);
    }
    else {
@@ -2318,6 +2324,7 @@ static attr_kind_t parse_predefined_attr(ident_t ident)
       { "DRIVING", ATTR_DRIVING },
       { "DRIVER", ATTR_DRIVER },   // Extension: signal driver as lvalue
       { "OTHERS", ATTR_OTHERS },   // Extension: resolve excluding local driver(s)
+      { "RECEIVER", ATTR_RECEIVER }, // Extension: local result of resolution
       { "VALUE", ATTR_VALUE },
       { "SUCC", ATTR_SUCC },
       { "PRED", ATTR_PRED },
@@ -3597,7 +3604,8 @@ static tree_t p_attribute_name(tree_t prefix)
    if (is_type_attribute(kind))
       tree_set_type(t, apply_type_attribute(t));
    else if (kind == ATTR_DELAYED || kind == ATTR_TRANSACTION
-            || kind == ATTR_STABLE || kind == ATTR_QUIET)
+            || kind == ATTR_STABLE || kind == ATTR_QUIET
+            || kind == ATTR_RECEIVER)
       implicit_signal_attribute(t);
 
    return t;

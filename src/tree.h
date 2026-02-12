@@ -242,6 +242,7 @@ typedef enum {
    ATTR_DRIVING_VALUE,
    ATTR_DRIVER,          // Extension: access signal driver as assignment target
    ATTR_OTHERS,          // Extension: resolved value excluding local driver(s)
+   ATTR_RECEIVER,        // Extension: local result of resolution process
    ATTR_VALUE,
    ATTR_SUCC,
    ATTR_PRED,
@@ -267,6 +268,7 @@ typedef enum {
    IMPLICIT_TRANSACTION,
    IMPLICIT_STABLE,
    IMPLICIT_QUIET,
+   IMPLICIT_RECEIVER,
 } implicit_kind_t;
 
 typedef enum {

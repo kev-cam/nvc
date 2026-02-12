@@ -627,6 +627,7 @@ class_t class_of(tree_t t)
       case ATTR_STABLE:
       case ATTR_QUIET:
       case ATTR_TRANSACTION:
+      case ATTR_RECEIVER:
          return C_SIGNAL;
       default:
          return C_DEFAULT;
@@ -1929,6 +1930,12 @@ tree_t longest_static_prefix(tree_t expr)
 
          return expr;
       }
+
+   case T_ATTR_REF:
+      // Extension: 'DRIVER attribute - extract the signal from prefix
+      if (tree_subkind(expr) == ATTR_DRIVER)
+         return longest_static_prefix(tree_name(expr));
+      return expr;
 
    default:
       return expr;

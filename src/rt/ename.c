@@ -30,6 +30,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static tree_t select_name(tree_t where, ident_t id)
 {
@@ -93,8 +94,15 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
    ident_t path = jit_get_name(j, scope);
    int next_arg = 2;
 
+   tree_t container = NULL;   // Last concurrent block for implicit lookups
+   ident_t container_path = NULL;
+
    const int nparts = tree_parts(name);
    for (int i = 0; i < nparts; i++, where = next, next = NULL) {
+      if (is_concurrent_block(where) || is_package(where)) {
+         container = where;
+         container_path = path;
+      }
       tree_t pe = tree_part(name, i);
       assert(tree_kind(pe) == T_PATH_ELT);
 
@@ -179,13 +187,39 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
       }
 
       if (!is_concurrent_block(where) && !is_package(where)) {
-         diag_t *d = diag_new(DIAG_ERROR, tree_loc(pe));
-         diag_printf(d, "%s is not a concurrent region",
-                     istr(tree_ident(where)));
-         diag_hint(d, tree_loc(where), "location of %s",
-                   istr(tree_ident(where)));
-         diag_emit(d);
-         jit_abort_with_status(1);
+         // Extension: .signal.receiver / .signal.driver / .signal.others
+         // resolves to the implicit signal <signal>$<attr> in parent scope
+         static const char *implicit_attrs[] = {
+            "receiver", "driver", "others"
+         };
+         bool found_implicit = false;
+         if (container != NULL && class_of(where) == C_SIGNAL) {
+            ident_t id_lower = ident_downcase(id);
+            const char *id_str = istr(id_lower);
+            for (int k = 0; k < 3; k++) {
+               if (strcmp(id_str, implicit_attrs[k]) == 0) {
+                  ident_t implicit_id =
+                     ident_prefix(tree_ident(where), id_lower, '$');
+                  next = select_name(container, implicit_id);
+                  if (next != NULL) {
+                     found_implicit = true;
+                     where = container;
+                     path = container_path;
+                  }
+                  break;
+               }
+            }
+         }
+         if (!found_implicit) {
+            diag_t *d = diag_new(DIAG_ERROR, tree_loc(pe));
+            diag_printf(d, "%s is not a concurrent region",
+                        istr(tree_ident(where)));
+            diag_hint(d, tree_loc(where), "location of %s",
+                      istr(tree_ident(where)));
+            diag_emit(d);
+            jit_abort_with_status(1);
+         }
+         continue;
       }
       else if (is_implicit_block(where)) {
          // Skip over implicit block for component declaration

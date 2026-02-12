@@ -5865,7 +5865,13 @@ static void lower_fill_target_parts(lower_unit_t *lu, tree_t target,
       ++(*ptr);
    }
    else {
-      (*ptr)->reg    = lower_lvalue(lu, target);
+      // Extension: 'DRIVER target uses the signal reference from its prefix
+      tree_t actual_target = target;
+      if (tree_kind(target) == T_ATTR_REF
+          && tree_subkind(target) == ATTR_DRIVER)
+         actual_target = tree_name(target);
+
+      (*ptr)->reg    = lower_lvalue(lu, actual_target);
       (*ptr)->target = target;
       (*ptr)->kind   = kind;
 
@@ -8335,6 +8341,23 @@ static void lower_implicit_guard(lower_unit_t *lu, object_t *obj)
    emit_return(lower_rvalue(lu, expr));
 }
 
+static void lower_implicit_receiver(lower_unit_t *lu, object_t *obj)
+{
+   tree_t decl = tree_from_object(obj);
+   assert(tree_kind(decl) == T_IMPLICIT_SIGNAL);
+
+   vcode_type_t vtype = lower_type(tree_type(decl));
+   vcode_set_result(vtype);
+
+   vcode_type_t vcontext = vtype_context(lu->parent->name);
+   emit_param(vcontext, vcontext, ident_new("context"));
+
+   emit_param(vtype, vtype, ident_new("p"));
+
+   tree_t prefix = tree_value(decl);
+   emit_return(lower_rvalue(lu, prefix));
+}
+
 static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
 {
    ident_t name = tree_ident(decl);
@@ -8459,6 +8482,47 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
          vcode_reg_t prefix_reg = lower_attr_prefix(parent, prefix);
 
          type_t prefix_type = tree_type(prefix);
+         if (type_is_homogeneous(prefix_type)) {
+            vcode_reg_t count_reg =
+               lower_type_width(parent, prefix_type, prefix_reg);
+            vcode_reg_t nets_reg = lower_array_data(prefix_reg);
+
+            emit_map_implicit(nets_reg, sig, count_reg);
+         }
+         else
+            lower_for_each_field(parent, prefix_type, prefix_reg,
+                                 locus, lower_implicit_field_cb,
+                                 (void *)(intptr_t)sig);
+      }
+      break;
+
+   case IMPLICIT_RECEIVER:
+      {
+         object_t *obj = tree_to_object(decl);
+         ident_t qual = ident_prefix(parent->name, name, '.');
+
+         unit_registry_defer(parent->registry, qual, parent, emit_function,
+                             lower_implicit_receiver, NULL, obj);
+
+         vcode_reg_t locus = lower_debug_locus(decl);
+
+         vcode_type_t voffset = vtype_offset();
+         vcode_reg_t one_reg = emit_const(voffset, 1);
+
+         vcode_reg_t delay_reg = emit_const(vtype_time(), TIME_HIGH);
+         vcode_reg_t kind_reg = emit_const(voffset, IMPLICIT_RECEIVER);
+         vcode_reg_t context_reg = lower_context_for_mangled(parent, qual);
+         vcode_reg_t closure = emit_closure(qual, context_reg, vtype);
+
+         vcode_reg_t sig = emit_implicit_signal(vtype, one_reg, one_reg, locus,
+                                                kind_reg, closure, delay_reg);
+         emit_store(sig, var);
+
+         tree_t prefix = tree_value(decl);
+         type_t prefix_type = tree_type(prefix);
+
+         vcode_reg_t prefix_reg = lower_attr_prefix(parent, prefix);
+
          if (type_is_homogeneous(prefix_type)) {
             vcode_reg_t count_reg =
                lower_type_width(parent, prefix_type, prefix_reg);
