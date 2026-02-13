@@ -37,6 +37,7 @@
 
 #define MAX_NAME  512
 #define MAX_TYPE  128
+#define MAX_VAL   1024
 
 #define SUFFIX_DRIVER  "_driver"
 #define SUFFIX_OTHERS  "_others"
@@ -45,6 +46,7 @@
 #define RESOLVER_FUNC    "resolve_net"
 
 #define CACHE_DIR        "_sv2vhdl_cache"
+#define VHPI_MODULE      "_sv2vhdl_vhpi"
 
 /* ---------- Data structures ---------- */
 
@@ -489,6 +491,376 @@ static int write_and_compile(const char *vhdl, const char *cache_path,
     return 0;
 }
 
+/* ---------- VHPI bridge for Python ---------- */
+
+/*
+ * Python module: _sv2vhdl_vhpi
+ *
+ * Gives Python code direct VHPI access to explore the design hierarchy.
+ * Uses vhpi_handle_by_name() for navigation (NVC accepts both ":" and "."
+ * delimiters, so enames work directly).
+ *
+ * Functions:
+ *   get_signals(region_path)   -> list of signal dicts
+ *   get_instances(region_path) -> list of instance dicts
+ *   get_generics(path)         -> dict of generic name -> value
+ *   get_value(signal_path)     -> string value
+ *   get_signal_info(path)      -> dict with signal properties
+ */
+
+/*
+ * Resolve a path to a VHPI handle.
+ * Accepts ename format (.foo.bar) or VHPI format (:FOO:BAR).
+ * Returns NULL with Python exception set on failure.
+ */
+static vhpiHandleT resolve_path(const char *path)
+{
+    if (!path || !*path) {
+        PyErr_SetString(PyExc_ValueError, "empty path");
+        return NULL;
+    }
+
+    /* Skip leading dot for enames — vhpi_handle_by_name handles both */
+    const char *p = path;
+    if (*p == '.') p++;
+
+    vhpiHandleT h = vhpi_handle_by_name(p, NULL);
+    if (!h) {
+        PyErr_Format(PyExc_KeyError, "VHPI path not found: %s", path);
+        return NULL;
+    }
+    return h;
+}
+
+/*
+ * get_signals(region_path) -> list of dicts
+ *
+ * Each dict: {name, full_name, ename, type, elem_type, size}
+ */
+static PyObject *py_vhpi_get_signals(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
+
+    vhpiHandleT region = resolve_path(path);
+    if (!region) return NULL;
+
+    PyObject *result = PyList_New(0);
+    if (!result) { vhpi_release_handle(region); return NULL; }
+
+    vhpiHandleT iter = vhpi_iterator(vhpiSigDecls, region);
+    if (!iter) {
+        vhpi_release_handle(region);
+        return result;  /* empty list — no signals */
+    }
+
+    for (vhpiHandleT sig = vhpi_scan(iter); sig; sig = vhpi_scan(iter)) {
+        const char *name = get_name(sig);
+        const char *full = get_full_name(sig);
+        int size = vhpi_get(vhpiSizeP, sig);
+        if (size <= 0) size = 1;
+
+        char sig_type[MAX_TYPE], elem_type[MAX_TYPE], ename[MAX_NAME];
+        get_type_info(sig, sig_type, sizeof(sig_type),
+                      elem_type, sizeof(elem_type));
+        if (full)
+            vhpi_to_ename(full, ename, sizeof(ename));
+        else
+            ename[0] = '\0';
+
+        PyObject *d = PyDict_New();
+        if (d) {
+            PyDict_SetItemString(d, "name",
+                PyUnicode_FromString(name ? name : ""));
+            PyDict_SetItemString(d, "full_name",
+                PyUnicode_FromString(full ? full : ""));
+            PyDict_SetItemString(d, "ename",
+                PyUnicode_FromString(ename));
+            PyDict_SetItemString(d, "type",
+                PyUnicode_FromString(sig_type));
+            PyDict_SetItemString(d, "elem_type",
+                PyUnicode_FromString(elem_type));
+            PyDict_SetItemString(d, "size",
+                PyLong_FromLong(size));
+            PyList_Append(result, d);
+            Py_DECREF(d);
+        }
+        vhpi_release_handle(sig);
+    }
+    vhpi_release_handle(iter);
+    vhpi_release_handle(region);
+    return result;
+}
+
+/*
+ * get_instances(region_path) -> list of dicts
+ *
+ * Each dict: {name, full_name, ename, entity}
+ */
+static PyObject *py_vhpi_get_instances(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
+
+    vhpiHandleT region = resolve_path(path);
+    if (!region) return NULL;
+
+    PyObject *result = PyList_New(0);
+    if (!result) { vhpi_release_handle(region); return NULL; }
+
+    vhpiHandleT iter = vhpi_iterator(vhpiCompInstStmts, region);
+    if (!iter) {
+        vhpi_release_handle(region);
+        return result;
+    }
+
+    for (vhpiHandleT inst = vhpi_scan(iter); inst; inst = vhpi_scan(iter)) {
+        const char *name = get_name(inst);
+        const char *full = get_full_name(inst);
+
+        /* Get entity name */
+        const char *entity_name = "";
+        vhpiHandleT du = vhpi_handle(vhpiDesignUnit, inst);
+        if (du) {
+            vhpiHandleT entity = vhpi_handle(vhpiPrimaryUnit, du);
+            if (entity) {
+                const char *en = get_name(entity);
+                if (en) entity_name = en;
+                vhpi_release_handle(entity);
+            }
+            vhpi_release_handle(du);
+        }
+
+        char ename[MAX_NAME];
+        if (full)
+            vhpi_to_ename(full, ename, sizeof(ename));
+        else
+            ename[0] = '\0';
+
+        PyObject *d = PyDict_New();
+        if (d) {
+            PyDict_SetItemString(d, "name",
+                PyUnicode_FromString(name ? name : ""));
+            PyDict_SetItemString(d, "full_name",
+                PyUnicode_FromString(full ? full : ""));
+            PyDict_SetItemString(d, "ename",
+                PyUnicode_FromString(ename));
+            PyDict_SetItemString(d, "entity",
+                PyUnicode_FromString(entity_name));
+            PyList_Append(result, d);
+            Py_DECREF(d);
+        }
+        vhpi_release_handle(inst);
+    }
+    vhpi_release_handle(iter);
+    vhpi_release_handle(region);
+    return result;
+}
+
+/*
+ * get_generics(path) -> dict of {name: value}
+ *
+ * Reads generic constants from an instance or entity.
+ * Values returned as Python int, float, or string depending on VHPI type.
+ */
+static PyObject *py_vhpi_get_generics(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
+
+    vhpiHandleT obj = resolve_path(path);
+    if (!obj) return NULL;
+
+    PyObject *result = PyDict_New();
+    if (!result) { vhpi_release_handle(obj); return NULL; }
+
+    vhpiHandleT iter = vhpi_iterator(vhpiGenericDecls, obj);
+    if (!iter) {
+        vhpi_release_handle(obj);
+        return result;  /* empty dict */
+    }
+
+    for (vhpiHandleT gen = vhpi_scan(iter); gen; gen = vhpi_scan(iter)) {
+        const char *gname = get_name(gen);
+        if (!gname) {
+            vhpi_release_handle(gen);
+            continue;
+        }
+
+        /* Try reading as integer first */
+        vhpiValueT val;
+        memset(&val, 0, sizeof(val));
+        val.format = vhpiIntVal;
+        if (vhpi_get_value(gen, &val) == 0) {
+            PyDict_SetItemString(result, gname,
+                PyLong_FromLong(val.value.intg));
+            vhpi_release_handle(gen);
+            continue;
+        }
+
+        /* Try as real */
+        memset(&val, 0, sizeof(val));
+        val.format = vhpiRealVal;
+        if (vhpi_get_value(gen, &val) == 0) {
+            PyDict_SetItemString(result, gname,
+                PyFloat_FromDouble(val.value.real));
+            vhpi_release_handle(gen);
+            continue;
+        }
+
+        /* Fall back to string */
+        char strbuf[MAX_VAL];
+        memset(&val, 0, sizeof(val));
+        val.format = vhpiStrVal;
+        val.bufSize = sizeof(strbuf);
+        val.value.str = (vhpiCharT *)strbuf;
+        if (vhpi_get_value(gen, &val) == 0) {
+            PyDict_SetItemString(result, gname,
+                PyUnicode_FromString(strbuf));
+        } else {
+            /* Can't read — store None */
+            PyDict_SetItemString(result, gname, Py_None);
+        }
+
+        vhpi_release_handle(gen);
+    }
+    vhpi_release_handle(iter);
+    vhpi_release_handle(obj);
+    return result;
+}
+
+/*
+ * get_value(signal_path) -> string
+ *
+ * Reads the current value of a signal as a string.
+ * For std_logic: "1", "0", "X", "Z", "U", etc.
+ * For vectors: "10XZ" etc.
+ */
+static PyObject *py_vhpi_get_value(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
+
+    vhpiHandleT sig = resolve_path(path);
+    if (!sig) return NULL;
+
+    char strbuf[MAX_VAL];
+    vhpiValueT val;
+    memset(&val, 0, sizeof(val));
+    val.format = vhpiStrVal;
+    val.bufSize = sizeof(strbuf);
+    val.value.str = (vhpiCharT *)strbuf;
+
+    if (vhpi_get_value(sig, &val) != 0) {
+        vhpi_release_handle(sig);
+        PyErr_Format(PyExc_RuntimeError,
+                     "vhpi_get_value failed for: %s", path);
+        return NULL;
+    }
+
+    vhpi_release_handle(sig);
+    return PyUnicode_FromString(strbuf);
+}
+
+/*
+ * get_signal_info(signal_path) -> dict
+ *
+ * Returns detailed info about a single signal:
+ * {name, full_name, ename, type, elem_type, size, value}
+ */
+static PyObject *py_vhpi_get_signal_info(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
+
+    vhpiHandleT sig = resolve_path(path);
+    if (!sig) return NULL;
+
+    const char *name = get_name(sig);
+    const char *full = get_full_name(sig);
+    int size = vhpi_get(vhpiSizeP, sig);
+    if (size <= 0) size = 1;
+
+    char sig_type[MAX_TYPE], elem_type[MAX_TYPE], ename[MAX_NAME];
+    get_type_info(sig, sig_type, sizeof(sig_type),
+                  elem_type, sizeof(elem_type));
+    if (full)
+        vhpi_to_ename(full, ename, sizeof(ename));
+    else
+        ename[0] = '\0';
+
+    /* Read value */
+    char valbuf[MAX_VAL];
+    vhpiValueT val;
+    memset(&val, 0, sizeof(val));
+    val.format = vhpiStrVal;
+    val.bufSize = sizeof(valbuf);
+    val.value.str = (vhpiCharT *)valbuf;
+    int got_val = (vhpi_get_value(sig, &val) == 0);
+
+    PyObject *d = PyDict_New();
+    if (d) {
+        PyDict_SetItemString(d, "name",
+            PyUnicode_FromString(name ? name : ""));
+        PyDict_SetItemString(d, "full_name",
+            PyUnicode_FromString(full ? full : ""));
+        PyDict_SetItemString(d, "ename",
+            PyUnicode_FromString(ename));
+        PyDict_SetItemString(d, "type",
+            PyUnicode_FromString(sig_type));
+        PyDict_SetItemString(d, "elem_type",
+            PyUnicode_FromString(elem_type));
+        PyDict_SetItemString(d, "size",
+            PyLong_FromLong(size));
+        PyDict_SetItemString(d, "value",
+            got_val ? PyUnicode_FromString(valbuf)
+                    : PyUnicode_FromString("?"));
+    }
+
+    vhpi_release_handle(sig);
+    return d;
+}
+
+/* Module method table */
+static PyMethodDef vhpi_methods[] = {
+    {"get_signals",     py_vhpi_get_signals,     METH_VARARGS,
+     "get_signals(region_path) -> list of signal dicts in a region"},
+    {"get_instances",   py_vhpi_get_instances,   METH_VARARGS,
+     "get_instances(region_path) -> list of instance dicts in a region"},
+    {"get_generics",    py_vhpi_get_generics,    METH_VARARGS,
+     "get_generics(path) -> dict of generic name -> value"},
+    {"get_value",       py_vhpi_get_value,       METH_VARARGS,
+     "get_value(signal_path) -> string value of a signal"},
+    {"get_signal_info", py_vhpi_get_signal_info, METH_VARARGS,
+     "get_signal_info(signal_path) -> dict with full signal properties"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef vhpi_module_def = {
+    PyModuleDef_HEAD_INIT,
+    VHPI_MODULE,                          /* m_name */
+    "VHPI bridge for Python — explore "
+    "design hierarchy from sv2vhdl",      /* m_doc */
+    -1,                                   /* m_size */
+    vhpi_methods,                         /* m_methods */
+    NULL, NULL, NULL, NULL                /* m_slots, traverse, clear, free */
+};
+
+static PyObject *PyInit_sv2vhdl_vhpi(void)
+{
+    return PyModule_Create(&vhpi_module_def);
+}
+
 /* ---------- Python interface ---------- */
 
 static const char *get_plugin_dir(void)
@@ -511,6 +883,9 @@ static const char *get_plugin_dir(void)
 
 static int python_init(void)
 {
+    /* Register VHPI bridge module BEFORE Py_Initialize */
+    PyImport_AppendInittab(VHPI_MODULE, PyInit_sv2vhdl_vhpi);
+
     Py_Initialize();
     if (!Py_IsInitialized()) {
         vhpi_printf("resolver: ERROR - failed to initialize Python");

@@ -15,7 +15,22 @@ Each net dict has:
 Returns a VHDL string containing:
     1. A resolver entity (no ports, uses external names)
     2. A wrapper entity (instantiates DUT + resolver)
+
+The _sv2vhdl_vhpi module (registered by the C plugin) provides direct
+VHPI access for Python-driven hierarchy exploration:
+    _sv2vhdl_vhpi.get_signals(region_path)   -> [signal dicts]
+    _sv2vhdl_vhpi.get_instances(region_path) -> [instance dicts]
+    _sv2vhdl_vhpi.get_generics(path)         -> {name: value}
+    _sv2vhdl_vhpi.get_value(signal_path)     -> string value
+    _sv2vhdl_vhpi.get_signal_info(path)      -> signal dict with value
 """
+
+# Import VHPI bridge — available when running inside the simulator plugin
+try:
+    import _sv2vhdl_vhpi as vhpi
+    _have_vhpi = True
+except ImportError:
+    _have_vhpi = False
 
 
 def _djb2(s, h=5381):
@@ -159,4 +174,105 @@ def resolve_net(nets, design_name):
     lines.append(f"end architecture;")
     lines.append(f"")
 
+    # Use VHPI bridge to explore the design scope
+    if _have_vhpi and nets:
+        parent = nets[0]["driver_ename"].rsplit(".", 1)[0]
+        try:
+            info = explore_region(parent)
+            n_sig = len(info["signals"])
+            n_inst = len(info["instances"])
+            print(f"[sv2vhdl] VHPI bridge: explored {parent} "
+                  f"({n_sig} signals, {n_inst} instances)")
+
+            # Report power supplies
+            if info["power"]:
+                for rail, sigs in info["power"].items():
+                    for s in sigs:
+                        print(f"[sv2vhdl]   power {rail}: "
+                              f"{s['name']} ({s['ename']})")
+
+            # Report instance generics
+            for inst in info["instances"]:
+                gens = get_instance_generics(inst["ename"])
+                if gens:
+                    print(f"[sv2vhdl]   {inst['name']} generics: {gens}")
+        except Exception as e:
+            print(f"[sv2vhdl] VHPI explore: {e}")
+
     return "\n".join(lines)
+
+
+# ---------- VHPI exploration helpers ----------
+
+def explore_region(region_path):
+    """Explore a design region using VHPI bridge.
+
+    Returns dict with signals, instances, and any power supplies found.
+    """
+    if not _have_vhpi:
+        raise RuntimeError("VHPI bridge not available (not running in simulator)")
+
+    signals = vhpi.get_signals(region_path)
+    instances = vhpi.get_instances(region_path)
+
+    # Identify power supply signals by naming convention
+    power_signals = {}
+    for sig in signals:
+        name = sig["name"].upper()
+        if name.endswith("_VDD") or name == "VDD":
+            power_signals.setdefault("vdd", []).append(sig)
+        elif name.endswith("_VSS") or name == "VSS":
+            power_signals.setdefault("vss", []).append(sig)
+
+    return {
+        "signals": signals,
+        "instances": instances,
+        "power": power_signals,
+    }
+
+
+def find_power_supplies(net_ename):
+    """Find power supply signals in the same scope as a net.
+
+    Given a signal ename like '.top.net_a_driver', looks in the parent
+    region ('.top') for signals matching VDD/VSS naming conventions.
+
+    Returns: dict with 'vdd' and 'vss' lists of signal dicts, or empty
+    if no power signals found or VHPI not available.
+    """
+    if not _have_vhpi:
+        return {}
+
+    # Derive parent region from signal ename
+    parent = net_ename.rsplit(".", 1)[0]
+    if not parent:
+        return {}
+
+    try:
+        signals = vhpi.get_signals(parent)
+    except (KeyError, RuntimeError):
+        return {}
+
+    power = {}
+    for sig in signals:
+        name = sig["name"].upper()
+        if name.endswith("_VDD") or name == "VDD":
+            power.setdefault("vdd", []).append(sig)
+        elif name.endswith("_VSS") or name == "VSS":
+            power.setdefault("vss", []).append(sig)
+
+    return power
+
+
+def get_instance_generics(instance_ename):
+    """Read generics from an instance via VHPI.
+
+    Returns dict of {generic_name: value} or empty dict.
+    """
+    if not _have_vhpi:
+        return {}
+
+    try:
+        return vhpi.get_generics(instance_ename)
+    except (KeyError, RuntimeError):
+        return {}
