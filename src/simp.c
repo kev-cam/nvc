@@ -833,6 +833,7 @@ static bool simp_find_drivers(tree_t t, tree_list_t *list)
    case T_NEXT:
    case T_EXIT:
    case T_FORCE:
+   case T_DEPOSIT:
    case T_RELEASE:
    case T_RETURN:
    case T_ASSERT:

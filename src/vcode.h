@@ -174,6 +174,7 @@ typedef enum {
    VCODE_OP_DIR_CHECK,
    VCODE_OP_SCHED_PROCESS,
    VCODE_OP_TABLE_REF,
+   VCODE_OP_DEPOSIT,
 } vcode_op_t;
 
 typedef enum {
@@ -420,6 +421,7 @@ void emit_sched_waveform(vcode_reg_t nets, vcode_reg_t nnets,
                          vcode_reg_t values, vcode_reg_t reject,
                          vcode_reg_t after);
 void emit_force(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t values);
+void emit_deposit(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t values);
 void emit_release(vcode_reg_t nets, vcode_reg_t nnets);
 void emit_disconnect(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t reject,
                      vcode_reg_t after);

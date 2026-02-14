@@ -975,6 +975,7 @@ const char *vcode_op_string(vcode_op_t op)
       "or trigger", "cmp trigger", "instance name",
       "map implicit", "bind external", "array scope", "record scope", "syscall",
       "put conversion", "dir check", "sched process", "table ref",
+      "deposit",
    };
    if ((unsigned)op >= ARRAY_LEN(strs))
       return "???";
@@ -1759,6 +1760,7 @@ void vcode_dump_with_mark(int mark_op, vcode_dump_fn_t callback, void *arg)
             break;
 
          case VCODE_OP_FORCE:
+         case VCODE_OP_DEPOSIT:
          case VCODE_OP_RELEASE:
             {
                printf("%s ", vcode_op_string(op->kind));
@@ -4363,6 +4365,19 @@ void emit_force(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t values)
                 "force target is not signal");
    VCODE_ASSERT(vcode_reg_kind(nnets) == VCODE_TYPE_OFFSET,
                 "force net count is not offset type");
+}
+
+void emit_deposit(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t values)
+{
+   op_t *op = vcode_add_op(VCODE_OP_DEPOSIT);
+   vcode_add_arg(op, nets);
+   vcode_add_arg(op, nnets);
+   vcode_add_arg(op, values);
+
+   VCODE_ASSERT(vcode_reg_kind(nets) == VCODE_TYPE_SIGNAL,
+                "deposit target is not signal");
+   VCODE_ASSERT(vcode_reg_kind(nnets) == VCODE_TYPE_OFFSET,
+                "deposit net count is not offset type");
 }
 
 void emit_release(vcode_reg_t nets, vcode_reg_t nnets)

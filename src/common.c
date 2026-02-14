@@ -2445,6 +2445,7 @@ void build_wait(tree_t expr, build_wait_fn_t fn, void *ctx)
 
    case T_VAR_ASSIGN:
    case T_FORCE:
+   case T_DEPOSIT:
       build_wait_for_target(tree_target(expr), fn, ctx);
       build_wait(tree_value(expr), fn, ctx);
       break;

@@ -1211,6 +1211,12 @@ static void dump_stmt(tree_t t, int indent)
       dump_expr(tree_value(t));
       break;
 
+   case T_DEPOSIT:
+      dump_expr(tree_target(t));
+      print_syntax(" := ");
+      dump_expr(tree_value(t));
+      break;
+
    case T_RELEASE:
       dump_expr(tree_target(t));
       print_syntax(" <= #release");

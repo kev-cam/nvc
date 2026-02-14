@@ -6366,6 +6366,49 @@ static void lower_force(lower_unit_t *lu, tree_t stmt)
       emit_force(nets, emit_const(vtype_offset(), 1), value_reg);
 }
 
+static void lower_deposit_field_cb(lower_unit_t *lu, tree_t field,
+                                    vcode_reg_t ptr, vcode_reg_t value,
+                                    vcode_reg_t locus, void *__ctx)
+{
+   type_t type = tree_type(field);
+   if (type_is_homogeneous(type)) {
+      vcode_reg_t nets_reg = emit_load_indirect(ptr);
+      vcode_reg_t count_reg = lower_type_width(lu, type, nets_reg);
+      emit_deposit(lower_array_data(nets_reg), count_reg, value);
+   }
+   else
+      lower_for_each_field_2(lu, type, type, ptr, value, locus,
+                             lower_deposit_field_cb, NULL);
+}
+
+static void lower_deposit(lower_unit_t *lu, tree_t stmt)
+{
+   tree_t target = tree_target(stmt);
+   type_t type = tree_type(target);
+
+   vcode_reg_t nets = lower_lvalue(lu, target);
+
+   tree_t value = tree_value(stmt);
+   type_t value_type = tree_type(value);
+   vcode_reg_t value_reg = lower_rvalue(lu, value);
+
+   if (type_is_array(type)) {
+      vcode_reg_t locus = lower_debug_locus(target);
+      lower_check_array_sizes(lu, type, value_type, nets, value_reg, locus);
+
+      vcode_reg_t count_reg = lower_array_total_len(lu, type, nets);
+      vcode_reg_t data_reg = lower_array_data(value_reg);
+      emit_deposit(lower_array_data(nets), count_reg, data_reg);
+   }
+   else if (type_is_record(type)) {
+      vcode_reg_t locus = lower_debug_locus(value);
+      lower_for_each_field_2(lu, type, value_type, nets, value_reg, locus,
+                             lower_deposit_field_cb, NULL);
+   }
+   else
+      emit_deposit(nets, emit_const(vtype_offset(), 1), value_reg);
+}
+
 static void lower_release_field_cb(lower_unit_t *lu, tree_t field,
                                    vcode_reg_t ptr, vcode_reg_t unused,
                                    vcode_reg_t locus, void *ctx)
@@ -7449,6 +7492,9 @@ static void lower_stmt(lower_unit_t *lu, tree_t stmt, loop_stack_t *loops)
       break;
    case T_RELEASE:
       lower_release(lu, stmt);
+      break;
+   case T_DEPOSIT:
+      lower_deposit(lu, stmt);
       break;
    case T_IF:
       lower_if(lu, stmt, loops);

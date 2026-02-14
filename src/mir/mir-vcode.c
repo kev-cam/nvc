@@ -1139,6 +1139,15 @@ static void import_release(mir_unit_t *mu, mir_import_t *imp, int op)
    mir_build_release(mu, target, count);
 }
 
+static void import_deposit(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t target = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count = imp->map[vcode_get_arg(op, 1)];
+   mir_value_t values = imp->map[vcode_get_arg(op, 2)];
+
+   mir_build_deposit_signal(mu, target, count, values);
+}
+
 static void import_disconnect(mir_unit_t *mu, mir_import_t *imp, int op)
 {
    mir_value_t target = imp->map[vcode_get_arg(op, 0)];
@@ -1702,6 +1711,9 @@ static void import_block(mir_unit_t *mu, mir_import_t *imp)
          break;
       case VCODE_OP_RELEASE:
          import_release(mu, imp, i);
+         break;
+      case VCODE_OP_DEPOSIT:
+         import_deposit(mu, imp, i);
          break;
       case VCODE_OP_DISCONNECT:
          import_disconnect(mu, imp, i);

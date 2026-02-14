@@ -50,6 +50,7 @@ static bool sem_check_array_ref(tree_t t, nametab_t *tab);
 static bool sem_locally_static(tree_t t);
 static bool sem_globally_static(tree_t t);
 static tree_t sem_check_lvalue(tree_t t);
+static bool sem_check_signal_target(tree_t target, nametab_t *tab, bool guarded);
 static bool sem_check_same_type(tree_t left, tree_t right);
 static bool sem_check_type(tree_t t, type_t expect, nametab_t *tab);
 static bool sem_static_name(tree_t t, static_fn_t check_fn);
@@ -2421,6 +2422,24 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
 
    if (!sem_check_readable(value))
       return false;
+
+   // Extension: allow := on signal targets (blocking deposit)
+   tree_t decl = sem_check_lvalue(target);
+   if (decl != NULL && class_of(decl) == C_SIGNAL) {
+      tree_change_kind(t, T_DEPOSIT);
+
+      if (!sem_check_signal_target(target, tab, true))
+         return false;
+
+      if (!sem_check_same_type(value, target)) {
+         type_t target_type = tree_type(target);
+         type_t value_type  = tree_type(value);
+         sem_error(t, "type of value %pT does not match type of target %pT",
+                   value_type, target_type);
+      }
+
+      return true;
+   }
 
    if (!sem_check_variable_target(target))
       return false;
@@ -7322,6 +7341,8 @@ bool sem_check(tree_t t, nametab_t *tab)
       return sem_check_prot_decl(t, tab);
    case T_INERTIAL:
       return sem_check_inertial(t, tab);
+   case T_DEPOSIT:
+      return true;   // Already validated in sem_check_var_assign
    default:
       sem_error(t, "cannot check %s", tree_kind_str(tree_kind(t)));
    }

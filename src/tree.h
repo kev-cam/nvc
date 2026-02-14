@@ -407,6 +407,7 @@ typedef enum tree_kind {
    T_PSL_FCALL,
    T_PSL_UNION,
    T_CHOICE,
+   T_DEPOSIT,
 
    T_LAST_TREE_KIND
 } tree_kind_t;
