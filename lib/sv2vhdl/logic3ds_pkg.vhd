@@ -5,7 +5,7 @@
 --
 -- Encoding: 4-byte record
 --   Byte 0: value      natural range 0 to 255  (0=logic 0, 255=logic 1)
---   Byte 1: strength   l3ds_strength enum       (8 Verilog strength levels)
+--   Byte 1: strength   l3ds_strength (0-127)     (power-of-2 bit encoding)
 --   Byte 2: flags      l3ds_flags enum          (uncertainty + power state)
 --   Byte 3: reserved   natural range 0 to 255   (zero for now)
 
@@ -17,18 +17,27 @@ package logic3ds_pkg is
 
     ---------------------------------------------------------------------------
     -- Strength levels (IEEE 1800-2017 Section 7.8)
-    -- Enum position = integer value; higher = stronger drive
+    -- Bit encoding: bit 0 = capacitive modifier, bits 1-4 = drive level.
+    -- Capacitive variant of a level = level OR ST_CAP.
+    -- Ordering: within same base level, active drive > capacitive charge.
+    -- Between levels, higher base wins.  Use str_gt() for comparison.
     ---------------------------------------------------------------------------
-    type l3ds_strength is (
-        ST_HIGHZ,    -- 0: High impedance (no drive)
-        ST_SMALL,    -- 1: Small capacitance
-        ST_MEDIUM,   -- 2: Medium capacitance
-        ST_WEAK,     -- 3: Weak drive
-        ST_LARGE,    -- 4: Large capacitance
-        ST_PULL,     -- 5: Pull drive
-        ST_STRONG,   -- 6: Strong drive
-        ST_SUPPLY    -- 7: Supply drive
-    );
+    subtype l3ds_strength is natural range 0 to 31;
+
+    -- Bit fields
+    constant ST_CAP    : l3ds_strength := 1;   -- Capacitive modifier
+
+    -- Active drive levels (bit 0 = 0)
+    constant ST_HIGHZ  : l3ds_strength := 0;   -- No drive
+    constant ST_WEAK   : l3ds_strength := 2;   -- Weak drive
+    constant ST_PULL   : l3ds_strength := 4;   -- Pull drive
+    constant ST_STRONG : l3ds_strength := 8;   -- Strong drive
+    constant ST_SUPPLY : l3ds_strength := 16;  -- Supply drive
+
+    -- Capacitive strengths (drive level OR ST_CAP)
+    constant ST_SMALL  : l3ds_strength := 3;   -- ST_WEAK  + ST_CAP
+    constant ST_MEDIUM : l3ds_strength := 5;   -- ST_PULL  + ST_CAP
+    constant ST_LARGE  : l3ds_strength := 9;   -- ST_STRONG + ST_CAP
 
     ---------------------------------------------------------------------------
     -- Flags for uncertainty and power state
@@ -81,6 +90,13 @@ package logic3ds_pkg is
     constant L3DS_SU1   : logic3ds := (value => 255, strength => ST_SUPPLY, flags => FL_KNOWN, reserved => 0);
 
     ---------------------------------------------------------------------------
+    -- Strength comparison (respects capacitive < active at same base level)
+    ---------------------------------------------------------------------------
+    function str_gt(a, b : l3ds_strength) return boolean;
+    function str_ge(a, b : l3ds_strength) return boolean;
+    function is_capacitive(s : l3ds_strength) return boolean;
+
+    ---------------------------------------------------------------------------
     -- Conversion functions
     ---------------------------------------------------------------------------
     function to_logic3ds(a : logic3d; str : l3ds_strength) return logic3ds;
@@ -110,6 +126,33 @@ package logic3ds_pkg is
 end package;
 
 package body logic3ds_pkg is
+
+    ---------------------------------------------------------------------------
+    -- Strength comparison: compare by base level (s/2), then capacitive
+    -- is weaker than active drive at the same base.
+    -- Ordering: HIGHZ < SMALL < WEAK < MEDIUM < PULL < LARGE < STRONG < SUPPLY
+    ---------------------------------------------------------------------------
+    function str_gt(a, b : l3ds_strength) return boolean is
+        variable a_base : natural := a / 2;
+        variable b_base : natural := b / 2;
+    begin
+        if a_base /= b_base then
+            return a_base > b_base;
+        else
+            -- Same base: active drive (cap=0) beats capacitive (cap=1)
+            return (a mod 2) < (b mod 2);
+        end if;
+    end function;
+
+    function str_ge(a, b : l3ds_strength) return boolean is
+    begin
+        return a = b or str_gt(a, b);
+    end function;
+
+    function is_capacitive(s : l3ds_strength) return boolean is
+    begin
+        return (s mod 2) = 1;
+    end function;
 
     ---------------------------------------------------------------------------
     -- Promote: logic3d -> logic3ds with given drive strength
@@ -151,13 +194,13 @@ package body logic3ds_pkg is
             when FL_UNDRIVEN | FL_UDR_NOPOWER =>
                 return L3D_Z;
             when FL_UNKNOWN | FL_UNK_NOPOWER =>
-                if a.strength > ST_WEAK then
+                if str_gt(a.strength, ST_WEAK) then
                     return L3D_X;
                 else
                     return L3D_W;
                 end if;
             when FL_KNOWN =>
-                if a.strength > ST_WEAK then
+                if str_gt(a.strength, ST_WEAK) then
                     if a.value >= 127 then
                         return L3D_1;
                     else
@@ -207,7 +250,7 @@ package body logic3ds_pkg is
                drivers(i).flags /= FL_UNDRIVEN and
                drivers(i).flags /= FL_UDR_NOPOWER then
 
-                if not found_any or drivers(i).strength > best_str then
+                if not found_any or str_gt(drivers(i).strength, best_str) then
                     -- New strongest driver
                     best_str   := drivers(i).strength;
                     best_val   := drivers(i).value;
