@@ -43,6 +43,32 @@ package logic3d_types_pkg is
     constant L3D_U : logic3d := 7;  -- 111: uninitialized
 
     ---------------------------------------------------------------------------
+    -- Vector type for resolution functions
+    ---------------------------------------------------------------------------
+    type logic3d_vector is array (natural range <>) of logic3d;
+
+    ---------------------------------------------------------------------------
+    -- Resolution function (matches std_logic resolution semantics)
+    --
+    -- Strong (driven) beats weak (undriven):
+    --   0/1 override L/H on the same net
+    -- Equal strength, same value: that value
+    -- Equal strength, opposing values: uncertain at that strength
+    --   (strong 0 vs strong 1 -> X; weak 0 vs weak 1 -> W)
+    -- Z is identity (no contribution)
+    -- U propagates unconditionally (uninitialized taints all)
+    --
+    -- The 8-value encoding fits NVC's memoization (tab2[8][8])
+    -- for fast 1- and 2-driver paths.
+    ---------------------------------------------------------------------------
+    function l3d_resolve(drivers : logic3d_vector) return logic3d;
+
+    ---------------------------------------------------------------------------
+    -- Resolved subtype: use for signals with multiple drivers
+    ---------------------------------------------------------------------------
+    subtype resolved_logic3d is l3d_resolve logic3d;
+
+    ---------------------------------------------------------------------------
     -- Lookup tables (8x8 for 2-input, 8 for 1-input)
     -- Gate outputs are always strong.
     -- Weak inputs (L,H) treated as known 0,1 for gate logic.
@@ -132,6 +158,22 @@ package logic3d_types_pkg is
     constant WEAKEN_LUT : lut1_t := (0, 1, 0, 1, 4, 5, 5, 5);
 
     ---------------------------------------------------------------------------
+    -- Resolution lookup (matches std_logic resolution table)
+    -- Z is identity; U dominates; strong beats weak; contention -> X/W
+    ---------------------------------------------------------------------------
+    constant RESOLVE_LUT : lut2_t := (
+    --                  L  H  0  1  Z  W  X  U
+        0 => (0, 5, 2, 3, 0, 5, 6, 7),  -- L: weak 0
+        1 => (5, 1, 2, 3, 1, 5, 6, 7),  -- H: weak 1
+        2 => (2, 2, 2, 6, 2, 2, 6, 7),  -- 0: strong 0
+        3 => (3, 3, 6, 3, 3, 3, 6, 7),  -- 1: strong 1
+        4 => (0, 1, 2, 3, 4, 5, 6, 7),  -- Z: identity
+        5 => (5, 5, 2, 3, 5, 5, 6, 7),  -- W: weak unknown
+        6 => (6, 6, 6, 6, 6, 6, 6, 7),  -- X: strong unknown
+        7 => (7, 7, 7, 7, 7, 7, 7, 7)   -- U: uninitialized (dominates)
+    );
+
+    ---------------------------------------------------------------------------
     -- Gate functions
     ---------------------------------------------------------------------------
     function l3d_not(a : logic3d) return logic3d;
@@ -156,9 +198,18 @@ package logic3d_types_pkg is
 
     ---------------------------------------------------------------------------
     -- Conversion to/from std_logic
+    --
+    -- Both directions are lossless for signal values:
+    --   to_logic3d:  9 std_logic values -> 8 logic3d values
+    --                '-' maps to L3D_X (don't-care is not a signal value)
+    --   to_std_logic: 8 logic3d values -> 8 distinct std_logic values
+    --
+    -- Lossless round-trip: to_logic3d(to_std_logic(x)) = x for all x
+    -- This means std_logic drivers can be mixed with logic3d drivers
+    -- by converting to logic3d first, then resolving with l3d_resolve.
     ---------------------------------------------------------------------------
-    function to_std_logic(a : logic3d) return std_logic;
-    function to_logic3d(s : std_logic) return logic3d;
+    function to_std_logic(a : logic3d) return std_logic;  -- lossless
+    function to_logic3d(s : std_logic) return logic3d;    -- lossless
 
     ---------------------------------------------------------------------------
     -- Utilities - check individual bits, independent of other attributes
@@ -174,6 +225,23 @@ package logic3d_types_pkg is
 end package;
 
 package body logic3d_types_pkg is
+
+    ---------------------------------------------------------------------------
+    -- Resolution function (pairwise fold over RESOLVE_LUT)
+    -- Single driver: identity. Two drivers: single LUT lookup.
+    -- N drivers: chain pairwise (associative and commutative).
+    ---------------------------------------------------------------------------
+    function l3d_resolve(drivers : logic3d_vector) return logic3d is
+        variable result : logic3d := L3D_Z;
+    begin
+        if drivers'length = 1 then
+            return drivers(drivers'low);
+        end if;
+        for i in drivers'range loop
+            result := RESOLVE_LUT(result, drivers(i));
+        end loop;
+        return result;
+    end function;
 
     ---------------------------------------------------------------------------
     -- Gate implementations (single table lookup)

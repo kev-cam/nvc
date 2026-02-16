@@ -98,15 +98,36 @@ package logic3ds_pkg is
 
     ---------------------------------------------------------------------------
     -- Conversion functions
+    --
+    -- Lossless (no information lost):
+    --   std_logic  -> logic3ds  (via to_logic3d then to_logic3ds)
+    --   logic3d    -> logic3ds  (promote: adds strength, preserves value/flags)
+    --   logic3d    -> std_logic (all 8 values map uniquely)
+    --
+    -- Lossy (information lost):
+    --   logic3ds   -> logic3d   (strength collapsed to binary strong/weak)
+    --   logic3ds   -> std_logic (strength + continuous value both lost)
+    --
+    -- Lossless conversions allow mixing std_logic and logic3d drivers
+    -- on the same net: convert to logic3ds, resolve with l3ds_resolve,
+    -- then demote back.
     ---------------------------------------------------------------------------
-    function to_logic3ds(a : logic3d; str : l3ds_strength) return logic3ds;
-    function to_logic3d(a : logic3ds) return logic3d;
-    function to_std_logic(a : logic3ds) return std_logic;
+    function to_logic3ds(a : logic3d; str : l3ds_strength) return logic3ds;  -- lossless
+    function to_logic3ds(s : std_logic; str : l3ds_strength) return logic3ds;  -- lossless
+    function to_logic3d(a : logic3ds) return logic3d;    -- lossy (strength lost)
+    function to_std_logic(a : logic3ds) return std_logic; -- lossy (strength + 3d lost)
 
     ---------------------------------------------------------------------------
     -- Resolution function (IEEE 1800-2017 Section 28.12)
     ---------------------------------------------------------------------------
     function l3ds_resolve(drivers : logic3ds_vector) return logic3ds;
+
+    ---------------------------------------------------------------------------
+    -- Resolved subtype: use for signals with multiple drivers
+    -- NVC will call l3ds_resolve automatically when multiple
+    -- concurrent assignments drive the same resolved_logic3ds signal.
+    ---------------------------------------------------------------------------
+    subtype resolved_logic3ds is l3ds_resolve logic3ds;
 
     ---------------------------------------------------------------------------
     -- Query functions
@@ -188,6 +209,14 @@ package body logic3ds_pkg is
             when others =>
                 return (value => 0,   strength => ST_HIGHZ, flags => FL_UNKNOWN,  reserved => 0);
         end case;
+    end function;
+
+    ---------------------------------------------------------------------------
+    -- Promote: std_logic -> logic3ds (lossless, via logic3d intermediate)
+    ---------------------------------------------------------------------------
+    function to_logic3ds(s : std_logic; str : l3ds_strength) return logic3ds is
+    begin
+        return to_logic3ds(to_logic3d(s), str);
     end function;
 
     ---------------------------------------------------------------------------
