@@ -5045,8 +5045,8 @@ static vcode_reg_t lower_attr_ref(lower_unit_t *lu, tree_t expr)
       // As lvalue, it's handled by the signal assignment path
       return lower_driving_value(lu, name);
 
-   case ATTR_OTHERS:
-      // Extension: 'OTHERS returns resolved value excluding local driver(s)
+   case ATTR_OTHER:
+      // Extension: 'OTHER returns resolved value excluding local driver(s)
       // TODO: needs runtime support for per-process "others" resolver
       // For now, placeholder returns driving_value (incorrect but compiles)
       return lower_driving_value(lu, name);
@@ -5635,7 +5635,7 @@ static void lower_sched_event(lower_unit_t *lu, tree_t on)
 {
    type_t type = tree_type(on);
 
-   // Extension: for 'DRIVER/'OTHERS implicit signals, the reference type
+   // Extension: for 'DRIVER/'OTHER implicit signals, the reference type
    // may still be INTEGER (from parse time) while the underlying implicit
    // signal has been retyped by sem.c type propagation (e.g. to a record).
    // Use the declaration's actual type for correct field decomposition.
@@ -8594,12 +8594,12 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
       break;
 
    case IMPLICIT_DRIVER:
-   case IMPLICIT_OTHERS:
+   case IMPLICIT_OTHER:
       {
-         // Extension: 'DRIVER and 'OTHERS are implicit signals for
+         // Extension: 'DRIVER and 'OTHER are implicit signals for
          // bidirectional switch modeling.  They are created as regular
          // signals (no update closure) -- the resolver entity or
-         // VHPI plugin drives 'OTHERS, and the entity deposits to 'DRIVER.
+         // VHPI plugin drives 'OTHER, and the entity deposits to 'DRIVER.
          // Type is universal: sem.c propagates the actual type from
          // assignment context (could be logic3d integer or logic3ds record).
          // For scalars, initialise to 0 (L3D_Z = high-impedance).

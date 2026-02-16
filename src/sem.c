@@ -2409,7 +2409,7 @@ static bool sem_check_variable_target(tree_t target)
    return true;
 }
 
-// Extension: propagate the resolved type to a 'DRIVER or 'OTHERS attr ref
+// Extension: propagate the resolved type to a 'DRIVER or 'OTHER attr ref
 // and its underlying implicit signal declaration.  Called when the actual
 // type is determined from the assignment context.
 static void sem_propagate_implicit_type(tree_t aref, type_t ty)
@@ -2440,9 +2440,9 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
    if (!sem_check_readable(value))
       return false;
 
-   // Extension: 'OTHERS is universal source - type from assignment target
+   // Extension: 'OTHER is universal source - type from assignment target
    const bool universal_source =
-      tree_kind(value) == T_ATTR_REF && tree_subkind(value) == ATTR_OTHERS;
+      tree_kind(value) == T_ATTR_REF && tree_subkind(value) == ATTR_OTHER;
 
    // Extension: allow := on signal targets (blocking deposit)
    tree_t decl = sem_check_lvalue(target);
@@ -2483,7 +2483,7 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
                 value_type, target_type);
    }
 
-   // Propagate type for universal 'OTHERS source
+   // Propagate type for universal 'OTHER source
    if (universal_source)
       sem_propagate_implicit_type(value, tree_type(target));
 
@@ -4543,8 +4543,8 @@ static bool sem_check_attr_ref(tree_t t, bool allow_range, nametab_t *tab)
       // Same validation as 'DRIVING but used as lvalue
       return sem_check_driving(t);
 
-   case ATTR_OTHERS:
-      // Extension: 'OTHERS returns resolved value excluding local driver(s)
+   case ATTR_OTHER:
+      // Extension: 'OTHER returns resolved value excluding local driver(s)
       // Used for bidirectional components
       return sem_check_driving(t);
 
@@ -5607,7 +5607,7 @@ static bool sem_locally_static(tree_t t)
           || predef == ATTR_LAST_EVENT || predef == ATTR_LAST_ACTIVE
           || predef == ATTR_LAST_VALUE || predef == ATTR_DRIVING
           || predef == ATTR_DRIVING_VALUE || predef == ATTR_DRIVER
-          || predef == ATTR_OTHERS || predef == ATTR_PATH_NAME
+          || predef == ATTR_OTHER || predef == ATTR_PATH_NAME
           || predef == ATTR_INSTANCE_NAME || predef == ATTR_SIMPLE_NAME)
          return false;
 
@@ -5769,7 +5769,7 @@ static bool sem_static_name(tree_t t, static_fn_t check_fn)
          case ATTR_TRANSACTION:
          case ATTR_RECEIVER:
          case ATTR_DRIVER:
-         case ATTR_OTHERS:
+         case ATTR_OTHER:
             return sem_static_name(tree_name(t), check_fn);
          default:
             return false;
@@ -5894,7 +5894,7 @@ static bool sem_globally_static(tree_t t)
           || predef == ATTR_LAST_EVENT || predef == ATTR_LAST_ACTIVE
           || predef == ATTR_LAST_VALUE || predef == ATTR_DRIVING
           || predef == ATTR_DRIVING_VALUE || predef == ATTR_DRIVER
-          || predef == ATTR_OTHERS)
+          || predef == ATTR_OTHER)
          return false;   // Clause k
       else if (predef == ATTR_USER) {
          // A user-defined attribute whose value is a globally static

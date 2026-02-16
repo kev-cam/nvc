@@ -485,7 +485,7 @@ void set_default_standard(vhdl_standard_t s)
 const char *standard_text(vhdl_standard_t s)
 {
    static const char *text[] = {
-      "1987", "1993", "2000", "2002", "2008", "2019"
+      "1987", "1993", "2000", "2002", "2008", "2019", "2040"
    };
 
    if ((unsigned)s < ARRAY_LEN(text))
@@ -629,7 +629,7 @@ class_t class_of(tree_t t)
       case ATTR_TRANSACTION:
       case ATTR_RECEIVER:
       case ATTR_DRIVER:
-      case ATTR_OTHERS:
+      case ATTR_OTHER:
          return C_SIGNAL;
       default:
          return C_DEFAULT;
@@ -1840,7 +1840,7 @@ static bool is_static(tree_t expr)
          case ATTR_DRIVING:
          case ATTR_DRIVING_VALUE:
          case ATTR_DRIVER:     // Extension: not static
-         case ATTR_OTHERS:     // Extension: not static
+         case ATTR_OTHER:     // Extension: not static
          case ATTR_STABLE:
          case ATTR_QUIET:
             return false;

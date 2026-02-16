@@ -1835,6 +1835,20 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
          return value_ptr(nexus, &(src->u.driver.waveforms.value));
 
    case SOURCE_PORT:
+      if (unlikely(standard() == STD_MX)) {
+         // Mixed mode: a port with no internal driver is not a source.
+         // Check if the port's internal nexus has any SOURCE_DRIVER;
+         // if it only has SOURCE_PORT (inbound mapping), the port has
+         // no real driver and would just feed back the old value.
+         rt_nexus_t *input = src->u.port.input;
+         bool has_driver = false;
+         if (input->n_sources > 0) {
+            for (rt_source_t *s = &(input->sources); s; s = s->chain_input)
+               if (s->tag == SOURCE_DRIVER) { has_driver = true; break; }
+         }
+         if (!has_driver)
+            return NULL;
+      }
       if (likely(src->u.port.conv_func == NULL)) {
          if (src->u.port.input->flags & NET_F_EFFECTIVE)
             return nexus_driving(src->u.port.input);
@@ -2036,6 +2050,19 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          // to the value of an implicit 'TRANSACTION or 'QUIET signal
          schedule_implicit_update(m, n);
          return;
+      }
+      else if (unlikely(standard() == STD_MX
+                        && s->tag == SOURCE_PORT)) {
+         // Mixed mode: skip port with no internal driver
+         rt_nexus_t *input = s->u.port.input;
+         bool has_driver = false;
+         if (input->n_sources > 0) {
+            for (rt_source_t *si = &(input->sources);
+                 si; si = si->chain_input)
+               if (si->tag == SOURCE_DRIVER) { has_driver = true; break; }
+         }
+         if (!has_driver)
+            continue;
       }
       else if (s0 == NULL)
          s0 = s;
@@ -2258,7 +2285,8 @@ static void check_undriven_std_logic(rt_nexus_t *n)
    // of which is an undriven port with initial value 'U'. The resolved
    // value will then always be 'U' which often confuses users.
 
-   if (n->n_sources < 2 || !(n->signal->shared.flags & SIG_F_STD_LOGIC))
+   if (n->n_sources < 2 || !(n->signal->shared.flags & SIG_F_STD_LOGIC)
+       || standard() == STD_MX)
       return;
 
    rt_signal_t *undriven = NULL;

@@ -2385,11 +2385,14 @@ static vhdl_standard_t parse_standard(const char *str)
       case 2019:
       case 19:
          return STD_19;
+      case 2040:
+      case 40:
+         return STD_MX;
       }
    }
 
    fatal("invalid standard revision: %s (allowed 1993, 2000, 2002, "
-         "2008, 2019)", str);
+         "2008, 2019, 2040)", str);
 }
 
 static message_style_t parse_message_style(const char *str)

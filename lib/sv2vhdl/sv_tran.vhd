@@ -1,10 +1,10 @@
 -- SystemVerilog Bidirectional Switches
 -- IEEE 1800 Section 28.8
 --
--- Modeled using 'driver/'others implicit signals on inout ports.
+-- Modeled using 'driver/'other implicit signals on inout ports.
 -- 'DRIVER  = implicit signal for what this entity drives onto the net
--- 'OTHERS  = implicit signal for the resolved value excluding this driver
--- 'DRIVER and 'OTHERS are universal (untyped).
+-- 'OTHER   = implicit signal for the resolved value excluding this driver
+-- 'DRIVER and 'OTHER are universal (untyped).
 --
 -- Two architecture variants per entity:
 --   behavioral : uses logic3d (3-bit, no strength resolution)
@@ -30,10 +30,10 @@ end entity sv_tran;
 
 architecture behavioral of sv_tran is
 begin
-    process (a'others, b'others)
+    process (a'other, b'other)
     begin
-        a'driver := b'others;
-        b'driver := a'others;
+        a'driver := b'other;
+        b'driver := a'other;
     end process;
 end architecture behavioral;
 
@@ -44,11 +44,11 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_tran is
 begin
-    process (a'others, b'others)
+    process (a'other, b'other)
         variable a_val, b_val : logic3ds;
     begin
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
         a'driver := a_val;
         b'driver := b_val;
     end process;
@@ -71,13 +71,13 @@ end entity sv_tranif0;
 
 architecture behavioral of sv_tranif0 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3d;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_one(c) then
             a_val := a_val mod L3D_DRIVEN;
@@ -100,13 +100,13 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_tranif0 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3ds;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_one(c) then
             -- ctrl=1: tranif0 blocks
@@ -139,13 +139,13 @@ end entity sv_tranif1;
 
 architecture behavioral of sv_tranif1 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3d;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_zero(c) then
             a_val := a_val mod L3D_DRIVEN;
@@ -168,13 +168,13 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_tranif1 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3ds;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_zero(c) then
             -- ctrl=0: tranif1 blocks
@@ -206,10 +206,10 @@ end entity sv_rtran;
 -- logic3d: equivalent to tran (no strength to reduce)
 architecture behavioral of sv_rtran is
 begin
-    process (a'others, b'others)
+    process (a'other, b'other)
     begin
-        a'driver := b'others;
-        b'driver := a'others;
+        a'driver := b'other;
+        b'driver := a'other;
     end process;
 end architecture behavioral;
 
@@ -220,11 +220,11 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_rtran is
 begin
-    process (a'others, b'others)
+    process (a'other, b'other)
         variable a_val, b_val : logic3ds;
     begin
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
         a_val := l3ds_weaken(a_val);
         b_val := l3ds_weaken(b_val);
         a'driver := a_val;
@@ -250,13 +250,13 @@ end entity sv_rtranif0;
 -- logic3d: equivalent to tranif0 (no strength to reduce)
 architecture behavioral of sv_rtranif0 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3d;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_one(c) then
             a_val := a_val mod L3D_DRIVEN;
@@ -279,13 +279,13 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_rtranif0 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3ds;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
         a_val := l3ds_weaken(a_val);
         b_val := l3ds_weaken(b_val);
 
@@ -321,13 +321,13 @@ end entity sv_rtranif1;
 -- logic3d: equivalent to tranif1 (no strength to reduce)
 architecture behavioral of sv_rtranif1 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3d;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
 
         if is_zero(c) then
             a_val := a_val mod L3D_DRIVEN;
@@ -350,13 +350,13 @@ use work.logic3ds_pkg.all;
 
 architecture strength of sv_rtranif1 is
 begin
-    process (a'others, b'others, ctrl)
+    process (a'other, b'other, ctrl)
         variable c : logic3d;
         variable a_val, b_val : logic3ds;
     begin
         c := to_logic3d(ctrl);
-        a_val := b'others;
-        b_val := a'others;
+        a_val := b'other;
+        b_val := a'other;
         a_val := l3ds_weaken(a_val);
         b_val := l3ds_weaken(b_val);
 

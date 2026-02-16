@@ -187,10 +187,10 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
       }
 
       if (!is_concurrent_block(where) && !is_package(where)) {
-         // Extension: .signal.receiver / .signal.driver / .signal.others
+         // Extension: .signal.receiver / .signal.driver / .signal.other
          // resolves to the implicit signal <signal>$<attr> in parent scope
          static const char *implicit_attrs[] = {
-            "receiver", "driver", "others"
+            "receiver", "driver", "other"
          };
          bool found_implicit = false;
          if (container != NULL && class_of(where) == C_SIGNAL) {
