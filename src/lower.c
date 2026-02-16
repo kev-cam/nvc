@@ -5635,6 +5635,16 @@ static void lower_sched_event(lower_unit_t *lu, tree_t on)
 {
    type_t type = tree_type(on);
 
+   // Extension: for 'DRIVER/'OTHERS implicit signals, the reference type
+   // may still be INTEGER (from parse time) while the underlying implicit
+   // signal has been retyped by sem.c type propagation (e.g. to a record).
+   // Use the declaration's actual type for correct field decomposition.
+   if (tree_kind(on) == T_REF) {
+      tree_t decl = tree_ref(on);
+      if (tree_kind(decl) == T_IMPLICIT_SIGNAL)
+         type = tree_type(decl);
+   }
+
    vcode_reg_t nets_reg = lower_lvalue(lu, on);
    assert(nets_reg != VCODE_INVALID_REG);
 
@@ -8580,6 +8590,29 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
             lower_for_each_field(parent, prefix_type, prefix_reg,
                                  locus, lower_implicit_field_cb,
                                  (void *)(intptr_t)sig);
+      }
+      break;
+
+   case IMPLICIT_DRIVER:
+   case IMPLICIT_OTHERS:
+      {
+         // Extension: 'DRIVER and 'OTHERS are implicit signals for
+         // bidirectional switch modeling.  They are created as regular
+         // signals (no update closure) -- the resolver entity or
+         // VHPI plugin drives 'OTHERS, and the entity deposits to 'DRIVER.
+         // Type is universal: sem.c propagates the actual type from
+         // assignment context (could be logic3d integer or logic3ds record).
+         // For scalars, initialise to 0 (L3D_Z = high-impedance).
+         // For records, let lower_sub_signals use per-field defaults.
+         vcode_reg_t init_reg;
+         if (type_is_scalar(type))
+            init_reg = emit_const(lower_type(type), 0);
+         else
+            init_reg = VCODE_INVALID_REG;
+
+         lower_sub_signals(parent, type, type, type, decl, NULL, var,
+                           VCODE_INVALID_REG, init_reg, VCODE_INVALID_REG,
+                           VCODE_INVALID_REG, 0, VCODE_INVALID_REG);
       }
       break;
    }

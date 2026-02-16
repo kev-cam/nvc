@@ -2409,6 +2409,23 @@ static bool sem_check_variable_target(tree_t target)
    return true;
 }
 
+// Extension: propagate the resolved type to a 'DRIVER or 'OTHERS attr ref
+// and its underlying implicit signal declaration.  Called when the actual
+// type is determined from the assignment context.
+static void sem_propagate_implicit_type(tree_t aref, type_t ty)
+{
+   tree_set_type(aref, ty);
+   tree_t ref = tree_value(aref);
+   if (ref != NULL && tree_kind(ref) == T_REF) {
+      // Also update the T_REF type: the simplifier replaces the ATTR_REF
+      // with this T_REF, so it needs the propagated type for lowering.
+      tree_set_type(ref, ty);
+      tree_t decl = tree_ref(ref);
+      if (tree_kind(decl) == T_IMPLICIT_SIGNAL)
+         tree_set_type(decl, ty);
+   }
+}
+
 static bool sem_check_var_assign(tree_t t, nametab_t *tab)
 {
    tree_t target = tree_target(t);
@@ -2423,6 +2440,10 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
    if (!sem_check_readable(value))
       return false;
 
+   // Extension: 'OTHERS is universal source - type from assignment target
+   const bool universal_source =
+      tree_kind(value) == T_ATTR_REF && tree_subkind(value) == ATTR_OTHERS;
+
    // Extension: allow := on signal targets (blocking deposit)
    tree_t decl = sem_check_lvalue(target);
    if (decl != NULL && class_of(decl) == C_SIGNAL) {
@@ -2431,12 +2452,23 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
       if (!sem_check_signal_target(target, tab, true))
          return false;
 
-      if (!sem_check_same_type(value, target)) {
+      // Extension: 'DRIVER is universal target - type from value
+      const bool universal_target =
+         tree_kind(target) == T_ATTR_REF
+         && tree_subkind(target) == ATTR_DRIVER;
+
+      if (!universal_target && !universal_source
+          && !sem_check_same_type(value, target)) {
          type_t target_type = tree_type(target);
          type_t value_type  = tree_type(value);
          sem_error(t, "type of value %pT does not match type of target %pT",
                    value_type, target_type);
       }
+
+      if (universal_target)
+         sem_propagate_implicit_type(target, tree_type(value));
+      if (universal_source)
+         sem_propagate_implicit_type(value, tree_type(target));
 
       return true;
    }
@@ -2444,12 +2476,16 @@ static bool sem_check_var_assign(tree_t t, nametab_t *tab)
    if (!sem_check_variable_target(target))
       return false;
 
-   if (!sem_check_same_type(value, target)) {
+   if (!universal_source && !sem_check_same_type(value, target)) {
       type_t target_type = tree_type(target);
       type_t value_type  = tree_type(value);
       sem_error(t, "type of value %pT does not match type of target %pT",
                 value_type, target_type);
    }
+
+   // Propagate type for universal 'OTHERS source
+   if (universal_source)
+      sem_propagate_implicit_type(value, tree_type(target));
 
    return true;
 }
@@ -2479,6 +2515,10 @@ static bool sem_check_waveforms(tree_t t, tree_t target, nametab_t *tab)
          if (!universal_target && !sem_check_type(value, expect, tab))
             sem_error(t, "type of value %pT does not match type of target %pT",
                       tree_type(value), expect);
+
+         // Propagate type for universal 'DRIVER target
+         if (universal_target)
+            sem_propagate_implicit_type(target, tree_type(value));
       }
       else {
          tree_t decl = sem_check_lvalue(target);
@@ -5728,6 +5768,8 @@ static bool sem_static_name(tree_t t, static_fn_t check_fn)
          case ATTR_QUIET:
          case ATTR_TRANSACTION:
          case ATTR_RECEIVER:
+         case ATTR_DRIVER:
+         case ATTR_OTHERS:
             return sem_static_name(tree_name(t), check_fn);
          default:
             return false;

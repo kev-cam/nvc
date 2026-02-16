@@ -2208,6 +2208,8 @@ static void implicit_signal_attribute(tree_t aref)
    case ATTR_STABLE: tb_cat(tb, "stable"); break;
    case ATTR_QUIET: tb_cat(tb, "quiet"); break;
    case ATTR_RECEIVER: tb_cat(tb, "receiver"); break;
+   case ATTR_DRIVER: tb_cat(tb, "driver"); break;
+   case ATTR_OTHERS: tb_cat(tb, "others"); break;
    default: break;
    }
    if (delay != NULL && tree_kind(delay) == T_LITERAL) {
@@ -2227,6 +2229,8 @@ static void implicit_signal_attribute(tree_t aref)
    case ATTR_QUIET: kind = IMPLICIT_QUIET; break;
    case ATTR_TRANSACTION: kind = IMPLICIT_TRANSACTION; break;
    case ATTR_RECEIVER: kind = IMPLICIT_RECEIVER; break;
+   case ATTR_DRIVER: kind = IMPLICIT_DRIVER; break;
+   case ATTR_OTHERS: kind = IMPLICIT_OTHERS; break;
    default:
       fatal_trace("invalid implicit signal attribute");
    }
@@ -2249,11 +2253,14 @@ static void implicit_signal_attribute(tree_t aref)
                 || (delay != NULL && tree_has_delay(value)
                     && same_tree(tree_delay(value), delay)));
       }
-      else if (attr == ATTR_TRANSACTION || attr == ATTR_RECEIVER)
+      else if (attr == ATTR_TRANSACTION || attr == ATTR_RECEIVER
+               || attr == ATTR_DRIVER || attr == ATTR_OTHERS)
          match = same_tree(value, prefix);
 
       if (match) {
          tree_set_value(aref, make_ref(d));
+         if (attr == ATTR_DRIVER || attr == ATTR_OTHERS)
+            tree_set_type(aref, std_type(NULL, STD_INTEGER));
          return;
       }
       else {
@@ -2273,6 +2280,17 @@ static void implicit_signal_attribute(tree_t aref)
    }
    else if (attr == ATTR_RECEIVER) {
       tree_set_type(imp, solve_types(nametab, aref, NULL));
+      tree_set_value(imp, prefix);
+   }
+   else if (attr == ATTR_DRIVER || attr == ATTR_OTHERS) {
+      // Extension: 'DRIVER and 'OTHERS are universal (untyped).
+      // Use INTEGER as placeholder -- sem.c will resolve the actual type
+      // from the assignment context (target type for 'OTHERS, value type
+      // for 'DRIVER).  This allows any type to flow through the implicit
+      // signal, not just integer subtypes.
+      type_t t = std_type(NULL, STD_INTEGER);
+      tree_set_type(imp, t);
+      tree_set_type(aref, t);
       tree_set_value(imp, prefix);
    }
    else {
@@ -3544,6 +3562,12 @@ static tree_t p_attribute_name(tree_t prefix)
       id = ident_new("SUBTYPE");
       kind = ATTR_SUBTYPE;
       break;
+   case tOTHERS:
+      // Extension: 'OTHERS attribute for bidirectional switch modeling
+      consume(tOTHERS);
+      id = ident_new("OTHERS");
+      kind = ATTR_OTHERS;
+      break;
    case tID:
       id = p_identifier();
       kind = parse_predefined_attr(id);
@@ -3605,7 +3629,8 @@ static tree_t p_attribute_name(tree_t prefix)
       tree_set_type(t, apply_type_attribute(t));
    else if (kind == ATTR_DELAYED || kind == ATTR_TRANSACTION
             || kind == ATTR_STABLE || kind == ATTR_QUIET
-            || kind == ATTR_RECEIVER)
+            || kind == ATTR_RECEIVER || kind == ATTR_DRIVER
+            || kind == ATTR_OTHERS)
       implicit_signal_attribute(t);
 
    return t;

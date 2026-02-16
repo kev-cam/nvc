@@ -123,6 +123,13 @@ package logic3ds_pkg is
     function make_logic3ds(val : natural; str : l3ds_strength; fl : l3ds_flags) return logic3ds;
     function l3ds_drive(value : boolean; str : l3ds_strength) return logic3ds;
 
+    ---------------------------------------------------------------------------
+    -- Strength manipulation
+    ---------------------------------------------------------------------------
+    function weaken_strength(s : l3ds_strength) return l3ds_strength;
+    function l3ds_weaken(a : logic3ds) return logic3ds;
+    function l3ds_set_unknown(a : logic3ds) return logic3ds;
+
 end package;
 
 package body logic3ds_pkg is
@@ -347,6 +354,41 @@ package body logic3ds_pkg is
         else
             return (value => 0,   strength => str, flags => FL_KNOWN, reserved => 0);
         end if;
+    end function;
+
+    ---------------------------------------------------------------------------
+    -- Strength manipulation
+    ---------------------------------------------------------------------------
+
+    -- Reduce strength one drive level (for resistive tran gates)
+    -- supply->strong, strong->pull, pull->weak, weak->small(weak|cap)
+    -- Capacitive variants reduce similarly: large->medium, medium->small
+    function weaken_strength(s : l3ds_strength) return l3ds_strength is
+    begin
+        case s is
+            when ST_SUPPLY => return ST_STRONG;
+            when ST_LARGE  => return ST_MEDIUM;   -- strong|cap -> pull|cap
+            when ST_STRONG => return ST_PULL;
+            when ST_MEDIUM => return ST_SMALL;     -- pull|cap -> weak|cap
+            when ST_PULL   => return ST_WEAK;
+            when ST_SMALL  => return ST_HIGHZ;     -- weak|cap -> highz
+            when ST_WEAK   => return ST_SMALL;     -- weak -> weak|cap (small)
+            when others    => return ST_HIGHZ;
+        end case;
+    end function;
+
+    -- Weaken entire logic3ds signal (reduce strength, preserve value/flags)
+    function l3ds_weaken(a : logic3ds) return logic3ds is
+    begin
+        return (value => a.value, strength => weaken_strength(a.strength),
+                flags => a.flags, reserved => 0);
+    end function;
+
+    -- Mark signal as unknown (preserve value and strength)
+    function l3ds_set_unknown(a : logic3ds) return logic3ds is
+    begin
+        return (value => a.value, strength => a.strength,
+                flags => FL_UNKNOWN, reserved => 0);
     end function;
 
 end package body;

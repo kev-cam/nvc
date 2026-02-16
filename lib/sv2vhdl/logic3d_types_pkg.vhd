@@ -17,23 +17,29 @@ package logic3d_types_pkg is
     ---------------------------------------------------------------------------
     subtype logic3d is natural range 0 to 7;
 
-    -- Encoding: bit2=uncertain, bit1=strength, bit0=value
-    -- 000 = weak 0      (L3D_L)  std_logic 'L'
-    -- 001 = weak 1      (L3D_H)  std_logic 'H'
-    -- 010 = strong 0    (L3D_0)  std_logic '0'
-    -- 011 = strong 1    (L3D_1)  std_logic '1'
-    -- 100 = high-Z      (L3D_Z)  std_logic 'Z'
-    -- 101 = weak unknown (L3D_W)  std_logic 'W'
-    -- 110 = unknown      (L3D_X)  std_logic 'X'
+    -- Encoding: bit2=uncertain, bit1=driven, bit0=value
+    -- 000 = undriven 0   (L3D_L)  std_logic 'L'
+    -- 001 = undriven 1   (L3D_H)  std_logic 'H'
+    -- 010 = driven 0     (L3D_0)  std_logic '0'
+    -- 011 = driven 1     (L3D_1)  std_logic '1'
+    -- 100 = high-Z       (L3D_Z)  std_logic 'Z'
+    -- 101 = uncertain 1  (L3D_W)  std_logic 'W'
+    -- 110 = uncertain 0  (L3D_X)  std_logic 'X'
     -- 111 = uninitialized (L3D_U) std_logic 'U'
 
-    constant L3D_L : logic3d := 0;  -- 000: weak 0
-    constant L3D_H : logic3d := 1;  -- 001: weak 1
-    constant L3D_0 : logic3d := 2;  -- 010: strong 0
-    constant L3D_1 : logic3d := 3;  -- 011: strong 1
+    -- Bit field constants for direct manipulation
+    constant L3D_UNCERTAIN : natural := 4;  -- bit 2
+    constant L3D_DRIVEN    : natural := 2;  -- bit 1
+    constant L3D_VALUE     : natural := 1;  -- bit 0
+
+    -- State constants
+    constant L3D_L : logic3d := 0;  -- 000: undriven 0
+    constant L3D_H : logic3d := 1;  -- 001: undriven 1
+    constant L3D_0 : logic3d := 2;  -- 010: driven 0
+    constant L3D_1 : logic3d := 3;  -- 011: driven 1
     constant L3D_Z : logic3d := 4;  -- 100: high-Z
-    constant L3D_W : logic3d := 5;  -- 101: weak unknown
-    constant L3D_X : logic3d := 6;  -- 110: unknown
+    constant L3D_W : logic3d := 5;  -- 101: uncertain 1
+    constant L3D_X : logic3d := 6;  -- 110: uncertain 0
     constant L3D_U : logic3d := 7;  -- 111: uninitialized
 
     ---------------------------------------------------------------------------
@@ -137,6 +143,7 @@ package logic3d_types_pkg is
     function l3d_xnor(a, b : logic3d) return logic3d;
     function l3d_buf(a : logic3d) return logic3d;
     function l3d_weaken(a : logic3d) return logic3d;
+    function l3d_set_uncertain(a : logic3d) return logic3d;
 
     -- Multi-input (chained lookups, no delta cycles)
     function l3d_and3(a, b, c : logic3d) return logic3d;
@@ -214,6 +221,12 @@ package body logic3d_types_pkg is
     function l3d_weaken(a : logic3d) return logic3d is
     begin
         return WEAKEN_LUT(a);
+    end function;
+
+    -- Set uncertain bit (mark undriven): preserves value/strength, sets bit 2
+    function l3d_set_uncertain(a : logic3d) return logic3d is
+    begin
+        return (a mod 4) + 4;
     end function;
 
     ---------------------------------------------------------------------------

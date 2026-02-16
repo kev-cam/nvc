@@ -628,6 +628,8 @@ class_t class_of(tree_t t)
       case ATTR_QUIET:
       case ATTR_TRANSACTION:
       case ATTR_RECEIVER:
+      case ATTR_DRIVER:
+      case ATTR_OTHERS:
          return C_SIGNAL;
       default:
          return C_DEFAULT;

@@ -269,6 +269,8 @@ typedef enum {
    IMPLICIT_STABLE,
    IMPLICIT_QUIET,
    IMPLICIT_RECEIVER,
+   IMPLICIT_DRIVER,
+   IMPLICIT_OTHERS,
 } implicit_kind_t;
 
 typedef enum {
