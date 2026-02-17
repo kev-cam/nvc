@@ -408,6 +408,8 @@ static lib_t lib_find_at(const char *name, const char *path)
 
    char *best LOCAL = NULL;
    const char *std_suffix = standard_suffix(standard());
+   const char *fallback_suffix = (standard() == STD_MX)
+      ? standard_suffix(STD_08) : NULL;
    const size_t namelen = strlen(name);
 
    struct dirent *e;
@@ -421,7 +423,9 @@ static lib_t lib_find_at(const char *name, const char *path)
             continue;
          else if (strncasecmp(name, e->d_name, namelen) != 0)
             continue;
-         else if (strcmp(dot + 1, std_suffix) != 0)
+         else if (strcmp(dot + 1, std_suffix) != 0
+                  && !(fallback_suffix
+                       && strcmp(dot + 1, fallback_suffix) == 0))
             continue;
       }
       else {
@@ -519,8 +523,12 @@ lib_t lib_new(const char *spec)
    const char *last_dot = strrchr(name, '.');
    if (last_dot != NULL) {
       const char *ext = standard_suffix(standard());
-      if (strcmp(last_dot + 1, ext) != 0)
-         fatal("library directory suffix must be '%s' for this standard", ext);
+      if (strcmp(last_dot + 1, ext) != 0) {
+         if (standard() != STD_MX
+             || strcmp(last_dot + 1, standard_suffix(STD_08)) != 0)
+            fatal("library directory suffix must be '%s' for this standard",
+                  ext);
+      }
    }
 
    for (const char *p = name; *p && p != last_dot; p++) {

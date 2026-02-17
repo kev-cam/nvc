@@ -5046,10 +5046,9 @@ static vcode_reg_t lower_attr_ref(lower_unit_t *lu, tree_t expr)
       return lower_driving_value(lu, name);
 
    case ATTR_OTHER:
-      // Extension: 'OTHER returns resolved value excluding local driver(s)
-      // TODO: needs runtime support for per-process "others" resolver
-      // For now, placeholder returns driving_value (incorrect but compiles)
-      return lower_driving_value(lu, name);
+      // Extension: 'OTHER reads the implicit 'other signal which is
+      // driven externally by the resolver entity via external names.
+      return lower_rvalue(lu, tree_value(expr));
 
    case ATTR_LAST_VALUE:
       return lower_last_value(lu, name);
@@ -5875,13 +5874,7 @@ static void lower_fill_target_parts(lower_unit_t *lu, tree_t target,
       ++(*ptr);
    }
    else {
-      // Extension: 'DRIVER target uses the signal reference from its prefix
-      tree_t actual_target = target;
-      if (tree_kind(target) == T_ATTR_REF
-          && tree_subkind(target) == ATTR_DRIVER)
-         actual_target = tree_name(target);
-
-      (*ptr)->reg    = lower_lvalue(lu, actual_target);
+      (*ptr)->reg    = lower_lvalue(lu, target);
       (*ptr)->target = target;
       (*ptr)->kind   = kind;
 
@@ -6394,6 +6387,7 @@ static void lower_deposit_field_cb(lower_unit_t *lu, tree_t field,
 static void lower_deposit(lower_unit_t *lu, tree_t stmt)
 {
    tree_t target = tree_target(stmt);
+
    type_t type = tree_type(target);
 
    vcode_reg_t nets = lower_lvalue(lu, target);

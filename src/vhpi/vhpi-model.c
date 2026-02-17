@@ -5247,6 +5247,332 @@ vhpiHandleT vhpi_bind_foreign(const char *obj_lib, const char *model,
    return NULL;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// NVC extension: port map actual signal discovery
+
+/*
+ * Look up a generic declaration's concrete value from ancestor block genmaps.
+ * Walks UpperRegion chain to find a block whose genmap provides the value
+ * for the given generic declaration (used for for-generate loop variables).
+ */
+static bool lookup_generic_value(c_abstractRegion *region, tree_t generic_decl,
+                                 int64_t *value)
+{
+   for (c_abstractRegion *r = region; r != NULL; r = r->UpperRegion) {
+      tree_t block = r->tree;
+      if (block == NULL)
+         continue;
+
+      const int ngenerics = tree_generics(block);
+      const int ngenmaps = tree_genmaps(block);
+
+      for (int i = 0; i < ngenerics && i < ngenmaps; i++) {
+         if (tree_generic(block, i) == generic_decl) {
+            tree_t map = tree_genmap(block, i);
+            if (tree_has_value(map)) {
+               tree_t val = tree_value(map);
+               if (tree_kind(val) == T_LITERAL
+                   && tree_subkind(val) == L_INT) {
+                  *value = tree_ival(val);
+                  return true;
+               }
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/*
+ * Try to evaluate a tree expression to a constant integer.
+ * Handles: T_LITERAL, T_REF (constants, generics, enums), T_QUALIFIED,
+ *          T_FCALL (basic integer arithmetic: +, -, *, /, mod, rem, negate).
+ * Uses the region context to resolve generate loop variables.
+ */
+static bool try_eval_int(tree_t t, c_abstractRegion *region, int64_t *result)
+{
+   switch (tree_kind(t)) {
+   case T_LITERAL:
+      switch (tree_subkind(t)) {
+      case L_INT:
+         *result = tree_ival(t);
+         return true;
+      default:
+         return false;
+      }
+
+   case T_QUALIFIED:
+      return try_eval_int(tree_value(t), region, result);
+
+   case T_REF:
+      if (tree_has_ref(t)) {
+         tree_t decl = tree_ref(t);
+         switch (tree_kind(decl)) {
+         case T_CONST_DECL:
+            if (tree_has_value(decl))
+               return try_eval_int(tree_value(decl), region, result);
+            return false;
+         case T_GENERIC_DECL:
+            return lookup_generic_value(region, decl, result);
+         case T_ENUM_LIT:
+            *result = tree_pos(decl);
+            return true;
+         case T_ALIAS:
+            if (tree_has_value(decl))
+               return try_eval_int(tree_value(decl), region, result);
+            return false;
+         default:
+            return false;
+         }
+      }
+      return false;
+
+   case T_FCALL:
+      if (!tree_has_ref(t))
+         return false;
+      {
+         const subprogram_kind_t kind = tree_subkind(tree_ref(t));
+         const int nparams = tree_params(t);
+
+         if (nparams == 1) {
+            // Unary operators
+            int64_t a;
+            if (!try_eval_int(tree_value(tree_param(t, 0)), region, &a))
+               return false;
+            switch (kind) {
+            case S_NEGATE:   *result = -a; return true;
+            case S_IDENTITY: *result = a;  return true;
+            default: return false;
+            }
+         }
+         else if (nparams == 2) {
+            // Binary operators
+            int64_t a, b;
+            if (!try_eval_int(tree_value(tree_param(t, 0)), region, &a))
+               return false;
+            if (!try_eval_int(tree_value(tree_param(t, 1)), region, &b))
+               return false;
+            switch (kind) {
+            case S_ADD: *result = a + b; return true;
+            case S_SUB: *result = a - b; return true;
+            case S_MUL: *result = a * b; return true;
+            case S_DIV:
+               if (b == 0) return false;
+               *result = a / b;
+               return true;
+            case S_MOD:
+               if (b == 0) return false;
+               *result = a % b;
+               return true;
+            case S_REM:
+               if (b == 0) return false;
+               *result = a % b;
+               return true;
+            case S_EXP:
+               {
+                  int64_t r = 1;
+                  for (int64_t i = 0; i < b; i++)
+                     r *= a;
+                  *result = r;
+                  return true;
+               }
+            default: return false;
+            }
+         }
+      }
+      return false;
+
+   default:
+      return false;
+   }
+}
+
+/*
+ * Format a tree expression (actual in a port map) as a VHPI-compatible name.
+ * Handles: T_REF, T_ARRAY_REF, T_RECORD_REF, T_OPEN, T_LITERAL, T_FCALL
+ * Uses the region context to resolve generate loop variable expressions.
+ * Appends to the text buffer.
+ */
+static void format_actual_name(text_buf_t *tb, tree_t actual,
+                               c_abstractRegion *region)
+{
+   switch (tree_kind(actual)) {
+   case T_REF:
+      tb_istr(tb, tree_ident(tree_ref(actual)));
+      break;
+
+   case T_ARRAY_REF:
+      format_actual_name(tb, tree_value(actual), region);
+      tb_cat(tb, "(");
+      for (int i = 0; i < tree_params(actual); i++) {
+         if (i > 0) tb_cat(tb, ",");
+         tree_t p = tree_param(actual, i);
+         tree_t v = tree_value(p);
+         int64_t ival;
+         if (try_eval_int(v, region, &ival))
+            tb_printf(tb, "%"PRIi64, ival);
+         else
+            format_actual_name(tb, v, region);
+      }
+      tb_cat(tb, ")");
+      break;
+
+   case T_ARRAY_SLICE:
+      format_actual_name(tb, tree_value(actual), region);
+      tb_cat(tb, "(slice)");
+      break;
+
+   case T_RECORD_REF:
+      format_actual_name(tb, tree_value(actual), region);
+      tb_cat(tb, ".");
+      tb_istr(tb, tree_ident(actual));
+      break;
+
+   case T_OPEN:
+      tb_cat(tb, "OPEN");
+      break;
+
+   case T_TYPE_CONV:
+   case T_CONV_FUNC:
+      format_actual_name(tb, tree_value(actual), region);
+      break;
+
+   default:
+      tb_cat(tb, "?");
+      break;
+   }
+}
+
+/*
+ * NVC extension: get port map actual signal names for a component instance.
+ * Format: "formal1=actual1;formal2=actual2;..."
+ *
+ * Both formal and actual use uppercase VHDL identifiers.
+ * For array elements: "AC(0)", for record fields: "REC.FIELD"
+ * Open ports are represented as "OPEN".
+ * Generate loop variable expressions (e.g., i+1) are evaluated to constants.
+ *
+ * Returns NULL if the handle is not a component instance or on error.
+ * The returned string is statically allocated and overwritten on next call.
+ */
+DLLEXPORT
+const vhpiCharT *nvc_vhpi_get_port_map(vhpiHandleT inst_handle)
+{
+   vhpi_clear_error();
+
+   c_vhpiObject *obj = from_handle(inst_handle);
+   if (obj == NULL) return NULL;
+
+   c_abstractRegion *r = is_abstractRegion(obj);
+   if (r == NULL || (obj->kind != vhpiCompInstStmtK
+                     && obj->kind != vhpiRootInstK)) {
+      vhpi_error(vhpiError, &obj->loc,
+                 "nvc_vhpi_get_port_map: not a component instance");
+      return NULL;
+   }
+
+   tree_t block = r->tree;
+   const int nparams = tree_params(block);
+   if (nparams == 0) return NULL;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+
+   for (int i = 0; i < nparams; i++) {
+      tree_t map = tree_param(block, i);
+
+      // Get formal port name
+      tree_t formal;
+      if (tree_subkind(map) == P_NAMED)
+         formal = tree_ref(name_to_ref(tree_name(map)));
+      else
+         formal = tree_port(block, tree_pos(map));
+
+      if (i > 0) tb_cat(tb, ";");
+      tb_istr(tb, tree_ident(formal));
+      tb_cat(tb, "=");
+
+      // Get actual signal expression
+      if (!tree_has_value(map)) {
+         tb_cat(tb, "OPEN");
+      }
+      else {
+         tree_t actual = tree_value(map);
+         format_actual_name(tb, actual, r->UpperRegion);
+      }
+   }
+
+   static char result_buf[4096];
+   const char *s = tb_get(tb);
+   size_t len = strlen(s);
+   if (len >= sizeof(result_buf)) len = sizeof(result_buf) - 1;
+   memcpy(result_buf, s, len);
+   result_buf[len] = '\0';
+
+   return (const vhpiCharT *)result_buf;
+}
+
+/*
+ * NVC extension: get the type name of the 'DRIVER implicit signal for
+ * a port in a component instance.
+ *
+ * In --std=2040 mode, 'DRIVER and 'OTHER take their type from the
+ * assignment context, not the port type.  This function finds the
+ * T_IMPLICIT_SIGNAL declaration of IMPLICIT_DRIVER kind for the named
+ * port and returns its type name.
+ *
+ * Returns the type name (e.g. "LOGIC3DS", "STD_LOGIC", "INTEGER"),
+ * or NULL if not found.  The returned string is statically allocated.
+ */
+DLLEXPORT
+const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
+                                           const vhpiCharT *port_name)
+{
+   vhpi_clear_error();
+
+   c_vhpiObject *obj = from_handle(inst_handle);
+   if (obj == NULL) return NULL;
+
+   c_abstractRegion *r = is_abstractRegion(obj);
+   if (r == NULL || (obj->kind != vhpiCompInstStmtK
+                     && obj->kind != vhpiRootInstK))
+      return NULL;
+
+   tree_t block = r->tree;
+   const int ndecls = tree_decls(block);
+
+   /* Convert port_name to an ident for comparison */
+   ident_t port_id = ident_new((const char *)port_name);
+
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) != T_IMPLICIT_SIGNAL)
+         continue;
+      if (tree_subkind(d) != IMPLICIT_DRIVER)
+         continue;
+
+      /* The implicit signal's value is a T_REF to the port decl.
+       * Match by comparing the port's identifier. */
+      if (!tree_has_value(d))
+         continue;
+
+      tree_t val = tree_value(d);
+      if (tree_kind(val) == T_REF && tree_has_ref(val)) {
+         tree_t port_decl = tree_ref(val);
+         if (tree_ident(port_decl) == port_id) {
+            /* Found it — return the type name */
+            type_t t = tree_type(d);
+            static char type_buf[256];
+            const char *tname = type_pp(t);
+            snprintf(type_buf, sizeof(type_buf), "%s",
+                     tname ? tname : "?");
+            return (const vhpiCharT *)type_buf;
+         }
+      }
+   }
+
+   return NULL;
+}
+
 void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)
 {
    c_vhpiObject *obj = from_handle(handle);

@@ -51,6 +51,10 @@ begin
         b_val := a'other;
         a'driver := a_val;
         b'driver := b_val;
+        -- Relay: also drive the port so the resolved value appears
+        -- on the actual signal (resolved with any other drivers).
+        a <= to_std_logic(a_val);
+        b <= to_std_logic(b_val);
     end process;
 end architecture strength;
 

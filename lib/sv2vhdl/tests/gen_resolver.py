@@ -302,15 +302,99 @@ def emit_resolver_vhdl(design_name, nets):
     return "\n".join(lines)
 
 
+def load_from_json(json_path):
+    """Load net connectivity from NVC --export-resolvers JSON."""
+    import json
+    with open(json_path) as f:
+        data = json.load(f)
+
+    design = data["design"]
+    nets = []
+    for jnet in data["nets"]:
+        net = Net(jnet["net"])
+        for ep in jnet["endpoints"]:
+            kind = ep["kind"]
+            if kind == "driver":
+                net.endpoints.append(Endpoint(
+                    kind="assign", instance="", entity="", arch="",
+                    port="", source_expr=""))
+            elif kind == "tran":
+                net.endpoints.append(Endpoint(
+                    kind="tran_port", instance=ep["instance"],
+                    entity="", arch="", port=ep["port"], source_expr=""))
+            elif kind == "gate":
+                net.endpoints.append(Endpoint(
+                    kind="gate_port", instance=ep["instance"],
+                    entity="", arch="", port=ep["port"], source_expr=""))
+        nets.append(net)
+
+    return design, nets
+
+
+def echo_connectivity(design, nets):
+    """Print what we understood from the JSON, for verification."""
+    lines = []
+    lines.append(f"# Resolver connectivity for {design}")
+    lines.append(f"# {len(nets)} nets total")
+    lines.append(f"#")
+
+    tran_tran = 0
+    driver_tran = 0
+    leaf = 0
+    for net in nets:
+        kinds = [e.kind for e in net.endpoints]
+        n_tran = kinds.count("tran_port")
+        n_assign = kinds.count("assign")
+        n_gate = kinds.count("gate_port")
+
+        if len(net.endpoints) <= 1:
+            leaf += 1
+            tag = "leaf"
+        elif n_assign > 0 and n_tran > 0:
+            driver_tran += 1
+            tag = "driver+tran"
+        elif n_tran >= 2:
+            tran_tran += 1
+            tag = "tran<->tran"
+        else:
+            tag = "other"
+
+        parts = []
+        for ep in net.endpoints:
+            if ep.kind == "assign":
+                parts.append("driver")
+            elif ep.kind == "tran_port":
+                parts.append(f"{ep.instance}.{ep.port}(tran)")
+            elif ep.kind == "gate_port":
+                parts.append(f"{ep.instance}.{ep.port}(gate)")
+        lines.append(f"# [{tag:13s}] {net.name}: {' <-> '.join(parts)}")
+
+    lines.append(f"#")
+    lines.append(f"# Summary: {tran_tran} tran<->tran, "
+                 f"{driver_tran} driver+tran, {leaf} leaf")
+    return "\n".join(lines)
+
+
 def main():
     import sys
-    design_name, nets = build_test_tran_str()
-    vhdl = emit_resolver_vhdl(design_name, nets)
-    outfile = f"resolver_{design_name}.vhd"
-    with open(outfile, "w") as f:
-        f.write(vhdl)
-    print(vhdl)
-    print(f"\n-- Written to {outfile}", file=sys.stderr)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate resolver VHDL")
+    parser.add_argument("--from-json", metavar="FILE",
+                        help="Read connectivity from NVC JSON export")
+    args = parser.parse_args()
+
+    if args.from_json:
+        design, nets = load_from_json(args.from_json)
+        print(echo_connectivity(design, nets))
+    else:
+        design_name, nets = build_test_tran_str()
+        vhdl = emit_resolver_vhdl(design_name, nets)
+        outfile = f"resolver_{design_name}.vhd"
+        with open(outfile, "w") as f:
+            f.write(vhdl)
+        print(vhdl)
+        print(f"\n-- Written to {outfile}", file=sys.stderr)
 
 
 if __name__ == "__main__":

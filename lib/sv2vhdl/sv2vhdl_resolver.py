@@ -2,19 +2,25 @@
 sv2vhdl_resolver.py -- Resolution network VHDL generator for sv2vhdl
 
 Called by libresolver.so (VHPI plugin) when the simulator discovers
-nets that need resolution (vector _driver/_others signal pairs with
-length > 1).
+nets that need resolution (tran entities with multiple inout ports).
 
 Each net dict has:
-    net_name     : str  -- base net name (VHPI full path minus suffix)
-    type         : str  -- element type (e.g. "STD_LOGIC")
-    length       : int  -- number of endpoints (vector size)
-    driver_ename : str  -- external name path to _driver signal
-    others_ename : str  -- external name path to _others signal
+    net_name   : str  -- tran instance ename path
+    drivers    : list -- [{ename: str, type: str}, ...]
+    receivers  : list -- [{ename: str, type: str}, ...]
 
-Returns a VHDL string containing:
-    1. A resolver entity (no ports, uses external names)
-    2. A wrapper entity (instantiates DUT + resolver)
+For a 2-endpoint net (the common tran case), resolution is a simple swap:
+    receiver[0] <= driver[1]
+    receiver[1] <= driver[0]
+
+For N>2 endpoints, each receiver gets the resolution of all other drivers.
+
+Returns a dict mapping filenames to VHDL strings:
+    - One file per net: "{design}_rn_{i}.vhd" with its own entity
+    - One wrapper file: "{design}_wrapper.vhd" instantiating DUT + all resolvers
+
+This per-net structure allows incremental recompilation when only some
+nets change.
 
 The _sv2vhdl_vhpi module (registered by the C plugin) provides direct
 VHPI access for Python-driven hierarchy exploration:
@@ -40,77 +46,146 @@ def _djb2(s, h=5381):
     return h
 
 
-def _topology_hash(nets):
-    """Compute topology hash over sorted nets (must match C side)."""
-    sorted_nets = sorted(nets, key=lambda n: n["net_name"])
+def _net_hash(net):
+    """Hash a single net's topology and types for per-file caching."""
     h = 5381
-    for n in sorted_nets:
-        desc = f'{n["net_name"]}:{n["type"]}:{n["length"]}'
-        h = _djb2(desc, h)
+    h = _djb2(net["net_name"], h)
+    for drv in net["drivers"]:
+        h = _djb2(drv["ename"], h)
+        h = _djb2(drv.get("type", ""), h)
+    for rcv in net["receivers"]:
+        h = _djb2(rcv["ename"], h)
+        h = _djb2(rcv.get("type", ""), h)
     return h
 
 
 def _sanitize_id(name):
     """Turn a hierarchical path into a valid VHDL identifier for labels."""
-    return name.replace(".", "_").replace(":", "_").replace("@", "").strip("_")
+    return name.replace(".", "_").replace(":", "_").replace("@", "").replace(
+        "(", "_").replace(")", "_").strip("_")
 
 
-def _type_str(sig_type, length):
-    """Build the VHDL type string for an external name.
+def _type_info(net):
+    """Determine resolution function, vector type, and use clauses for a net.
 
-    sig_type is the signal's own type (e.g. STD_LOGIC_VECTOR for arrays,
-    STD_LOGIC for scalars). For arrays, append the range constraint.
+    Inspects the first driver's type to choose the appropriate resolution
+    infrastructure:
+      - logic3ds  -> l3ds_resolve / logic3ds_vector  (logic3ds_pkg)
+      - logic3d   -> l3d_resolve  / logic3d_vector   (logic3d_types_pkg)
+      - std_logic -> resolved     / std_ulogic_vector (std_logic_1164)
+
+    Returns (resolve_func, vec_type, extra_use_clauses).
     """
-    t = sig_type.lower()
-    if length == 1:
-        return t
-    return f"{t}(0 to {length - 1})"
+    if not net["drivers"]:
+        return "resolved", "std_ulogic_vector", []
 
+    ep_type = net["drivers"][0]["type"].lower()
 
-def _gen_resolution_process(net, drv_alias, oth_alias):
-    """Generate VHDL process for one net's resolution logic."""
-    length = net["length"]
-    label = f"resolve_{_sanitize_id(net['net_name'])}"
-    lines = []
-
-    lines.append(f"    {label}: process({drv_alias})")
-    lines.append(f"    begin")
-
-    if length == 2:
-        # Simple swap: others(0) = driver(1), others(1) = driver(0)
-        lines.append(f"        {oth_alias}(0) <= {drv_alias}(1);")
-        lines.append(f"        {oth_alias}(1) <= {drv_alias}(0);")
+    if ep_type == "logic3ds":
+        return ("l3ds_resolve", "logic3ds_vector",
+                ["use work.logic3ds_pkg.all;"])
+    elif ep_type == "logic3d":
+        return ("l3d_resolve", "logic3d_vector",
+                ["use work.logic3d_types_pkg.all;"])
     else:
-        # N>2: others(i) = resolved(all drivers except i)
-        for i in range(length):
-            parts = [f"{drv_alias}({j})" for j in range(length) if j != i]
-            expr = " & ".join(parts)
-            lines.append(f"        {oth_alias}({i}) <= resolved({expr});")
+        return ("resolved", "std_ulogic_vector", [])
 
-    lines.append(f"    end process;")
-    return "\n".join(lines)
+
+def _gen_net_vhdl(net, idx, design_name, fix_ename):
+    """Generate VHDL for a single net's resolver entity.
+
+    Each resolver entity:
+      - Reads 'DRIVER signals from tran endpoints on this net
+      - Computes per-endpoint 'OTHER (exclude self)
+      - Drives the net's port signal with the combined resolved value
+
+    Returns (entity_name, vhdl_string).
+    """
+    entity_name = f"sv2vhdl_rn_{design_name}_{idx}"
+    net_h = _net_hash(net)
+    n_ep = len(net["drivers"])
+    resolve_func, vec_type, extra_uses = _type_info(net)
+    ep_type = net["drivers"][0]["type"].lower() if net["drivers"] else "std_logic"
+
+    lines = []
+    lines.append(f"-- Net hash: {net_h:016x}")
+    lines.append(f"-- Net: {net['net_name']} ({n_ep} endpoints)")
+    lines.append(f"-- Auto-generated by sv2vhdl resolver plugin")
+    lines.append(f"")
+    lines.append(f"library ieee;")
+    lines.append(f"use ieee.std_logic_1164.all;")
+    for use in extra_uses:
+        lines.append(use)
+    lines.append(f"")
+    lines.append(f"entity {entity_name} is end;")
+    lines.append(f"architecture generated of {entity_name} is")
+
+    # Alias declarations for driver/receiver pairs
+    drv_aliases = []
+    rcv_aliases = []
+    for i in range(n_ep):
+        drv = net["drivers"][i]
+        rcv = net["receivers"][i]
+        da = f"drv_{i}"
+        ra = f"rcv_{i}"
+        drv_path = fix_ename(drv["ename"])
+        rcv_path = fix_ename(rcv["ename"])
+        drv_type = drv["type"].lower()
+        rcv_type = rcv["type"].lower()
+        lines.append(f"    alias {da} is "
+                     f"<< signal {drv_path} : {drv_type} >>;")
+        lines.append(f"    alias {ra} is "
+                     f"<< signal {rcv_path} : {rcv_type} >>;")
+        drv_aliases.append(da)
+        rcv_aliases.append(ra)
+
+    lines.append(f"begin")
+
+    if n_ep == 1:
+        lines.append(f"    -- single endpoint, no resolution needed")
+    elif n_ep == 2:
+        # Simple swap: each gets the other's driver
+        lines.append(f"    {rcv_aliases[0]} <= {drv_aliases[1]};")
+        lines.append(f"    {rcv_aliases[1]} <= {drv_aliases[0]};")
+    else:
+        # N>2: each receiver gets the resolution of all OTHER drivers.
+        sens = ", ".join(drv_aliases)
+        lines.append(f"    resolve: process({sens})")
+        lines.append(f"        variable v : {vec_type}(0 to {n_ep - 2});")
+        lines.append(f"    begin")
+        for i in range(n_ep):
+            others = [drv_aliases[j] for j in range(n_ep) if j != i]
+            if len(others) == 1:
+                lines.append(f"        {rcv_aliases[i]} <= {others[0]};")
+            else:
+                for k, other in enumerate(others):
+                    lines.append(f"        v({k}) := {other};")
+                lines.append(f"        {rcv_aliases[i]} <= {resolve_func}(v);")
+        lines.append(f"    end process;")
+
+    lines.append(f"end architecture;")
+    lines.append(f"")
+
+    return entity_name, "\n".join(lines)
 
 
 def resolve_net(nets, design_name):
-    """Generate VHDL resolver code for multi-endpoint nets.
+    """Generate per-net VHDL resolver entities and a wrapper.
 
     Args:
         nets: list of net dicts (see module docstring)
         design_name: top-level entity name (lowercase)
 
     Returns:
-        str: Complete VHDL source, or None if nothing to generate.
+        dict: {filename: vhdl_string} with one file per net + wrapper,
+              or None if nothing to generate.
     """
     if not nets:
         return None
 
-    topo_hash = _topology_hash(nets)
-    resolver_entity = f"sv2vhdl_resolver_{design_name}"
     wrapper_entity = f"resolved_{design_name}"
     dut_label = "dut"
 
-    # Transform ename paths: replace absolute root with wrapper.dut path
-    # Original: .test_resolver_tb.sig  ->  .resolved_test_resolver_tb.dut.sig
     orig_prefix = f".{design_name}."
     new_prefix = f".{wrapper_entity}.{dut_label}."
 
@@ -119,87 +194,36 @@ def resolve_net(nets, design_name):
             return new_prefix + ename[len(orig_prefix):]
         return ename
 
+    files = {}
+    entity_names = []
+
+    # Generate one file per net
+    for idx, net in enumerate(nets):
+        entity_name, vhdl = _gen_net_vhdl(net, idx, design_name, fix_ename)
+        filename = f"{design_name}_rn_{idx}.vhd"
+        files[filename] = vhdl
+        entity_names.append(entity_name)
+
+    # Generate wrapper file
     lines = []
-
-    # Header
-    lines.append(f"-- Topology hash: {topo_hash:016x}")
+    lines.append(f"-- Wrapper: instantiates DUT + {len(nets)} resolver(s)")
     lines.append(f"-- Auto-generated by sv2vhdl resolver plugin")
-    lines.append(f"-- {len(nets)} net(s) requiring resolution")
     lines.append(f"")
-    lines.append(f"library ieee;")
-    lines.append(f"use ieee.std_logic_1164.all;")
-    lines.append(f"")
-
-    # Resolver entity (no ports)
-    lines.append(f"entity {resolver_entity} is end;")
-    lines.append(f"architecture generated of {resolver_entity} is")
-
-    # Alias declarations for external names (paths adjusted for wrapper)
-    for i, net in enumerate(nets):
-        drv_alias = f"drv_{i}"
-        oth_alias = f"oth_{i}"
-        type_s = _type_str(net["type"], net["length"])
-        drv_path = fix_ename(net["driver_ename"])
-        oth_path = fix_ename(net["others_ename"])
-        lines.append(f"    alias {drv_alias} is "
-                     f"<< signal {drv_path} : {type_s} >>;")
-        lines.append(f"    alias {oth_alias} is "
-                     f"<< signal {oth_path} : {type_s} >>;")
-
-    lines.append(f"begin")
-
-    # Resolution processes
-    for i, net in enumerate(nets):
-        drv_alias = f"drv_{i}"
-        oth_alias = f"oth_{i}"
-        lines.append(f"")
-        lines.append(f"    -- Net: {net['net_name']} "
-                     f"({net['length']} endpoints, {net['type']})")
-        lines.append(_gen_resolution_process(net, drv_alias, oth_alias))
-
-    lines.append(f"")
-    lines.append(f"end architecture;")
-    lines.append(f"")
-
-    # Wrapper entity: instantiates DUT + resolver
-    lines.append(f"-- Wrapper: run this for standalone simulation")
     lines.append(f"library ieee;")
     lines.append(f"use ieee.std_logic_1164.all;")
     lines.append(f"")
     lines.append(f"entity {wrapper_entity} is end;")
     lines.append(f"architecture wrapper of {wrapper_entity} is")
     lines.append(f"begin")
-    lines.append(f"    dut: entity work.{design_name};")
-    lines.append(f"    resolver: entity work.{resolver_entity};")
+    lines.append(f"    {dut_label}: entity work.{design_name};")
+    for idx, ename in enumerate(entity_names):
+        lines.append(f"    rn_{idx}: entity work.{ename};")
     lines.append(f"end architecture;")
     lines.append(f"")
 
-    # Use VHPI bridge to explore the design scope
-    if _have_vhpi and nets:
-        parent = nets[0]["driver_ename"].rsplit(".", 1)[0]
-        try:
-            info = explore_region(parent)
-            n_sig = len(info["signals"])
-            n_inst = len(info["instances"])
-            print(f"[sv2vhdl] VHPI bridge: explored {parent} "
-                  f"({n_sig} signals, {n_inst} instances)")
+    files[f"{design_name}_wrapper.vhd"] = "\n".join(lines)
 
-            # Report power supplies
-            if info["power"]:
-                for rail, sigs in info["power"].items():
-                    for s in sigs:
-                        print(f"[sv2vhdl]   power {rail}: "
-                              f"{s['name']} ({s['ename']})")
-
-            # Report instance generics
-            for inst in info["instances"]:
-                gens = get_instance_generics(inst["ename"])
-                if gens:
-                    print(f"[sv2vhdl]   {inst['name']} generics: {gens}")
-        except Exception as e:
-            print(f"[sv2vhdl] VHPI explore: {e}")
-
-    return "\n".join(lines)
+    return files
 
 
 # ---------- VHPI exploration helpers ----------
@@ -232,18 +256,10 @@ def explore_region(region_path):
 
 
 def find_power_supplies(net_ename):
-    """Find power supply signals in the same scope as a net.
-
-    Given a signal ename like '.top.net_a_driver', looks in the parent
-    region ('.top') for signals matching VDD/VSS naming conventions.
-
-    Returns: dict with 'vdd' and 'vss' lists of signal dicts, or empty
-    if no power signals found or VHPI not available.
-    """
+    """Find power supply signals in the same scope as a net."""
     if not _have_vhpi:
         return {}
 
-    # Derive parent region from signal ename
     parent = net_ename.rsplit(".", 1)[0]
     if not parent:
         return {}
@@ -265,10 +281,7 @@ def find_power_supplies(net_ename):
 
 
 def get_instance_generics(instance_ename):
-    """Read generics from an instance via VHPI.
-
-    Returns dict of {generic_name: value} or empty dict.
-    """
+    """Read generics from an instance via VHPI."""
     if not _have_vhpi:
         return {}
 

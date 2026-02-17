@@ -33,14 +33,23 @@
 #endif
 #include <dlfcn.h>
 
+/* NVC extension: port map and implicit type discovery */
+extern const vhpiCharT *nvc_vhpi_get_port_map(vhpiHandleT inst_handle);
+extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
+                                                  const vhpiCharT *port_name);
+
 /* ---------- Configuration ---------- */
 
 #define MAX_NAME  512
 #define MAX_TYPE  128
 #define MAX_VAL   1024
 
-#define SUFFIX_DRIVER  "_driver"
-#define SUFFIX_OTHERS  "_others"
+/* Tran-like entity names (bidirectional switches using 'driver/'other) */
+static const char *tran_entities[] = {
+    "SV_TRAN", "SV_TRANIF0", "SV_TRANIF1",
+    "SV_RTRAN", "SV_RTRANIF0", "SV_RTRANIF1",
+    NULL
+};
 
 #define RESOLVER_MODULE  "sv2vhdl_resolver"
 #define RESOLVER_FUNC    "resolve_net"
@@ -50,19 +59,25 @@
 
 /* ---------- Data structures ---------- */
 
+#define MAX_ENDPOINTS 64
+
 /*
- * Simplified net_info: one driver vector signal + one others vector signal.
- * Vector length indicates number of switch endpoints on the net.
+ * One endpoint on a net: a 'driver signal paired with a 'receiver (or 'other).
+ */
+typedef struct endpoint {
+    char driver_ename[MAX_NAME];   /* external name path: ".top.inst.port.driver" */
+    char receiver_ename[MAX_NAME]; /* external name path: ".top.inst.port.other" */
+    char type_name[MAX_TYPE];      /* signal type */
+} endpoint_t;
+
+/*
+ * A net requiring resolution: has a list of driver signals and
+ * a corresponding list of receiver signals.
  */
 typedef struct net_info {
-    char net_name[MAX_NAME];      /* base name (VHPI full name minus suffix) */
-    char type_name[MAX_TYPE];     /* signal type: "STD_LOGIC_VECTOR" or "STD_LOGIC" */
-    char elem_type[MAX_TYPE];     /* element type: "STD_ULOGIC" or same as type_name */
-    char driver_ename[MAX_NAME];  /* external name path: ".top.sig_driver" */
-    char others_ename[MAX_NAME];  /* external name path: ".top.sig_others" */
-    int  length;                  /* vector size (N endpoints) */
-    int  has_driver;
-    int  has_others;
+    char net_name[MAX_NAME];
+    endpoint_t endpoints[MAX_ENDPOINTS];
+    int  n_endpoints;
     int  needs_resolution;
     struct net_info *next;
 } net_info_t;
@@ -70,7 +85,6 @@ typedef struct net_info {
 /* ---------- Global state ---------- */
 
 static net_info_t *g_nets = NULL;
-static int g_total_signals = 0;
 static int g_total_instances = 0;
 static int g_depth = 0;
 static char g_design_name[MAX_NAME] = {0};
@@ -92,14 +106,6 @@ static int streqi(const char *a, const char *b)
     return *a == *b;
 }
 
-static int ends_with(const char *str, const char *suffix)
-{
-    size_t slen = strlen(str);
-    size_t xlen = strlen(suffix);
-    if (xlen > slen) return 0;
-    return streqi(str + slen - xlen, suffix);
-}
-
 static void safe_copy(char *dst, const char *src, size_t dstsz)
 {
     if (!src) { dst[0] = '\0'; return; }
@@ -107,24 +113,6 @@ static void safe_copy(char *dst, const char *src, size_t dstsz)
     if (len >= dstsz) len = dstsz - 1;
     memcpy(dst, src, len);
     dst[len] = '\0';
-}
-
-/*
- * Strip suffix from str, write base into buf. Returns buf on success, NULL
- * if str doesn't end with suffix.
- */
-static const char *strip_suffix(const char *str, const char *suffix,
-                                char *buf, size_t bufsz)
-{
-    size_t slen = strlen(str);
-    size_t xlen = strlen(suffix);
-    if (xlen > slen) return NULL;
-    if (!streqi(str + slen - xlen, suffix)) return NULL;
-    size_t baselen = slen - xlen;
-    if (baselen >= bufsz) baselen = bufsz - 1;
-    memcpy(buf, str, baselen);
-    buf[baselen] = '\0';
-    return buf;
 }
 
 /*
@@ -169,6 +157,79 @@ static net_info_t *find_or_create_net(const char *name)
     n->next = g_nets;
     g_nets = n;
     return n;
+}
+
+static int net_add_endpoint(net_info_t *net,
+                            const char *driver_ename,
+                            const char *receiver_ename,
+                            const char *type_name)
+{
+    if (net->n_endpoints >= MAX_ENDPOINTS) {
+        vhpi_printf("resolver: too many endpoints on net %s", net->net_name);
+        return -1;
+    }
+    endpoint_t *ep = &net->endpoints[net->n_endpoints++];
+    safe_copy(ep->driver_ename, driver_ename, sizeof(ep->driver_ename));
+    safe_copy(ep->receiver_ename, receiver_ename, sizeof(ep->receiver_ename));
+    safe_copy(ep->type_name, type_name, sizeof(ep->type_name));
+    return 0;
+}
+
+static int is_tran_entity(const char *entity_name)
+{
+    for (const char **p = tran_entities; *p; p++)
+        if (streqi(entity_name, *p))
+            return 1;
+    return 0;
+}
+
+/*
+ * Parse a port map string from nvc_vhpi_get_port_map().
+ * Format: "FORMAL1=ACTUAL1;FORMAL2=ACTUAL2;..."
+ * Looks up the given formal_name and copies the actual name to dst.
+ * Returns 1 on success, 0 if not found.
+ */
+static int portmap_lookup(const char *portmap, const char *formal_name,
+                          char *dst, size_t dstsz)
+{
+    if (!portmap || !formal_name) return 0;
+
+    const char *p = portmap;
+    size_t flen = strlen(formal_name);
+
+    while (*p) {
+        /* Match formal name (case-insensitive) */
+        const char *eq = strchr(p, '=');
+        if (!eq) break;
+
+        size_t name_len = (size_t)(eq - p);
+        int match = (name_len == flen);
+        if (match) {
+            for (size_t i = 0; i < flen; i++) {
+                if (tolower((unsigned char)p[i]) !=
+                    tolower((unsigned char)formal_name[i])) {
+                    match = 0;
+                    break;
+                }
+            }
+        }
+
+        /* Find end of actual (next ';' or end of string) */
+        const char *actual_start = eq + 1;
+        const char *semi = strchr(actual_start, ';');
+        size_t actual_len = semi ? (size_t)(semi - actual_start)
+                                 : strlen(actual_start);
+
+        if (match) {
+            if (actual_len >= dstsz) actual_len = dstsz - 1;
+            memcpy(dst, actual_start, actual_len);
+            dst[actual_len] = '\0';
+            return 1;
+        }
+
+        p = semi ? semi + 1 : actual_start + actual_len;
+    }
+    return 0;
 }
 
 /* ---------- Hierarchy walker ---------- */
@@ -223,102 +284,34 @@ static void get_type_info(vhpiHandleT sig, char *sig_type_buf, size_t stbufsz,
     vhpi_release_handle(type);
 }
 
-static void scan_signals(vhpiHandleT region)
-{
-    vhpiHandleT iter = vhpi_iterator(vhpiSigDecls, region);
-    if (!iter) return;
-
-    for (vhpiHandleT sig = vhpi_scan(iter); sig; sig = vhpi_scan(iter)) {
-        const char *name = get_name(sig);
-        const char *full = get_full_name(sig);
-        g_total_signals++;
-
-        if (!name || !full) {
-            vhpi_release_handle(sig);
-            continue;
-        }
-
-        char base[MAX_NAME];
-        char ename[MAX_NAME];
-        int is_driver = ends_with(name, SUFFIX_DRIVER);
-        int is_others = ends_with(name, SUFFIX_OTHERS);
-
-        if (!is_driver && !is_others) {
-            vhpi_release_handle(sig);
-            continue;
-        }
-
-        const char *suffix = is_driver ? SUFFIX_DRIVER : SUFFIX_OTHERS;
-
-        /* Strip suffix from signal name (not full path) to get net base name */
-        char name_base[MAX_NAME];
-        if (!strip_suffix(name, suffix, name_base, sizeof(name_base))) {
-            vhpi_release_handle(sig);
-            continue;
-        }
-
-        /* Build the net name from full path: strip suffix from full */
-        if (!strip_suffix(full, suffix, base, sizeof(base))) {
-            vhpi_release_handle(sig);
-            continue;
-        }
-
-        net_info_t *net = find_or_create_net(base);
-        if (!net) {
-            vhpi_release_handle(sig);
-            continue;
-        }
-
-        /* Get vector size */
-        int size = vhpi_get(vhpiSizeP, sig);
-        if (size <= 0) size = 1;  /* scalar */
-
-        /* Get type info */
-        char sig_type[MAX_TYPE], elem_type[MAX_TYPE];
-        get_type_info(sig, sig_type, sizeof(sig_type),
-                      elem_type, sizeof(elem_type));
-        if (net->type_name[0] == '\0')
-            safe_copy(net->type_name, sig_type, sizeof(net->type_name));
-        if (net->elem_type[0] == '\0')
-            safe_copy(net->elem_type, elem_type, sizeof(net->elem_type));
-
-        /* Convert VHPI full path to external name */
-        vhpi_to_ename(full, ename, sizeof(ename));
-
-        if (is_driver) {
-            safe_copy(net->driver_ename, ename, sizeof(net->driver_ename));
-            net->has_driver = 1;
-            if (net->length == 0 || size > net->length)
-                net->length = size;
-        } else {
-            safe_copy(net->others_ename, ename, sizeof(net->others_ename));
-            net->has_others = 1;
-            if (net->length == 0 || size > net->length)
-                net->length = size;
-        }
-
-        indent();
-        vhpi_printf("  signal: %s  size: %d  type: %s  ename: %s",
-                     name, size, elem_type, ename);
-
-        vhpi_release_handle(sig);
-    }
-    vhpi_release_handle(iter);
-}
-
-static void walk_hierarchy(vhpiHandleT region);
-
-static void scan_instances(vhpiHandleT region)
+/*
+ * Scan instances in a region.  For each instance whose entity is a
+ * tran-like primitive, use nvc_vhpi_get_port_map() to discover the
+ * actual signal each inout port connects to, and group endpoints
+ * by actual signal (the "net").
+ *
+ * Example: tran instances with port map(a => ac(2), b => ac(3))
+ *   - Signal AC(2) gets an endpoint: {tc.a.driver, tc.a.other}
+ *   - Signal AC(3) gets an endpoint: {tc.b.driver, tc.b.other}
+ *
+ * path_prefix is the accumulated hierarchical ename path, e.g.
+ * ".test_tran_str.gen_chain(1)"
+ *
+ * sig_prefix is the ename path of the scope where the actual signals
+ * are declared (the enclosing architecture), e.g. ".test_tran_str"
+ */
+static void scan_instances(vhpiHandleT region, const char *path_prefix,
+                           const char *sig_prefix)
 {
     vhpiHandleT iter = vhpi_iterator(vhpiCompInstStmts, region);
     if (!iter) return;
 
     for (vhpiHandleT inst = vhpi_scan(iter); inst; inst = vhpi_scan(iter)) {
         const char *inst_name = get_name(inst);
-        const char *inst_full = get_full_name(inst);
         g_total_instances++;
 
-        const char *entity_name = "?";
+        /* Get entity name */
+        const char *entity_name = NULL;
         vhpiHandleT du = vhpi_handle(vhpiDesignUnit, inst);
         if (du) {
             vhpiHandleT entity = vhpi_handle(vhpiPrimaryUnit, du);
@@ -329,31 +322,169 @@ static void scan_instances(vhpiHandleT region)
             vhpi_release_handle(du);
         }
 
-        indent();
-        vhpi_printf("  instance: %s  entity: %s",
-                     inst_full ? inst_full : (inst_name ? inst_name : "?"),
-                     entity_name ? entity_name : "?");
+        /* Build full instance ename path */
+        char inst_ename[MAX_NAME];
+        char inst_lower[MAX_NAME];
+        safe_copy(inst_lower, inst_name ? inst_name : "?", sizeof(inst_lower));
+        for (char *c = inst_lower; *c; c++)
+            *c = tolower((unsigned char)*c);
+        snprintf(inst_ename, sizeof(inst_ename), "%s.%s",
+                 path_prefix, inst_lower);
 
+        indent();
+        vhpi_printf("  instance: %s  entity: %s  ename: %s",
+                     inst_name ? inst_name : "?",
+                     entity_name ? entity_name : "?",
+                     inst_ename);
+
+        if (!entity_name || !is_tran_entity(entity_name)) {
+            vhpi_release_handle(inst);
+            continue;
+        }
+
+        /* Get port map from NVC extension */
+        const vhpiCharT *portmap =
+            (const vhpiCharT *)nvc_vhpi_get_port_map(inst);
+        if (!portmap) {
+            indent();
+            vhpi_printf("    WARNING: no port map for tran instance");
+            vhpi_release_handle(inst);
+            continue;
+        }
+
+        indent();
+        vhpi_printf("    portmap: %s", (const char *)portmap);
+
+        /* Scan inout ports, using port map to identify actual signals */
+        vhpiHandleT piter = vhpi_iterator(vhpiPortDecls, inst);
+        if (!piter) {
+            vhpi_release_handle(inst);
+            continue;
+        }
+
+        for (vhpiHandleT port = vhpi_scan(piter); port;
+             port = vhpi_scan(piter)) {
+            vhpiModeT mode = (vhpiModeT)vhpi_get(vhpiModeP, port);
+            if (mode != vhpiInoutMode) {
+                vhpi_release_handle(port);
+                continue;
+            }
+
+            const char *port_name = get_name(port);
+            if (!port_name) {
+                vhpi_release_handle(port);
+                continue;
+            }
+
+            /* Get implicit signal type (actual 'driver type, not port type).
+             * Falls back to port element type if no implicit signal found. */
+            char port_type[MAX_TYPE], port_etype[MAX_TYPE];
+            get_type_info(port, port_type, sizeof(port_type),
+                          port_etype, sizeof(port_etype));
+
+            const vhpiCharT *drv_type =
+                nvc_vhpi_get_driver_type(inst, (const vhpiCharT *)port_name);
+            if (drv_type)
+                safe_copy(port_etype, (const char *)drv_type,
+                          sizeof(port_etype));
+
+            char port_lower[MAX_NAME];
+            safe_copy(port_lower, port_name, sizeof(port_lower));
+            for (char *c = port_lower; *c; c++)
+                *c = tolower((unsigned char)*c);
+
+            /* Look up actual signal from port map */
+            char actual[MAX_NAME];
+            if (!portmap_lookup((const char *)portmap, port_name,
+                                actual, sizeof(actual))) {
+                indent();
+                vhpi_printf("    WARNING: port %s not in port map", port_name);
+                vhpi_release_handle(port);
+                continue;
+            }
+
+            /* Lowercase the actual signal name */
+            for (char *c = actual; *c; c++)
+                *c = tolower((unsigned char)*c);
+
+            /* Build net name: sig_prefix + "." + actual_signal
+             * e.g. ".test_tran_str.ac(2)" */
+            char net_name[MAX_NAME];
+            snprintf(net_name, sizeof(net_name), "%s.%s",
+                     sig_prefix, actual);
+
+            /* External name paths for implicit signals:
+             * .top.inst.port.driver and .top.inst.port.other */
+            char drv_ename[MAX_NAME], rcv_ename[MAX_NAME];
+            snprintf(drv_ename, sizeof(drv_ename), "%s.%s.driver",
+                     inst_ename, port_lower);
+            snprintf(rcv_ename, sizeof(rcv_ename), "%s.%s.other",
+                     inst_ename, port_lower);
+
+            /* Group by actual signal: all tran ports connecting
+             * to the same signal form one resolution group */
+            net_info_t *net = find_or_create_net(net_name);
+            if (net) {
+                net_add_endpoint(net, drv_ename, rcv_ename, port_etype);
+                indent();
+                vhpi_printf("    port %s -> actual=%s net=%s",
+                             port_name, actual, net_name);
+                vhpi_printf("      drv=%s rcv=%s", drv_ename, rcv_ename);
+            }
+
+            vhpi_release_handle(port);
+        }
+        vhpi_release_handle(piter);
         vhpi_release_handle(inst);
     }
     vhpi_release_handle(iter);
 }
 
-static void walk_hierarchy(vhpiHandleT region)
+/*
+ * Walk the hierarchy recursively.
+ * path_prefix: accumulated ename of this region (e.g. ".test.gen(1)")
+ * sig_prefix:  ename of the scope where actual port-map signals live
+ *              (typically the enclosing architecture, e.g. ".test")
+ */
+static void walk_hierarchy(vhpiHandleT region, const char *path_prefix,
+                           const char *sig_prefix)
 {
-    const char *rname = get_full_name(region);
+    const char *rname = get_name(region);
     indent();
-    vhpi_printf("region: %s", rname ? rname : "(root)");
+    vhpi_printf("region: %s  path: %s  sig_prefix: %s",
+                rname ? rname : "(root)", path_prefix, sig_prefix);
 
-    scan_signals(region);
-    scan_instances(region);
+    scan_instances(region, path_prefix, sig_prefix);
 
     vhpiHandleT riter = vhpi_iterator(vhpiInternalRegions, region);
     if (riter) {
         for (vhpiHandleT sub = vhpi_scan(riter); sub;
              sub = vhpi_scan(riter)) {
+            const char *sub_name = get_name(sub);
+            char sub_path[MAX_NAME];
+            char sub_lower[MAX_NAME];
+            safe_copy(sub_lower, sub_name ? sub_name : "?",
+                      sizeof(sub_lower));
+            for (char *c = sub_lower; *c; c++)
+                *c = tolower((unsigned char)*c);
+            snprintf(sub_path, sizeof(sub_path), "%s.%s",
+                     path_prefix, sub_lower);
+
+            /* Determine sig_prefix for the sub-region.
+             * For generate blocks and block statements, actual signals
+             * in port maps still reference the enclosing architecture,
+             * so sig_prefix stays the same.
+             * For component instances (entity architectures), the
+             * sig_prefix becomes the instance path. */
+            vhpiIntT kind = vhpi_get(vhpiKindP, sub);
+            const char *sub_sig_prefix;
+            if (kind == vhpiCompInstStmtK || kind == vhpiRootInstK)
+                sub_sig_prefix = sub_path;  /* entering a new entity */
+            else
+                sub_sig_prefix = sig_prefix;  /* generate/block: same scope */
+
             g_depth++;
-            walk_hierarchy(sub);
+            walk_hierarchy(sub, sub_path, sub_sig_prefix);
             g_depth--;
             vhpi_release_handle(sub);
         }
@@ -366,130 +497,10 @@ static void walk_hierarchy(vhpiHandleT region)
 static void analyze_nets(void)
 {
     for (net_info_t *n = g_nets; n; n = n->next) {
-        n->needs_resolution = (n->has_driver && n->has_others && n->length > 1);
+        n->needs_resolution = (n->n_endpoints >= 2);
     }
 }
 
-/* ---------- Topology hash ---------- */
-
-static unsigned long djb2_hash(const char *str, unsigned long hash)
-{
-    while (*str)
-        hash = hash * 33 + (unsigned char)*str++;
-    return hash;
-}
-
-static unsigned long compute_topology_hash(void)
-{
-    /* Collect net names that need resolution, sort them */
-    int count = 0;
-    for (net_info_t *n = g_nets; n; n = n->next)
-        if (n->needs_resolution) count++;
-
-    if (count == 0) return 0;
-
-    /* Simple array of pointers for sorting */
-    net_info_t **sorted = malloc(count * sizeof(*sorted));
-    if (!sorted) return 0;
-
-    int idx = 0;
-    for (net_info_t *n = g_nets; n; n = n->next)
-        if (n->needs_resolution)
-            sorted[idx++] = n;
-
-    /* Sort by net_name */
-    for (int i = 0; i < count - 1; i++)
-        for (int j = i + 1; j < count; j++)
-            if (strcmp(sorted[i]->net_name, sorted[j]->net_name) > 0) {
-                net_info_t *tmp = sorted[i];
-                sorted[i] = sorted[j];
-                sorted[j] = tmp;
-            }
-
-    /* Hash: name:type:length for each net */
-    unsigned long hash = 5381;
-    for (int i = 0; i < count; i++) {
-        char buf[MAX_NAME + MAX_TYPE + 32];
-        snprintf(buf, sizeof(buf), "%s:%s:%d",
-                 sorted[i]->net_name, sorted[i]->type_name, sorted[i]->length);
-        hash = djb2_hash(buf, hash);
-    }
-
-    free(sorted);
-    return hash;
-}
-
-/* ---------- Cache ---------- */
-
-static int check_cache(const char *cache_path, unsigned long expected_hash)
-{
-    FILE *f = fopen(cache_path, "r");
-    if (!f) return 0;
-
-    char line[256];
-    if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
-
-    unsigned long stored_hash = 0;
-    if (sscanf(line, "-- Topology hash: %lx", &stored_hash) == 1) {
-        return stored_hash == expected_hash;
-    }
-    return 0;
-}
-
-static int write_and_compile(const char *vhdl, const char *cache_path,
-                             const char *work_dir)
-{
-    /* Create cache directory */
-    mkdir(CACHE_DIR, 0755);
-
-    /* Write VHDL file */
-    FILE *f = fopen(cache_path, "w");
-    if (!f) {
-        vhpi_printf("resolver: ERROR - cannot write %s: %s",
-                     cache_path, strerror(errno));
-        return -1;
-    }
-    fputs(vhdl, f);
-    fclose(f);
-    vhpi_printf("resolver: wrote %s", cache_path);
-
-    /* Compile with nvc */
-    char cmd[MAX_NAME * 2];
-    if (work_dir && work_dir[0])
-        snprintf(cmd, sizeof(cmd),
-                 "nvc --std=2008 --work=%s -a %s 2>&1", work_dir, cache_path);
-    else
-        snprintf(cmd, sizeof(cmd),
-                 "nvc --std=2008 -a %s 2>&1", cache_path);
-
-    vhpi_printf("resolver: compiling: %s", cmd);
-    FILE *proc = popen(cmd, "r");
-    if (!proc) {
-        vhpi_printf("resolver: ERROR - cannot spawn nvc: %s", strerror(errno));
-        return -1;
-    }
-
-    char line[512];
-    while (fgets(line, sizeof(line), proc)) {
-        /* Strip trailing newline */
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-        vhpi_printf("  nvc: %s", line);
-    }
-
-    int status = pclose(proc);
-    if (status != 0) {
-        vhpi_printf("resolver: ERROR - nvc compilation failed (status %d)", status);
-        return -1;
-    }
-
-    vhpi_printf("resolver: compilation successful");
-    return 0;
-}
 
 /* ---------- VHPI bridge for Python ---------- */
 
@@ -945,25 +956,45 @@ static PyObject *build_net_dict(const net_info_t *net)
 
     PyDict_SetItemString(d, "net_name",
                          PyUnicode_FromString(net->net_name));
-    PyDict_SetItemString(d, "type",
-                         PyUnicode_FromString(net->type_name));
-    PyDict_SetItemString(d, "elem_type",
-                         PyUnicode_FromString(net->elem_type));
-    PyDict_SetItemString(d, "length",
-                         PyLong_FromLong(net->length));
-    PyDict_SetItemString(d, "driver_ename",
-                         PyUnicode_FromString(net->driver_ename));
-    PyDict_SetItemString(d, "others_ename",
-                         PyUnicode_FromString(net->others_ename));
+
+    /* Build lists of driver and receiver external name paths + types */
+    PyObject *drivers = PyList_New(0);
+    PyObject *receivers = PyList_New(0);
+
+    for (int i = 0; i < net->n_endpoints; i++) {
+        const endpoint_t *ep = &net->endpoints[i];
+
+        PyObject *drv = PyDict_New();
+        PyDict_SetItemString(drv, "ename",
+                             PyUnicode_FromString(ep->driver_ename));
+        PyDict_SetItemString(drv, "type",
+                             PyUnicode_FromString(ep->type_name));
+        PyList_Append(drivers, drv);
+        Py_DECREF(drv);
+
+        PyObject *rcv = PyDict_New();
+        PyDict_SetItemString(rcv, "ename",
+                             PyUnicode_FromString(ep->receiver_ename));
+        PyDict_SetItemString(rcv, "type",
+                             PyUnicode_FromString(ep->type_name));
+        PyList_Append(receivers, rcv);
+        Py_DECREF(rcv);
+    }
+
+    PyDict_SetItemString(d, "drivers", drivers);
+    PyDict_SetItemString(d, "receivers", receivers);
+    Py_DECREF(drivers);
+    Py_DECREF(receivers);
 
     return d;
 }
 
 /*
  * Call Python resolve_net() with list of nets needing resolution.
- * Returns the VHDL string (caller must free), or NULL on error/no-op.
+ * Returns a PyDict {filename: vhdl_string} (new reference), or NULL.
+ * Caller must Py_DECREF the result.
  */
-static char *call_python_resolver(void)
+static PyObject *call_python_resolver(void)
 {
     if (!g_python_ok || !g_py_func) {
         vhpi_printf("resolver: Python not available, skipping resolver calls");
@@ -1019,16 +1050,14 @@ static char *call_python_resolver(void)
         return NULL;
     }
 
-    char *vhdl = NULL;
-    if (PyUnicode_Check(result)) {
-        const char *s = PyUnicode_AsUTF8(result);
-        if (s) vhdl = strdup(s);
-    } else {
-        vhpi_printf("resolver: WARNING - unexpected return type from Python");
+    if (!PyDict_Check(result)) {
+        vhpi_printf("resolver: WARNING - expected dict from Python, got %s",
+                     Py_TYPE(result)->tp_name);
+        Py_DECREF(result);
+        return NULL;
     }
 
-    Py_DECREF(result);
-    return vhdl;
+    return result;  /* caller must Py_DECREF */
 }
 
 /* ---------- Report ---------- */
@@ -1047,15 +1076,19 @@ static void print_report(void)
         if (!n->needs_resolution) continue;
         nets_needing++;
 
-        vhpi_printf("--- Net: %s ---", n->net_name);
-        vhpi_printf("  Type: %s  Length: %d", n->type_name, n->length);
-        vhpi_printf("  Driver ename: %s", n->driver_ename);
-        vhpi_printf("  Others ename: %s", n->others_ename);
+        vhpi_printf("--- Net: %s  (%d endpoints) ---",
+                     n->net_name, n->n_endpoints);
+        for (int i = 0; i < n->n_endpoints; i++) {
+            vhpi_printf("  [%d] driver:   %s  type: %s",
+                         i, n->endpoints[i].driver_ename,
+                         n->endpoints[i].type_name);
+            vhpi_printf("      receiver: %s",
+                         n->endpoints[i].receiver_ename);
+        }
         vhpi_printf("");
     }
 
     vhpi_printf("=== Summary ===");
-    vhpi_printf("Total signals scanned: %d", g_total_signals);
     vhpi_printf("Total instances scanned: %d", g_total_instances);
     vhpi_printf("Total nets discovered: %d", total_nets);
     vhpi_printf("Nets requiring resolution: %d", nets_needing);
@@ -1073,7 +1106,6 @@ static void cleanup(void)
         n = nn;
     }
     g_nets = NULL;
-    g_total_signals = 0;
     g_total_instances = 0;
 }
 
@@ -1109,7 +1141,9 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     /* Phase 1: Discover resolution networks */
     vhpi_printf("--- Hierarchy Trace ---");
     g_depth = 0;
-    walk_hierarchy(root);
+    char root_ename[MAX_NAME];
+    snprintf(root_ename, sizeof(root_ename), ".%s", g_design_name);
+    walk_hierarchy(root, root_ename, root_ename);
 
     vhpi_printf("");
     vhpi_printf("--- Analysis ---");
@@ -1118,9 +1152,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     /* Report */
     print_report();
 
-    /* Phase 2: Check cache */
-    unsigned long hash = compute_topology_hash();
-
+    /* Phase 2: Count nets needing resolution */
     int nets_needing = 0;
     for (net_info_t *n = g_nets; n; n = n->next)
         if (n->needs_resolution) nets_needing++;
@@ -1132,30 +1164,14 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         return;
     }
 
-    char cache_path[MAX_NAME];
-    snprintf(cache_path, sizeof(cache_path), "%s/%s_resolver.vhd",
-             CACHE_DIR, g_design_name);
-
-    if (check_cache(cache_path, hash)) {
-        vhpi_printf("resolver: cache hit (%s, hash %08lx)", cache_path, hash);
-        vhpi_printf("resolver: for standalone run: nvc --std=2008 -e resolved_%s"
-                     " && nvc --std=2008 -r resolved_%s",
-                     g_design_name, g_design_name);
-        cleanup();
-        vhpi_release_handle(root);
-        return;
-    }
-
-    vhpi_printf("resolver: cache miss (hash %08lx), generating resolver...", hash);
-
-    /* Phase 3: Call Python to generate VHDL */
-    char *vhdl = call_python_resolver();
-    if (!vhdl) {
+    /* Phase 3: Call Python to generate per-net VHDL files */
+    PyObject *file_dict = call_python_resolver();
+    if (!file_dict) {
         vhpi_printf("resolver: ERROR - no VHDL generated");
         for (net_info_t *n = g_nets; n; n = n->next) {
             if (n->needs_resolution) {
-                vhpi_printf("resolver: UNRESOLVED net %s (%d endpoints, type %s)",
-                             n->net_name, n->length, n->type_name);
+                vhpi_printf("resolver: UNRESOLVED net %s (%d endpoints)",
+                             n->net_name, n->n_endpoints);
             }
         }
         cleanup();
@@ -1163,24 +1179,124 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         return;
     }
 
-    vhpi_printf("resolver: received VHDL (%zu bytes)", strlen(vhdl));
+    Py_ssize_t n_files = PyDict_Size(file_dict);
+    vhpi_printf("resolver: received %zd VHDL file(s)", n_files);
 
-    /* Phase 4: Write and compile */
-    /* Try to find work directory (same dir as where the design was compiled) */
+    /* Phase 4: Write files and optionally compile (per-file caching) */
+    mkdir(CACHE_DIR, 0755);
+    const char *rcmode = getenv("NVC_RCMODE");
+    const int skip_compile = (rcmode && strcmp(rcmode, "none") == 0);
     const char *work_dir = getenv("NVC_WORK");
     if (!work_dir) work_dir = "work";
 
-    if (write_and_compile(vhdl, cache_path, work_dir) == 0) {
-        vhpi_printf("");
-        vhpi_printf("resolver: resolver generated successfully!");
-        vhpi_printf("resolver: for standalone simulation:");
-        vhpi_printf("  nvc --std=2008 --work=%s -e resolved_%s",
-                     work_dir, g_design_name);
-        vhpi_printf("  nvc --std=2008 --work=%s -r resolved_%s",
-                     work_dir, g_design_name);
+    int written = 0, cached = 0, compiled = 0, errors = 0;
+
+    PyObject *py_fname, *py_vhdl;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(file_dict, &pos, &py_fname, &py_vhdl)) {
+        const char *fname = PyUnicode_AsUTF8(py_fname);
+        const char *vhdl = PyUnicode_AsUTF8(py_vhdl);
+        if (!fname || !vhdl) continue;
+
+        char cache_path[MAX_NAME];
+        snprintf(cache_path, sizeof(cache_path), "%s/%s",
+                 CACHE_DIR, fname);
+
+        /* Per-file cache: compare first line (net hash comment) */
+        {
+            FILE *existing = fopen(cache_path, "r");
+            if (existing) {
+                char old_line[256], new_line[256];
+                if (fgets(old_line, sizeof(old_line), existing)) {
+                    /* Extract first line from new VHDL */
+                    const char *nl = strchr(vhdl, '\n');
+                    size_t len = nl ? (size_t)(nl - vhdl) : strlen(vhdl);
+                    if (len >= sizeof(new_line)) len = sizeof(new_line) - 1;
+                    memcpy(new_line, vhdl, len);
+                    new_line[len] = '\0';
+
+                    /* Strip newlines for comparison */
+                    size_t olen = strlen(old_line);
+                    if (olen > 0 && old_line[olen-1] == '\n')
+                        old_line[olen-1] = '\0';
+
+                    if (strcmp(old_line, new_line) == 0) {
+                        fclose(existing);
+                        cached++;
+                        continue;  /* file unchanged */
+                    }
+                }
+                fclose(existing);
+            }
+        }
+
+        /* Write the file */
+        FILE *f = fopen(cache_path, "w");
+        if (!f) {
+            vhpi_printf("resolver: ERROR - cannot write %s: %s",
+                         cache_path, strerror(errno));
+            errors++;
+            continue;
+        }
+        fputs(vhdl, f);
+        fclose(f);
+        written++;
+
+        /* Compile if not in rcmode=none */
+        if (!skip_compile) {
+            char cmd[MAX_NAME * 2];
+            snprintf(cmd, sizeof(cmd),
+                     "nvc --std=2008 --work=%s -a %s 2>&1",
+                     work_dir, cache_path);
+
+            FILE *proc = popen(cmd, "r");
+            if (!proc) {
+                vhpi_printf("resolver: ERROR - cannot spawn nvc for %s",
+                             fname);
+                errors++;
+                continue;
+            }
+
+            char line[512];
+            while (fgets(line, sizeof(line), proc)) {
+                size_t len = strlen(line);
+                if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+                vhpi_printf("  nvc: %s", line);
+            }
+
+            int status = pclose(proc);
+            if (status != 0) {
+                vhpi_printf("resolver: ERROR - compilation failed for %s",
+                             fname);
+                errors++;
+            } else {
+                compiled++;
+            }
+        }
     }
 
-    free(vhdl);
+    vhpi_printf("");
+    if (skip_compile) {
+        vhpi_printf("resolver: --rcmode=none: wrote %d file(s), "
+                     "%d cached, %d error(s)", written, cached, errors);
+        vhpi_printf("resolver: to compile and run manually:");
+        vhpi_printf("  nvc --std=2008 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
+                     CACHE_DIR, g_design_name, CACHE_DIR, g_design_name);
+        vhpi_printf("  nvc --std=2008 -e resolved_%s", g_design_name);
+        vhpi_printf("  nvc --std=2008 -r resolved_%s", g_design_name);
+    } else {
+        vhpi_printf("resolver: wrote %d, cached %d, compiled %d, errors %d",
+                     written, cached, compiled, errors);
+        if (errors == 0) {
+            vhpi_printf("resolver: for standalone simulation:");
+            vhpi_printf("  nvc --std=2008 --work=%s -e resolved_%s",
+                         work_dir, g_design_name);
+            vhpi_printf("  nvc --std=2008 --work=%s -r resolved_%s",
+                         work_dir, g_design_name);
+        }
+    }
+
+    Py_DECREF(file_dict);
     cleanup();
     vhpi_release_handle(root);
 }

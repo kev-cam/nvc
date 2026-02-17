@@ -824,6 +824,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "gtkw",          optional_argument, 0, 'g' },
       { "shuffle",       no_argument,       0, 'H' },
+      { "rcmode",        required_argument, 0, 'R' },
       { 0, 0, 0, 0 }
    };
 
@@ -832,6 +833,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *wave_fname = NULL;
    const char   *gtkw_fname = NULL;
    const char   *pli_plugins = NULL;
+   const char   *rcmode = NULL;
 
    static bool have_run = false;
    if (have_run)
@@ -931,6 +933,15 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
                "as non-deterministic behaviour");
          opt_set_int(OPT_SHUFFLE_PROCS, 1);
          break;
+      case 'R':
+         if (strcmp(optarg, "none") == 0)
+            rcmode = "none";
+         else if (strcmp(optarg, "compile") == 0)
+            rcmode = "compile";
+         else
+            fatal("invalid --rcmode value '%s': expected 'none' or 'compile'",
+                  optarg);
+         break;
       default:
          should_not_reach_here();
       }
@@ -945,6 +956,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       if (argv[i][0] == '+')
          nplusargs++, optind++;
    }
+
+   if (rcmode != NULL && strcmp(rcmode, "none") == 0
+       && pli_plugins == NULL && state->plugins == NULL)
+      fatal("--rcmode=none requires --load to specify a resolver plugin");
+
+   if (rcmode != NULL)
+      setenv("NVC_RCMODE", rcmode, 1);
 
    set_top_level(argv, next_cmd, state);
 
@@ -1024,6 +1042,32 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    set_ctrl_c_handler(ctrl_c_handler, state->model);
 
    model_reset(state->model);
+
+   if (rcmode != NULL && strcmp(rcmode, "none") == 0) {
+      // Run with stop_time=0 to fire START_OF_SIMULATION callbacks
+      // (where the resolver plugin does its work), then stop immediately
+      model_run(state->model, 0);
+
+      notef("--rcmode=none: stopping after plugin callbacks");
+      set_ctrl_c_handler(NULL, NULL);
+
+      if (dumper != NULL)
+         wave_dumper_free(dumper);
+
+      vhpi_context_free(state->vhpi);
+      state->vhpi = NULL;
+
+      vpi_context_free(state->vpi);
+      state->vpi = NULL;
+
+      model_free(state->model);
+      state->model = NULL;
+
+      argc -= next_cmd - 1;
+      argv += next_cmd - 1;
+
+      return argc > 1 ? process_command(argc, argv, state) : EXIT_SUCCESS;
+   }
 
    if (dumper != NULL)
       wave_dumper_restart(dumper, state->model, state->jit);
@@ -2247,6 +2291,9 @@ static void usage(void)
            { "--format={fst,vcd}", "Waveform dump format" },
            { "--include=GLOB",
              "Include signals matching GLOB in waveform dump" },
+           { "--rcmode={none,compile}",
+             "Resolver compile mode: 'none' stops after elaboration "
+             "without compiling resolver code (requires --load)" },
            { "--shuffle", "Run processes in random order" },
            { "--stats", "Print time and memory usage at end of run" },
            { "--stop-delta=N", "Stop after N delta cycles (default 10000)" },

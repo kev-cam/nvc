@@ -130,6 +130,10 @@
   vhpi_scan;
   vhpi_vprintf;
 
+  # NVC extension: port map and implicit type discovery for resolver plugin
+  nvc_vhpi_get_port_map;
+  nvc_vhpi_get_driver_type;
+
   # Unit test
   global_func;
 };

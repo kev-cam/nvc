@@ -2063,6 +2063,8 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          }
          if (!has_driver)
             continue;
+         if (s0 == NULL)
+            s0 = s;
       }
       else if (s0 == NULL)
          s0 = s;
@@ -2075,7 +2077,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       // value of S is unchanged from its previous value.
       if (n->signal->shared.flags & SIG_F_REGISTER)
          put_driving(m, n, nexus_effective(n));
-      else if (r == NULL || is_pseudo_source(n->sources.tag))
+      else if (r == NULL || nonnull == 0 || is_pseudo_source(n->sources.tag))
          put_driving(m, n, nexus_initial(n));
       else
          call_resolution(m, n, r, nonnull, s0);
