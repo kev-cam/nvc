@@ -97,6 +97,9 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
    tree_t container = NULL;   // Last concurrent block for implicit lookups
    ident_t container_path = NULL;
 
+   bool is_array_element = false;
+   int64_t array_index = 0;
+
    const int nparts = tree_parts(name);
    for (int i = 0; i < nparts; i++, where = next, next = NULL) {
       if (is_concurrent_block(where) || is_package(where)) {
@@ -140,11 +143,14 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
          break;
       case PE_GENERATE:
          {
+            int64_t gen_index = args[next_arg++].integer;
+
             LOCAL_TEXT_BUF tb = tb_new();
             tb_istr(tb, tree_ident(pe));
-            tb_printf(tb, "(%"PRIi64")", args[next_arg++].integer);
+            tb_printf(tb, "(%"PRIi64")", gen_index);
 
             id = ident_new(tb_get(tb));
+            array_index = gen_index;
          }
          break;
       case PE_LIBRARY:
@@ -229,18 +235,32 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
       }
 
       if ((next = select_name(where, id)) == NULL) {
-         diag_t *d = diag_new(DIAG_ERROR, tree_loc(pe));
-         diag_printf(d, "external name %s not found",
-                     istr(tree_ident(tree_part(name, nparts - 1))));
-         diag_hint(d, tree_loc(pe), "name %s not found inside %s", istr(id),
-                   istr(tree_ident(where)));
+         // PE_GENERATE may be array element access, not a generate index
+         if (tree_subkind(pe) == PE_GENERATE && i + 1 == nparts) {
+            ident_t base_id = tree_ident(pe);
+            next = select_name(where, base_id);
+            if (next != NULL && type_is_array(tree_type(next))) {
+               is_array_element = true;
+               id = base_id;
+            }
+            else
+               next = NULL;
+         }
 
-         if (!tree_frozen(where))
-            diag_hint(d, NULL, "an object cannot be referenced by an "
-                      "external name until it has been elaborated");
+         if (next == NULL) {
+            diag_t *d = diag_new(DIAG_ERROR, tree_loc(pe));
+            diag_printf(d, "external name %s not found",
+                        istr(tree_ident(tree_part(name, nparts - 1))));
+            diag_hint(d, tree_loc(pe), "name %s not found inside %s", istr(id),
+                      istr(tree_ident(where)));
 
-         diag_emit(d);
-         jit_abort_with_status(1);
+            if (!tree_frozen(where))
+               diag_hint(d, NULL, "an object cannot be referenced by an "
+                         "external name until it has been elaborated");
+
+            diag_emit(d);
+            jit_abort_with_status(1);
+         }
       }
 
       if (i + 1 < nparts)
@@ -261,16 +281,17 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
 
    type_t type = tree_type(where);
    type_t expect = tree_type(name);
+   type_t check_type = is_array_element ? type_elem(type) : type;
 
-   if (!type_eq(type, expect)) {
+   if (!type_eq(check_type, expect)) {
       diag_t *d = diag_new(DIAG_ERROR, tree_loc(name));
       diag_printf(d, "type of %s %s is not %s",
                   class_str(tree_class(name)), istr(tree_ident(where)),
-                  type_pp2(expect, type));
+                  type_pp2(expect, check_type));
       diag_hint(d, tree_loc(name), "external name with type %s",
-                type_pp2(expect, type));
+                type_pp2(expect, check_type));
       diag_hint(d, tree_loc(where), "declaration of %s with type %s",
-                istr(tree_ident(where)), type_pp2(type, expect));
+                istr(tree_ident(where)), type_pp2(check_type, expect));
       diag_emit(d);
       jit_abort_with_status(1);
    }
@@ -279,6 +300,32 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
    (void)jit_link(j, handle);   // Package may not be loaded
 
    void *ptr = jit_get_frame_var(j, handle, tree_ident(where));
+
+   if (is_array_element) {
+      if (!type_const_bounds(type))
+         jit_msg(tree_loc(name), DIAG_FATAL,
+                 "array element external name requires constant bounds");
+
+      tree_t r = range_of(type, 0);
+      const int64_t left = assume_int(tree_left(r));
+      const int64_t right = assume_int(tree_right(r));
+      const range_kind_t dir = tree_subkind(r);
+      const int64_t length =
+         MAX(0, dir == RANGE_TO ? right - left + 1 : left - right + 1);
+      const int64_t idx_offset =
+         dir == RANGE_TO ? array_index - left : left - array_index;
+
+      if (idx_offset < 0 || idx_offset >= length)
+         jit_msg(tree_loc(name), DIAG_FATAL,
+                 "array index %"PRIi64" out of range", array_index);
+
+      jit_scalar_t *slot = jit_mspace_alloc(sizeof(jit_scalar_t) * 2);
+      slot[0].pointer = *(sig_shared_t **)ptr;
+      slot[1].integer = *(int32_t *)(ptr + 8) + idx_offset;
+
+      args[0].pointer = slot;
+      return;
+   }
 
    if (type_is_array(type) && type_const_bounds(type)) {
       const int ndims = dimension_of(type);
