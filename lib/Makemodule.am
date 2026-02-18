@@ -22,9 +22,11 @@ clean-libs:
 	rm -f lib/nvc.08/NVC.IEEE_SUPPORT lib/nvc.08/NVC.IEEE_SUPPORT-body
 	rm -f lib/nvc.19/NVC.IEEE_SUPPORT lib/nvc.19/NVC.IEEE_SUPPORT-body
 	rm -f lib/preload93.$(DLL_EXT) lib/preload08.$(DLL_EXT) lib/preload19.$(DLL_EXT)
+	rm -rf lib/sv2vhdl/SV2VHDL.* lib/sv2vhdl/_NVC_LIB lib/sv2vhdl/_index
+	rm -f lib/sv2vhdl/libresolver.$(DLL_EXT)
 	for d in std std.08 std.19 nvc nvc.08 nvc.19 ieee ieee.08 \
-	         ieee.19 synopsys; do \
-	  if test -d lib/$$d; then rmdir lib/$$d; fi; \
+	         ieee.19 synopsys sv2vhdl; do \
+	  if test -d lib/$$d; then rmdir lib/$$d 2>/dev/null || true; fi; \
 	done
 
 all-libs: $(BOOTSTRAPLIBS)

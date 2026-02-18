@@ -824,7 +824,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "gtkw",          optional_argument, 0, 'g' },
       { "shuffle",       no_argument,       0, 'H' },
-      { "rcmode",        required_argument, 0, 'R' },
+      { "rcmode",            required_argument, 0, 'R' },
+      { "export-resolvers", required_argument, 0, 'X' },
       { 0, 0, 0, 0 }
    };
 
@@ -834,6 +835,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *gtkw_fname = NULL;
    const char   *pli_plugins = NULL;
    const char   *rcmode = NULL;
+   const char   *resolver_dir = NULL;
 
    static bool have_run = false;
    if (have_run)
@@ -942,6 +944,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
             fatal("invalid --rcmode value '%s': expected 'none' or 'compile'",
                   optarg);
          break;
+      case 'X':
+         resolver_dir = optarg;
+         break;
       default:
          should_not_reach_here();
       }
@@ -963,6 +968,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (rcmode != NULL)
       setenv("NVC_RCMODE", rcmode, 1);
+
+   if (resolver_dir != NULL)
+      setenv("NVC_RESOLVER_DIR", resolver_dir, 1);
 
    set_top_level(argv, next_cmd, state);
 
@@ -2291,6 +2299,8 @@ static void usage(void)
            { "--format={fst,vcd}", "Waveform dump format" },
            { "--include=GLOB",
              "Include signals matching GLOB in waveform dump" },
+           { "--export-resolvers=DIR",
+             "Write generated resolver VHDL files to DIR" },
            { "--rcmode={none,compile}",
              "Resolver compile mode: 'none' stops after elaboration "
              "without compiling resolver code (requires --load)" },

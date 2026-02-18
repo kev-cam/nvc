@@ -1,0 +1,221 @@
+sv2vhdldir = $(pkglibdir)/sv2vhdl
+
+# --- Compiled VHDL units ---
+
+sv2vhdl_DATA = \
+	lib/sv2vhdl/_NVC_LIB \
+	lib/sv2vhdl/_index \
+	lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG \
+	lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG-body \
+	lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG \
+	lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG-body \
+	lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG \
+	lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG-body \
+	lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES \
+	lib/sv2vhdl/SV2VHDL.SV_AND \
+	lib/sv2vhdl/SV2VHDL.SV_AND-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NAND \
+	lib/sv2vhdl/SV2VHDL.SV_NAND-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_OR \
+	lib/sv2vhdl/SV2VHDL.SV_OR-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NOR \
+	lib/sv2vhdl/SV2VHDL.SV_NOR-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_XOR \
+	lib/sv2vhdl/SV2VHDL.SV_XOR-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_XNOR \
+	lib/sv2vhdl/SV2VHDL.SV_XNOR-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_BUF \
+	lib/sv2vhdl/SV2VHDL.SV_BUF-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NOT \
+	lib/sv2vhdl/SV2VHDL.SV_NOT-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NMOS \
+	lib/sv2vhdl/SV2VHDL.SV_NMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_PMOS \
+	lib/sv2vhdl/SV2VHDL.SV_PMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RNMOS \
+	lib/sv2vhdl/SV2VHDL.SV_RNMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RPMOS \
+	lib/sv2vhdl/SV2VHDL.SV_RPMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_CMOS \
+	lib/sv2vhdl/SV2VHDL.SV_CMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RCMOS \
+	lib/sv2vhdl/SV2VHDL.SV_RCMOS-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_BUFIF0 \
+	lib/sv2vhdl/SV2VHDL.SV_BUFIF0-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_BUFIF1 \
+	lib/sv2vhdl/SV2VHDL.SV_BUFIF1-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NOTIF0 \
+	lib/sv2vhdl/SV2VHDL.SV_NOTIF0-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_NOTIF1 \
+	lib/sv2vhdl/SV2VHDL.SV_NOTIF1-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_PULLUP \
+	lib/sv2vhdl/SV2VHDL.SV_PULLUP-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_PULLDOWN \
+	lib/sv2vhdl/SV2VHDL.SV_PULLDOWN-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_TRAN \
+	lib/sv2vhdl/SV2VHDL.SV_TRAN-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_TRAN-STRENGTH \
+	lib/sv2vhdl/SV2VHDL.SV_RTRAN \
+	lib/sv2vhdl/SV2VHDL.SV_RTRAN-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RTRAN-STRENGTH \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF0 \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF0-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF0-STRENGTH \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF1 \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF1-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_TRANIF1-STRENGTH \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF0 \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF0-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF0-STRENGTH \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF1 \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-BEHAVIORAL \
+	lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-STRENGTH
+
+# Shared library and Python script installed alongside VHDL
+sv2vhdl_DATA += \
+	$(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT) \
+	$(srcdir)/lib/sv2vhdl/sv2vhdl_resolver.py
+
+EXTRA_DIST += \
+	lib/sv2vhdl/logic3d_types_pkg.vhd \
+	lib/sv2vhdl/logic3ds_pkg.vhd \
+	lib/sv2vhdl/logic3d_vec_pkg.vhd \
+	lib/sv2vhdl/sv_primitives.vhd \
+	lib/sv2vhdl/sv_gates.vhd \
+	lib/sv2vhdl/sv_mos.vhd \
+	lib/sv2vhdl/sv_tristate.vhd \
+	lib/sv2vhdl/sv_pull.vhd \
+	lib/sv2vhdl/sv_tran.vhd \
+	lib/sv2vhdl/resolver.c \
+	lib/sv2vhdl/sv2vhdl_resolver.py
+
+BOOTSTRAPLIBS += $(sv2vhdl_DATA)
+
+lib/sv2vhdl/_NVC_LIB:
+
+lib/sv2vhdl/_index:
+
+# --- Packages (each file produces pkg + body in one compile) ---
+
+lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG: $(srcdir)/lib/sv2vhdl/logic3d_types_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3d_types_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+
+lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG: $(srcdir)/lib/sv2vhdl/logic3ds_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3ds_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG
+
+lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG: $(srcdir)/lib/sv2vhdl/logic3d_vec_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3d_vec_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG
+
+lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES: $(srcdir)/lib/sv2vhdl/sv_primitives.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_primitives.vhd
+
+# --- Entity files (each produces multiple entity+architecture units) ---
+# Primary target has the recipe; secondary outputs depend on the primary.
+
+lib/sv2vhdl/SV2VHDL.SV_AND: $(srcdir)/lib/sv2vhdl/sv_gates.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_gates.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_AND-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NAND: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NAND-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_OR: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_OR-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NOR: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NOR-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_XOR: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_XOR-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_XNOR: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_XNOR-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_BUF: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_BUF-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NOT: lib/sv2vhdl/SV2VHDL.SV_AND
+lib/sv2vhdl/SV2VHDL.SV_NOT-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_AND
+
+lib/sv2vhdl/SV2VHDL.SV_NMOS: $(srcdir)/lib/sv2vhdl/sv_mos.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_mos.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_NMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_PMOS: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_PMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RNMOS: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RNMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RPMOS: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RPMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_CMOS: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_CMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RCMOS: lib/sv2vhdl/SV2VHDL.SV_NMOS
+lib/sv2vhdl/SV2VHDL.SV_RCMOS-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_NMOS
+
+lib/sv2vhdl/SV2VHDL.SV_BUFIF0: $(srcdir)/lib/sv2vhdl/sv_tristate.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_tristate.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_BUFIF0-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_BUFIF1: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_BUFIF1-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_NOTIF0: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_NOTIF0-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_NOTIF1: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+lib/sv2vhdl/SV2VHDL.SV_NOTIF1-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_BUFIF0
+
+lib/sv2vhdl/SV2VHDL.SV_PULLUP: $(srcdir)/lib/sv2vhdl/sv_pull.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_pull.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_PULLUP-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_PULLUP
+lib/sv2vhdl/SV2VHDL.SV_PULLDOWN: lib/sv2vhdl/SV2VHDL.SV_PULLUP
+lib/sv2vhdl/SV2VHDL.SV_PULLDOWN-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_PULLUP
+
+lib/sv2vhdl/SV2VHDL.SV_TRAN: $(srcdir)/lib/sv2vhdl/sv_tran.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_tran.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_TRAN-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRAN-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRAN: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRAN-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRAN-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF0: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF0-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF0-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF1: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF1-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_TRANIF1-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF0: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF0-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF0-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF1: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
+lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
+
+# --- Shared library: libresolver.so ---
+
+PYTHON3_CONFIG ?= $$(which python3-config 2>/dev/null || which python3.10-config 2>/dev/null || echo python3-config)
+PYTHON3_CFLAGS ?= $$($(PYTHON3_CONFIG) --includes)
+PYTHON3_LDFLAGS ?= $$($(PYTHON3_CONFIG) --ldflags --embed 2>/dev/null || $(PYTHON3_CONFIG) --ldflags)
+
+$(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/resolver.c @ifGNUmake@ | $(DRIVER)
+	@mkdir -p $(abs_top_builddir)/lib/sv2vhdl
+	$(CC) $(SHLIB_LDFLAGS) $(SHLIB_CFLAGS) -Wall -O2 \
+	    -I$(top_srcdir)/src \
+	    $(PYTHON3_CFLAGS) \
+	    -o $@ $< \
+	    $(PYTHON3_LDFLAGS) \
+	    -ldl
+
+# --- Dependencies ---
+# sv2vhdl packages depend on ieee.08 (for std_logic_1164)
+# Entity files depend on packages being compiled first
+
+lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
+lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES: lib/ieee.08/IEEE.STD_LOGIC_1164
+lib/sv2vhdl/SV2VHDL.SV_AND: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.SV_NMOS: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.SV_BUFIF0: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.SV_PULLUP: lib/ieee.08/IEEE.STD_LOGIC_1164
+lib/sv2vhdl/SV2VHDL.SV_TRAN: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG

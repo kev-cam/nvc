@@ -70,6 +70,7 @@ include lib/ieee.08/Makemodule.am
 include lib/ieee.19/Makemodule.am
 include lib/vital/Makemodule.am
 include lib/synopsys/Makemodule.am
+include lib/sv2vhdl/Makemodule.am
 include contrib/Makemodule.am
 include contrib/gui/Makemodule.am
 include contrib/msi/Makemodule.am

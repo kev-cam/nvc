@@ -1183,7 +1183,9 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     vhpi_printf("resolver: received %zd VHDL file(s)", n_files);
 
     /* Phase 4: Write files and optionally compile (per-file caching) */
-    mkdir(CACHE_DIR, 0755);
+    const char *resolver_dir = getenv("NVC_RESOLVER_DIR");
+    if (!resolver_dir) resolver_dir = CACHE_DIR;
+    mkdir(resolver_dir, 0755);
     const char *rcmode = getenv("NVC_RCMODE");
     const int skip_compile = (rcmode && strcmp(rcmode, "none") == 0);
     const char *work_dir = getenv("NVC_WORK");
@@ -1200,7 +1202,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 
         char cache_path[MAX_NAME];
         snprintf(cache_path, sizeof(cache_path), "%s/%s",
-                 CACHE_DIR, fname);
+                 resolver_dir, fname);
 
         /* Per-file cache: compare first line (net hash comment) */
         {
@@ -1279,9 +1281,10 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     if (skip_compile) {
         vhpi_printf("resolver: --rcmode=none: wrote %d file(s), "
                      "%d cached, %d error(s)", written, cached, errors);
+        vhpi_printf("resolver: output directory: %s", resolver_dir);
         vhpi_printf("resolver: to compile and run manually:");
         vhpi_printf("  nvc --std=2008 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
-                     CACHE_DIR, g_design_name, CACHE_DIR, g_design_name);
+                     resolver_dir, g_design_name, resolver_dir, g_design_name);
         vhpi_printf("  nvc --std=2008 -e resolved_%s", g_design_name);
         vhpi_printf("  nvc --std=2008 -r resolved_%s", g_design_name);
     } else {
