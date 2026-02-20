@@ -1577,6 +1577,27 @@ static void clone_source(rt_model_t *m, rt_nexus_t *nexus,
       break;
 
    case SOURCE_IMPLICIT:
+      {
+         // STD_MX: receiver → parent implicit link needs splitting
+         // when the parent nexus is cloned during port mapping
+         if (old->u.port.input == NULL)
+            break;
+
+         if (old->u.port.input->width == offset) {
+            new->u.port.input = old->u.port.input->chain;  // Cycle breaking
+            // Manually link into new input's output chain since we didn't
+            // call clone_nexus (which would do this via output handling)
+            new->chain_output = new->u.port.input->outputs;
+            new->u.port.input->outputs = new;
+         }
+         else {
+            RT_LOCK(old->u.port.input->signal->lock);
+            new->u.port.input = clone_nexus(m, old->u.port.input, offset);
+            // clone_nexus output handling links us into the output chain
+         }
+         assert(new->u.port.input->width == nexus->width);
+         new->u.port.input->flags |= NET_F_EFFECTIVE;
+      }
       break;
    }
 }
@@ -1641,8 +1662,12 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
       }
       else {
          rt_nexus_t *out_n;
-         if (old_o->tag == SOURCE_IMPLICIT)
-            out_n = old_o->u.port.output;
+         if (old_o->tag == SOURCE_IMPLICIT) {
+            if (old_o->u.port.output->width == offset)
+               out_n = old_o->u.port.output->chain;  // Cycle breaking
+            else
+               out_n = old_o->u.port.output;
+         }
          else if (old_o->u.port.output->width == offset)
             out_n = old_o->u.port.output->chain;   // Cycle breaking
          else {
@@ -1866,6 +1891,17 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
       return NULL;
 
    case SOURCE_IMPLICIT:
+      if (standard() == STD_MX
+          && !(nexus->signal->shared.flags & SIG_F_IMPLICIT)) {
+         // Reverse implicit: receiver signal driving the parent.
+         // Deposit (:=) writes directly to nexus_effective without
+         // creating a SOURCE_DRIVER.  Only contribute when the receiver
+         // has actually been deposited to (last_event < TIME_HIGH);
+         // otherwise the stale initial value poisons resolution.
+         rt_nexus_t *input = src->u.port.input;
+         if (input != NULL && input->last_event < TIME_HIGH)
+            return nexus_effective(input);
+      }
       return NULL;
    }
 
@@ -2046,6 +2082,17 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          return;
       }
       else if (unlikely(s->tag == SOURCE_IMPLICIT)) {
+         if (standard() == STD_MX
+             && !(n->signal->shared.flags & SIG_F_IMPLICIT)) {
+            // Reverse implicit: receiver driving the parent signal.
+            // Include receiver's value as a regular source.
+            const void *sv = source_value(n, s);
+            if (sv != NULL) {
+               nonnull++;
+               if (s0 == NULL) s0 = s;
+            }
+            continue;
+         }
          // At least one of the inputs is active so schedule an update
          // to the value of an implicit 'TRANSACTION or 'QUIET signal
          schedule_implicit_update(m, n);
@@ -2116,6 +2163,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
    else {
       // Otherwise, the driving value of S is obtained by executing the
       // resolution function associated with S
+
       call_resolution(m, n, r, nonnull, s0);
    }
 }
@@ -3765,8 +3813,17 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
          wakeup_all(m, &(n->pending));
 
          for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
-            assert(o->tag == SOURCE_PORT);
-            defer_driving_update(m, o->u.port.output);
+            switch (o->tag) {
+            case SOURCE_PORT:
+               defer_driving_update(m, o->u.port.output);
+               break;
+            case SOURCE_IMPLICIT:
+               // Reverse implicit: receiver deposit propagates to parent
+               defer_driving_update(m, o->u.pseudo.nexus);
+               break;
+            default:
+               should_not_reach_here();
+            }
             m->next_is_delta = true;
          }
       }
@@ -4671,19 +4728,20 @@ void x_map_implicit(sig_shared_t *src_ss, uint32_t src_offset,
    assert(dst_offset == 0);
 
    rt_model_t *m = get_model();
-   rt_nexus_t *n = split_nexus(m, src_s, src_offset, count);
-   for (; count > 0; n = n->chain) {
-      count -= n->width;
+   rt_nexus_t *src_n = split_nexus(m, src_s, src_offset, count);
+   rt_nexus_t *dst_n = split_nexus(m, dst_s, dst_offset, count);
+   for (; count > 0; src_n = src_n->chain, dst_n = dst_n->chain) {
+      count -= src_n->width;
       assert(count >= 0);
 
-      rt_source_t *src = add_source(m, &(dst_s->nexus), SOURCE_IMPLICIT);
-      src->u.port.input = n;
+      rt_source_t *src = add_source(m, dst_n, SOURCE_IMPLICIT);
+      src->u.port.input = src_n;
 
-      src->chain_output = n->outputs;
-      n->outputs = src;
+      src->chain_output = src_n->outputs;
+      src_n->outputs = src;
 
-      n->flags |= NET_F_EFFECTIVE;   // Update outputs when active
-      n->flags &= ~NET_F_FAST_DRIVER;
+      src_n->flags |= NET_F_EFFECTIVE;   // Update outputs when active
+      src_n->flags &= ~NET_F_FAST_DRIVER;
    }
 }
 

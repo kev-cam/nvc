@@ -8547,7 +8547,36 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
       break;
 
    case IMPLICIT_RECEIVER:
-      {
+      if (standard() == STD_MX) {
+         // STD_MX: 'receiver is a standalone signal driven by the
+         // resolver network.  Reverse emit_map_implicit connects it
+         // as a source for the parent signal so that driving the
+         // receiver updates the parent's effective value.
+         vcode_reg_t init_reg;
+         if (type_is_scalar(type))
+            init_reg = emit_const(lower_type(type), 0);
+         else
+            init_reg = VCODE_INVALID_REG;
+
+         lower_sub_signals(parent, type, type, type, decl, NULL, var,
+                           VCODE_INVALID_REG, init_reg, VCODE_INVALID_REG,
+                           VCODE_INVALID_REG, 0, VCODE_INVALID_REG);
+
+         tree_t prefix = tree_value(decl);
+         type_t prefix_type = tree_type(prefix);
+
+         vcode_reg_t prefix_reg = lower_attr_prefix(parent, prefix);
+
+         if (type_is_homogeneous(prefix_type)) {
+            vcode_reg_t count_reg =
+               lower_type_width(parent, prefix_type, prefix_reg);
+            vcode_reg_t recv_reg = emit_load(var);
+
+            // Reverse: receiver is src, parent is dst
+            emit_map_implicit(recv_reg, prefix_reg, count_reg);
+         }
+      }
+      else {
          object_t *obj = tree_to_object(decl);
          ident_t qual = ident_prefix(parent->name, name, '.');
 
