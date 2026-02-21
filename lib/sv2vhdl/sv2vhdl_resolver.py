@@ -68,8 +68,8 @@ def _sanitize_id(name):
 def _type_info(net):
     """Determine resolution function, vector type, and use clauses for a net.
 
-    Inspects the first driver's type to choose the appropriate resolution
-    infrastructure:
+    Inspects the first tran (non-signal) driver's type to choose the
+    appropriate resolution infrastructure:
       - logic3ds  -> l3ds_resolve / logic3ds_vector  (logic3ds_pkg)
       - logic3d   -> l3d_resolve  / logic3d_vector   (logic3d_types_pkg)
       - std_logic -> resolved     / std_ulogic_vector (std_logic_1164)
@@ -79,7 +79,12 @@ def _type_info(net):
     if not net["drivers"]:
         return "resolved", "std_ulogic_vector", []
 
-    ep_type = net["drivers"][0]["type"].lower()
+    # Use the first non-signal endpoint's type for resolution
+    ep_type = "std_logic"
+    for drv in net["drivers"]:
+        if not drv.get("is_signal"):
+            ep_type = drv["type"].lower()
+            break
 
     if ep_type == "logic3ds":
         return ("l3ds_resolve", "logic3ds_vector",
@@ -96,16 +101,32 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
 
     Each resolver entity:
       - Reads 'DRIVER signals from tran endpoints on this net
-      - Computes per-endpoint 'OTHER (exclude self)
-      - Drives the net's port signal with the combined resolved value
+      - Reads net signals from signal endpoints (read-only, no receiver)
+      - Computes per-tran-endpoint 'OTHER (exclude self, include signals)
+      - Uses type conversion for signal endpoints when needed
 
     Returns (entity_name, vhdl_string).
     """
     entity_name = f"sv2vhdl_rn_{design_name}_{idx}"
     net_h = _net_hash(net)
     n_ep = len(net["drivers"])
+
+    # Classify endpoints: signal (read-only) vs tran (has receiver)
+    sig_indices = set()
+    tran_indices = []
+    for i, drv in enumerate(net["drivers"]):
+        if drv.get("is_signal"):
+            sig_indices.add(i)
+        else:
+            tran_indices.append(i)
+
     resolve_func, vec_type, extra_uses = _type_info(net)
-    ep_type = net["drivers"][0]["type"].lower() if net["drivers"] else "std_logic"
+
+    # Determine the tran endpoint type (for conversion decisions)
+    tran_type = "std_logic"
+    for i in tran_indices:
+        tran_type = net["drivers"][i]["type"].lower()
+        break
 
     lines = []
     lines.append(f"-- Net hash: {net_h:016x}")
@@ -120,48 +141,70 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
     lines.append(f"entity {entity_name} is end;")
     lines.append(f"architecture generated of {entity_name} is")
 
-    # Alias declarations for driver/receiver pairs
-    drv_aliases = []
-    rcv_aliases = []
+    # Alias declarations
+    drv_aliases = []  # "drv_X" for tran, "sig_X" for signal endpoints
+    rcv_aliases = []  # "rcv_X" for tran, None for signal endpoints
     for i in range(n_ep):
         drv = net["drivers"][i]
         rcv = net["receivers"][i]
-        da = f"drv_{i}"
-        ra = f"rcv_{i}"
-        drv_path = fix_ename(drv["ename"])
-        rcv_path = fix_ename(rcv["ename"])
-        drv_type = drv["type"].lower()
-        rcv_type = rcv["type"].lower()
-        lines.append(f"    alias {da} is "
-                     f"<< signal {drv_path} : {drv_type} >>;")
-        lines.append(f"    alias {ra} is "
-                     f"<< signal {rcv_path} : {rcv_type} >>;")
-        drv_aliases.append(da)
-        rcv_aliases.append(ra)
+        if i in sig_indices:
+            da = f"sig_{i}"
+            drv_path = fix_ename(drv["ename"])
+            drv_type = drv["type"].lower()
+            lines.append(f"    alias {da} is "
+                         f"<< signal {drv_path} : {drv_type} >>;")
+            drv_aliases.append(da)
+            rcv_aliases.append(None)
+        else:
+            da = f"drv_{i}"
+            ra = f"rcv_{i}"
+            drv_path = fix_ename(drv["ename"])
+            rcv_path = fix_ename(rcv["ename"])
+            drv_type = drv["type"].lower()
+            rcv_type = rcv["type"].lower()
+            lines.append(f"    alias {da} is "
+                         f"<< signal {drv_path} : {drv_type} >>;")
+            lines.append(f"    alias {ra} is "
+                         f"<< signal {rcv_path} : {rcv_type} >>;")
+            drv_aliases.append(da)
+            rcv_aliases.append(ra)
 
     lines.append(f"begin")
 
-    if n_ep == 1:
-        lines.append(f"    -- single endpoint, no resolution needed")
-    elif n_ep == 2:
-        # Simple swap: each gets the other's driver
-        lines.append(f"    {rcv_aliases[0]} <= {drv_aliases[1]};")
-        lines.append(f"    {rcv_aliases[1]} <= {drv_aliases[0]};")
+    def _drv_expr(j):
+        """VHDL expression for endpoint j's driver value, with type
+        conversion to tran_type when the signal endpoint type differs."""
+        if j in sig_indices:
+            sig_type = net["drivers"][j]["type"].lower()
+            if sig_type != tran_type:
+                if tran_type == "logic3ds":
+                    return f"to_logic3ds({drv_aliases[j]}, ST_SUPPLY)"
+                elif tran_type == "logic3d":
+                    return f"to_logic3d({drv_aliases[j]})"
+        return drv_aliases[j]
+
+    if not tran_indices:
+        lines.append(f"    -- no tran endpoints, nothing to resolve")
     else:
-        # N>2: each receiver gets the resolution of all OTHER drivers.
-        sens = ", ".join(drv_aliases)
-        lines.append(f"    resolve: process({sens})")
-        lines.append(f"        variable v : {vec_type}(0 to {n_ep - 2});")
-        lines.append(f"    begin")
-        for i in range(n_ep):
-            others = [drv_aliases[j] for j in range(n_ep) if j != i]
+        # One process per tran endpoint's 'other signal
+        # Signal endpoints are read-only (no receiver, no process)
+        for i in tran_indices:
+            others = [j for j in range(n_ep) if j != i]
+            sens = ", ".join(drv_aliases[j] for j in others)
+            lines.append(f"    p_{i}: process({sens})")
+            if len(others) > 1:
+                lines.append(f"        variable v : {vec_type}"
+                             f"(0 to {len(others) - 1});")
+            lines.append(f"    begin")
             if len(others) == 1:
-                lines.append(f"        {rcv_aliases[i]} <= {others[0]};")
+                lines.append(f"        {rcv_aliases[i]} := "
+                             f"{_drv_expr(others[0])};")
             else:
-                for k, other in enumerate(others):
-                    lines.append(f"        v({k}) := {other};")
-                lines.append(f"        {rcv_aliases[i]} <= {resolve_func}(v);")
-        lines.append(f"    end process;")
+                for k, j in enumerate(others):
+                    lines.append(f"        v({k}) := {_drv_expr(j)};")
+                lines.append(f"        {rcv_aliases[i]} := "
+                             f"{resolve_func}(v);")
+            lines.append(f"    end process;")
 
     lines.append(f"end architecture;")
     lines.append(f"")

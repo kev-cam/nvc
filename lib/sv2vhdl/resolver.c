@@ -68,6 +68,7 @@ typedef struct endpoint {
     char driver_ename[MAX_NAME];   /* external name path: ".top.inst.port.driver" */
     char receiver_ename[MAX_NAME]; /* external name path: ".top.inst.port.other" */
     char type_name[MAX_TYPE];      /* signal type */
+    int  is_signal;                /* 1 if this reads the net signal directly (no receiver) */
 } endpoint_t;
 
 /*
@@ -497,7 +498,29 @@ static void walk_hierarchy(vhpiHandleT region, const char *path_prefix,
 static void analyze_nets(void)
 {
     for (net_info_t *n = g_nets; n; n = n->next) {
-        n->needs_resolution = (n->n_endpoints >= 2);
+        if (n->n_endpoints >= 2) {
+            n->needs_resolution = 1;
+        } else if (n->n_endpoints == 1) {
+            /* Boundary net: add the net signal itself as a read-only
+             * driver endpoint.  This handles nets where the signal has
+             * a regular concurrent assignment (e.g., "ac(1) <= a" in a
+             * testbench).  The signal endpoint is read-only -- it has
+             * a driver alias but no receiver ('other).
+             *
+             * For nets without an external driver, the signal value
+             * will be the initial value (typically 'U'), which is
+             * harmless. */
+            if (n->n_endpoints < MAX_ENDPOINTS) {
+                endpoint_t *ep = &n->endpoints[n->n_endpoints++];
+                safe_copy(ep->driver_ename, n->net_name,
+                          sizeof(ep->driver_ename));
+                ep->receiver_ename[0] = '\0';
+                safe_copy(ep->type_name, "std_logic",
+                          sizeof(ep->type_name));
+                ep->is_signal = 1;
+                n->needs_resolution = 1;
+            }
+        }
     }
 }
 
@@ -969,6 +992,8 @@ static PyObject *build_net_dict(const net_info_t *net)
                              PyUnicode_FromString(ep->driver_ename));
         PyDict_SetItemString(drv, "type",
                              PyUnicode_FromString(ep->type_name));
+        if (ep->is_signal)
+            PyDict_SetItemString(drv, "is_signal", Py_True);
         PyList_Append(drivers, drv);
         Py_DECREF(drv);
 
@@ -977,6 +1002,8 @@ static PyObject *build_net_dict(const net_info_t *net)
                              PyUnicode_FromString(ep->receiver_ename));
         PyDict_SetItemString(rcv, "type",
                              PyUnicode_FromString(ep->type_name));
+        if (ep->is_signal)
+            PyDict_SetItemString(rcv, "is_signal", Py_True);
         PyList_Append(receivers, rcv);
         Py_DECREF(rcv);
     }
