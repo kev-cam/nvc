@@ -1871,7 +1871,7 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
             for (rt_source_t *s = &(input->sources); s; s = s->chain_input)
                if (s->tag == SOURCE_DRIVER) { has_driver = true; break; }
          }
-         if (!has_driver)
+         if (!has_driver && input->last_event >= TIME_HIGH)
             return NULL;
       }
       if (likely(src->u.port.conv_func == NULL)) {
@@ -2100,7 +2100,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       }
       else if (unlikely(standard() == STD_MX
                         && s->tag == SOURCE_PORT)) {
-         // Mixed mode: skip port with no internal driver
+         // Mixed mode: skip port with no internal driver and no deposit
          rt_nexus_t *input = s->u.port.input;
          bool has_driver = false;
          if (input->n_sources > 0) {
@@ -2108,7 +2108,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
                  si; si = si->chain_input)
                if (si->tag == SOURCE_DRIVER) { has_driver = true; break; }
          }
-         if (!has_driver)
+         if (!has_driver && input->last_event >= TIME_HIGH)
             continue;
          if (s0 == NULL)
             s0 = s;
