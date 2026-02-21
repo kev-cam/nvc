@@ -9882,7 +9882,17 @@ static tree_t p_simple_variable_assignment(ident_t label, tree_t name)
    tree_t value = p_conditional_or_unaffected_expression(STD_08);
 
    solve_target(nametab, target, value);
-   solve_known_subtype(nametab, value, target);
+
+   // Extension: 'DRIVER is universal target -- resolve RHS without
+   // constraining its return type to the placeholder INTEGER.
+   if (tree_kind(target) == T_ATTR_REF
+       && tree_subkind(target) == ATTR_DRIVER) {
+      solve_types(nametab, value, NULL);
+      if (tree_has_type(value))
+         tree_set_type(target, tree_type(value));
+   }
+   else
+      solve_known_subtype(nametab, value, target);
 
    tree_t t = tree_new(T_VAR_ASSIGN);
    tree_set_target(t, target);
@@ -10006,7 +10016,16 @@ static tree_t p_waveform_element(tree_t target)
       if (!tree_has_type(target))
          solve_target(nametab, target, value);
 
-      solve_known_subtype(nametab, value, target);
+      // Extension: 'DRIVER is universal target -- resolve RHS without
+      // constraining its return type to the placeholder INTEGER.
+      if (tree_kind(target) == T_ATTR_REF
+          && tree_subkind(target) == ATTR_DRIVER) {
+         solve_types(nametab, value, NULL);
+         if (tree_has_type(value))
+            tree_set_type(target, tree_type(value));
+      }
+      else
+         solve_known_subtype(nametab, value, target);
    }
    else if (!tree_has_type(target))
       solve_types(nametab, target, NULL);
