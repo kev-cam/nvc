@@ -5,7 +5,7 @@ set -e
 
 NVC=/usr/local/src/nvc/build/bin/nvc
 SV2VHDL=/usr/local/src/nvc/lib/sv2vhdl
-TESTDIR=$(dirname "$0")
+TESTDIR=$(cd "$(dirname "$0")" && pwd)
 WORKDIR=$(mktemp -d /tmp/test_driver_prop.XXXXXX)
 
 cleanup() { rm -rf "$WORKDIR"; }
@@ -40,9 +40,11 @@ run_test() {
     return 1
 }
 
-run_test resolved_test_passthru || true
-run_test resolved_test_chain2 || true
-run_test resolved_test_tied || true
+run_test test_prop1 || true
+run_test test_prop2 || true
+run_test test_prop3 || true
+run_test test_prop4 || true
+run_test test_prop5 || true
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -88,10 +88,10 @@ def _type_info(net):
 
     if ep_type == "logic3ds":
         return ("l3ds_resolve", "logic3ds_vector",
-                ["use work.logic3ds_pkg.all;"])
+                ["library sv2vhdl;", "use sv2vhdl.logic3ds_pkg.all;"])
     elif ep_type == "logic3d":
         return ("l3d_resolve", "logic3d_vector",
-                ["use work.logic3d_types_pkg.all;"])
+                ["library sv2vhdl;", "use sv2vhdl.logic3d_types_pkg.all;"])
     else:
         return ("resolved", "std_ulogic_vector", [])
 
