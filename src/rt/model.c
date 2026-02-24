@@ -1583,6 +1583,12 @@ static void clone_source(rt_model_t *m, rt_nexus_t *nexus,
          if (old->u.port.input == NULL)
             break;
 
+         // Must pre-set input to old receiver nexus before clone_nexus
+         // so that output handling can find us via u.port.input match.
+         // add_source sets u.pseudo.value (= u.port.input due to union
+         // overlap) to alloc_value which would prevent the match.
+         new->u.port.input = old->u.port.input;
+
          if (old->u.port.input->width == offset) {
             new->u.port.input = old->u.port.input->chain;  // Cycle breaking
             // Manually link into new input's output chain since we didn't
@@ -1861,17 +1867,19 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
 
    case SOURCE_PORT:
       if (unlikely(standard() == STD_MX)) {
-         // Mixed mode: a port with no internal driver is not a source.
-         // Check if the port's internal nexus has any SOURCE_DRIVER;
-         // if it only has SOURCE_PORT (inbound mapping), the port has
-         // no real driver and would just feed back the old value.
+         // Mixed mode: a port with no real driver is not a source.
+         // Only count SOURCE_DRIVER as proof of a real driver.
+         // SOURCE_PORT on the input nexus may be circular back-ref
+         // from inout bidirectional mapping.
          rt_nexus_t *input = src->u.port.input;
          bool has_driver = false;
          if (input->n_sources > 0) {
             for (rt_source_t *s = &(input->sources); s; s = s->chain_input)
-               if (s->tag == SOURCE_DRIVER) { has_driver = true; break; }
+               if (s->tag == SOURCE_DRIVER) {
+                  has_driver = true; break;
+               }
          }
-         if (!has_driver && input->last_event >= TIME_HIGH)
+         if (!has_driver)
             return NULL;
       }
       if (likely(src->u.port.conv_func == NULL)) {
@@ -2100,15 +2108,21 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       }
       else if (unlikely(standard() == STD_MX
                         && s->tag == SOURCE_PORT)) {
-         // Mixed mode: skip port with no internal driver and no deposit
+         // Mixed mode: skip port with no real driver and no deposit.
+         // Only count SOURCE_DRIVER as proof of a real driver.
+         // SOURCE_PORT on the input nexus may be a circular back-ref
+         // from inout bidirectional mapping (port A -> signal -> port A)
+         // which would poison resolution with 'U'.
          rt_nexus_t *input = s->u.port.input;
          bool has_driver = false;
          if (input->n_sources > 0) {
             for (rt_source_t *si = &(input->sources);
                  si; si = si->chain_input)
-               if (si->tag == SOURCE_DRIVER) { has_driver = true; break; }
+               if (si->tag == SOURCE_DRIVER) {
+                  has_driver = true; break;
+               }
          }
-         if (!has_driver && input->last_event >= TIME_HIGH)
+         if (!has_driver)
             continue;
          if (s0 == NULL)
             s0 = s;
@@ -2154,6 +2168,14 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
             convert_driving(s0->u.port.conv_func);
             put_driving(m, n, value_ptr(n, &(s0->u.port.conv_result)));
          }
+         break;
+
+      case SOURCE_IMPLICIT:
+         // STD_MX: receiver is the sole active source (other SOURCE_PORTs
+         // were skipped as undriven).  Use the receiver's effective value
+         // as the driving value of the parent signal.
+         if (s0->u.port.input != NULL)
+            put_driving(m, n, nexus_effective(s0->u.port.input));
          break;
 
       default:

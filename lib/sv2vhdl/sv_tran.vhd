@@ -37,7 +37,7 @@ begin
     end process;
 end architecture behavioral;
 
--- Strength-aware: pass logic3ds values through unchanged
+-- Strength-aware: cap supply to strong per IEEE 1364 Section 28.8
 library ieee;
 use ieee.std_logic_1164.all;
 use work.logic3ds_pkg.all;
@@ -49,12 +49,13 @@ begin
     begin
         a_val := b'other;
         b_val := a'other;
-        a'driver := a_val;
-        b'driver := b_val;
-        -- Relay: also drive the port so the resolved value appears
-        -- on the actual signal (resolved with any other drivers).
-        a <= to_std_logic(a_val);
-        b <= to_std_logic(b_val);
+        a'driver := l3ds_cap_supply(a_val);
+        b'driver := l3ds_cap_supply(b_val);
+        -- No port signal assignments (a <= / b <=) here.
+        -- The resolver network deposits to signal.receiver which
+        -- propagates to the parent signal via SOURCE_IMPLICIT.
+        -- Port relay drivers would create VHDL SOURCE_DRIVERs that
+        -- conflict with the deposit mechanism in chain topologies.
     end process;
 end architecture strength;
 

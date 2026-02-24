@@ -150,6 +150,7 @@ package logic3ds_pkg is
     function weaken_strength(s : l3ds_strength) return l3ds_strength;
     function l3ds_weaken(a : logic3ds) return logic3ds;
     function l3ds_set_unknown(a : logic3ds) return logic3ds;
+    function l3ds_cap_supply(a : logic3ds) return logic3ds;
 
 end package;
 
@@ -418,6 +419,18 @@ package body logic3ds_pkg is
     begin
         return (value => a.value, strength => a.strength,
                 flags => FL_UNKNOWN, reserved => 0);
+    end function;
+
+    -- Cap supply strength to strong (IEEE 1364: tran reduces supply to strong)
+    -- All other strengths pass unchanged.
+    function l3ds_cap_supply(a : logic3ds) return logic3ds is
+    begin
+        if a.strength = ST_SUPPLY then
+            return (value => a.value, strength => ST_STRONG,
+                    flags => a.flags, reserved => 0);
+        else
+            return a;
+        end if;
     end function;
 
 end package body;

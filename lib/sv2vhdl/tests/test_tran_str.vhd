@@ -48,33 +48,25 @@ begin
     ---------------------------------------------------------------------------
     -- Chain: assign (supply1, supply0) a1 = a;
     -- then tran t1(a1,a2); tran t2(a2,a3); ... tran t6(a6,a7);
+    --
+    -- No concurrent assignments here: the resolver handles assign values
+    -- as strength-annotated logic3ds deposits.  Plain VHDL assignments
+    -- would drive at full strength, overriding the strength attenuation.
     ---------------------------------------------------------------------------
-    ac(1) <= a;
-
     gen_chain: for i in 1 to 6 generate
         tc: entity work.sv_tran(strength)
             port map(a => ac(i), b => ac(i+1));
     end generate gen_chain;
 
     ---------------------------------------------------------------------------
-    -- 5x5 Grid: assign (row_str1, col_str0) aij = a, bij = b;
-    --           tran tij(aij, bij);
-    -- Strength annotations are metadata; drivers are simple assignments.
-    -- Cell (5,5) has no driver (both sides undriven = highz).
+    -- 5x5 Grid: tran gates only.
+    -- Assigns are modeled in the resolver as strength-annotated deposits.
+    -- Cell (5,5) has no assign driver (undriven = HiZ).
     ---------------------------------------------------------------------------
     gen_row: for i in 1 to 5 generate
         gen_col: for j in 1 to 5 generate
-
-            -- Drivers: present for all cells except (5,5)
-            gen_drv: if i /= 5 or j /= 5 generate
-                ag((i-1)*5+j) <= a;
-                bg((i-1)*5+j) <= b;
-            end generate gen_drv;
-
-            -- Tran gate: always present
             t_grid: entity work.sv_tran(strength)
                 port map(a => ag((i-1)*5+j), b => bg((i-1)*5+j));
-
         end generate gen_col;
     end generate gen_row;
 
