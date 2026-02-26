@@ -2135,6 +2135,54 @@ static void elab_auto_receivers(tree_t block)
    }
 }
 
+static void elab_auto_drivers(tree_t block)
+{
+   // In STD_MX mode, auto-create 'driver implicit signals for all
+   // architecture-level signals so that VHDL signal assignments can
+   // be redirected to write to the 'driver instead of the signal.
+   // This separates the driving and receiving nexuses, allowing the
+   // resolver network to bridge them.
+   if (standard() != STD_MX)
+      return;
+
+   const int ndecls = tree_decls(block);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) != T_SIGNAL_DECL)
+         continue;
+
+      // Skip non-homogeneous types (records): lowering can't load
+      // the whole record as a scalar for the implicit signal.
+      if (!type_is_homogeneous(tree_type(d)))
+         continue;
+
+      ident_t sig_id = tree_ident(d);
+      ident_t drv_id = ident_prefix(sig_id, ident_new("driver"), '$');
+
+      // Check if driver already exists (explicit reference in source)
+      bool has_driver = false;
+      for (int j = 0; j < ndecls; j++) {
+         tree_t dj = tree_decl(block, j);
+         if (tree_kind(dj) == T_IMPLICIT_SIGNAL
+             && tree_ident(dj) == drv_id
+             && tree_subkind(dj) == IMPLICIT_DRIVER) {
+            has_driver = true;
+            break;
+         }
+      }
+
+      if (!has_driver) {
+         tree_t imp = tree_new(T_IMPLICIT_SIGNAL);
+         tree_set_ident(imp, drv_id);
+         tree_set_loc(imp, tree_loc(d));
+         tree_set_subkind(imp, IMPLICIT_DRIVER);
+         tree_set_type(imp, tree_type(d));
+         tree_set_value(imp, make_ref(d));
+         tree_add_decl(block, imp);
+      }
+   }
+}
+
 static void elab_architecture(tree_t inst, tree_t arch, const elab_ctx_t *ctx)
 {
    ident_t label = tree_ident(inst);
@@ -2164,6 +2212,7 @@ static void elab_architecture(tree_t inst, tree_t arch, const elab_ctx_t *ctx)
       ei->block = vhdl_architecture_instance(arch, inst, new_ctx.dotted);
 
       elab_auto_receivers(ei->block);
+      elab_auto_drivers(ei->block);
       elab_fold_generics(ei->block, &new_ctx);
 
       elab_context(arch);

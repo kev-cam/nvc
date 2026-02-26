@@ -8,6 +8,7 @@ Each net dict has:
     net_name   : str  -- tran instance ename path
     drivers    : list -- [{ename: str, type: str}, ...]
     receivers  : list -- [{ename: str, type: str}, ...]
+    init_value : str  -- initial value of net signal (e.g., "0", "1", "U")
 
 For a 2-endpoint net (the common tran case), resolution is a simple swap:
     receiver[0] <= driver[1]
@@ -47,9 +48,10 @@ def _djb2(s, h=5381):
 
 
 def _net_hash(net):
-    """Hash a single net's topology and types for per-file caching."""
+    """Hash a single net's topology, types, and init value for per-file caching."""
     h = 5381
     h = _djb2(net["net_name"], h)
+    h = _djb2(net.get("init_value", ""), h)
     for drv in net["drivers"]:
         h = _djb2(drv["ename"], h)
         h = _djb2(drv.get("type", ""), h)
@@ -101,9 +103,13 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
 
     Each resolver entity:
       - Reads 'DRIVER signals from tran endpoints on this net
-      - Reads net signals from signal endpoints (read-only, no receiver)
+      - Reads net signals from signal endpoints
       - Computes per-tran-endpoint 'OTHER (exclude self, include signals)
+      - Deposits resolved tran driver values to signal endpoint 'RECEIVERs
       - Uses type conversion for signal endpoints when needed
+
+    Signal endpoints get their resolved value via deposit to 'receiver,
+    which propagates to the parent signal via SOURCE_IMPLICIT.
 
     Returns (entity_name, vhdl_string).
     """
@@ -111,7 +117,7 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
     net_h = _net_hash(net)
     n_ep = len(net["drivers"])
 
-    # Classify endpoints: signal (read-only) vs tran (has receiver)
+    # Classify endpoints: signal vs tran (has driver/other)
     sig_indices = set()
     tran_indices = []
     for i, drv in enumerate(net["drivers"]):
@@ -144,6 +150,7 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
     # Alias declarations
     drv_aliases = []  # "drv_X" for tran, "sig_X" for signal endpoints
     rcv_aliases = []  # "rcv_X" for tran, None for signal endpoints
+    sig_rcv_aliases = {}  # i -> "rcv_sig_X" for signal endpoint receivers
     for i in range(n_ep):
         drv = net["drivers"][i]
         rcv = net["receivers"][i]
@@ -155,6 +162,15 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
                          f"<< signal {drv_path} : {drv_type} >>;")
             drv_aliases.append(da)
             rcv_aliases.append(None)
+            # Receiver alias for signal endpoint: signal.receiver
+            # elab_auto_receivers creates 'receiver for all arch signals
+            # in STD_MX mode; depositing to it propagates via SOURCE_IMPLICIT
+            if tran_indices:
+                ra = f"rcv_sig_{i}"
+                rcv_path = drv_path + ".receiver"
+                lines.append(f"    alias {ra} is "
+                             f"<< signal {rcv_path} : {drv_type} >>;")
+                sig_rcv_aliases[i] = ra
         else:
             da = f"drv_{i}"
             ra = f"rcv_{i}"
@@ -183,11 +199,20 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
                     return f"to_logic3d({drv_aliases[j]})"
         return drv_aliases[j]
 
+    def _to_sig_type(expr, sig_type):
+        """Convert resolved tran-type value to signal endpoint type."""
+        if tran_type == sig_type:
+            return expr
+        if tran_type == "logic3ds" and sig_type == "std_logic":
+            return f"to_std_logic({expr})"
+        if tran_type == "logic3d" and sig_type == "std_logic":
+            return f"to_std_logic({expr})"
+        return expr
+
     if not tran_indices:
         lines.append(f"    -- no tran endpoints, nothing to resolve")
     else:
         # One process per tran endpoint's 'other signal
-        # Signal endpoints are read-only (no receiver, no process)
         for i in tran_indices:
             others = [j for j in range(n_ep) if j != i]
             sens = ", ".join(drv_aliases[j] for j in others)
@@ -204,6 +229,33 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
                     lines.append(f"        v({k}) := {_drv_expr(j)};")
                 lines.append(f"        {rcv_aliases[i]} := "
                              f"{resolve_func}(v);")
+            lines.append(f"    end process;")
+
+        # One process per signal endpoint: deposit resolved tran drivers
+        # to signal's 'receiver (propagates to parent via SOURCE_IMPLICIT)
+        for i in sig_indices:
+            if i not in sig_rcv_aliases:
+                continue
+            sig_type = net["drivers"][i]["type"].lower()
+            # Sensitivity: all tran drivers
+            sens = ", ".join(drv_aliases[j] for j in tran_indices)
+            lines.append(f"    p_sig_{i}: process({sens})")
+            if len(tran_indices) > 1:
+                lines.append(f"        variable v : {vec_type}"
+                             f"(0 to {len(tran_indices) - 1});")
+            lines.append(f"    begin")
+            if len(tran_indices) == 1:
+                j = tran_indices[0]
+                val_expr = _to_sig_type(drv_aliases[j], sig_type)
+                lines.append(f"        {sig_rcv_aliases[i]} := "
+                             f"{val_expr};")
+            else:
+                for k, j in enumerate(tran_indices):
+                    lines.append(f"        v({k}) := {drv_aliases[j]};")
+                resolved = f"{resolve_func}(v)"
+                val_expr = _to_sig_type(resolved, sig_type)
+                lines.append(f"        {sig_rcv_aliases[i]} := "
+                             f"{val_expr};")
             lines.append(f"    end process;")
 
     lines.append(f"end architecture;")

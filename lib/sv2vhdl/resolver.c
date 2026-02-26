@@ -77,6 +77,7 @@ typedef struct endpoint {
  */
 typedef struct net_info {
     char net_name[MAX_NAME];
+    char init_value[MAX_VAL];  /* initial value of net signal (read at time 0) */
     endpoint_t endpoints[MAX_ENDPOINTS];
     int  n_endpoints;
     int  needs_resolution;
@@ -174,6 +175,41 @@ static int net_add_endpoint(net_info_t *net,
     safe_copy(ep->receiver_ename, receiver_ename, sizeof(ep->receiver_ename));
     safe_copy(ep->type_name, type_name, sizeof(ep->type_name));
     return 0;
+}
+
+/*
+ * Read the initial value of a net signal via VHPI.
+ * Called at start_of_sim, so signals have their declared initial values.
+ * Stores the value string (e.g., "0", "1", "U", "0000") in net->init_value.
+ */
+static void read_net_init(net_info_t *net)
+{
+    if (net->init_value[0] != '\0')
+        return;  /* already read */
+
+    /* Strip leading dot from ename for vhpi_handle_by_name */
+    const char *path = net->net_name;
+    if (*path == '.') path++;
+
+    vhpiHandleT sig = vhpi_handle_by_name(path, NULL);
+    if (!sig) {
+        safe_copy(net->init_value, "U", sizeof(net->init_value));
+        return;
+    }
+
+    char valbuf[MAX_VAL];
+    vhpiValueT val;
+    memset(&val, 0, sizeof(val));
+    val.format = vhpiStrVal;
+    val.bufSize = sizeof(valbuf);
+    val.value.str = (vhpiCharT *)valbuf;
+
+    if (vhpi_get_value(sig, &val) == 0)
+        safe_copy(net->init_value, valbuf, sizeof(net->init_value));
+    else
+        safe_copy(net->init_value, "U", sizeof(net->init_value));
+
+    vhpi_release_handle(sig);
 }
 
 static int is_tran_entity(const char *entity_name)
@@ -426,10 +462,12 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
              * to the same signal form one resolution group */
             net_info_t *net = find_or_create_net(net_name);
             if (net) {
+                read_net_init(net);
                 net_add_endpoint(net, drv_ename, rcv_ename, port_etype);
                 indent();
-                vhpi_printf("    port %s -> actual=%s net=%s",
-                             port_name, actual, net_name);
+                vhpi_printf("    port %s -> actual=%s net=%s init=%s",
+                             port_name, actual, net_name,
+                             net->init_value);
                 vhpi_printf("      drv=%s rcv=%s", drv_ename, rcv_ename);
             }
 
@@ -1008,6 +1046,8 @@ static PyObject *build_net_dict(const net_info_t *net)
 
     PyDict_SetItemString(d, "drivers", drivers);
     PyDict_SetItemString(d, "receivers", receivers);
+    PyDict_SetItemString(d, "init_value",
+                         PyUnicode_FromString(net->init_value));
     Py_DECREF(drivers);
     Py_DECREF(receivers);
 

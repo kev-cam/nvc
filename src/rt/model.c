@@ -1899,16 +1899,30 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
       return NULL;
 
    case SOURCE_IMPLICIT:
-      if (standard() == STD_MX
-          && !(nexus->signal->shared.flags & SIG_F_IMPLICIT)) {
-         // Reverse implicit: receiver signal driving the parent.
-         // Deposit (:=) writes directly to nexus_effective without
-         // creating a SOURCE_DRIVER.  Only contribute when the receiver
-         // has actually been deposited to (last_event < TIME_HIGH);
-         // otherwise the stale initial value poisons resolution.
+      if (standard() == STD_MX) {
          rt_nexus_t *input = src->u.port.input;
-         if (input != NULL && input->last_event < TIME_HIGH)
-            return nexus_effective(input);
+         if (input == NULL)
+            return NULL;
+         tree_t iwhere = input->signal->where;
+         if (tree_kind(iwhere) == T_IMPLICIT_SIGNAL
+             && tree_subkind(iwhere) == IMPLICIT_DRIVER) {
+            // Forward implicit: auto-created 'driver → parent.
+            // The driver's driving value is updated by put_driving
+            // before the output chain triggers this call.
+            if (input->flags & NET_F_EFFECTIVE)
+               return nexus_driving(input);
+            else
+               return nexus_effective(input);
+         }
+         else {
+            // Reverse implicit: receiver → parent signal.
+            // Deposit (:=) writes directly to nexus_effective without
+            // creating a SOURCE_DRIVER.  Only contribute when the receiver
+            // has actually been deposited to (last_event < TIME_HIGH);
+            // otherwise the stale initial value poisons resolution.
+            if (input->last_event < TIME_HIGH)
+               return nexus_effective(input);
+         }
       }
       return NULL;
    }
@@ -2090,10 +2104,9 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          return;
       }
       else if (unlikely(s->tag == SOURCE_IMPLICIT)) {
-         if (standard() == STD_MX
-             && !(n->signal->shared.flags & SIG_F_IMPLICIT)) {
-            // Reverse implicit: receiver driving the parent signal.
-            // Include receiver's value as a regular source.
+         if (standard() == STD_MX) {
+            // Both forward (driver→receiver) and reverse (receiver→parent)
+            // implicit sources contribute to driving value.
             const void *sv = source_value(n, s);
             if (sv != NULL) {
                nonnull++;
@@ -2171,11 +2184,15 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          break;
 
       case SOURCE_IMPLICIT:
-         // STD_MX: receiver is the sole active source (other SOURCE_PORTs
-         // were skipped as undriven).  Use the receiver's effective value
-         // as the driving value of the parent signal.
-         if (s0->u.port.input != NULL)
-            put_driving(m, n, nexus_effective(s0->u.port.input));
+         // STD_MX: implicit source is the sole active source.
+         // For reverse (receiver→parent): read receiver's effective value.
+         // For forward (driver→receiver): read driver's driving value.
+         if (s0->u.port.input != NULL) {
+            if (s0->u.port.input->flags & NET_F_EFFECTIVE)
+               put_driving(m, n, nexus_driving(s0->u.port.input));
+            else
+               put_driving(m, n, nexus_effective(s0->u.port.input));
+         }
          break;
 
       default:
@@ -4912,7 +4929,7 @@ sig_shared_t *x_implicit_signal(uint32_t count, uint32_t size, tree_t where,
 
    rt_model_t *m = get_model();
 
-   const size_t datasz = MAX(2 * count * size, 8);
+   const size_t datasz = MAX(3 * count * size, 8);
    rt_implicit_t *imp = static_alloc(m, sizeof(rt_implicit_t) + datasz);
    setup_signal(m, &(imp->signal), where, count, size, SIG_F_IMPLICIT, 0);
 

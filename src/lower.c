@@ -47,6 +47,7 @@
 typedef enum {
    EXPR_LVALUE,
    EXPR_RVALUE,
+   EXPR_TARGET,   // Signal assignment target: redirect to 'driver in STD_MX
 } expr_ctx_t;
 
 typedef struct _loop_stack loop_stack_t;
@@ -2804,7 +2805,7 @@ static vcode_reg_t lower_var_ref(lower_unit_t *lu, tree_t decl, expr_ctx_t ctx)
       ptr_reg = emit_var_upref(hops, var);
 
    if (ptr_reg != VCODE_INVALID_REG) {
-      if (ctx == EXPR_LVALUE)
+      if (ctx != EXPR_RVALUE)
          return ptr_reg;
       else if (type_is_scalar(type))
          return emit_load_indirect(ptr_reg);
@@ -2818,7 +2819,7 @@ static vcode_reg_t lower_var_ref(lower_unit_t *lu, tree_t decl, expr_ctx_t ctx)
    else if (type_is_record(type) || type_is_protected(type))
       return emit_index(var, VCODE_INVALID_REG);
    else if ((type_is_scalar(type) || type_is_file(type) || type_is_access(type))
-            && ctx == EXPR_LVALUE)
+            && ctx != EXPR_RVALUE)
       return emit_index(var, VCODE_INVALID_REG);
    else
       return emit_load(var);
@@ -3050,6 +3051,27 @@ static bool lower_is_trivial_constant(tree_t decl)
       return tree_kind(tree_value(decl)) == T_LITERAL;
 }
 
+static tree_t lower_find_stdmx_implicit(lower_unit_t *lu, tree_t signal,
+                                        implicit_kind_t kind)
+{
+   // Find the auto-created 'driver or 'receiver implicit signal
+   // for the given T_SIGNAL_DECL by scanning the containing scope.
+   for (lower_unit_t *p = lu; p != NULL; p = p->parent) {
+      tree_t scope = p->container;
+      const int ndecls = tree_decls(scope);
+      for (int i = 0; i < ndecls; i++) {
+         tree_t d = tree_decl(scope, i);
+         if (tree_kind(d) == T_IMPLICIT_SIGNAL
+             && tree_subkind(d) == kind
+             && tree_has_value(d)
+             && tree_kind(tree_value(d)) == T_REF
+             && tree_ref(tree_value(d)) == signal)
+            return d;
+      }
+   }
+   return NULL;
+}
+
 static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
 {
    tree_t decl = tree_ref(ref);
@@ -3057,7 +3079,7 @@ static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
    tree_kind_t kind = tree_kind(decl);
    switch (kind) {
    case T_ENUM_LIT:
-      if (ctx == EXPR_LVALUE)
+      if (ctx != EXPR_RVALUE)
          return VCODE_INVALID_REG;
       else
          return emit_const(lower_type(tree_type(decl)), tree_pos(decl));
@@ -3076,6 +3098,15 @@ static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
       return lower_generic_ref(lu, decl, ctx);
 
    case T_SIGNAL_DECL:
+      if (standard() == STD_MX && ctx == EXPR_TARGET) {
+         // Signal assignment target: redirect to 'driver so that
+         // the parent signal can resolve all driver contributions.
+         tree_t imp = lower_find_stdmx_implicit(lu, decl,
+                                                IMPLICIT_DRIVER);
+         if (imp != NULL)
+            return lower_signal_ref(lu, imp);
+      }
+      // Fall through
    case T_IMPLICIT_SIGNAL:
       return lower_signal_ref(lu, decl);
 
@@ -3083,7 +3114,7 @@ static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
       return VCODE_INVALID_REG;
 
    case T_CONST_DECL:
-      if (ctx == EXPR_LVALUE)
+      if (ctx != EXPR_RVALUE)
          return VCODE_INVALID_REG;
       else if (lower_is_trivial_constant(decl))
          return lower_expr(lu, tree_value(decl), ctx);
@@ -5644,7 +5675,9 @@ static void lower_sched_event(lower_unit_t *lu, tree_t on)
          type = tree_type(decl);
    }
 
-   vcode_reg_t nets_reg = lower_lvalue(lu, on);
+   vcode_reg_t nets_reg;
+   nets_reg = lower_lvalue(lu, on);
+
    assert(nets_reg != VCODE_INVALID_REG);
 
    if (!type_is_homogeneous(type))
@@ -5874,7 +5907,9 @@ static void lower_fill_target_parts(lower_unit_t *lu, tree_t target,
       ++(*ptr);
    }
    else {
-      (*ptr)->reg    = lower_lvalue(lu, target);
+      (*ptr)->reg    = (standard() == STD_MX)
+         ? lower_expr(lu, target, EXPR_TARGET)
+         : lower_lvalue(lu, target);
       (*ptr)->target = target;
       (*ptr)->kind   = kind;
 
@@ -8627,15 +8662,48 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
          // assignment context (could be logic3d integer or logic3ds record).
          // For scalars, initialise to 0 (L3D_Z = high-impedance).
          // For records, let lower_sub_signals use per-field defaults.
+         //
+         // STD_MX auto-created 'driver: inherit parent signal's declared
+         // initial value so forward implicit propagation doesn't poison
+         // the parent with 'U' at time 0.
          vcode_reg_t init_reg;
-         if (type_is_scalar(type))
-            init_reg = emit_const(lower_type(type), 0);
+         if (type_is_scalar(type)) {
+            if (standard() == STD_MX && kind == IMPLICIT_DRIVER
+                && tree_has_value(decl)) {
+               tree_t psig = tree_ref(tree_value(decl));
+               if (tree_kind(psig) == T_SIGNAL_DECL
+                   && tree_has_value(psig))
+                  init_reg = lower_rvalue(parent, tree_value(psig));
+               else
+                  init_reg = emit_const(lower_type(type), 0);
+            }
+            else
+               init_reg = emit_const(lower_type(type), 0);
+         }
          else
             init_reg = VCODE_INVALID_REG;
 
          lower_sub_signals(parent, type, type, type, decl, NULL, var,
                            VCODE_INVALID_REG, init_reg, VCODE_INVALID_REG,
                            VCODE_INVALID_REG, 0, VCODE_INVALID_REG);
+
+         // STD_MX auto-created 'driver: connect driver → parent signal
+         // via forward emit_map_implicit so that VHDL signal assignments
+         // (redirected to 'driver) propagate back to the parent signal.
+         // Only for auto-created drivers (parent is T_SIGNAL_DECL).
+         // Explicit 'driver on ports are handled by the resolver network.
+         if (standard() == STD_MX && kind == IMPLICIT_DRIVER
+             && tree_has_value(decl) && type_is_homogeneous(type)) {
+            tree_t parent_sig = tree_ref(tree_value(decl));
+            if (tree_kind(parent_sig) == T_SIGNAL_DECL) {
+               vcode_reg_t drv_reg = emit_load(var);
+               vcode_reg_t parent_reg =
+                  lower_signal_ref(parent, parent_sig);
+               vcode_reg_t count_reg =
+                  lower_type_width(parent, type, drv_reg);
+               emit_map_implicit(drv_reg, parent_reg, count_reg);
+            }
+         }
       }
       break;
    }
@@ -10932,7 +11000,10 @@ void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
    for (; di; di = di->chain_proc) {
       assert(!di->tentative);
       type_t prefix_type = tree_type(di->prefix);
-      vcode_reg_t nets_reg = lower_lvalue(lu, di->prefix);
+      // STD_MX: redirect driver creation to 'driver implicit signal
+      vcode_reg_t nets_reg = (standard() == STD_MX)
+         ? lower_expr(lu, di->prefix, EXPR_TARGET)
+         : lower_lvalue(lu, di->prefix);
 
       if (!type_is_homogeneous(prefix_type))
          lower_for_each_field(lu, prefix_type, nets_reg, VCODE_INVALID_REG,
