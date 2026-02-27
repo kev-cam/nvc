@@ -1,0 +1,149 @@
+photonicsdir = $(pkglibdir)/photonics
+
+# --- Compiled VHDL units ---
+
+photonics_DATA = \
+	lib/photonics/_NVC_LIB \
+	lib/photonics/_index \
+	lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG \
+	lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG-body \
+	lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG \
+	lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG-body \
+	lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG \
+	lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG-body \
+	lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE \
+	lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_COUPLER \
+	lib/photonics/PHOTONICS.OPTICAL_COUPLER-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_SPLITTER \
+	lib/photonics/PHOTONICS.OPTICAL_SPLITTER-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER \
+	lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR \
+	lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR \
+	lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_CROSSING \
+	lib/photonics/PHOTONICS.OPTICAL_CROSSING-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_SOURCE \
+	lib/photonics/PHOTONICS.OPTICAL_SOURCE-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_DETECTOR \
+	lib/photonics/PHOTONICS.OPTICAL_DETECTOR-BEHAVIORAL \
+	lib/photonics/PHOTONICS.OPTICAL_PBS \
+	lib/photonics/PHOTONICS.OPTICAL_PBS-BEHAVIORAL
+
+# Python resolver script installed alongside VHDL
+photonics_DATA += \
+	$(srcdir)/lib/photonics/photonics_resolver.py
+
+EXTRA_DIST += \
+	lib/photonics/optical_field_pkg.vhd \
+	lib/photonics/optical_matrix_pkg.vhd \
+	lib/photonics/optical_stokes_pkg.vhd \
+	lib/photonics/optical_waveguide.vhd \
+	lib/photonics/optical_coupler.vhd \
+	lib/photonics/optical_splitter.vhd \
+	lib/photonics/optical_phase_shifter.vhd \
+	lib/photonics/optical_polarization_rotator.vhd \
+	lib/photonics/optical_attenuator.vhd \
+	lib/photonics/optical_crossing.vhd \
+	lib/photonics/optical_source.vhd \
+	lib/photonics/optical_detector.vhd \
+	lib/photonics/optical_pbs.vhd \
+	lib/photonics/photonics_resolver.py
+
+BOOTSTRAPLIBS += $(photonics_DATA)
+
+lib/photonics/_NVC_LIB:
+
+lib/photonics/_index:
+
+# --- Packages (each file produces pkg + body in one compile) ---
+
+lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG: $(srcdir)/lib/photonics/optical_field_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_field_pkg.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG-body: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+
+lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG: $(srcdir)/lib/photonics/optical_matrix_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_matrix_pkg.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG-body: lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG
+
+lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG: $(srcdir)/lib/photonics/optical_stokes_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_stokes_pkg.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG-body: lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG
+
+# --- Entity files (each produces entity + architecture) ---
+
+lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE: $(srcdir)/lib/photonics/optical_waveguide.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_waveguide.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE
+
+lib/photonics/PHOTONICS.OPTICAL_COUPLER: $(srcdir)/lib/photonics/optical_coupler.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_coupler.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_COUPLER-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_COUPLER
+
+lib/photonics/PHOTONICS.OPTICAL_SPLITTER: $(srcdir)/lib/photonics/optical_splitter.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_splitter.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_SPLITTER-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_SPLITTER
+
+lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER: $(srcdir)/lib/photonics/optical_phase_shifter.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_phase_shifter.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER
+
+lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR: $(srcdir)/lib/photonics/optical_polarization_rotator.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_polarization_rotator.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR
+
+lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR: $(srcdir)/lib/photonics/optical_attenuator.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_attenuator.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR
+
+lib/photonics/PHOTONICS.OPTICAL_CROSSING: $(srcdir)/lib/photonics/optical_crossing.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_crossing.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_CROSSING-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_CROSSING
+
+lib/photonics/PHOTONICS.OPTICAL_SOURCE: $(srcdir)/lib/photonics/optical_source.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_source.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_SOURCE-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_SOURCE
+
+lib/photonics/PHOTONICS.OPTICAL_DETECTOR: $(srcdir)/lib/photonics/optical_detector.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_detector.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_DETECTOR-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_DETECTOR
+
+lib/photonics/PHOTONICS.OPTICAL_PBS: $(srcdir)/lib/photonics/optical_pbs.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/photonics -a --relative=$(srcdir) $(srcdir)/lib/photonics/optical_pbs.vhd
+
+lib/photonics/PHOTONICS.OPTICAL_PBS-BEHAVIORAL: lib/photonics/PHOTONICS.OPTICAL_PBS
+
+# --- Dependencies ---
+# Packages depend on ieee.08 (for math_real, std_logic_1164)
+# optical_matrix_pkg depends on optical_field_pkg
+# optical_stokes_pkg depends on optical_field_pkg
+# Entity files depend on packages being compiled first
+
+lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.MATH_REAL
+lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_STOKES_PKG: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+
+lib/photonics/PHOTONICS.OPTICAL_WAVEGUIDE: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG
+lib/photonics/PHOTONICS.OPTICAL_COUPLER: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG
+lib/photonics/PHOTONICS.OPTICAL_SPLITTER: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_PHASE_SHIFTER: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_POLARIZATION_ROTATOR: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG
+lib/photonics/PHOTONICS.OPTICAL_ATTENUATOR: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_CROSSING: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_SOURCE: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_DETECTOR: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG
+lib/photonics/PHOTONICS.OPTICAL_PBS: lib/photonics/PHOTONICS.OPTICAL_FIELD_PKG lib/photonics/PHOTONICS.OPTICAL_MATRIX_PKG
