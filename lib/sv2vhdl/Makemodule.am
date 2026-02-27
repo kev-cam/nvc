@@ -200,7 +200,7 @@ PYTHON3_LDFLAGS ?= $$($(PYTHON3_CONFIG) --ldflags --embed 2>/dev/null || $(PYTHO
 $(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/resolver.c @ifGNUmake@ | $(DRIVER)
 	@mkdir -p $(abs_top_builddir)/lib/sv2vhdl
 	$(CC) $(SHLIB_LDFLAGS) $(SHLIB_CFLAGS) -Wall -O2 \
-	    -I$(top_srcdir)/src \
+	    -I$(top_srcdir)/src/vhpi \
 	    $(PYTHON3_CFLAGS) \
 	    -o $@ $< \
 	    $(PYTHON3_LDFLAGS) \
