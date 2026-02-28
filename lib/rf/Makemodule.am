@@ -1,0 +1,126 @@
+rfdir = $(pkglibdir)/rf
+
+# --- Compiled VHDL units ---
+
+rf_DATA = \
+	lib/rf/_NVC_LIB \
+	lib/rf/_index \
+	lib/rf/RF.RF_SIGNAL_PKG \
+	lib/rf/RF.RF_SIGNAL_PKG-body \
+	lib/rf/RF.IQ_PKG \
+	lib/rf/RF.IQ_PKG-body \
+	lib/rf/RF.OFDM_PKG \
+	lib/rf/RF.OFDM_PKG-body \
+	lib/rf/RF.RF_SOURCE \
+	lib/rf/RF.RF_SOURCE-BEHAVIORAL \
+	lib/rf/RF.RF_ANTENNA \
+	lib/rf/RF.RF_ANTENNA-BEHAVIORAL \
+	lib/rf/RF.RF_AMPLIFIER \
+	lib/rf/RF.RF_AMPLIFIER-BEHAVIORAL \
+	lib/rf/RF.RF_ATTENUATOR \
+	lib/rf/RF.RF_ATTENUATOR-BEHAVIORAL \
+	lib/rf/RF.RF_FILTER \
+	lib/rf/RF.RF_FILTER-BEHAVIORAL \
+	lib/rf/RF.RF_MIXER \
+	lib/rf/RF.RF_MIXER-BEHAVIORAL \
+	lib/rf/RF.RF_SPLITTER \
+	lib/rf/RF.RF_SPLITTER-BEHAVIORAL \
+	lib/rf/RF.RF_CHANNEL \
+	lib/rf/RF.RF_CHANNEL-BEHAVIORAL
+
+# Python resolver script
+rf_DATA += \
+	$(srcdir)/lib/rf/rf_resolver.py
+
+EXTRA_DIST += \
+	lib/rf/rf_signal_pkg.vhd \
+	lib/rf/iq_pkg.vhd \
+	lib/rf/ofdm_pkg.vhd \
+	lib/rf/rf_source.vhd \
+	lib/rf/rf_antenna.vhd \
+	lib/rf/rf_amplifier.vhd \
+	lib/rf/rf_attenuator.vhd \
+	lib/rf/rf_filter.vhd \
+	lib/rf/rf_mixer.vhd \
+	lib/rf/rf_splitter.vhd \
+	lib/rf/rf_channel.vhd \
+	lib/rf/rf_resolver.py
+
+BOOTSTRAPLIBS += $(rf_DATA)
+
+lib/rf/_NVC_LIB:
+
+lib/rf/_index:
+
+# --- Packages ---
+
+lib/rf/RF.RF_SIGNAL_PKG: $(srcdir)/lib/rf/rf_signal_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_signal_pkg.vhd
+
+lib/rf/RF.RF_SIGNAL_PKG-body: lib/rf/RF.RF_SIGNAL_PKG
+
+lib/rf/RF.IQ_PKG: $(srcdir)/lib/rf/iq_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/iq_pkg.vhd
+
+lib/rf/RF.IQ_PKG-body: lib/rf/RF.IQ_PKG
+
+lib/rf/RF.OFDM_PKG: $(srcdir)/lib/rf/ofdm_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/ofdm_pkg.vhd
+
+lib/rf/RF.OFDM_PKG-body: lib/rf/RF.OFDM_PKG
+
+# --- Entity files ---
+
+lib/rf/RF.RF_SOURCE: $(srcdir)/lib/rf/rf_source.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_source.vhd
+
+lib/rf/RF.RF_SOURCE-BEHAVIORAL: lib/rf/RF.RF_SOURCE
+
+lib/rf/RF.RF_ANTENNA: $(srcdir)/lib/rf/rf_antenna.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_antenna.vhd
+
+lib/rf/RF.RF_ANTENNA-BEHAVIORAL: lib/rf/RF.RF_ANTENNA
+
+lib/rf/RF.RF_AMPLIFIER: $(srcdir)/lib/rf/rf_amplifier.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_amplifier.vhd
+
+lib/rf/RF.RF_AMPLIFIER-BEHAVIORAL: lib/rf/RF.RF_AMPLIFIER
+
+lib/rf/RF.RF_ATTENUATOR: $(srcdir)/lib/rf/rf_attenuator.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_attenuator.vhd
+
+lib/rf/RF.RF_ATTENUATOR-BEHAVIORAL: lib/rf/RF.RF_ATTENUATOR
+
+lib/rf/RF.RF_FILTER: $(srcdir)/lib/rf/rf_filter.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_filter.vhd
+
+lib/rf/RF.RF_FILTER-BEHAVIORAL: lib/rf/RF.RF_FILTER
+
+lib/rf/RF.RF_MIXER: $(srcdir)/lib/rf/rf_mixer.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_mixer.vhd
+
+lib/rf/RF.RF_MIXER-BEHAVIORAL: lib/rf/RF.RF_MIXER
+
+lib/rf/RF.RF_SPLITTER: $(srcdir)/lib/rf/rf_splitter.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_splitter.vhd
+
+lib/rf/RF.RF_SPLITTER-BEHAVIORAL: lib/rf/RF.RF_SPLITTER
+
+lib/rf/RF.RF_CHANNEL: $(srcdir)/lib/rf/rf_channel.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/rf -a --relative=$(srcdir) $(srcdir)/lib/rf/rf_channel.vhd
+
+lib/rf/RF.RF_CHANNEL-BEHAVIORAL: lib/rf/RF.RF_CHANNEL
+
+# --- Dependencies ---
+lib/rf/RF.RF_SIGNAL_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.MATH_REAL
+lib/rf/RF.IQ_PKG: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.OFDM_PKG: lib/rf/RF.IQ_PKG
+
+lib/rf/RF.RF_SOURCE: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_ANTENNA: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_AMPLIFIER: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_ATTENUATOR: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_FILTER: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_MIXER: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_SPLITTER: lib/rf/RF.RF_SIGNAL_PKG
+lib/rf/RF.RF_CHANNEL: lib/rf/RF.RF_SIGNAL_PKG
