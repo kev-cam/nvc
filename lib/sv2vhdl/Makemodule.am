@@ -9,6 +9,8 @@ sv2vhdl_DATA = \
 	lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG-body \
 	lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG \
 	lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG-body \
+	lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG \
+	lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG-body \
 	lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG \
 	lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG-body \
 	lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES \
@@ -79,6 +81,7 @@ sv2vhdl_DATA += \
 EXTRA_DIST += \
 	lib/sv2vhdl/logic3d_types_pkg.vhd \
 	lib/sv2vhdl/logic3ds_pkg.vhd \
+	lib/sv2vhdl/logic3da_pkg.vhd \
 	lib/sv2vhdl/logic3d_vec_pkg.vhd \
 	lib/sv2vhdl/sv_primitives.vhd \
 	lib/sv2vhdl/sv_gates.vhd \
@@ -106,6 +109,11 @@ lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG: $(srcdir)/lib/sv2vhdl/logic3ds_pkg.vhd @ifGNUm
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3ds_pkg.vhd
 
 lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG
+
+lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG: $(srcdir)/lib/sv2vhdl/logic3da_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3da_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG
 
 lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG: $(srcdir)/lib/sv2vhdl/logic3d_vec_pkg.vhd @ifGNUmake@ | $(DRIVER)
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3d_vec_pkg.vhd
@@ -212,6 +220,7 @@ $(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/re
 
 lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
 lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
+lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG lib/ieee.08/IEEE.MATH_REAL
 lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES: lib/ieee.08/IEEE.STD_LOGIC_1164
 lib/sv2vhdl/SV2VHDL.SV_AND: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
