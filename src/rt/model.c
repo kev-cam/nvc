@@ -1907,8 +1907,20 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
          if (tree_kind(iwhere) == T_IMPLICIT_SIGNAL
              && tree_subkind(iwhere) == IMPLICIT_DRIVER) {
             // Forward implicit: auto-created 'driver → parent.
-            // The driver's driving value is updated by put_driving
-            // before the output chain triggers this call.
+            // Only contribute when the driver has at least one
+            // SOURCE_DRIVER (a process writes to it).  Auto-drivers
+            // with no SOURCE_DRIVER are unused and should not
+            // contribute stale initial values to resolution.
+            if (input->n_sources == 0)
+               return NULL;
+            bool has_driver = false;
+            for (rt_source_t *si = &(input->sources);
+                 si; si = si->chain_input)
+               if (si->tag == SOURCE_DRIVER) {
+                  has_driver = true; break;
+               }
+            if (!has_driver)
+               return NULL;
             if (input->flags & NET_F_EFFECTIVE)
                return nexus_driving(input);
             else
@@ -2121,17 +2133,19 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       }
       else if (unlikely(standard() == STD_MX
                         && s->tag == SOURCE_PORT)) {
-         // Mixed mode: skip port with no real driver and no deposit.
-         // Only count SOURCE_DRIVER as proof of a real driver.
-         // SOURCE_PORT on the input nexus may be a circular back-ref
-         // from inout bidirectional mapping (port A -> signal -> port A)
-         // which would poison resolution with 'U'.
+         // Mixed mode: skip port with no real driver.
+         // Count SOURCE_DRIVER or SOURCE_IMPLICIT as proof of a real
+         // driver.  SOURCE_IMPLICIT covers auto-driver signals in
+         // STD_MX mode where assignments are redirected to 'driver.
+         // Ports with no such source on their input nexus are either
+         // circular inout back-refs or undriven ports.
          rt_nexus_t *input = s->u.port.input;
          bool has_driver = false;
-         if (input->n_sources > 0) {
+         if (input != NULL && input->n_sources > 0) {
             for (rt_source_t *si = &(input->sources);
                  si; si = si->chain_input)
-               if (si->tag == SOURCE_DRIVER) {
+               if (si->tag == SOURCE_DRIVER
+                   || si->tag == SOURCE_IMPLICIT) {
                   has_driver = true; break;
                }
          }
