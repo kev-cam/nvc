@@ -28,8 +28,8 @@ rf_DATA = \
 	lib/rf/RF.RF_CHANNEL \
 	lib/rf/RF.RF_CHANNEL-BEHAVIORAL
 
-# Python resolver script
-rf_DATA += \
+# Python script is a source file - use dist_ so clean doesn't delete it
+dist_rf_DATA = \
 	$(srcdir)/lib/rf/rf_resolver.py
 
 EXTRA_DIST += \

@@ -32,8 +32,8 @@ photonics_DATA = \
 	lib/photonics/PHOTONICS.OPTICAL_PBS \
 	lib/photonics/PHOTONICS.OPTICAL_PBS-BEHAVIORAL
 
-# Python resolver script installed alongside VHDL
-photonics_DATA += \
+# Python script is a source file - use dist_ so clean doesn't delete it
+dist_photonics_DATA = \
 	$(srcdir)/lib/photonics/photonics_resolver.py
 
 EXTRA_DIST += \

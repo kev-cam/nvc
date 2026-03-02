@@ -337,6 +337,17 @@ case $host_os in
 esac
 AC_SUBST(SHLIB_LDFLAGS)
 
+# Python3 for sv2vhdl resolver plugin
+AC_CHECK_PROGS([PYTHON3_CONFIG], [python3-config python3.10-config], [no])
+if test "x$PYTHON3_CONFIG" != "xno"; then
+  PYTHON3_CFLAGS=`$PYTHON3_CONFIG --includes`
+  PYTHON3_LDFLAGS=`$PYTHON3_CONFIG --ldflags --embed 2>/dev/null || $PYTHON3_CONFIG --ldflags`
+else
+  AC_MSG_WARN([python3-config not found - sv2vhdl resolver plugin may not build])
+fi
+AC_SUBST(PYTHON3_CFLAGS)
+AC_SUBST(PYTHON3_LDFLAGS)
+
 NVC_CHECK_EMUTLS
 if test "$nvc_cv_use_emutls" = "yes"; then
   AC_MSG_WARN(m4_normalize(

@@ -75,10 +75,13 @@ sv2vhdl_DATA = \
 	lib/sv2vhdl/SV2VHDL.SV_MATH_PKG \
 	lib/sv2vhdl/SV2VHDL.SV_MATH_PKG-body
 
-# Shared libraries and Python script installed alongside VHDL
+# Shared libraries installed alongside VHDL
 sv2vhdl_DATA += \
 	$(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT) \
-	$(abs_top_builddir)/lib/sv2vhdl/libsv_math.$(DLL_EXT) \
+	$(abs_top_builddir)/lib/sv2vhdl/libsv_math.$(DLL_EXT)
+
+# Python script is a source file - use dist_ so clean doesn't delete it
+dist_sv2vhdl_DATA = \
 	$(srcdir)/lib/sv2vhdl/sv2vhdl_resolver.py
 
 EXTRA_DIST += \
