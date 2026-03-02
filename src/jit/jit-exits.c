@@ -649,6 +649,62 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
       }
       break;
 
+   case JIT_EXIT_INIT_PIPE:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       depth  = args[2].integer;
+
+         x_init_pipe(shared, depth);
+      }
+      break;
+
+   case JIT_EXIT_PIPE_WRITE:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+         jit_scalar_t  value  = { .integer = args[3].integer };
+         bool          scalar = args[4].integer;
+
+         if (scalar)
+            x_pipe_write(shared, offset, count, &value.integer);
+         else
+            x_pipe_write(shared, offset, count, value.pointer);
+      }
+      break;
+
+   case JIT_EXIT_PIPE_READ:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+
+         uint64_t result = 0;
+         x_pipe_read(shared, offset, count, &result);
+         args[0].integer = result;
+      }
+      break;
+
+   case JIT_EXIT_PIPE_FULL:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+
+         args[0].integer = x_pipe_full(shared, offset, count);
+      }
+      break;
+
+   case JIT_EXIT_PIPE_EMPTY:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+
+         args[0].integer = x_pipe_empty(shared, offset, count);
+      }
+      break;
+
    case JIT_EXIT_PUT_CONVERSION:
       {
          rt_conv_func_t *cf     = args[0].pointer;

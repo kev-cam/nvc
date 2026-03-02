@@ -1158,6 +1158,52 @@ static void import_disconnect(mir_unit_t *mu, mir_import_t *imp, int op)
    mir_build_disconnect(mu, target, count, reject, after);
 }
 
+static void import_init_pipe(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t depth = imp->map[vcode_get_arg(op, 1)];
+
+   mir_build_init_pipe(mu, signal, depth);
+}
+
+static void import_pipe_write(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count = imp->map[vcode_get_arg(op, 1)];
+   mir_value_t value = imp->map[vcode_get_arg(op, 2)];
+
+   mir_build_pipe_write(mu, signal, count, value);
+}
+
+static void import_pipe_read(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count = imp->map[vcode_get_arg(op, 1)];
+
+   vcode_reg_t result = vcode_get_result(op);
+   mir_type_t type = import_type(mu, imp, vcode_reg_type(result));
+
+   imp->map[result] = mir_build_pipe_read(mu, type, signal, count);
+}
+
+static void import_pipe_full(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count = imp->map[vcode_get_arg(op, 1)];
+
+   vcode_reg_t result = vcode_get_result(op);
+   imp->map[result] = mir_build_pipe_full(mu, signal, count);
+}
+
+static void import_pipe_empty(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count = imp->map[vcode_get_arg(op, 1)];
+
+   vcode_reg_t result = vcode_get_result(op);
+   imp->map[result] = mir_build_pipe_empty(mu, signal, count);
+}
+
 static void import_exponent_check(mir_unit_t *mu, mir_import_t *imp, int op)
 {
    mir_value_t exp = imp->map[vcode_get_arg(op, 0)];
@@ -1797,6 +1843,21 @@ static void import_block(mir_unit_t *mu, mir_import_t *imp)
          break;
       case VCODE_OP_SCHED_PROCESS:
          import_sched_process(mu, imp, i);
+         break;
+      case VCODE_OP_INIT_PIPE:
+         import_init_pipe(mu, imp, i);
+         break;
+      case VCODE_OP_PIPE_WRITE:
+         import_pipe_write(mu, imp, i);
+         break;
+      case VCODE_OP_PIPE_READ:
+         import_pipe_read(mu, imp, i);
+         break;
+      case VCODE_OP_PIPE_FULL:
+         import_pipe_full(mu, imp, i);
+         break;
+      case VCODE_OP_PIPE_EMPTY:
+         import_pipe_empty(mu, imp, i);
          break;
       default:
          vcode_dump_with_mark(i, NULL, NULL);

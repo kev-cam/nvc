@@ -180,6 +180,17 @@ typedef struct {
    int8_t        tab1[16];
 } res_memo_t;
 
+typedef struct _rt_pipe_fifo {
+   uint32_t       capacity;    // max entries (default 1)
+   uint32_t       count;       // current entries
+   uint32_t       head;        // read index
+   uint32_t       tail;        // write index
+   uint32_t       elem_size;   // bytes per element
+   rt_wakeable_t *rd_wait;     // processes blocked on empty
+   rt_wakeable_t *wr_wait;     // processes blocked on full
+   uint8_t        data[];      // circular buffer: capacity * elem_size
+} rt_pipe_fifo_t;
+
 typedef struct _rt_nexus {
    rt_nexus_t    *chain;
    rt_signal_t   *signal;
@@ -195,10 +206,11 @@ typedef struct _rt_nexus {
    void          *pending;
    rt_source_t   *outputs;
    void          *free_value;
+   rt_pipe_fifo_t *pipe_fifo;
    rt_source_t    sources;
 } rt_nexus_t;
 
-STATIC_ASSERT(sizeof(rt_nexus_t) <= 128);
+STATIC_ASSERT(sizeof(rt_nexus_t) <= 136);
 
 // The code generator knows the layout of this struct
 typedef struct _sig_shared {
@@ -224,7 +236,7 @@ typedef struct _rt_signal {
    sig_shared_t  shared;
 } rt_signal_t;
 
-STATIC_ASSERT(sizeof(rt_signal_t) + 8 <= 192);
+STATIC_ASSERT(sizeof(rt_signal_t) + 8 <= 200);
 
 typedef struct _rt_implicit {
    rt_wakeable_t wakeable;

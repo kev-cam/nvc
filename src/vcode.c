@@ -975,7 +975,8 @@ const char *vcode_op_string(vcode_op_t op)
       "or trigger", "cmp trigger", "instance name",
       "map implicit", "bind external", "array scope", "record scope", "syscall",
       "put conversion", "dir check", "sched process", "table ref",
-      "deposit",
+      "deposit", "init pipe", "pipe write", "pipe read", "pipe full",
+      "pipe empty",
    };
    if ((unsigned)op >= ARRAY_LEN(strs))
       return "???";
@@ -1771,6 +1772,49 @@ void vcode_dump_with_mark(int mark_op, vcode_dump_fn_t callback, void *arg)
                   printf(" values ");
                   vcode_dump_reg(op->args.items[2]);
                }
+            }
+            break;
+
+         case VCODE_OP_INIT_PIPE:
+            {
+               printf("%s ", vcode_op_string(op->kind));
+               vcode_dump_reg(op->args.items[0]);
+               printf(" depth ");
+               vcode_dump_reg(op->args.items[1]);
+            }
+            break;
+
+         case VCODE_OP_PIPE_WRITE:
+            {
+               printf("%s ", vcode_op_string(op->kind));
+               vcode_dump_reg(op->args.items[0]);
+               printf(" count ");
+               vcode_dump_reg(op->args.items[1]);
+               printf(" value ");
+               vcode_dump_reg(op->args.items[2]);
+            }
+            break;
+
+         case VCODE_OP_PIPE_READ:
+            {
+               col += vcode_dump_reg(op->result);
+               col += printf(" := %s ", vcode_op_string(op->kind));
+               col += vcode_dump_reg(op->args.items[0]);
+               col += printf(" count ");
+               col += vcode_dump_reg(op->args.items[1]);
+               vcode_dump_result_type(col, op);
+            }
+            break;
+
+         case VCODE_OP_PIPE_FULL:
+         case VCODE_OP_PIPE_EMPTY:
+            {
+               col += vcode_dump_reg(op->result);
+               col += printf(" := %s ", vcode_op_string(op->kind));
+               col += vcode_dump_reg(op->args.items[0]);
+               col += printf(" count ");
+               col += vcode_dump_reg(op->args.items[1]);
+               vcode_dump_result_type(col, op);
             }
             break;
 
@@ -4390,6 +4434,69 @@ void emit_release(vcode_reg_t nets, vcode_reg_t nnets)
                 "release target is not signal");
    VCODE_ASSERT(vcode_reg_kind(nnets) == VCODE_TYPE_OFFSET,
                 "release net count is not offset type");
+}
+
+void emit_init_pipe(vcode_reg_t signal, vcode_reg_t depth)
+{
+   op_t *op = vcode_add_op(VCODE_OP_INIT_PIPE);
+   vcode_add_arg(op, signal);
+   vcode_add_arg(op, depth);
+
+   VCODE_ASSERT(vcode_reg_kind(signal) == VCODE_TYPE_SIGNAL,
+                "init pipe target is not signal");
+}
+
+void emit_pipe_write(vcode_reg_t signal, vcode_reg_t count,
+                     vcode_reg_t value)
+{
+   op_t *op = vcode_add_op(VCODE_OP_PIPE_WRITE);
+   vcode_add_arg(op, signal);
+   vcode_add_arg(op, count);
+   vcode_add_arg(op, value);
+
+   VCODE_ASSERT(vcode_reg_kind(signal) == VCODE_TYPE_SIGNAL,
+                "pipe write target is not signal");
+   VCODE_ASSERT(vcode_reg_kind(count) == VCODE_TYPE_OFFSET,
+                "pipe write count is not offset type");
+}
+
+vcode_reg_t emit_pipe_read(vcode_reg_t signal, vcode_reg_t count,
+                           vcode_type_t type)
+{
+   op_t *op = vcode_add_op(VCODE_OP_PIPE_READ);
+   vcode_add_arg(op, signal);
+   vcode_add_arg(op, count);
+
+   VCODE_ASSERT(vcode_reg_kind(signal) == VCODE_TYPE_SIGNAL,
+                "pipe read source is not signal");
+   VCODE_ASSERT(vcode_reg_kind(count) == VCODE_TYPE_OFFSET,
+                "pipe read count is not offset type");
+
+   return (op->result = vcode_add_reg(type));
+}
+
+vcode_reg_t emit_pipe_full(vcode_reg_t signal, vcode_reg_t count)
+{
+   op_t *op = vcode_add_op(VCODE_OP_PIPE_FULL);
+   vcode_add_arg(op, signal);
+   vcode_add_arg(op, count);
+
+   VCODE_ASSERT(vcode_reg_kind(signal) == VCODE_TYPE_SIGNAL,
+                "pipe full check target is not signal");
+
+   return (op->result = vcode_add_reg(vtype_bool()));
+}
+
+vcode_reg_t emit_pipe_empty(vcode_reg_t signal, vcode_reg_t count)
+{
+   op_t *op = vcode_add_op(VCODE_OP_PIPE_EMPTY);
+   vcode_add_arg(op, signal);
+   vcode_add_arg(op, count);
+
+   VCODE_ASSERT(vcode_reg_kind(signal) == VCODE_TYPE_SIGNAL,
+                "pipe empty check source is not signal");
+
+   return (op->result = vcode_add_reg(vtype_bool()));
 }
 
 void emit_disconnect(vcode_reg_t nets, vcode_reg_t nnets, vcode_reg_t reject,

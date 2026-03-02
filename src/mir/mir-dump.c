@@ -180,6 +180,11 @@ const char *mir_op_string(mir_op_t op)
       [MIR_OP_SCHED_INACTIVE] = "sched inactive",
       [MIR_OP_SCHED_DEPOSIT] = "sched deposit",
       [MIR_OP_PUT_DRIVER] = "put driver",
+      [MIR_OP_INIT_PIPE] = "init pipe",
+      [MIR_OP_PIPE_WRITE] = "pipe write",
+      [MIR_OP_PIPE_READ] = "pipe read",
+      [MIR_OP_PIPE_FULL] = "pipe full",
+      [MIR_OP_PIPE_EMPTY] = "pipe empty",
    };
 
    return map[op];
@@ -1599,6 +1604,38 @@ void mir_annotate(mir_unit_t *mu, const mir_annotate_t *cb, void *ctx)
                mir_dump_arg(mu, result, 2, cb, ctx);
                printf(" after ");
                mir_dump_arg(mu, result, 3, cb, ctx);
+            }
+            break;
+
+         case MIR_OP_INIT_PIPE:
+            {
+               printf("%s ", mir_op_string(n->op));
+               mir_dump_arg(mu, result, 0, cb, ctx);
+               printf(" depth ");
+               mir_dump_arg(mu, result, 1, cb, ctx);
+            }
+            break;
+
+         case MIR_OP_PIPE_WRITE:
+            {
+               printf("%s ", mir_op_string(n->op));
+               mir_dump_arg(mu, result, 0, cb, ctx);
+               printf(" count ");
+               mir_dump_arg(mu, result, 1, cb, ctx);
+               printf(" value ");
+               mir_dump_arg(mu, result, 2, cb, ctx);
+            }
+            break;
+
+         case MIR_OP_PIPE_READ:
+         case MIR_OP_PIPE_FULL:
+         case MIR_OP_PIPE_EMPTY:
+            {
+               col += mir_dump_value(mu, result, cb, ctx);
+               col += printf(" := %s ", mir_op_string(n->op));
+               mir_dump_arg(mu, result, 0, cb, ctx);
+               printf(" count ");
+               mir_dump_arg(mu, result, 1, cb, ctx);
             }
             break;
 

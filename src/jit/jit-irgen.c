@@ -3583,6 +3583,82 @@ static void irgen_op_put_driver(jit_irgen_t *g, mir_value_t n)
    macro_exit(g, JIT_EXIT_PUT_DRIVER);
 }
 
+static void irgen_op_init_pipe(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t depth  = irgen_get_arg(g, n, 1);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, depth);
+
+   macro_exit(g, JIT_EXIT_INIT_PIPE);
+}
+
+static void irgen_op_pipe_write(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t count  = irgen_get_arg(g, n, 1);
+   jit_value_t value  = irgen_get_arg(g, n, 2);
+
+   jit_value_t scalar = irgen_is_scalar(g, n, 2);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+   j_send(g, 3, value);
+   j_send(g, 4, scalar);
+
+   macro_exit(g, JIT_EXIT_PIPE_WRITE);
+}
+
+static void irgen_op_pipe_read(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t count  = irgen_get_arg(g, n, 1);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+
+   macro_exit(g, JIT_EXIT_PIPE_READ);
+
+   j_recv(g, g->map[n.id], 0);
+}
+
+static void irgen_op_pipe_full(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t count  = irgen_get_arg(g, n, 1);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+
+   macro_exit(g, JIT_EXIT_PIPE_FULL);
+
+   j_recv(g, g->map[n.id], 0);
+}
+
+static void irgen_op_pipe_empty(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t count  = irgen_get_arg(g, n, 1);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+
+   macro_exit(g, JIT_EXIT_PIPE_EMPTY);
+
+   j_recv(g, g->map[n.id], 0);
+}
+
 static void irgen_op_put_conversion(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t cf     = irgen_get_arg(g, n, 0);
@@ -4822,6 +4898,21 @@ static void irgen_block(jit_irgen_t *g, mir_block_t block)
          break;
       case MIR_OP_PUT_CONVERSION:
          irgen_op_put_conversion(g, n);
+         break;
+      case MIR_OP_INIT_PIPE:
+         irgen_op_init_pipe(g, n);
+         break;
+      case MIR_OP_PIPE_WRITE:
+         irgen_op_pipe_write(g, n);
+         break;
+      case MIR_OP_PIPE_READ:
+         irgen_op_pipe_read(g, n);
+         break;
+      case MIR_OP_PIPE_FULL:
+         irgen_op_pipe_full(g, n);
+         break;
+      case MIR_OP_PIPE_EMPTY:
+         irgen_op_pipe_empty(g, n);
          break;
       case MIR_OP_EVENT:
          irgen_op_event(g, n);

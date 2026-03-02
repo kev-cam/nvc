@@ -8243,10 +8243,18 @@ static void lower_signal_decl(lower_unit_t *lu, tree_t decl)
    sig_flags_t flags = 0;
    if (tree_flags(decl) & TREE_F_REGISTER)
       flags |= SIG_F_REGISTER;
+   if (tree_flags(decl) & TREE_F_PIPE)
+      flags |= SIG_F_PIPE;
 
    lower_sub_signals(lu, type, type, value_type, decl, NULL, var,
                      VCODE_INVALID_REG, init_reg, VCODE_INVALID_REG,
                      VCODE_INVALID_REG, flags, bounds_reg);
+
+   if (tree_flags(decl) & TREE_F_PIPE) {
+      vcode_reg_t sig_reg = emit_load(var);
+      vcode_reg_t depth_reg = emit_const(vtype_offset(), 1);
+      emit_init_pipe(sig_reg, depth_reg);
+   }
 
    PUSH_COVER_SCOPE(lu, decl);
 

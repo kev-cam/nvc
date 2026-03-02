@@ -184,6 +184,11 @@ typedef enum {
    JIT_EXIT_SCHED_DEPOSIT,
    JIT_EXIT_PUT_DRIVER,
    JIT_EXIT_SCHED_INACTIVE,
+   JIT_EXIT_INIT_PIPE,
+   JIT_EXIT_PIPE_WRITE,
+   JIT_EXIT_PIPE_READ,
+   JIT_EXIT_PIPE_FULL,
+   JIT_EXIT_PIPE_EMPTY,
 } jit_exit_t;
 
 typedef uint16_t jit_reg_t;

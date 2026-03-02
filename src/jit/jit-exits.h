@@ -116,4 +116,13 @@ void x_instance_name(attr_kind_t kind, text_buf_t *tb);
 void x_enable_trigger(rt_trigger_t *trigger);
 void x_disable_trigger(rt_trigger_t *trigger);
 
+// Pipe operations
+void x_init_pipe(sig_shared_t *ss, int32_t depth);
+void x_pipe_write(sig_shared_t *ss, uint32_t offset, int32_t count,
+                  void *values);
+void x_pipe_read(sig_shared_t *ss, uint32_t offset, int32_t count,
+                 void *result);
+bool x_pipe_full(sig_shared_t *ss, uint32_t offset, int32_t count);
+bool x_pipe_empty(sig_shared_t *ss, uint32_t offset, int32_t count);
+
 #endif  // _JIT_EXITS_H

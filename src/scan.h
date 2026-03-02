@@ -551,5 +551,6 @@ void reset_sdf_parser(void);
 #define tRTRAN         624
 #define tRTRANIF0      625
 #define tRTRANIF1      626
+#define tPIPE          627
 
 #endif  // _SCAN_H

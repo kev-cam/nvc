@@ -2804,6 +2804,66 @@ void mir_build_transfer_signal(mir_unit_t *mu, mir_value_t target,
    MIR_ASSERT(mir_is_signal(mu, source), "source is not a signal");
 }
 
+void mir_build_init_pipe(mir_unit_t *mu, mir_value_t signal,
+                         mir_value_t depth)
+{
+   mir_build_2(mu, MIR_OP_INIT_PIPE, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               signal, depth);
+
+   MIR_ASSERT(mir_is_signal(mu, signal),
+              "init pipe target is not signal");
+   MIR_ASSERT(mir_is_offset(mu, depth),
+              "init pipe depth is not offset type");
+}
+
+void mir_build_pipe_write(mir_unit_t *mu, mir_value_t signal,
+                          mir_value_t count, mir_value_t value)
+{
+   mir_build_3(mu, MIR_OP_PIPE_WRITE, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               signal, count, value);
+
+   MIR_ASSERT(mir_is_signal(mu, signal),
+              "pipe write target is not signal");
+   MIR_ASSERT(mir_is_offset(mu, count),
+              "pipe write count is not offset type");
+}
+
+mir_value_t mir_build_pipe_read(mir_unit_t *mu, mir_type_t type,
+                                mir_value_t signal, mir_value_t count)
+{
+   MIR_ASSERT(mir_is_signal(mu, signal),
+              "pipe read source is not signal");
+   MIR_ASSERT(mir_is_offset(mu, count),
+              "pipe read count is not offset type");
+
+   return mir_build_2(mu, MIR_OP_PIPE_READ, type, MIR_NULL_STAMP,
+                      signal, count);
+}
+
+mir_value_t mir_build_pipe_full(mir_unit_t *mu, mir_value_t signal,
+                                mir_value_t count)
+{
+   mir_type_t btype = mir_bool_type(mu);
+
+   MIR_ASSERT(mir_is_signal(mu, signal),
+              "pipe full check target is not signal");
+
+   return mir_build_2(mu, MIR_OP_PIPE_FULL, btype, MIR_NULL_STAMP,
+                      signal, count);
+}
+
+mir_value_t mir_build_pipe_empty(mir_unit_t *mu, mir_value_t signal,
+                                 mir_value_t count)
+{
+   mir_type_t btype = mir_bool_type(mu);
+
+   MIR_ASSERT(mir_is_signal(mu, signal),
+              "pipe empty check source is not signal");
+
+   return mir_build_2(mu, MIR_OP_PIPE_EMPTY, btype, MIR_NULL_STAMP,
+                      signal, count);
+}
+
 void mir_build_cover_stmt(mir_unit_t *mu, uint32_t tag)
 {
    mir_build_1(mu, MIR_OP_COVER_STMT, MIR_NULL_TYPE, MIR_NULL_STAMP,

@@ -260,6 +260,11 @@ typedef enum {
    MIR_OP_SCHED_DEPOSIT,
    MIR_OP_PUT_DRIVER,
    MIR_OP_TABLE_REF,
+   MIR_OP_INIT_PIPE,
+   MIR_OP_PIPE_WRITE,
+   MIR_OP_PIPE_READ,
+   MIR_OP_PIPE_FULL,
+   MIR_OP_PIPE_EMPTY,
 } mir_op_t;
 
 typedef enum {
@@ -681,6 +686,18 @@ void mir_build_resolve_signal(mir_unit_t *mu, mir_value_t signal,
 void mir_build_transfer_signal(mir_unit_t *mu, mir_value_t target,
                                mir_value_t source, mir_value_t count,
                                mir_value_t reject, mir_value_t after);
+
+// Pipe operations
+void mir_build_init_pipe(mir_unit_t *mu, mir_value_t signal,
+                         mir_value_t depth);
+void mir_build_pipe_write(mir_unit_t *mu, mir_value_t signal,
+                          mir_value_t count, mir_value_t value);
+mir_value_t mir_build_pipe_read(mir_unit_t *mu, mir_type_t type,
+                                mir_value_t signal, mir_value_t count);
+mir_value_t mir_build_pipe_full(mir_unit_t *mu, mir_value_t signal,
+                                mir_value_t count);
+mir_value_t mir_build_pipe_empty(mir_unit_t *mu, mir_value_t signal,
+                                 mir_value_t count);
 
 // Coverage
 void mir_build_cover_stmt(mir_unit_t *mu, uint32_t tag);

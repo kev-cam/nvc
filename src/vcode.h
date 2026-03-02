@@ -175,6 +175,11 @@ typedef enum {
    VCODE_OP_SCHED_PROCESS,
    VCODE_OP_TABLE_REF,
    VCODE_OP_DEPOSIT,
+   VCODE_OP_INIT_PIPE,
+   VCODE_OP_PIPE_WRITE,
+   VCODE_OP_PIPE_READ,
+   VCODE_OP_PIPE_FULL,
+   VCODE_OP_PIPE_EMPTY,
 } vcode_op_t;
 
 typedef enum {
@@ -451,6 +456,13 @@ vcode_reg_t emit_init_signal(vcode_type_t type, vcode_reg_t count,
                              vcode_reg_t flags, vcode_reg_t locus,
                              vcode_reg_t offset);
 void emit_resolve_signal(vcode_reg_t signal, vcode_reg_t resolution);
+void emit_init_pipe(vcode_reg_t signal, vcode_reg_t depth);
+void emit_pipe_write(vcode_reg_t signal, vcode_reg_t count,
+                     vcode_reg_t value);
+vcode_reg_t emit_pipe_read(vcode_reg_t signal, vcode_reg_t count,
+                           vcode_type_t type);
+vcode_reg_t emit_pipe_full(vcode_reg_t signal, vcode_reg_t count);
+vcode_reg_t emit_pipe_empty(vcode_reg_t signal, vcode_reg_t count);
 vcode_reg_t emit_implicit_signal(vcode_type_t type, vcode_reg_t count,
                                  vcode_reg_t size, vcode_reg_t locus,
                                  vcode_reg_t kind, vcode_reg_t closure,

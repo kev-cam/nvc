@@ -1630,6 +1630,7 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
    new->event_delta  = old->event_delta;
    new->last_event   = old->last_event;
    new->rank         = old->rank;
+   new->pipe_fifo    = NULL;
 
    old->chain = new;
    old->width = offset;
@@ -1767,6 +1768,7 @@ static void setup_signal(rt_model_t *m, rt_signal_t *s, tree_t where,
    s->nexus.flags        = flags | NET_F_FAST_DRIVER | NET_F_HAS_INITIAL;
    s->nexus.signal       = s;
    s->nexus.pending      = NULL;
+   s->nexus.pipe_fifo    = NULL;
    s->nexus.active_delta = DELTA_CYCLE_MAX;
    s->nexus.event_delta  = DELTA_CYCLE_MAX;
    s->nexus.last_event   = TIME_HIGH;
@@ -5103,6 +5105,112 @@ void x_put_conversion(rt_conv_func_t *cf, sig_shared_t *ss, uint32_t offset,
 
       values += n->width * n->size;
    }
+}
+
+void x_init_pipe(sig_shared_t *ss, int32_t depth)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   TRACE("init pipe %s depth=%d", istr(tree_ident(s->where)), depth);
+
+   if (depth < 1)
+      depth = 1;
+
+   rt_nexus_t *n = &(s->nexus);
+   for (int i = 0; i < s->n_nexus; i++, n = n->chain) {
+      const uint32_t elem_size = n->size * n->width;
+      const size_t fifo_size = sizeof(rt_pipe_fifo_t) + depth * elem_size;
+      rt_pipe_fifo_t *fifo = xcalloc(fifo_size);
+      fifo->capacity = depth;
+      fifo->count = 0;
+      fifo->head = 0;
+      fifo->tail = 0;
+      fifo->elem_size = elem_size;
+      fifo->rd_wait = NULL;
+      fifo->wr_wait = NULL;
+      n->pipe_fifo = fifo;
+   }
+}
+
+void x_pipe_write(sig_shared_t *ss, uint32_t offset, int32_t count,
+                  void *values)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   TRACE("pipe write %s+%d count=%d", istr(tree_ident(s->where)),
+         offset, count);
+
+   rt_model_t *m = get_model();
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+   const char *vptr = values;
+   for (; count > 0; n = n->chain) {
+      count -= n->width;
+      assert(count >= 0);
+
+      rt_pipe_fifo_t *fifo = n->pipe_fifo;
+      if (fifo != NULL && fifo->count < fifo->capacity) {
+         uint8_t *dst = fifo->data + fifo->tail * fifo->elem_size;
+         memcpy(dst, vptr, fifo->elem_size);
+         fifo->tail = (fifo->tail + 1) % fifo->capacity;
+         fifo->count++;
+      }
+
+      // Also update the signal data for normal propagation
+      memcpy(ss->data + n->offset * n->size, vptr, n->size * n->width);
+
+      vptr += n->size * n->width;
+   }
+}
+
+void x_pipe_read(sig_shared_t *ss, uint32_t offset, int32_t count,
+                 void *result)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   TRACE("pipe read %s+%d count=%d", istr(tree_ident(s->where)),
+         offset, count);
+
+   rt_model_t *m = get_model();
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+   char *rptr = result;
+   for (; count > 0; n = n->chain) {
+      count -= n->width;
+      assert(count >= 0);
+
+      rt_pipe_fifo_t *fifo = n->pipe_fifo;
+      if (fifo != NULL && fifo->count > 0) {
+         uint8_t *src = fifo->data + fifo->head * fifo->elem_size;
+         memcpy(rptr, src, fifo->elem_size);
+         fifo->head = (fifo->head + 1) % fifo->capacity;
+         fifo->count--;
+      }
+      else {
+         // FIFO empty or not a pipe: read from signal data
+         memcpy(rptr, ss->data + n->offset * n->size, n->size * n->width);
+      }
+
+      rptr += n->size * n->width;
+   }
+}
+
+bool x_pipe_full(sig_shared_t *ss, uint32_t offset, int32_t count)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+   rt_model_t *m = get_model();
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+
+   rt_pipe_fifo_t *fifo = n->pipe_fifo;
+   return fifo != NULL && fifo->count >= fifo->capacity;
+}
+
+bool x_pipe_empty(sig_shared_t *ss, uint32_t offset, int32_t count)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+   rt_model_t *m = get_model();
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+
+   rt_pipe_fifo_t *fifo = n->pipe_fifo;
+   return fifo == NULL || fifo->count == 0;
 }
 
 void x_resolve_signal(sig_shared_t *ss, jit_handle_t handle, void *context,

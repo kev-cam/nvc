@@ -1002,7 +1002,11 @@ static bool sem_check_signal_decl(tree_t t, nametab_t *tab)
    if (!sem_no_access_file_or_protected(t, type, "signals"))
       return false;
 
-   if (is_guarded_signal(t) && !type_is_resolved(type))
+   if (tree_flags(t) & TREE_F_PIPE) {
+      if (tree_flags(t) & (TREE_F_BUS | TREE_F_REGISTER))
+         sem_error(t, "pipe declaration may not use BUS or REGISTER");
+   }
+   else if (is_guarded_signal(t) && !type_is_resolved(type))
       sem_error(t, "guarded signal must have resolved subtype");
 
    if (tree_has_value(t)) {

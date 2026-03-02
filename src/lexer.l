@@ -230,6 +230,7 @@ SELECT        ?i:select
 GENERATE      ?i:generate
 ACCESS        ?i:access
 POSTPONED     ?i:postponed
+PIPE          ?i:pipe
 FILE          ?i:file
 OPEN          ?i:open
 UNTIL         ?i:until
@@ -454,6 +455,7 @@ PROTECT           ?i:protect
 {ATTRIBUTE}              { TOKEN(tATTRIBUTE); }
 {PROCEDURE}              { TOKEN(tPROCEDURE); }
 {POSTPONED}              { TOKEN(tPOSTPONED); }
+{PIPE}                   { TOKEN(tPIPE); }
 {EXIT}                   { TOKEN(tEXIT); }
 {WHEN}                   { TOKEN(tWHEN); }
 {CASE}                   { TOKEN(tCASE); }

@@ -7623,6 +7623,48 @@ static void p_signal_declaration(tree_t parent)
    }
 }
 
+static void p_pipe_declaration(tree_t parent)
+{
+   // pipe identifier_list : subtype_indication [ := expression ] ;
+
+   BEGIN("pipe declaration");
+
+   consume(tPIPE);
+
+   LOCAL_IDENT_LIST ids = p_identifier_list();
+
+   for (ident_list_t *it = ids; it != NULL; it = it->next)
+      hide_name(nametab, it->ident);
+
+   consume(tCOLON);
+
+   type_t type = p_subtype_indication();
+
+   tree_t init = NULL;
+   if (optional(tWALRUS))
+      init = p_conditional_expression();
+
+   consume(tSEMI);
+
+   for (ident_list_t *it = ids; it != NULL; it = it->next) {
+      tree_t t = tree_new(T_SIGNAL_DECL);
+      tree_set_loc(t, &(it->loc));
+      tree_set_ident(t, it->ident);
+      tree_set_type(t, type);
+      tree_set_flag(t, TREE_F_PIPE);
+
+      if (init != NULL) {
+         solve_known_subtype(nametab, init, t);
+         tree_set_value(t, init);
+      }
+
+      tree_add_decl(parent, t);
+
+      insert_name(nametab, t, it->ident);
+      sem_check(t, nametab);
+   }
+}
+
 static type_t p_signature(void)
 {
    // [ [ type_mark { , type_mark } ] [ return type_mark ] ]
@@ -8409,6 +8451,10 @@ static void p_entity_declarative_item(tree_t entity)
       p_signal_declaration(entity);
       break;
 
+   case tPIPE:
+      p_pipe_declaration(entity);
+      break;
+
    case tPACKAGE:
       if (peek_nth(4) == tNEW)
          tree_add_decl(entity, p_package_instantiation_declaration(NULL));
@@ -8425,7 +8471,7 @@ static void p_entity_declarative_item(tree_t entity)
    default:
       expect(tATTRIBUTE, tTYPE, tSUBTYPE, tCONSTANT, tFUNCTION, tPROCEDURE,
              tIMPURE, tPURE, tALIAS, tUSE, tDISCONNECT, tGROUP, tSHARED,
-             tSIGNAL, STD(08, tPACKAGE), STD(19, tVIEW));
+             tSIGNAL, tPIPE, STD(08, tPACKAGE), STD(19, tVIEW));
    }
 }
 
@@ -8993,6 +9039,10 @@ static void p_package_declarative_item(tree_t pack)
       p_signal_declaration(pack);
       break;
 
+   case tPIPE:
+      p_pipe_declaration(pack);
+      break;
+
    case tATTRIBUTE:
       if (peek_nth(3) == tOF)
          p_attribute_specification(pack);
@@ -9050,8 +9100,8 @@ static void p_package_declarative_item(tree_t pack)
 
    default:
       expect(tTYPE, tFUNCTION, tPROCEDURE, tIMPURE, tPURE, tSUBTYPE, tSIGNAL,
-             tATTRIBUTE, tCONSTANT, tCOMPONENT, tFILE, tSHARED, tALIAS, tUSE,
-             tDISCONNECT, tGROUP, tPACKAGE, STD(19, tVIEW));
+             tPIPE, tATTRIBUTE, tCONSTANT, tCOMPONENT, tFILE, tSHARED,
+             tALIAS, tUSE, tDISCONNECT, tGROUP, tPACKAGE, STD(19, tVIEW));
    }
 }
 
@@ -9747,6 +9797,10 @@ static void p_block_declarative_item(tree_t parent)
       p_signal_declaration(parent);
       break;
 
+   case tPIPE:
+      p_pipe_declaration(parent);
+      break;
+
    case tTYPE:
       p_type_declaration(parent);
       break;
@@ -9846,9 +9900,10 @@ static void p_block_declarative_item(tree_t parent)
       break;
 
    default:
-      expect(tSIGNAL, tTYPE, tSUBTYPE, tFILE, tCONSTANT, tFUNCTION, tIMPURE,
-             tPURE, tPROCEDURE, tALIAS, tATTRIBUTE, tFOR, tCOMPONENT, tUSE,
-             tSHARED, tDISCONNECT, tGROUP, STD(08, tPACKAGE), STD(19, tVIEW));
+      expect(tSIGNAL, tPIPE, tTYPE, tSUBTYPE, tFILE, tCONSTANT, tFUNCTION,
+             tIMPURE, tPURE, tPROCEDURE, tALIAS, tATTRIBUTE, tFOR,
+             tCOMPONENT, tUSE, tSHARED, tDISCONNECT, tGROUP,
+             STD(08, tPACKAGE), STD(19, tVIEW));
    }
 }
 
