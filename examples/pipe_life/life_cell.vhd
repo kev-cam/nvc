@@ -23,9 +23,9 @@
 --   };
 --
 -- Mapping:
---   pipe<int> in[8]       ->  in_n, in_ne, ... : in std_logic
---   pipe<int> *out[8]     ->  out_n, out_ne, ... : out std_logic
---   out[i]->write(alive)  ->  out_n <= alive   (pipe: enqueue / signal: schedule)
+--   pipe<int> in[8]       ->  in_n, in_ne, ... : in integer
+--   pipe<int> *out[8]     ->  out_n, out_ne, ... : out integer
+--   out[i]->write(alive)  ->  out_n <= nstate  (pipe: enqueue / signal: schedule)
 --   in[i].read()          ->  in_n             (pipe: dequeue  / signal: read)
 
 library ieee;
@@ -33,75 +33,93 @@ use ieee.std_logic_1164.all;
 
 entity life_cell is
     generic (
-        INIT_ALIVE : std_logic := '0';
+        INIT_STATE : integer := 0;
         MAX_GEN    : integer := 10
     );
     port (
         -- Outputs: broadcast state to neighbors
-        out_n  : out std_logic;
-        out_ne : out std_logic;
-        out_e  : out std_logic;
-        out_se : out std_logic;
-        out_s  : out std_logic;
-        out_sw : out std_logic;
-        out_w  : out std_logic;
-        out_nw : out std_logic;
+        out_n  : out integer;
+        out_ne : out integer;
+        out_e  : out integer;
+        out_se : out integer;
+        out_s  : out integer;
+        out_sw : out integer;
+        out_w  : out integer;
+        out_nw : out integer;
         -- Inputs: receive neighbor states
-        in_n   : in  std_logic := '0';
-        in_ne  : in  std_logic := '0';
-        in_e   : in  std_logic := '0';
-        in_se  : in  std_logic := '0';
-        in_s   : in  std_logic := '0';
-        in_sw  : in  std_logic := '0';
-        in_w   : in  std_logic := '0';
-        in_nw  : in  std_logic := '0'
+        in_n   : in  integer := 0;
+        in_ne  : in  integer := 0;
+        in_e   : in  integer := 0;
+        in_se  : in  integer := 0;
+        in_s   : in  integer := 0;
+        in_sw  : in  integer := 0;
+        in_w   : in  integer := 0;
+        in_nw  : in  integer := 0
     );
 end entity;
 
 architecture behavioral of life_cell is
 begin
     process
-        variable alive : std_logic := INIT_ALIVE;
-        variable count : integer;
+        variable nstate : integer := INIT_STATE;
+        variable count  : integer;
     begin
         for gen in 0 to MAX_GEN - 1 loop
             -- Broadcast state to all neighbors
             -- (pipe: enqueues into each neighbor's FIFO)
             -- (signal: schedules update for next delta cycle)
-            out_n  <= alive;
-            out_ne <= alive;
-            out_e  <= alive;
-            out_se <= alive;
-            out_s  <= alive;
-            out_sw <= alive;
-            out_w  <= alive;
-            out_nw <= alive;
+            out_n  <= nstate;
+            out_ne <= nstate;
+            out_e  <= nstate;
+            out_se <= nstate;
+            out_s  <= nstate;
+            out_sw <= nstate;
+            out_w  <= nstate;
+            out_nw <= nstate;
 
             -- Wait for all neighbors to have written.
             -- (pipe: reads below block until data arrives — this wait is optional)
             -- (signal: delta cycle propagates scheduled updates)
             wait for 0 ns;
 
-            -- Count alive neighbors
+            -- Count alive neighbors (> 0 means alive)
             -- (pipe: each read dequeues from neighbor's FIFO)
             -- (signal: reads current value)
             count := 0;
-            if in_n  = '1' then count := count + 1; end if;
-            if in_ne = '1' then count := count + 1; end if;
-            if in_e  = '1' then count := count + 1; end if;
-            if in_se = '1' then count := count + 1; end if;
-            if in_s  = '1' then count := count + 1; end if;
-            if in_sw = '1' then count := count + 1; end if;
-            if in_w  = '1' then count := count + 1; end if;
-            if in_nw = '1' then count := count + 1; end if;
+            if in_n  > 0 then count := count + 1; end if;
+            if in_ne > 0 then count := count + 1; end if;
+            if in_e  > 0 then count := count + 1; end if;
+            if in_se > 0 then count := count + 1; end if;
+            if in_s  > 0 then count := count + 1; end if;
+            if in_sw > 0 then count := count + 1; end if;
+            if in_w  > 0 then count := count + 1; end if;
+            if in_nw > 0 then count := count + 1; end if;
 
-            -- Conway's rules
-            if count = 3 or (count = 2 and alive = '1') then
-                alive := '1';
+            -- Conway's rules: positive = alive, negative/zero = dead
+            if nstate > 0 then
+                if count < 2 or count > 3 then
+                    nstate := -count;
+                else
+                    nstate := count;
+                end if;
             else
-                alive := '0';
+                if count = 3 then
+                    nstate := count;
+                else
+                    nstate := -count;
+                end if;
             end if;
         end loop;
+
+        -- Final broadcast so display can show last generation
+        out_n  <= nstate;
+        out_ne <= nstate;
+        out_e  <= nstate;
+        out_se <= nstate;
+        out_s  <= nstate;
+        out_sw <= nstate;
+        out_w  <= nstate;
+        out_nw <= nstate;
 
         wait;
     end process;

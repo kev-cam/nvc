@@ -1188,6 +1188,9 @@ static void check_multiple_sources(rt_nexus_t *n, source_kind_t kind)
    if (n->signal->resolution != NULL || is_pseudo_source(kind))
       return;
 
+   if (n->signal->shared.flags & SIG_F_PIPE)
+      return;
+
    diag_t *d;
    if (is_signal_scope(n->signal->parent)) {
       rt_scope_t *root = n->signal->parent;

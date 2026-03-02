@@ -25,6 +25,7 @@
 
 library ieee;
 use ieee.std_logic_1164.all;
+use std.textio.all;
 
 entity life_top is
     generic (
@@ -36,25 +37,31 @@ end entity;
 
 architecture grid of life_top is
 
+    -- Call libc sleep() directly via VHPIDIRECT
+    function c_sleep(seconds : integer) return integer;
+    attribute foreign of c_sleep : function is "VHPIDIRECT sleep";
+    function c_sleep(seconds : integer) return integer is
+    begin return 0; end function;
+
     -- Glider at (1,1):
     --   . 1 .      row 1: col 2
     --   . . 1      row 2: col 3
     --   1 1 1      row 3: cols 1,2,3
-    function glider_init(r, c : integer) return std_logic is
+    function init_state(r, c : integer) return integer is
     begin
         if (r = 1 and c = 2) or
            (r = 2 and c = 3) or
            (r = 3 and c = 1) or
            (r = 3 and c = 2) or
            (r = 3 and c = 3) then
-            return '1';
+            return 1;
         end if;
-        return '0';
+        return 0;
     end function;
 
     -- One pipe array per direction.
     -- p_north(r,c) carries cell(r,c)'s state northward to cell(r-1,c).
-    type pipe_grid is array (0 to ROWS - 1, 0 to COLS - 1) of std_logic;
+    type pipe_grid is array (0 to ROWS - 1, 0 to COLS - 1) of integer;
 
     ---------------------------------------------------------------------------
     -- Pipe declarations — change 'pipe' to 'signal' for synchronous mode.
@@ -83,7 +90,7 @@ begin
 
             cell_inst: entity work.life_cell
                 generic map (
-                    INIT_ALIVE => glider_init(r, c),
+                    INIT_STATE => init_state(r, c),
                     MAX_GEN    => MAX_GEN
                 )
                 port map (
@@ -111,5 +118,48 @@ begin
 
         end generate;
     end generate;
+
+    -- Display process: read p_n to observe cell state.
+    -- p_n(r,c) carries the state of cell(r,c) since each cell
+    -- broadcasts the same value in all 8 directions.
+    -- Positive = alive (value is neighbor count), negative/zero = dead.
+    p_display: process
+        variable L : line;
+        variable s : integer;
+        variable dummy : integer;
+
+        procedure draw(gen : integer) is
+        begin
+            -- Cursor home
+            write(L, character'val(27) & "[H");
+            writeline(output, L);
+            -- Grid
+            for r in 0 to ROWS - 1 loop
+                for c in 0 to COLS - 1 loop
+                    s := p_n(r, c);
+                    if s > 0 then
+                        write(L, character'val(48 + s));
+                    else
+                        write(L, '.');
+                    end if;
+                end loop;
+                writeline(output, L);
+            end loop;
+            -- Status line
+            write(L, string'("gen "));
+            write(L, gen);
+            write(L, string'("   "));
+            writeline(output, L);
+        end procedure;
+
+    begin
+        for gen in 0 to MAX_GEN loop
+            wait on p_n;
+            draw(gen);
+            dummy := c_sleep(1);
+        end loop;
+        report "DONE";
+        wait;
+    end process;
 
 end architecture;
