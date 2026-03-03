@@ -202,23 +202,35 @@ typedef struct {
 
 STATIC_ASSERT(sizeof(handle_slot_t) <= 16);
 
+#define VPI_MCD_MAX_FILES 31
+
+typedef struct {
+   FILE       *fp;
+   char       *name;
+} vpi_mcd_entry_t;
+
 typedef struct _vpi_context {
-   shash_t       *strtab;
-   rt_model_t    *model;
-   hash_t        *objcache;
-   tree_t         top;
-   jit_t         *jit;
-   handle_slot_t *handles;
-   unsigned       num_handles;
-   unsigned       free_hint;
-   vpiHandleList  systasks;
-   vpiObjectList  syscalls;
-   c_sysTfCall   *call;
-   jit_scalar_t  *args;
-   tlab_t        *tlab;
-   text_buf_t    *valuestr;
-   mem_pool_t    *pool;
-   vpiObjectList  recycle;
+   shash_t         *strtab;
+   rt_model_t      *model;
+   hash_t          *objcache;
+   tree_t           top;
+   jit_t           *jit;
+   handle_slot_t   *handles;
+   unsigned         num_handles;
+   unsigned         free_hint;
+   vpiHandleList    systasks;
+   vpiObjectList    syscalls;
+   c_sysTfCall     *call;
+   jit_scalar_t    *args;
+   tlab_t          *tlab;
+   text_buf_t      *valuestr;
+   mem_pool_t      *pool;
+   vpiObjectList    recycle;
+   int              argc;
+   char           **argv;
+   vpi_mcd_entry_t  mcd_files[VPI_MCD_MAX_FILES];
+   FILE            *fd_files[VPI_MCD_MAX_FILES];
+   unsigned         fd_count;
 } vpi_context_t;
 
 static c_vpiObject *build_expr(vlog_node_t v, c_abstractScope *scope);
@@ -1314,6 +1326,12 @@ void vpi_context_initialise(vpi_context_t *c, tree_t top, rt_model_t *model,
    c->model = model;
    c->top   = top;
    c->jit   = jit;
+   c->argc  = argc;
+   c->argv  = argv;
+
+   // MCD channel 0 = stdout (always open)
+   c->mcd_files[0].fp   = stdout;
+   c->mcd_files[0].name = xstrdup("stdout");
 }
 
 static void vpi_handles_diag(vpi_context_t *c, diag_t *d, handle_kind_t kind)
@@ -1447,6 +1465,532 @@ vpiHandle vpi_bind_foreign(ident_t name, vlog_node_t where)
    }
 
    return NULL;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Additional VPI API functions
+
+DLLEXPORT
+PLI_INT32 vpi_free_object(vpiHandle object)
+{
+   // Deprecated synonym for vpi_release_handle (IEEE 1800-2009)
+   return vpi_release_handle(object);
+}
+
+DLLEXPORT
+PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("property=%s object=%s", vpi_property_str(property),
+             handle_pp(object));
+
+   c_vpiObject *obj = from_handle(object);
+   if (obj == NULL)
+      return NULL;
+
+   vpi_context_t *c = vpi_context();
+   if (c->strtab == NULL)
+      c->strtab = shash_new(64);
+
+   c_sysTfCall *call = is_sysTfCall(obj);
+   if (call != NULL && call->callback != NULL) {
+      switch (property) {
+      case vpiName:
+      case vpiFullName:
+         return (PLI_BYTE8 *)call->callback->systf.tfname;
+      }
+   }
+
+   c_abstractDecl *decl = is_abstractDecl(obj);
+   if (decl != NULL) {
+      switch (property) {
+      case vpiName:
+      case vpiFullName:
+         return (PLI_BYTE8 *)istr(vlog_ident(decl->where));
+      }
+   }
+
+   c_abstractScope *scope = is_abstractScope(obj);
+   if (scope != NULL) {
+      switch (property) {
+      case vpiName:
+      case vpiFullName:
+         return (PLI_BYTE8 *)istr(vlog_ident(scope->where));
+      }
+   }
+
+   vpi_error(vpiError, &(obj->loc), "cannot get string property %s",
+             vpi_property_str(property));
+   return NULL;
+}
+
+DLLEXPORT
+void vpi_get_time(vpiHandle object, p_vpi_time time_p)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("object=%s", handle_pp(object));
+
+   vpi_context_t *c = vpi_context();
+   rt_model_t *m = vpi_get_model(c);
+   const int64_t now = model_now(m, NULL);
+
+   if (time_p == NULL)
+      return;
+
+   switch (time_p->type) {
+   case vpiSimTime:
+      time_p->high = (PLI_UINT32)(now >> 32);
+      time_p->low  = (PLI_UINT32)(now & 0xffffffff);
+      break;
+   case vpiScaledRealTime:
+      time_p->real = (double)now;
+      break;
+   default:
+      vpi_error(vpiError, NULL, "unsupported time type %d", time_p->type);
+   }
+}
+
+DLLEXPORT
+PLI_INT32 vpi_printf(PLI_BYTE8 *format, ...)
+{
+   va_list ap;
+   va_start(ap, format);
+   PLI_INT32 result = vfprintf(stdout, format, ap);
+   va_end(ap);
+   return result;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_vprintf(PLI_BYTE8 *format, va_list ap)
+{
+   return vfprintf(stdout, format, ap);
+}
+
+DLLEXPORT
+PLI_INT32 vpi_control(PLI_INT32 operation, ...)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("operation=%d", operation);
+
+   switch (operation) {
+   case vpiStop:
+      notef("$stop called via VPI");
+      jit_abort();
+      break;
+   case vpiFinish:
+      notef("$finish called via VPI");
+      jit_abort();
+      break;
+   default:
+      vpi_error(vpiWarning, NULL, "unsupported vpi_control operation %d",
+                operation);
+   }
+   return 0;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_sim_control(PLI_INT32 operation, ...)
+{
+   // Legacy alias
+   return vpi_control(operation);
+}
+
+DLLEXPORT
+void vpi_sim_vcontrol(PLI_INT32 operation, va_list ap)
+{
+   vpi_control(operation);
+}
+
+DLLEXPORT
+PLI_INT32 vpi_flush(void)
+{
+   fflush(stdout);
+   return 0;
+}
+
+DLLEXPORT
+vpiHandle vpi_register_cb(p_cb_data cb_data_p)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("reason=%d", cb_data_p ? cb_data_p->reason : -1);
+
+   // Minimal stub: accept the registration but don't fire callbacks
+   // TODO: implement cbEndOfSimulation, cbValueChange, etc.
+
+   if (cb_data_p == NULL) {
+      vpi_error(vpiError, NULL, "null cb_data");
+      return NULL;
+   }
+
+   c_callback *cb = recyle_object(sizeof(c_callback), vpiCallback);
+   cb->name = ident_new("$callback");
+   memset(&cb->systf, 0, sizeof(cb->systf));
+
+   return internal_handle_for(&cb->refcounted.object);
+}
+
+DLLEXPORT
+PLI_INT32 vpi_remove_cb(vpiHandle cb_obj)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("cb_obj=%s", handle_pp(cb_obj));
+
+   if (cb_obj != NULL)
+      drop_handle(vpi_context(), cb_obj);
+
+   return 1;
+}
+
+DLLEXPORT
+void vpi_get_cb_info(vpiHandle object, p_cb_data cb_data_p)
+{
+   vpi_clear_error();
+   // Stub
+   if (cb_data_p != NULL)
+      memset(cb_data_p, 0, sizeof(*cb_data_p));
+}
+
+DLLEXPORT
+PLI_INT32 vpi_compare_objects(vpiHandle object1, vpiHandle object2)
+{
+   vpi_clear_error();
+
+   vpi_context_t *c = vpi_context();
+   handle_slot_t *s1 = decode_handle(c, object1);
+   handle_slot_t *s2 = decode_handle(c, object2);
+
+   if (s1 == NULL || s2 == NULL)
+      return 0;
+
+   return s1->obj == s2->obj;
+}
+
+DLLEXPORT
+void *vpi_get_userdata(vpiHandle obj)
+{
+   // Stub — userdata storage not yet implemented
+   return NULL;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_put_userdata(vpiHandle obj, void *userdata)
+{
+   // Stub
+   return 0;
+}
+
+DLLEXPORT
+void vpi_get_systf_info(vpiHandle object, p_vpi_systf_data systf_data_p)
+{
+   vpi_clear_error();
+
+   c_vpiObject *obj = from_handle(object);
+   if (obj == NULL)
+      return;
+
+   c_callback *cb = is_callback(obj);
+   if (cb != NULL && systf_data_p != NULL) {
+      *systf_data_p = cb->systf;
+      return;
+   }
+
+   c_sysTfCall *call = is_sysTfCall(obj);
+   if (call != NULL && call->callback != NULL && systf_data_p != NULL) {
+      *systf_data_p = call->callback->systf;
+      return;
+   }
+
+   vpi_error(vpiError, &(obj->loc), "object is not a systf");
+}
+
+DLLEXPORT
+vpiHandle vpi_handle_multi(PLI_INT32 type, vpiHandle refHandle1,
+                           vpiHandle refHandle2, ...)
+{
+   vpi_clear_error();
+   // Stub
+   return NULL;
+}
+
+DLLEXPORT
+void vpi_get_delays(vpiHandle object, p_vpi_delay delay_p)
+{
+   vpi_clear_error();
+   // Stub: zero delays
+   if (delay_p != NULL)
+      memset(delay_p, 0, sizeof(*delay_p));
+}
+
+DLLEXPORT
+void vpi_put_delays(vpiHandle object, p_vpi_delay delay_p)
+{
+   vpi_clear_error();
+   // Stub: no-op
+}
+
+DLLEXPORT
+PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("vlog_info_p=%p", vlog_info_p);
+
+   if (vlog_info_p == NULL)
+      return 0;
+
+   vpi_context_t *c = vpi_context();
+
+   vlog_info_p->argc    = c->argc;
+   vlog_info_p->argv    = c->argv;
+   vlog_info_p->product = (PLI_BYTE8 *)"NVC";
+   vlog_info_p->version = (PLI_BYTE8 *)PACKAGE_VERSION;
+
+   return 1;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// MCD (Multi-Channel Descriptor) support
+
+DLLEXPORT
+PLI_UINT32 vpi_mcd_open(PLI_BYTE8 *fileName)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("fileName=%s", fileName);
+
+   vpi_context_t *c = vpi_context();
+
+   // Find a free MCD slot (slot 0 = stdout, always open)
+   for (int i = 1; i < VPI_MCD_MAX_FILES; i++) {
+      if (c->mcd_files[i].fp == NULL) {
+         FILE *fp = fopen(fileName, "w");
+         if (fp == NULL) {
+            vpi_error(vpiError, NULL, "cannot open %s", fileName);
+            return 0;
+         }
+         c->mcd_files[i].fp   = fp;
+         c->mcd_files[i].name = xstrdup(fileName);
+         return (PLI_UINT32)(1u << i);
+      }
+   }
+
+   vpi_error(vpiError, NULL, "too many open MCD files");
+   return 0;
+}
+
+DLLEXPORT
+PLI_UINT32 vpi_mcd_close(PLI_UINT32 mcd)
+{
+   vpi_clear_error();
+
+   vpi_context_t *c = vpi_context();
+   PLI_UINT32 failed = 0;
+
+   for (int i = 1; i < VPI_MCD_MAX_FILES; i++) {
+      if ((mcd & (1u << i)) && c->mcd_files[i].fp != NULL) {
+         if (fclose(c->mcd_files[i].fp) != 0)
+            failed |= (1u << i);
+         c->mcd_files[i].fp = NULL;
+         free(c->mcd_files[i].name);
+         c->mcd_files[i].name = NULL;
+      }
+   }
+
+   return failed;
+}
+
+DLLEXPORT
+PLI_BYTE8 *vpi_mcd_name(PLI_UINT32 cd)
+{
+   vpi_context_t *c = vpi_context();
+
+   for (int i = 0; i < VPI_MCD_MAX_FILES; i++) {
+      if ((cd & (1u << i)) && c->mcd_files[i].name != NULL)
+         return (PLI_BYTE8 *)c->mcd_files[i].name;
+   }
+
+   return NULL;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_mcd_printf(PLI_UINT32 mcd, PLI_BYTE8 *format, ...)
+{
+   vpi_context_t *c = vpi_context();
+   PLI_INT32 result = 0;
+
+   va_list ap;
+   for (int i = 0; i < VPI_MCD_MAX_FILES; i++) {
+      if ((mcd & (1u << i)) && c->mcd_files[i].fp != NULL) {
+         va_start(ap, format);
+         result = vfprintf(c->mcd_files[i].fp, format, ap);
+         va_end(ap);
+      }
+   }
+
+   return result;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_mcd_vprintf(PLI_UINT32 mcd, PLI_BYTE8 *format, va_list ap)
+{
+   vpi_context_t *c = vpi_context();
+   PLI_INT32 result = 0;
+
+   for (int i = 0; i < VPI_MCD_MAX_FILES; i++) {
+      if ((mcd & (1u << i)) && c->mcd_files[i].fp != NULL) {
+         va_list copy;
+         va_copy(copy, ap);
+         result = vfprintf(c->mcd_files[i].fp, format, copy);
+         va_end(copy);
+      }
+   }
+
+   return result;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_mcd_flush(PLI_UINT32 mcd)
+{
+   vpi_context_t *c = vpi_context();
+
+   for (int i = 0; i < VPI_MCD_MAX_FILES; i++) {
+      if ((mcd & (1u << i)) && c->mcd_files[i].fp != NULL)
+         fflush(c->mcd_files[i].fp);
+   }
+
+   return 0;
+}
+
+DLLEXPORT
+PLI_INT32 vpi_fopen(const char *fileName, const char *mode)
+{
+   vpi_clear_error();
+
+   VPI_TRACE("fileName=%s mode=%s", fileName, mode);
+
+   vpi_context_t *c = vpi_context();
+
+   if (c->fd_count >= VPI_MCD_MAX_FILES) {
+      vpi_error(vpiError, NULL, "too many open files");
+      return 0;
+   }
+
+   FILE *fp = fopen(fileName, mode);
+   if (fp == NULL) {
+      vpi_error(vpiError, NULL, "cannot open %s", fileName);
+      return 0;
+   }
+
+   unsigned idx = c->fd_count++;
+   c->fd_files[idx] = fp;
+
+   // FDs have bit 31 set to distinguish from MCDs
+   return (PLI_INT32)(idx | (1u << 31));
+}
+
+DLLEXPORT
+FILE *vpi_get_file(PLI_INT32 fd)
+{
+   vpi_context_t *c = vpi_context();
+
+   if (fd & (1u << 31)) {
+      // File descriptor
+      unsigned idx = fd & ~(1u << 31);
+      if (idx < c->fd_count)
+         return c->fd_files[idx];
+   }
+
+   return NULL;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Iverilog VPI extensions (stubs for system.vpi compatibility)
+
+DLLEXPORT
+void vpip_make_systf_system_defined(vpiHandle ref)
+{
+   // No-op: we don't distinguish system-defined vs user-defined
+}
+
+DLLEXPORT
+void vpip_count_drivers(vpiHandle ref, unsigned idx,
+                        unsigned counts[4])
+{
+   // Stub: return 0 drivers
+   if (counts != NULL)
+      memset(counts, 0, 4 * sizeof(unsigned));
+}
+
+DLLEXPORT
+void vpip_set_return_value(int value)
+{
+   // Stub: we don't have vvp's exit code mechanism
+}
+
+DLLEXPORT
+void vpip_mcd_rawwrite(PLI_UINT32 mcd, const char *buf, size_t count)
+{
+   vpi_context_t *c = vpi_context();
+
+   for (int i = 0; i < VPI_MCD_MAX_FILES; i++) {
+      if ((mcd & (1u << i)) && c->mcd_files[i].fp != NULL)
+         fwrite(buf, 1, count, c->mcd_files[i].fp);
+   }
+}
+
+DLLEXPORT
+s_vpi_vecval vpip_calc_clog2(vpiHandle arg)
+{
+   s_vpi_vecval result = { .aval = 0, .bval = 0 };
+
+   s_vpi_value val = { .format = vpiIntVal };
+   vpi_get_value(arg, &val);
+
+   if (!vpi_chk_error(NULL)) {
+      uint32_t u = (uint32_t)val.value.integer;
+      PLI_INT32 r = 0;
+      if (u > 0) {
+         u--;
+         while (u > 0) { r++; u >>= 1; }
+      }
+      result.aval = r;
+   }
+
+   return result;
+}
+
+DLLEXPORT
+void vpip_format_strength(char *str, s_vpi_value *value, unsigned bit)
+{
+   // Stub: return "StX" placeholder
+   if (str != NULL) {
+      str[0] = 'S'; str[1] = 't'; str[2] = 'X'; str[3] = '\0';
+   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Plugin loading
+
+void vpi_load_plugins(const char *plugins)
+{
+   char *plugins_copy LOCAL = xstrdup(plugins);
+
+   char *tok = strtok(plugins_copy, ",");
+   do {
+      jit_dll_t *dll = ffi_load_dll(tok);
+      void (**startup_funcs)() = ffi_find_symbol(dll, "vlog_startup_routines");
+
+      if (startup_funcs != NULL) {
+         notef("loading VPI plugin %s", tok);
+         while (*startup_funcs)
+            (*startup_funcs++)();
+      }
+   } while ((tok = strtok(NULL, ",")));
 }
 
 void vpi_call_foreign(vpiHandle handle, jit_scalar_t *args, tlab_t *tlab)

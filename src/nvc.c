@@ -1044,8 +1044,10 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
 
-   if (pli_plugins != NULL)
+   if (pli_plugins != NULL) {
       vhpi_load_plugins(pli_plugins);
+      vpi_load_plugins(pli_plugins);
+   }
 
    set_ctrl_c_handler(ctrl_c_handler, state->model);
 
@@ -2692,7 +2694,9 @@ int main(int argc, char **argv)
 
    if (state.plugins != NULL) {
       state.vhpi = vhpi_context_new();
+      state.vpi = vpi_context_new();
       vhpi_load_plugins(state.plugins);
+      vpi_load_plugins(state.plugins);
    }
 
    const int ret = process_command(argc, argv, &state);

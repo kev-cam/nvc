@@ -32,4 +32,6 @@ void vpi_context_free(vpi_context_t *c);
 vpiHandle vpi_bind_foreign(ident_t name, vlog_node_t where);
 void vpi_call_foreign(vpiHandle handle, jit_scalar_t *args, tlab_t *tlab);
 
+void vpi_load_plugins(const char *plugins);
+
 #endif  // _VPI_MODEL_H
