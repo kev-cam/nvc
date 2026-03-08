@@ -73,7 +73,9 @@ sv2vhdl_DATA = \
 	lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-BEHAVIORAL \
 	lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-STRENGTH \
 	lib/sv2vhdl/SV2VHDL.SV_MATH_PKG \
-	lib/sv2vhdl/SV2VHDL.SV_MATH_PKG-body
+	lib/sv2vhdl/SV2VHDL.SV_MATH_PKG-body \
+	lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG \
+	lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG-body
 
 # Shared libraries installed alongside VHDL
 sv2vhdl_DATA += \
@@ -96,6 +98,7 @@ EXTRA_DIST += \
 	lib/sv2vhdl/sv_pull.vhd \
 	lib/sv2vhdl/sv_tran.vhd \
 	lib/sv2vhdl/sv_math_pkg.vhd \
+	lib/sv2vhdl/sv_display_pkg.vhd \
 	lib/sv2vhdl/sv_math.c \
 	lib/sv2vhdl/resolver.c \
 	lib/sv2vhdl/sv2vhdl_resolver.py
@@ -132,6 +135,11 @@ lib/sv2vhdl/SV2VHDL.SV_MATH_PKG: $(srcdir)/lib/sv2vhdl/sv_math_pkg.vhd @ifGNUmak
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_math_pkg.vhd
 
 lib/sv2vhdl/SV2VHDL.SV_MATH_PKG-body: lib/sv2vhdl/SV2VHDL.SV_MATH_PKG
+
+lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG: $(srcdir)/lib/sv2vhdl/sv_display_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_display_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG-body: lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG
 
 lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES: $(srcdir)/lib/sv2vhdl/sv_primitives.vhd @ifGNUmake@ | $(DRIVER)
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_primitives.vhd
@@ -248,4 +256,5 @@ lib/sv2vhdl/SV2VHDL.SV_NMOS: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_BUFIF0: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_PULLUP: lib/ieee.08/IEEE.STD_LOGIC_1164
 lib/sv2vhdl/SV2VHDL.SV_MATH_PKG: lib/ieee.08/IEEE.MATH_REAL
+lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
 lib/sv2vhdl/SV2VHDL.SV_TRAN: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG
