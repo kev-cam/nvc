@@ -454,6 +454,13 @@ void pool_stats(mem_pool_t *mp, size_t *alloc, size_t *npages);
          __s->value;                                                    \
       })
 
+#define unaligned_store(ptr, val, type) ({                              \
+         void *__ptr = (ptr);                                           \
+         struct { type value; }                                         \
+            __attribute__((packed)) *__s = __ptr;                       \
+         __s->value = (val);                                            \
+      })
+
 #define TYPE_MAX(x)                             \
    _Generic((x),                                \
             uint64_t: UINT64_MAX,               \
