@@ -3,6 +3,8 @@
 - PSL `nondet` built-in function is now supported.
 - Fixed wrong VHDL assertion count when an assertion fails in a
   resolution function (#1700).
+- Fixed a crash and wrong composite handling for generic array types
+  in package generics (#1460).
 - The `--precompile` elaboration option which was deprecated in the last
   release has been removed.  The related `--with-system-cc` configure
   option has also been removed.

@@ -1362,3 +1362,4 @@ ivtest63        verilog
 issue1640       verilog
 issue1647       verilog
 vlog48          verilog
+issue1460       normal,2019
