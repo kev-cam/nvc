@@ -907,6 +907,31 @@ static type_mask_t vlog_check_sys_fcall(vlog_node_t v)
    switch (is_well_known(vlog_ident(v))) {
    case W_DLR_CLOG2:
       return TM_INTEGRAL | TM_CONST;
+   case W_DLR_SQRT:
+   case W_DLR_LN:
+   case W_DLR_LOG10:
+   case W_DLR_EXP:
+   case W_DLR_CEIL:
+   case W_DLR_FLOOR:
+   case W_DLR_SIN:
+   case W_DLR_COS:
+   case W_DLR_TAN:
+   case W_DLR_ASIN:
+   case W_DLR_ACOS:
+   case W_DLR_ATAN:
+   case W_DLR_SINH:
+   case W_DLR_COSH:
+   case W_DLR_TANH:
+   case W_DLR_ASINH:
+   case W_DLR_ACOSH:
+   case W_DLR_ATANH:
+   case W_DLR_POW:
+   case W_DLR_ATAN2:
+   case W_DLR_HYPOT:
+   case W_DLR_ABS:
+   case W_DLR_MIN:
+   case W_DLR_MAX:
+      return TM_REAL;
    default:
       return TM_INTEGRAL;
    }

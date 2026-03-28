@@ -531,14 +531,37 @@ static void init_tfCall(c_tfCall *call, vlog_node_t v, c_abstractScope *scope)
    vpi_list_reserve(&(call->args), nparams);
 
    for (int i = 0, argslot = 1; i < nparams; i++) {
-      c_vpiObject *obj = build_expr(vlog_param(v, i), scope);
+      vlog_node_t param = vlog_param(v, i);
+      c_vpiObject *obj = build_expr(param, scope);
       vpi_list_add(&(call->args), obj);
+
+      // Determine if this param is lowered into MIR syscall args
+      // (must match vlog_lower_systf_param logic)
+      bool lowered = true;
+      switch (vlog_kind(param)) {
+      case V_STRING:
+      case V_NUMBER:
+      case V_EMPTY:
+         lowered = false;
+         break;
+      case V_REF:
+         {
+            vlog_node_t d = vlog_ref(param);
+            lowered = (vlog_kind(d) == V_TF_PORT_DECL
+                       || vlog_kind(d) == V_FUNC_DECL);
+         }
+         break;
+      default:
+         break;
+      }
 
       c_operation *op = is_operation(obj);
       if (op != NULL && op->subtype != vpiNullOp) {
          op->argslot = argslot;
-         argslot += 3;
       }
+
+      if (lowered)
+         argslot += 3;
    }
 }
 
@@ -617,6 +640,10 @@ static c_constant *build_constant(vlog_node_t v)
       con->subtype = vpiBinaryConst;
       con->size = number_width(vlog_number(v));
       break;
+   case V_REAL:
+      con->subtype = vpiRealConst;
+      con->size = 64;
+      break;
    default:
       should_not_reach_here();
    }
@@ -653,6 +680,7 @@ static c_vpiObject *build_expr(vlog_node_t v, c_abstractScope *scope)
    switch (vlog_kind(v)) {
    case V_STRING:
    case V_NUMBER:
+   case V_REAL:
       return &(build_constant(v)->expr.object);
    case V_REF:
       {
@@ -1149,11 +1177,34 @@ void vpi_get_value(vpiHandle handle, p_vpi_value value_p)
          {
             number_t n = vlog_number(con->expr.where);
 
+            if (value_p->format == vpiRealVal) {
+               const uint64_t *abits, *bbits;
+               number_get(n, &abits, &bbits);
+               int64_t ival = (int64_t)abits[0];
+               const int width = number_width(n);
+               if (width < 64 && (ival & (INT64_C(1) << (width - 1))))
+                  ival |= ~((INT64_C(1) << width) - 1);
+               value_p->value.real = (double)ival;
+               return;
+            }
+
             const uint64_t *abits, *bbits;
             number_get(n, &abits, &bbits);
 
             vpi_format_number(number_width(n), abits, bbits, value_p,
                               c->valuestr);
+            return;
+         }
+
+      case vpiRealConst:
+         {
+            double dval = vlog_dval(con->expr.where);
+            if (value_p->format == vpiRealVal)
+               value_p->value.real = dval;
+            else {
+               tb_printf(c->valuestr, "%g", dval);
+               value_p->value.str = (PLI_BYTE8 *)tb_get(c->valuestr);
+            }
             return;
          }
       }
@@ -1162,7 +1213,35 @@ void vpi_get_value(vpiHandle handle, p_vpi_value value_p)
    c_operation *op = is_operation(obj);
    if (op != NULL && c->args != NULL && op->subtype != vpiNullOp) {
       int size = c->args[op->argslot].integer;
+
+      if (size == -1) {
+         // Real value: sentinel size -1, double in next slot
+         if (value_p->format == vpiRealVal) {
+            value_p->value.real = c->args[op->argslot + 1].real;
+         }
+         else {
+            // Format real as string for %f etc.
+            tb_rewind(c->valuestr);
+            tb_printf(c->valuestr, "%g", c->args[op->argslot + 1].real);
+            value_p->value.str = (PLI_BYTE8 *)tb_get(c->valuestr);
+         }
+         return;
+      }
+
       assert(size <= 64);
+
+      if (value_p->format == vpiRealVal) {
+         // Convert integer vector to real (sign-extend from size bits)
+         int64_t ival = c->args[op->argslot + 1].integer;
+         if (size < 64) {
+            int64_t mask = (INT64_C(1) << size) - 1;
+            ival &= mask;
+            if (ival & (INT64_C(1) << (size - 1)))
+               ival |= ~mask;   // Sign extend
+         }
+         value_p->value.real = (double)ival;
+         return;
+      }
 
       uint64_t abits[1] = { c->args[op->argslot + 1].integer };
       uint64_t bbits[1] = { c->args[op->argslot + 2].integer };
@@ -1185,7 +1264,7 @@ void vpi_get_value(vpiHandle handle, p_vpi_value value_p)
          if (vlog_subkind(type) != DT_REAL)
             goto fail;
 
-         value_p->format = unaligned_load(signal_value(s), double);
+         value_p->value.real = unaligned_load(signal_value(s), double);
          return;
 
       default:
@@ -1250,6 +1329,15 @@ vpiHandle vpi_put_value(vpiHandle handle, p_vpi_value value_p,
 
             c->args[0].integer = value_p->value.integer;
             c->args[1].integer = 0;
+
+            return NULL;
+         }
+
+      case vpiRealFunc:
+         {
+            assert(value_p->format == vpiRealVal);
+
+            c->args[0].real = value_p->value.real;
 
             return NULL;
          }

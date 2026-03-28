@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -53,7 +54,7 @@ static int calc_dec_size(int nr_bits, bool is_signed)
    return r;
 }
 
-static void format_number(vpiHandle it, char radix, int fwidth)
+static void format_number(vpiHandle it, char radix, int fwidth, int fprec)
 {
    vpiHandle arg = vpi_scan(it);
    if (arg == NULL)
@@ -101,8 +102,38 @@ static void format_number(vpiHandle it, char radix, int fwidth)
          s_vpi_value argval = { .format = vpiRealVal };
          vpi_get_value(arg, &argval);
 
-         if (!vpi_chk_error(NULL))
-            printf("%f", argval.value.real);
+         if (!vpi_chk_error(NULL)) {
+            if (fprec >= 0)
+               printf("%.*f", fprec, argval.value.real);
+            else
+               printf("%f", argval.value.real);
+         }
+      }
+      break;
+   case 'g':
+      {
+         s_vpi_value argval = { .format = vpiRealVal };
+         vpi_get_value(arg, &argval);
+
+         if (!vpi_chk_error(NULL)) {
+            if (fprec >= 0)
+               printf("%.*g", fprec, argval.value.real);
+            else
+               printf("%g", argval.value.real);
+         }
+      }
+      break;
+   case 'e':
+      {
+         s_vpi_value argval = { .format = vpiRealVal };
+         vpi_get_value(arg, &argval);
+
+         if (!vpi_chk_error(NULL)) {
+            if (fprec >= 0)
+               printf("%.*e", fprec, argval.value.real);
+            else
+               printf("%e", argval.value.real);
+         }
       }
       break;
    }
@@ -140,7 +171,13 @@ static void interpret_format(const char *fmt, vpiHandle it)
 
          int fwidth = 0;
          if (isdigit_iso88591(*p))
-            fwidth = strtol(p + 1, (char **)&p, 10);
+            fwidth = strtol(p, (char **)&p, 10);
+
+         int fprec = -1;
+         if (*p == '.') {
+            p++;
+            fprec = strtol(p, (char **)&p, 10);
+         }
 
          switch (*p) {
          case 's':
@@ -152,7 +189,9 @@ static void interpret_format(const char *fmt, vpiHandle it)
          case 'h':
          case 't':
          case 'f':
-            format_number(it, *p, fwidth);
+         case 'g':
+         case 'e':
+            format_number(it, *p, fwidth, fprec);
             break;
          case 'c':
             format_char(it, fwidth);
@@ -371,6 +410,67 @@ static PLI_INT32 random_tf(PLI_BYTE8 *userdata)
    return 0;
 }
 
+// Helper: read one real arg from VPI, apply f(double)->double, return real
+static PLI_INT32 math1_tf(PLI_BYTE8 *userdata)
+{
+   double (*fn)(double) = (double (*)(double))(intptr_t)userdata;
+
+   vpiHandle call = vpi_handle(vpiSysTfCall, NULL);
+   vpiHandle argv = vpi_iterate(vpiArgument, call);
+   vpiHandle arg = vpi_scan(argv);
+   vpi_release_handle(argv);
+
+   s_vpi_value val = { .format = vpiRealVal };
+   vpi_get_value(arg, &val);
+   vpi_release_handle(arg);
+
+   s_vpi_value result = {
+      .format = vpiRealVal,
+      .value = { .real = fn(val.value.real) },
+   };
+   vpi_put_value(call, &result, NULL, 0);
+   vpi_release_handle(call);
+   return 0;
+}
+
+// Helper: read two real args from VPI, apply f(double,double)->double
+static PLI_INT32 math2_tf(PLI_BYTE8 *userdata)
+{
+   double (*fn)(double, double) = (double (*)(double, double))(intptr_t)userdata;
+
+   vpiHandle call = vpi_handle(vpiSysTfCall, NULL);
+   vpiHandle argv = vpi_iterate(vpiArgument, call);
+   vpiHandle arg1 = vpi_scan(argv);
+   vpiHandle arg2 = vpi_scan(argv);
+   vpi_release_handle(argv);
+
+   s_vpi_value val1 = { .format = vpiRealVal };
+   vpi_get_value(arg1, &val1);
+   vpi_release_handle(arg1);
+
+   s_vpi_value val2 = { .format = vpiRealVal };
+   vpi_get_value(arg2, &val2);
+   vpi_release_handle(arg2);
+
+   s_vpi_value result = {
+      .format = vpiRealVal,
+      .value = { .real = fn(val1.value.real, val2.value.real) },
+   };
+   vpi_put_value(call, &result, NULL, 0);
+   vpi_release_handle(call);
+   return 0;
+}
+
+#define MATH1(name, cfunc) \
+   { .type = vpiSysFunc, .sysfunctype = vpiRealFunc, \
+     .tfname = "$" #name, .calltf = math1_tf, \
+     .user_data = (PLI_BYTE8 *)(intptr_t)(cfunc) }
+
+#define MATH2(name, cfunc) \
+   { .type = vpiSysFunc, .sysfunctype = vpiRealFunc, \
+     .tfname = "$" #name, .calltf = math2_tf, \
+     .user_data = (PLI_BYTE8 *)(intptr_t)(cfunc) }
+
 static s_vpi_systf_data builtins[] = {
    {
       .type   = vpiSysTask,
@@ -413,7 +513,32 @@ static s_vpi_systf_data builtins[] = {
       .tfname      = "$random",
       .sysfunctype = vpiIntFunc,
       .calltf      = random_tf
-   }
+   },
+   // Verilog-AMS / IEEE 1800 math system functions
+   MATH1(sqrt,  sqrt),
+   MATH1(ln,    log),
+   MATH1(log10, log10),
+   MATH1(exp,   exp),
+   MATH1(ceil,  ceil),
+   MATH1(floor, floor),
+   MATH1(sin,   sin),
+   MATH1(cos,   cos),
+   MATH1(tan,   tan),
+   MATH1(asin,  asin),
+   MATH1(acos,  acos),
+   MATH1(atan,  atan),
+   MATH1(sinh,  sinh),
+   MATH1(cosh,  cosh),
+   MATH1(tanh,  tanh),
+   MATH1(asinh, asinh),
+   MATH1(acosh, acosh),
+   MATH1(atanh, atanh),
+   MATH1(abs,   fabs),
+   MATH2(pow,   pow),
+   MATH2(atan2, atan2),
+   MATH2(hypot, hypot),
+   MATH2(min,   fmin),
+   MATH2(max,   fmax),
 };
 
 void vpi_register_builtins(void)

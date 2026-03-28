@@ -661,6 +661,18 @@ static mir_value_t vlog_lower_binary(vlog_gen_t *g, vlog_node_t v)
 
    mir_value_t right = vlog_lower_rvalue(g, rhs_expr), result;
 
+   // Promote to real if either operand is real
+   mir_type_t ltype = mir_get_type(g->mu, left);
+   mir_type_t rtype = mir_get_type(g->mu, right);
+   const bool l_real = mir_get_class(g->mu, ltype) == MIR_TYPE_REAL;
+   const bool r_real = mir_get_class(g->mu, rtype) == MIR_TYPE_REAL;
+   if (l_real && !r_real) {
+      right = mir_build_cast(g->mu, ltype, right);
+   }
+   else if (!l_real && r_real) {
+      left = mir_build_cast(g->mu, rtype, left);
+   }
+
    if (mir_is_vector(g->mu, left))
       result = vlog_lower_vector_binary(g, binop, left, right);
    else {
@@ -675,11 +687,29 @@ static mir_value_t vlog_lower_binary(vlog_gen_t *g, vlog_node_t v)
       case V_BINARY_CASE_NEQ:
          result = mir_build_cmp(g->mu, MIR_CMP_NEQ, left, right);
          break;
+      case V_BINARY_PLUS:
+         result = mir_build_add(g->mu, type, left, right);
+         break;
+      case V_BINARY_MINUS:
+         result = mir_build_sub(g->mu, type, left, right);
+         break;
       case V_BINARY_TIMES:
          result = mir_build_mul(g->mu, type, left, right);
          break;
-      case V_BINARY_PLUS:
-         result = mir_build_add(g->mu, type, left, right);
+      case V_BINARY_DIVIDE:
+         result = mir_build_div(g->mu, type, left, right);
+         break;
+      case V_BINARY_LT:
+         result = mir_build_cmp(g->mu, MIR_CMP_LT, left, right);
+         break;
+      case V_BINARY_GT:
+         result = mir_build_cmp(g->mu, MIR_CMP_GT, left, right);
+         break;
+      case V_BINARY_LEQ:
+         result = mir_build_cmp(g->mu, MIR_CMP_LEQ, left, right);
+         break;
+      case V_BINARY_GEQ:
+         result = mir_build_cmp(g->mu, MIR_CMP_GEQ, left, right);
          break;
       default:
          CANNOT_HANDLE(v);
@@ -768,6 +798,7 @@ static mir_value_t vlog_lower_systf_param(vlog_gen_t *g, vlog_node_t v)
    case V_PART_SELECT:
    case V_COND_EXPR:
    case V_MEMBER_REF:
+   case V_REAL:
       // TODO: these should not be evaluated until vpi_get_value is called
       return vlog_lower_rvalue(g, v);
    default:
@@ -779,7 +810,7 @@ static mir_value_t vlog_lower_sys_tfcall(vlog_gen_t *g, vlog_node_t v)
 {
    const int nparams = vlog_params(v);
    mir_value_t *args LOCAL =
-      xmalloc_array((nparams * 2) + 1, sizeof(mir_value_t));
+      xmalloc_array((nparams * 3) + 1, sizeof(mir_value_t));
    int actual = 0;
    mir_type_t t_offset = mir_offset_type(g->mu);
    for (int i = 0; i < nparams; i++) {
@@ -802,6 +833,13 @@ static mir_value_t vlog_lower_sys_tfcall(vlog_gen_t *g, vlog_node_t v)
             args[actual++] = mir_build_cast(g->mu, t_vec4, arg);
          }
          break;
+      case MIR_TYPE_REAL:
+         // Sentinel size -1 indicates real arg; value in next slot
+         // Pad to 3 slots to match vec4 arg layout (argslot increments by 3)
+         args[actual++] = mir_const(g->mu, t_offset, -1);
+         args[actual++] = arg;
+         args[actual++] = mir_const(g->mu, t_offset, 0);  // padding
+         break;
       default:
          should_not_reach_here();
       }
@@ -811,11 +849,40 @@ static mir_value_t vlog_lower_sys_tfcall(vlog_gen_t *g, vlog_node_t v)
 
    mir_type_t type = MIR_NULL_TYPE;
    if (vlog_kind(v) == V_SYS_FCALL) {
-      // XXX: this should call into VPI
-      if (icmp(vlog_ident(v), "$random"))
-         type = mir_vec2_type(g->mu, 32, false);
-      else
-         type = mir_vec2_type(g->mu, 64, false);
+      switch (is_well_known(vlog_ident(v))) {
+      case W_DLR_SQRT:
+      case W_DLR_LN:
+      case W_DLR_LOG10:
+      case W_DLR_EXP:
+      case W_DLR_CEIL:
+      case W_DLR_FLOOR:
+      case W_DLR_SIN:
+      case W_DLR_COS:
+      case W_DLR_TAN:
+      case W_DLR_ASIN:
+      case W_DLR_ACOS:
+      case W_DLR_ATAN:
+      case W_DLR_SINH:
+      case W_DLR_COSH:
+      case W_DLR_TANH:
+      case W_DLR_ASINH:
+      case W_DLR_ACOSH:
+      case W_DLR_ATANH:
+      case W_DLR_POW:
+      case W_DLR_ATAN2:
+      case W_DLR_HYPOT:
+      case W_DLR_ABS:
+      case W_DLR_MIN:
+      case W_DLR_MAX:
+         type = mir_double_type(g->mu);
+         break;
+      default:
+         if (icmp(vlog_ident(v), "$random"))
+            type = mir_vec2_type(g->mu, 32, false);
+         else
+            type = mir_vec2_type(g->mu, 64, false);
+         break;
+      }
    }
 
    return mir_build_syscall(g->mu, vlog_ident(v), type, MIR_NULL_STAMP,
