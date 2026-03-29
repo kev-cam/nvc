@@ -261,7 +261,7 @@ static void ieee_msg_v(jit_func_t *func, jit_anchor_t *caller,
       .func = func
    };
 
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
    thread->anchor = &frame;
 
    diag_t *d = diag_new(get_diag_severity(severity), NULL);

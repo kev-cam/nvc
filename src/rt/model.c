@@ -22,6 +22,7 @@
 #include "hash.h"
 #include "jit/jit-exits.h"
 #include "jit/jit.h"
+#include "jit/jit-priv.h"
 #include "lib.h"
 #include "option.h"
 #include "printf.h"
@@ -2639,6 +2640,10 @@ void model_reset(rt_model_t *m)
    tlab_reset(thread->tlab);   // No allocations can be live past here
 
    run_callbacks(m, END_OF_INITIALISATION);
+
+   // Install fast path for thread context access now that
+   // the thread local has been allocated and init is complete
+   jit_thread_install_fast_path();
 }
 
 static void update_property(rt_model_t *m, rt_prop_t *prop)

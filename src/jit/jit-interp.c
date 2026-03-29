@@ -801,7 +801,7 @@ static void interp_memset(jit_interp_t *state, jit_ir_t *ir)
 
 static void interp_galloc(jit_interp_t *state, jit_ir_t *ir)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
    thread->anchor = state->anchor;
 
    state->anchor->irpos = ir - state->func->irbuf;
@@ -822,7 +822,7 @@ static void interp_galloc(jit_interp_t *state, jit_ir_t *ir)
 
 static void interp_lalloc(jit_interp_t *state, jit_ir_t *ir)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
    thread->anchor = state->anchor;
 
    state->anchor->irpos = ir - state->func->irbuf;

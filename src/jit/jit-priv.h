@@ -365,14 +365,15 @@ typedef sigjmp_buf jit_jmpbuf_t;
 
 typedef struct _jit_thread_local jit_thread_local_t;
 
-// Virtual method table for thread context access.
-// Default uses TLS lookup.  Can be replaced with direct pointer
-// for single-threaded simulation.
-typedef struct {
-   jit_thread_local_t *(*get)(void);
-} jit_thread_vtable_t;
+// Shim function pointer for thread context access.
+// Initially points at jit_thread_local (full TLS lookup).
+// After init, re-plumbed to return cached pointer directly,
+// eliminating __tls_get_addr overhead for single-threaded simulation.
+typedef jit_thread_local_t *(*jit_thread_get_fn)(void);
+extern jit_thread_get_fn jit_thread_get;
 
-extern const jit_thread_vtable_t *jit_thread_vt;
+// Register a direct replacement, bypassing the .so thunk
+void jit_thread_shim_register(jit_thread_get_fn direct_fn);
 
 struct _jit_thread_local {
    jit_t                 *jit;
@@ -418,6 +419,7 @@ void jit_hexdump(const unsigned char *data, size_t sz, int blocksz,
 void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f);
 void jit_tier_up(jit_func_t *f);
 jit_thread_local_t *jit_thread_local(void);
+void jit_thread_install_fast_path(void);
 void jit_fill_irbuf(jit_func_t *f);
 int32_t *jit_get_cover_ptr(jit_func_t *f, jit_value_t addr);
 jit_entry_fn_t jit_bind_intrinsic(ident_t name);

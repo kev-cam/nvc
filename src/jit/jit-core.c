@@ -120,12 +120,31 @@ jit_thread_local_t *jit_thread_local(void)
    return *ptr;
 }
 
-// Default thread context vtable — uses TLS lookup
-static const jit_thread_vtable_t jit_thread_default_vtable = {
-   .get = jit_thread_local,
-};
+// Shim: initially routes through jit_thread_local (TLS lookup).
+// After jit_thread_shim_register(), points directly at the cached
+// return, bypassing the .so PLT thunk and __tls_get_addr entirely.
+jit_thread_get_fn jit_thread_get = jit_thread_local;
 
-const jit_thread_vtable_t *jit_thread_vt = &jit_thread_default_vtable;
+void jit_thread_shim_register(jit_thread_get_fn direct_fn)
+{
+   jit_thread_get = direct_fn;
+}
+
+// Fast path: returns cached pointer without TLS lookup.
+// Installed by model_reset after the thread local is allocated.
+static jit_thread_local_t *jit_cached_tl = NULL;
+
+static jit_thread_local_t *jit_thread_get_cached(void)
+{
+   return jit_cached_tl;
+}
+
+void jit_thread_install_fast_path(void)
+{
+   // Ensure the thread local is allocated
+   jit_cached_tl = jit_thread_local();
+   jit_thread_shim_register(jit_thread_get_cached);
+}
 
 jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc, cover_data_t *db)
 {
@@ -193,7 +212,7 @@ mspace_t *jit_get_mspace(jit_t *j)
 
 void *jit_mspace_alloc(size_t size)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
    assert(thread->state == JIT_RUNNING);
    return mspace_alloc(thread->jit->mspace, size);
 }
@@ -316,7 +335,7 @@ void jit_fill_irbuf(jit_func_t *f)
    assert(f->irbuf == NULL);
 
 #ifndef USE_EMUTLS
-   const jit_state_t oldstate = jit_thread_local()->state;
+   const jit_state_t oldstate = jit_thread_get()->state;
    jit_transition(f->jit, oldstate, JIT_COMPILING);
 #endif
 
@@ -495,7 +514,7 @@ static void jit_emit_trace(diag_t *d, const loc_t *loc, object_t *enclosing,
 
 jit_stack_trace_t *jit_stack_trace(void)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
 
    int count = 0;
    for (jit_anchor_t *a = thread->anchor; a; a = a->caller)
@@ -545,7 +564,7 @@ static void jit_diag_cb(diag_t *d, void *arg)
       diag_suppress(d, true);
       return;
    }
-   else if (unlikely(jit_thread_local()->state != JIT_RUNNING))
+   else if (unlikely(jit_thread_get()->state != JIT_RUNNING))
       fatal_trace("JIT diag callback called when not running");
 
    jit_stack_trace_t *stack LOCAL = jit_stack_trace();
@@ -562,7 +581,7 @@ static void jit_diag_cb(diag_t *d, void *arg)
 
 static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
 
 #ifdef DEBUG
    if (thread->state != from)
@@ -598,7 +617,7 @@ static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
 static bool jit_try_vcall(jit_t *j, jit_func_t *f, jit_scalar_t *args,
                           tlab_t *tlab)
 {
-   jit_thread_local_t *volatile thread = jit_thread_local();
+   jit_thread_local_t *volatile thread = jit_thread_get();
    volatile const jit_state_t oldstate = thread->state;
 
    const int rc = jit_setjmp(thread->abort_env);
@@ -819,7 +838,7 @@ void jit_msg(const loc_t *where, diag_level_t level, const char *fmt, ...)
 
 void jit_abort(void)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
 
    switch (thread->state) {
    case JIT_IDLE:
@@ -843,7 +862,7 @@ void jit_abort_with_status(int code)
 {
    assert(code != INT_MIN);
 
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
    if (thread->jit != NULL)
       atomic_store(&(thread->jit->exit_status), code);
 
@@ -1307,7 +1326,7 @@ void jit_reset(jit_t *j)
 
 jit_t *jit_for_thread(void)
 {
-   jit_thread_local_t *thread = jit_thread_local();
+   jit_thread_local_t *thread = jit_thread_get();
 
    if (unlikely(thread->jit == NULL))
       fatal_trace("thread not attached to JIT");
