@@ -120,6 +120,13 @@ jit_thread_local_t *jit_thread_local(void)
    return *ptr;
 }
 
+// Default thread context vtable — uses TLS lookup
+static const jit_thread_vtable_t jit_thread_default_vtable = {
+   .get = jit_thread_local,
+};
+
+const jit_thread_vtable_t *jit_thread_vt = &jit_thread_default_vtable;
+
 jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc, cover_data_t *db)
 {
    jit_t *j = xcalloc(sizeof(jit_t));

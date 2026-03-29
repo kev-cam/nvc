@@ -191,7 +191,18 @@ typedef struct _rt_pipe_fifo {
    uint8_t        data[];      // circular buffer: capacity * elem_size
 } rt_pipe_fifo_t;
 
+// Virtual method table for nexus signal operations.
+// Default entries point at the full general-case implementations.
+// Can be replaced at runtime with short-circuit fast paths
+// (e.g. single-driver direct store, federation bridge redirect).
+typedef struct _rt_nexus_vtable {
+   void  (*update_driving)(rt_model_t *m, rt_nexus_t *n);
+   void  (*deposit)(rt_model_t *m, rt_nexus_t *n, const void *value);
+   void *(*read_source)(rt_nexus_t *nexus, rt_source_t *src);
+} rt_nexus_vtable_t;
+
 typedef struct _rt_nexus {
+   const rt_nexus_vtable_t *vtable;
    rt_nexus_t    *chain;
    rt_signal_t   *signal;
    uint32_t       offset;
@@ -210,7 +221,7 @@ typedef struct _rt_nexus {
    rt_source_t    sources;
 } rt_nexus_t;
 
-STATIC_ASSERT(sizeof(rt_nexus_t) <= 136);
+STATIC_ASSERT(sizeof(rt_nexus_t) <= 144);
 
 // The code generator knows the layout of this struct
 typedef struct _sig_shared {
@@ -236,7 +247,7 @@ typedef struct _rt_signal {
    sig_shared_t  shared;
 } rt_signal_t;
 
-STATIC_ASSERT(sizeof(rt_signal_t) + 8 <= 200);
+STATIC_ASSERT(sizeof(rt_signal_t) + 8 <= 208);
 
 typedef struct _rt_implicit {
    rt_wakeable_t wakeable;

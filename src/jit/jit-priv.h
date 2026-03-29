@@ -363,13 +363,24 @@ typedef sigjmp_buf jit_jmpbuf_t;
 #define jit_longjmp(buf, arg) siglongjmp((buf), arg)
 #endif
 
+typedef struct _jit_thread_local jit_thread_local_t;
+
+// Virtual method table for thread context access.
+// Default uses TLS lookup.  Can be replaced with direct pointer
+// for single-threaded simulation.
 typedef struct {
+   jit_thread_local_t *(*get)(void);
+} jit_thread_vtable_t;
+
+extern const jit_thread_vtable_t *jit_thread_vt;
+
+struct _jit_thread_local {
    jit_t                 *jit;
    jit_state_t            state;
    jit_jmpbuf_t           abort_env;
    volatile sig_atomic_t  jmp_buf_valid;
    jit_anchor_t          *anchor;
-} jit_thread_local_t;
+};
 
 typedef struct _code_cache code_cache_t;
 typedef struct _code_span code_span_t;

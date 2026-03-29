@@ -170,6 +170,14 @@ static void free_value(rt_nexus_t *n, rt_value_t v);
 static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset);
 static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value);
 static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value);
+static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n);
+
+// Default nexus vtable — full general-case implementations
+static const rt_nexus_vtable_t nexus_default_vtable = {
+   .update_driving = calculate_driving_value,
+   .deposit        = put_effective,
+   .read_source    = source_value,
+};
 static void update_implicit_signal(rt_model_t *m, rt_implicit_t *imp);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
@@ -1623,6 +1631,7 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
       signal->shared.flags |= NET_F_FAST_DRIVER;
 
    rt_nexus_t *new = static_alloc(m, sizeof(rt_nexus_t));
+   new->vtable       = &nexus_default_vtable;
    new->width        = old->width - offset;
    new->size         = old->size;
    new->signal       = signal;
@@ -1764,6 +1773,7 @@ static void setup_signal(rt_model_t *m, rt_signal_t *s, tree_t where,
 
    APUSH(parent->signals, s);
 
+   s->nexus.vtable       = &nexus_default_vtable;
    s->nexus.width        = count;
    s->nexus.size         = size;
    s->nexus.n_sources    = 0;
@@ -3755,6 +3765,36 @@ bool model_step(rt_model_t *m)
       model_cycle(m);
 
    return should_stop_now(m, TIME_HIGH);
+}
+
+void model_run_init(rt_model_t *m)
+{
+   MODEL_ENTRY(m);
+
+   if (m->force_stop)
+      return;
+
+   run_callbacks(m, START_OF_SIMULATION);
+}
+
+void model_run_fini(rt_model_t *m)
+{
+   MODEL_ENTRY(m);
+
+   run_callbacks(m, END_OF_SIMULATION);
+
+   if (m->liveness)
+      check_liveness_properties(m, m->root);
+}
+
+int64_t model_step_to(rt_model_t *m, uint64_t stop_time)
+{
+   MODEL_ENTRY(m);
+
+   while (!should_stop_now(m, stop_time))
+      model_cycle(m);
+
+   return model_next_time(m);
 }
 
 static inline void check_postponed(int64_t after, rt_proc_t *proc)
