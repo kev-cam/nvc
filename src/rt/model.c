@@ -179,6 +179,10 @@ static const rt_nexus_vtable_t nexus_default_vtable = {
    .deposit        = put_effective,
    .read_source    = source_value,
 };
+static void calculate_driving_single(rt_model_t *m, rt_nexus_t *n);
+static void calculate_driving_memo1(rt_model_t *m, rt_nexus_t *n);
+static const rt_nexus_vtable_t nexus_single_driver_vtable;
+static const rt_nexus_vtable_t nexus_memo1_vtable;
 static void update_implicit_signal(rt_model_t *m, rt_implicit_t *imp);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
@@ -1271,8 +1275,10 @@ static rt_source_t *add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
    if (n->n_sources < UINT8_MAX)
       n->n_sources++;
 
-   if (n->n_sources > 1)
+   if (n->n_sources > 1) {
       n->flags &= ~NET_F_FAST_DRIVER;
+      n->vtable = &nexus_default_vtable;   // Revert to full resolution
+   }
 
    src->chain_input  = NULL;
    src->chain_output = NULL;
@@ -1964,6 +1970,9 @@ static void call_resolution(rt_model_t *m, rt_nexus_t *n, res_memo_t *r,
    if ((n->flags & NET_F_R_IDENT) && nonnull == 1) {
       // Resolution function behaves like identity for a single driver
       put_driving(m, n, source_value(n, s0));
+      // Rewrite: identity with single driver is just a direct deposit
+      if (s0->tag == SOURCE_DRIVER)
+         n->vtable = &nexus_single_driver_vtable;
    }
    else if ((r->flags & R_MEMO) && nonnull == 1) {
       // Resolution function has been memoised so do a table lookup
@@ -1983,6 +1992,9 @@ static void call_resolution(rt_model_t *m, rt_nexus_t *n, res_memo_t *r,
 
       put_driving(m, n, resolved);
       tlab_trim(thread->tlab, mark);
+      // Rewrite: single driver with memo table, skip source walk next time
+      if (s0->tag == SOURCE_DRIVER)
+         n->vtable = &nexus_memo1_vtable;
    }
    else if ((r->flags & R_MEMO) && nonnull == 2) {
       // Resolution function has been memoised so do a table lookup
@@ -2194,6 +2206,9 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          // that driver.
          assert(!s0->disconnected);
          put_driving(m, n, value_ptr(n, &(s0->u.driver.waveforms.value)));
+         // Rewrite vtable: next call skips source walk entirely
+         if (nonnull == 1)
+            n->vtable = &nexus_single_driver_vtable;
          break;
 
       case SOURCE_PORT:
@@ -2644,6 +2659,7 @@ void model_reset(rt_model_t *m)
    // Install fast path for thread context access now that
    // the thread local has been allocated and init is complete
    jit_thread_install_fast_path();
+
 }
 
 static void update_property(rt_model_t *m, rt_prop_t *prop)
@@ -3268,6 +3284,52 @@ static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value)
       put_effective(m, n, value);
 }
 
+// Fast path: single SOURCE_DRIVER, no resolution function.
+// Reads driver value directly and deposits it, skipping the full
+// calculate_driving_value → call_resolution → source_value chain.
+// Installed via vtable on nexuses that qualify after model_reset.
+static void calculate_driving_single(rt_model_t *m, rt_nexus_t *n)
+{
+   rt_source_t *s = &(n->sources);
+   assert(s->tag == SOURCE_DRIVER);
+   assert(!s->disconnected);
+   put_driving(m, n, value_ptr(n, &(s->u.driver.waveforms.value)));
+}
+
+// Fast path: single SOURCE_DRIVER with memoised resolution.
+// Does table lookup on driver value without walking sources.
+static void calculate_driving_memo1(rt_model_t *m, rt_nexus_t *n)
+{
+   rt_source_t *s = &(n->sources);
+   assert(s->tag == SOURCE_DRIVER);
+   assert(!s->disconnected);
+
+   res_memo_t *r = n->signal->resolution;
+   char *p0 = (char *)value_ptr(n, &(s->u.driver.waveforms.value));
+
+   // Single-driver memoised: tab1 lookup per bit
+   const size_t valuesz = n->width * n->size;
+   uint8_t resolved[valuesz <= 64 ? 64 : valuesz];
+   for (int j = 0; j < n->width; j++)
+      resolved[j] = r->tab1[(int)(uint8_t)p0[j]];
+
+   put_driving(m, n, resolved);
+}
+
+// Vtable for single-driver nexuses (no resolution needed)
+static const rt_nexus_vtable_t nexus_single_driver_vtable = {
+   .update_driving = calculate_driving_single,
+   .deposit        = put_effective,
+   .read_source    = source_value,
+};
+
+// Vtable for single-driver with memoised resolution
+static const rt_nexus_vtable_t nexus_memo1_vtable = {
+   .update_driving = calculate_driving_memo1,
+   .deposit        = put_effective,
+   .read_source    = source_value,
+};
+
 static void defer_driving_update(rt_model_t *m, rt_nexus_t *n)
 {
    if (n->flags & NET_F_PENDING)
@@ -3284,7 +3346,7 @@ static void update_driving(rt_model_t *m, rt_nexus_t *n, bool safe)
       n->active_delta = m->iteration;
       n->flags &= ~NET_F_PENDING;
 
-      calculate_driving_value(m, n);
+      n->vtable->update_driving(m, n);
 
       // Update outputs if the effective value must be calculated
       // separately or there was an event on this signal
@@ -5108,7 +5170,7 @@ void x_put_driver(sig_shared_t *ss, uint32_t offset, int32_t count,
       assert(d->u.driver.waveforms.next == NULL);
       copy_value_ptr(n, &d->u.driver.waveforms.value, vptr);
 
-      calculate_driving_value(m, n);
+      n->vtable->update_driving(m, n);
 
       for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
          assert(o->tag == SOURCE_PORT);
