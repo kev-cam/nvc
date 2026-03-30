@@ -402,10 +402,8 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
         for (vhpiHandleT port = vhpi_scan(piter); port;
              port = vhpi_scan(piter)) {
             vhpiModeT mode = (vhpiModeT)vhpi_get(vhpiModeP, port);
-            if (mode != vhpiInoutMode) {
-                vhpi_release_handle(port);
-                continue;
-            }
+            (void)mode;  // All port modes are candidates for resolution
+                         // (needed for back-annotation and federation)
 
             const char *port_name = get_name(port);
             if (!port_name) {
@@ -1217,13 +1215,17 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     /* Report */
     print_report();
 
-    /* Phase 2: Count nets needing resolution */
+    /* Phase 2: Mark all nets as needing resolution.
+     * Even single-driver nets go through the resolver generator so that
+     * back-annotation and federated simulation can intercept any net. */
     int nets_needing = 0;
-    for (net_info_t *n = g_nets; n; n = n->next)
-        if (n->needs_resolution) nets_needing++;
+    for (net_info_t *n = g_nets; n; n = n->next) {
+        n->needs_resolution = 1;
+        nets_needing++;
+    }
 
     if (nets_needing == 0) {
-        vhpi_printf("resolver: no nets need resolution, nothing to generate");
+        vhpi_printf("resolver: no nets discovered, nothing to generate");
         cleanup();
         vhpi_release_handle(root);
         return;
@@ -1313,7 +1315,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         if (!skip_compile) {
             char cmd[MAX_NAME * 2];
             snprintf(cmd, sizeof(cmd),
-                     "nvc --std=2008 --work=%s -a %s 2>&1",
+                     "nvc --std=2040 --work=%s -a %s 2>&1",
                      work_dir, cache_path);
 
             FILE *proc = popen(cmd, "r");
@@ -1348,18 +1350,18 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
                      "%d cached, %d error(s)", written, cached, errors);
         vhpi_printf("resolver: output directory: %s", resolver_dir);
         vhpi_printf("resolver: to compile and run manually:");
-        vhpi_printf("  nvc --std=2008 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
+        vhpi_printf("  nvc --std=2040 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
                      resolver_dir, g_design_name, resolver_dir, g_design_name);
-        vhpi_printf("  nvc --std=2008 -e resolved_%s", g_design_name);
-        vhpi_printf("  nvc --std=2008 -r resolved_%s", g_design_name);
+        vhpi_printf("  nvc --std=2040 -e resolved_%s", g_design_name);
+        vhpi_printf("  nvc --std=2040 -r resolved_%s", g_design_name);
     } else {
         vhpi_printf("resolver: wrote %d, cached %d, compiled %d, errors %d",
                      written, cached, compiled, errors);
         if (errors == 0) {
             vhpi_printf("resolver: for standalone simulation:");
-            vhpi_printf("  nvc --std=2008 --work=%s -e resolved_%s",
+            vhpi_printf("  nvc --std=2040 --work=%s -e resolved_%s",
                          work_dir, g_design_name);
-            vhpi_printf("  nvc --std=2008 --work=%s -r resolved_%s",
+            vhpi_printf("  nvc --std=2040 --work=%s -r resolved_%s",
                          work_dir, g_design_name);
         }
     }
