@@ -44,6 +44,9 @@ void model_free(rt_model_t *m);
 void model_reset(rt_model_t *m);
 void model_run(rt_model_t *m, uint64_t stop_time);
 bool model_step(rt_model_t *m);
+void model_run_init(rt_model_t *m);
+void model_run_fini(rt_model_t *m);
+int64_t model_step_to(rt_model_t *m, uint64_t stop_time);
 bool model_can_create_delta(rt_model_t *m);
 int64_t model_now(rt_model_t *m, unsigned *deltas);
 int64_t model_next_time(rt_model_t *m);
@@ -80,6 +83,11 @@ rt_scope_t *create_scope(rt_model_t *m, tree_t block, rt_scope_t *parent);
 
 void get_instance_name(rt_scope_t *s, text_buf_t *tb);
 void get_path_name(rt_scope_t *s, text_buf_t *tb);
+
+// Replace process execution vtable (for compiled state machine swap)
+typedef struct _rt_proc_vtable rt_proc_vtable_t;
+void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt);
+void proc_reset_vtable(rt_proc_t *proc);
 
 const void *signal_value(rt_signal_t *s);
 const void *signal_last_value(rt_signal_t *s);

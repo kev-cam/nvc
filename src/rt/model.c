@@ -981,25 +981,16 @@ static void reset_property(rt_model_t *m, rt_prop_t *prop)
    thread->active_scope = NULL;
 }
 
-static void run_process(rt_model_t *m, rt_proc_t *proc)
+// Default process eval: run via JIT
+static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
 {
-   TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
-         istr(proc->name));
-
-   rt_wakeable_t *obj = &(proc->wakeable);
-
-   if (obj->trigger != NULL && !run_trigger(m, obj->trigger))
-      return;   // Filtered
-
    model_thread_t *thread = model_thread(m);
    assert(thread->tlab != NULL);
    assert(thread->tlab->alloc == 0);
 
-   thread->active_obj = obj;
+   thread->active_obj = &(proc->wakeable);
    thread->active_scope = proc->scope;
 
-   // Stateless processes have NULL privdata so pass a dummy pointer
-   // value in so it can be distinguished from a reset
    jit_scalar_t state = {
       .pointer = *mptr_get(proc->privdata) ?: (void *)-1
    };
@@ -1024,10 +1015,45 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
       thread->tlab = tlab_acquire(m->mspace);
    }
    else if (proc->tlab == NULL)
-      tlab_reset(thread->tlab);   // All data inside the TLAB is dead
+      tlab_reset(thread->tlab);
 
    thread->active_obj = NULL;
    thread->active_scope = NULL;
+}
+
+static void proc_reset_default(rt_proc_t *proc);
+
+static const rt_proc_vtable_t proc_default_vtable = {
+   .eval  = proc_eval_jit,
+   .reset = proc_reset_default,
+};
+
+static void proc_reset_default(rt_proc_t *proc)
+{
+   proc->vtable = &proc_default_vtable;
+}
+
+void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt)
+{
+   proc->vtable = vt;
+}
+
+void proc_reset_vtable(rt_proc_t *proc)
+{
+   proc->vtable = &proc_default_vtable;
+}
+
+static void run_process(rt_model_t *m, rt_proc_t *proc)
+{
+   TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
+         istr(proc->name));
+
+   rt_wakeable_t *obj = &(proc->wakeable);
+
+   if (obj->trigger != NULL && !run_trigger(m, obj->trigger))
+      return;   // Filtered
+
+   proc->vtable->eval(m, proc);
 }
 
 static void reset_scope(rt_model_t *m, rt_scope_t *s)
@@ -2499,6 +2525,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
             ident_t sym = ident_prefix(sym_prefix, name, '.');
 
             rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
+            p->vtable    = &proc_default_vtable;
             p->where     = t;
             p->name      = ident_prefix(path, ident_downcase(name), ':');
             p->handle    = jit_lazy_compile(m->jit, sym);
@@ -2533,6 +2560,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
             ident_t sym = ident_prefix(sym_prefix, name, '.');
 
             rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
+            p->vtable    = &proc_default_vtable;
             p->where     = t;
             p->name      = ident_prefix(path, ident_downcase(name), ':');
             p->handle    = jit_lazy_compile(m->jit, sym);
@@ -5361,6 +5389,7 @@ void x_process_init(jit_handle_t handle, tree_t where)
    assert(s->kind == SCOPE_INSTANCE);
 
    rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
+   p->vtable    = &proc_default_vtable;
    p->where     = where;
    p->name      = name;
    p->handle    = handle;

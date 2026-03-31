@@ -66,7 +66,18 @@ typedef struct _rt_trigger {
    jit_scalar_t    args[];
 } rt_trigger_t;
 
-typedef struct _rt_proc {
+// Virtual method table for process execution.
+// Default runs via JIT. Can be replaced with compiled state machine.
+typedef struct _rt_proc rt_proc_t;
+typedef void (*proc_eval_fn)(rt_model_t *m, rt_proc_t *proc);
+
+typedef struct _rt_proc_vtable {
+   proc_eval_fn eval;     // execute one cycle
+   void (*reset)(rt_proc_t *proc);  // revert to default vtable
+} rt_proc_vtable_t;
+
+struct _rt_proc {
+   const rt_proc_vtable_t *vtable;
    rt_wakeable_t  wakeable;
    tree_t         where;
    ident_t        name;
@@ -74,9 +85,9 @@ typedef struct _rt_proc {
    tlab_t        *tlab;
    rt_scope_t    *scope;
    mptr_t         privdata;
-} rt_proc_t;
+};
 
-STATIC_ASSERT(sizeof(rt_proc_t) <= 128);
+STATIC_ASSERT(sizeof(rt_proc_t) <= 136);
 
 typedef struct _rt_prop {
    rt_wakeable_t  wakeable;
