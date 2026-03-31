@@ -28,6 +28,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+static int g_quiet = 0;
+#define resolver_printf(...) do { if (!g_quiet) resolver_printf(__VA_ARGS__); } while(0)
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -154,7 +157,7 @@ static net_info_t *find_or_create_net(const char *name)
             return n;
     }
     net_info_t *n = calloc(1, sizeof(*n));
-    if (!n) { vhpi_printf("resolver: out of memory"); return NULL; }
+    if (!n) { resolver_printf("resolver: out of memory"); return NULL; }
     safe_copy(n->net_name, name, sizeof(n->net_name));
     n->next = g_nets;
     g_nets = n;
@@ -167,7 +170,7 @@ static int net_add_endpoint(net_info_t *net,
                             const char *type_name)
 {
     if (net->n_endpoints >= MAX_ENDPOINTS) {
-        vhpi_printf("resolver: too many endpoints on net %s", net->net_name);
+        resolver_printf("resolver: too many endpoints on net %s", net->net_name);
         return -1;
     }
     endpoint_t *ep = &net->endpoints[net->n_endpoints++];
@@ -284,7 +287,7 @@ static const char *get_full_name(vhpiHandleT h)
 static void indent(void)
 {
     for (int i = 0; i < g_depth; i++)
-        vhpi_printf("  ");
+        resolver_printf("  ");
 }
 
 /*
@@ -369,7 +372,7 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
                  path_prefix, inst_lower);
 
         indent();
-        vhpi_printf("  instance: %s  entity: %s  ename: %s",
+        resolver_printf("  instance: %s  entity: %s  ename: %s",
                      inst_name ? inst_name : "?",
                      entity_name ? entity_name : "?",
                      inst_ename);
@@ -384,13 +387,13 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
             (const vhpiCharT *)nvc_vhpi_get_port_map(inst);
         if (!portmap) {
             indent();
-            vhpi_printf("    WARNING: no port map for tran instance");
+            resolver_printf("    WARNING: no port map for tran instance");
             vhpi_release_handle(inst);
             continue;
         }
 
         indent();
-        vhpi_printf("    portmap: %s", (const char *)portmap);
+        resolver_printf("    portmap: %s", (const char *)portmap);
 
         /* Scan inout ports, using port map to identify actual signals */
         vhpiHandleT piter = vhpi_iterator(vhpiPortDecls, inst);
@@ -433,7 +436,7 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
             if (!portmap_lookup((const char *)portmap, port_name,
                                 actual, sizeof(actual))) {
                 indent();
-                vhpi_printf("    WARNING: port %s not in port map", port_name);
+                resolver_printf("    WARNING: port %s not in port map", port_name);
                 vhpi_release_handle(port);
                 continue;
             }
@@ -463,10 +466,10 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
                 read_net_init(net);
                 net_add_endpoint(net, drv_ename, rcv_ename, port_etype);
                 indent();
-                vhpi_printf("    port %s -> actual=%s net=%s init=%s",
+                resolver_printf("    port %s -> actual=%s net=%s init=%s",
                              port_name, actual, net_name,
                              net->init_value);
-                vhpi_printf("      drv=%s rcv=%s", drv_ename, rcv_ename);
+                resolver_printf("      drv=%s rcv=%s", drv_ename, rcv_ename);
             }
 
             vhpi_release_handle(port);
@@ -488,7 +491,7 @@ static void walk_hierarchy(vhpiHandleT region, const char *path_prefix,
 {
     const char *rname = get_name(region);
     indent();
-    vhpi_printf("region: %s  path: %s  sig_prefix: %s",
+    resolver_printf("region: %s  path: %s  sig_prefix: %s",
                 rname ? rname : "(root)", path_prefix, sig_prefix);
 
     scan_instances(region, path_prefix, sig_prefix);
@@ -970,7 +973,7 @@ static int python_init(void)
         }
     }
 
-    vhpi_printf("resolver: Python %s initialized, module path: %s",
+    resolver_printf("resolver: Python %s initialized, module path: %s",
                 Py_GetVersion(), plugin_dir);
 
     g_py_module = PyImport_ImportModule(RESOLVER_MODULE);
@@ -992,7 +995,7 @@ static int python_init(void)
         return 0;
     }
 
-    vhpi_printf("resolver: loaded %s.%s", RESOLVER_MODULE, RESOLVER_FUNC);
+    resolver_printf("resolver: loaded %s.%s", RESOLVER_MODULE, RESOLVER_FUNC);
     return 1;
 }
 
@@ -1060,7 +1063,7 @@ static PyObject *build_net_dict(const net_info_t *net)
 static PyObject *call_python_resolver(void)
 {
     if (!g_python_ok || !g_py_func) {
-        vhpi_printf("resolver: Python not available, skipping resolver calls");
+        resolver_printf("resolver: Python not available, skipping resolver calls");
         return NULL;
     }
 
@@ -1083,11 +1086,11 @@ static PyObject *call_python_resolver(void)
     Py_ssize_t list_len = PyList_Size(net_list);
     if (list_len == 0) {
         Py_DECREF(net_list);
-        vhpi_printf("resolver: no nets need resolution");
+        resolver_printf("resolver: no nets need resolution");
         return NULL;
     }
 
-    vhpi_printf("resolver: calling %s.%s with %zd net(s), design=%s",
+    resolver_printf("resolver: calling %s.%s with %zd net(s), design=%s",
                 RESOLVER_MODULE, RESOLVER_FUNC, list_len, g_design_name);
 
     /* Call: resolve_net(net_list, design_name) */
@@ -1109,12 +1112,12 @@ static PyObject *call_python_resolver(void)
 
     if (result == Py_None) {
         Py_DECREF(result);
-        vhpi_printf("resolver: Python returned None (no resolver generated)");
+        resolver_printf("resolver: Python returned None (no resolver generated)");
         return NULL;
     }
 
     if (!PyDict_Check(result)) {
-        vhpi_printf("resolver: WARNING - expected dict from Python, got %s",
+        resolver_printf("resolver: WARNING - expected dict from Python, got %s",
                      Py_TYPE(result)->tp_name);
         Py_DECREF(result);
         return NULL;
@@ -1130,32 +1133,32 @@ static void print_report(void)
     int nets_needing = 0;
     int total_nets = 0;
 
-    vhpi_printf("");
-    vhpi_printf("=== SV2VHDL Resolution Network Analysis ===");
-    vhpi_printf("");
+    resolver_printf("");
+    resolver_printf("=== SV2VHDL Resolution Network Analysis ===");
+    resolver_printf("");
 
     for (net_info_t *n = g_nets; n; n = n->next) {
         total_nets++;
         if (!n->needs_resolution) continue;
         nets_needing++;
 
-        vhpi_printf("--- Net: %s  (%d endpoints) ---",
+        resolver_printf("--- Net: %s  (%d endpoints) ---",
                      n->net_name, n->n_endpoints);
         for (int i = 0; i < n->n_endpoints; i++) {
-            vhpi_printf("  [%d] driver:   %s  type: %s",
+            resolver_printf("  [%d] driver:   %s  type: %s",
                          i, n->endpoints[i].driver_ename,
                          n->endpoints[i].type_name);
-            vhpi_printf("      receiver: %s",
+            resolver_printf("      receiver: %s",
                          n->endpoints[i].receiver_ename);
         }
-        vhpi_printf("");
+        resolver_printf("");
     }
 
-    vhpi_printf("=== Summary ===");
-    vhpi_printf("Total instances scanned: %d", g_total_instances);
-    vhpi_printf("Total nets discovered: %d", total_nets);
-    vhpi_printf("Nets requiring resolution: %d", nets_needing);
-    vhpi_printf("");
+    resolver_printf("=== Summary ===");
+    resolver_printf("Total instances scanned: %d", g_total_instances);
+    resolver_printf("Total nets discovered: %d", total_nets);
+    resolver_printf("Nets requiring resolution: %d", nets_needing);
+    resolver_printf("");
 }
 
 /* ---------- Cleanup ---------- */
@@ -1178,9 +1181,9 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 {
     (void)cb_data;
 
-    vhpi_printf("");
-    vhpi_printf("=== SV2VHDL Resolver Plugin ===");
-    vhpi_printf("");
+    resolver_printf("");
+    resolver_printf("=== SV2VHDL Resolver Plugin ===");
+    resolver_printf("");
 
     vhpiHandleT root = vhpi_handle(vhpiRootInst, NULL);
     if (!root) {
@@ -1197,19 +1200,19 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         *c = tolower((unsigned char)*c);
 
     const char *root_full = get_full_name(root);
-    vhpi_printf("Root: %s (design: %s)", root_full ? root_full : "(unnamed)",
+    resolver_printf("Root: %s (design: %s)", root_full ? root_full : "(unnamed)",
                 g_design_name);
-    vhpi_printf("");
+    resolver_printf("");
 
     /* Phase 1: Discover resolution networks */
-    vhpi_printf("--- Hierarchy Trace ---");
+    resolver_printf("--- Hierarchy Trace ---");
     g_depth = 0;
     char root_ename[MAX_NAME];
     snprintf(root_ename, sizeof(root_ename), ".%s", g_design_name);
     walk_hierarchy(root, root_ename, root_ename);
 
-    vhpi_printf("");
-    vhpi_printf("--- Analysis ---");
+    resolver_printf("");
+    resolver_printf("--- Analysis ---");
     analyze_nets();
 
     /* Report */
@@ -1225,7 +1228,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     }
 
     if (nets_needing == 0) {
-        vhpi_printf("resolver: no nets discovered, nothing to generate");
+        resolver_printf("resolver: no nets discovered, nothing to generate");
         cleanup();
         vhpi_release_handle(root);
         return;
@@ -1237,7 +1240,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         vhpi_printf("resolver: ERROR - no VHDL generated");
         for (net_info_t *n = g_nets; n; n = n->next) {
             if (n->needs_resolution) {
-                vhpi_printf("resolver: UNRESOLVED net %s (%d endpoints)",
+                resolver_printf("resolver: UNRESOLVED net %s (%d endpoints)",
                              n->net_name, n->n_endpoints);
             }
         }
@@ -1247,7 +1250,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     }
 
     Py_ssize_t n_files = PyDict_Size(file_dict);
-    vhpi_printf("resolver: received %zd VHDL file(s)", n_files);
+    resolver_printf("resolver: received %zd VHDL file(s)", n_files);
 
     /* Phase 4: Write files and optionally compile (per-file caching) */
     const char *resolver_dir = getenv("NVC_RESOLVER_DIR");
@@ -1330,7 +1333,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
             while (fgets(line, sizeof(line), proc)) {
                 size_t len = strlen(line);
                 if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-                vhpi_printf("  nvc: %s", line);
+                resolver_printf("  nvc: %s", line);
             }
 
             int status = pclose(proc);
@@ -1344,24 +1347,24 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         }
     }
 
-    vhpi_printf("");
+    resolver_printf("");
     if (skip_compile) {
-        vhpi_printf("resolver: --rcmode=none: wrote %d file(s), "
+        resolver_printf("resolver: --rcmode=none: wrote %d file(s), "
                      "%d cached, %d error(s)", written, cached, errors);
-        vhpi_printf("resolver: output directory: %s", resolver_dir);
-        vhpi_printf("resolver: to compile and run manually:");
-        vhpi_printf("  nvc --std=2040 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
+        resolver_printf("resolver: output directory: %s", resolver_dir);
+        resolver_printf("resolver: to compile and run manually:");
+        resolver_printf("  nvc --std=2040 -a %s/%s_rn_*.vhd %s/%s_wrapper.vhd",
                      resolver_dir, g_design_name, resolver_dir, g_design_name);
-        vhpi_printf("  nvc --std=2040 -e resolved_%s", g_design_name);
-        vhpi_printf("  nvc --std=2040 -r resolved_%s", g_design_name);
+        resolver_printf("  nvc --std=2040 -e resolved_%s", g_design_name);
+        resolver_printf("  nvc --std=2040 -r resolved_%s", g_design_name);
     } else {
-        vhpi_printf("resolver: wrote %d, cached %d, compiled %d, errors %d",
+        resolver_printf("resolver: wrote %d, cached %d, compiled %d, errors %d",
                      written, cached, compiled, errors);
         if (errors == 0) {
-            vhpi_printf("resolver: for standalone simulation:");
-            vhpi_printf("  nvc --std=2040 --work=%s -e resolved_%s",
+            resolver_printf("resolver: for standalone simulation:");
+            resolver_printf("  nvc --std=2040 --work=%s -e resolved_%s",
                          work_dir, g_design_name);
-            vhpi_printf("  nvc --std=2040 --work=%s -r resolved_%s",
+            resolver_printf("  nvc --std=2040 --work=%s -r resolved_%s",
                          work_dir, g_design_name);
         }
     }
@@ -1373,7 +1376,8 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 
 static void resolver_startup(void)
 {
-    vhpi_printf("resolver: plugin loaded");
+    g_quiet = (getenv("SV2VHDL_QUIET") != NULL);
+    resolver_printf("resolver: plugin loaded");
     g_python_ok = python_init();
 
     vhpiCbDataT cb = {
@@ -1387,7 +1391,7 @@ static void end_of_sim(const vhpiCbDataT *cb_data)
 {
     (void)cb_data;
     python_fini();
-    vhpi_printf("resolver: Python finalized");
+    resolver_printf("resolver: Python finalized");
 }
 
 static void resolver_register_cleanup(void)
