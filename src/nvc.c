@@ -40,6 +40,7 @@
 #include "vlog/vlog-node.h"
 #include "vlog/vlog-phase.h"
 #include "vpi/vpi-model.h"
+#include "cosim.h"
 
 #include <getopt.h>
 #include <stdlib.h>
@@ -826,6 +827,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "shuffle",       no_argument,       0, 'H' },
       { "rcmode",            required_argument, 0, 'R' },
       { "export-resolvers", required_argument, 0, 'X' },
+      { "xyce-netlist",     required_argument, 0, 'Y' },
+      { "xyce-config",      required_argument, 0, 'Z' },
+      { "accel",             no_argument,       0, 'A' },
       { 0, 0, 0, 0 }
    };
 
@@ -836,6 +840,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *pli_plugins = NULL;
    const char   *rcmode = NULL;
    const char   *resolver_dir = NULL;
+   const char   *xyce_netlist = NULL;
+   const char   *xyce_config = NULL;
+   bool          use_accel = false;
 
    static bool have_run = false;
    if (have_run)
@@ -947,6 +954,15 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       case 'X':
          resolver_dir = optarg;
          break;
+      case 'Y':
+         xyce_netlist = optarg;
+         break;
+      case 'Z':
+         xyce_config = optarg;
+         break;
+      case 'A':
+         use_accel = true;
+         break;
       default:
          should_not_reach_here();
       }
@@ -1053,6 +1069,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    model_reset(state->model);
 
+   if (use_accel)
+      accel_auto(state->model);
+
    if (rcmode != NULL && strcmp(rcmode, "none") == 0) {
       // Run with stop_time=0 to fire START_OF_SIMULATION callbacks
       // (where the resolver plugin does its work), then stop immediately
@@ -1085,6 +1104,29 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    if (opt_get_int(OPT_IEEE_WARNINGS) == IEEE_WARNINGS_OFF_AT_0)
       model_set_phase_cb(state->model, END_TIME_STEP,
                          enable_ieee_warnings_cb, state);
+
+   if (xyce_netlist != NULL) {
+      const int rc = cosim_run(state->model, xyce_netlist,
+                               xyce_config, stop_time);
+      set_ctrl_c_handler(NULL, NULL);
+
+      if (dumper != NULL)
+         wave_dumper_free(dumper);
+
+      vhpi_context_free(state->vhpi);
+      state->vhpi = NULL;
+
+      vpi_context_free(state->vpi);
+      state->vpi = NULL;
+
+      model_free(state->model);
+      state->model = NULL;
+
+      argc -= next_cmd - 1;
+      argv += next_cmd - 1;
+
+      return argc > 1 ? process_command(argc, argv, state) : rc;
+   }
 
    model_run(state->model, stop_time);
 

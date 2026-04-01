@@ -20,6 +20,10 @@
 #include <Python.h>
 
 #include "vhpi_user.h"
+#include "rt/model.h"
+#include "rt/structs.h"
+#include "ident.h"
+#include "tree.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +33,7 @@
 #include <errno.h>
 
 static int g_quiet = 0;
-#define resolver_printf(...) do { if (!g_quiet) resolver_printf(__VA_ARGS__); } while(0)
+#define resolver_printf(...) do { if (!g_quiet) vhpi_printf(__VA_ARGS__); } while(0)
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -59,6 +63,13 @@ static const char *tran_entities[] = {
 
 #define CACHE_DIR        "_sv2vhdl_cache"
 #define VHPI_MODULE      "_sv2vhdl_vhpi"
+
+/* Cycle sim: compiled state machine acceleration */
+#define ACCEL_DIR           "_accel"
+
+typedef void (*sm_eval_fn)(void);
+typedef void (*sm_init_fn)(uint8_t **ptrs, int *widths, int n);
+typedef void (*sm_reset_fn)(void);
 
 /* ---------- Data structures ---------- */
 
@@ -1372,6 +1383,83 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     Py_DECREF(file_dict);
     cleanup();
     vhpi_release_handle(root);
+
+    /* Phase 4: Check for compiled state machine acceleration.
+     * Look for sm_<design>.so in ACCEL_DIR or current directory.
+     * If found, load it and wire signals through the state machine
+     * instead of the JIT-compiled processes. */
+    {
+        char so_path[MAX_NAME];
+        snprintf(so_path, sizeof(so_path), "sm_%s.so", g_design_name);
+
+        void *dl = dlopen(so_path, RTLD_NOW);
+        if (!dl) {
+            /* Try in ACCEL_DIR */
+            snprintf(so_path, sizeof(so_path), "%s/sm_%s.so",
+                     ACCEL_DIR, g_design_name);
+            dl = dlopen(so_path, RTLD_NOW);
+        }
+
+        if (dl) {
+            sm_eval_fn eval = dlsym(dl, "sm_eval_mapped");
+            sm_init_fn init = dlsym(dl, "sm_init_mapped");
+            sm_reset_fn reset = dlsym(dl, "sm_reset_mapped");
+            int *n_regs = dlsym(dl, "sm_n_regs");
+            const char **reg_names = dlsym(dl, "sm_reg_names");
+
+            if (eval && init && n_regs && reg_names) {
+                resolver_printf("accel: loaded %s (%d registers)", so_path, *n_regs);
+                for (int i = 0; i < *n_regs; i++)
+                    resolver_printf("  reg[%d]: %s", i, reg_names[i]);
+
+                /* Map NVC signal storage to state machine registers */
+                rt_model_t *mdl = get_model_or_null();
+                if (mdl) {
+                    rt_scope_t *rscope = root_scope(mdl);
+                    uint8_t **ptrs = calloc(*n_regs, sizeof(uint8_t *));
+                    int *widths = calloc(*n_regs, sizeof(int));
+                    int mapped = 0;
+
+                    /* Walk child scopes to find matching signals */
+                    for (int ci = 0; ; ci++) {
+                        rt_scope_t *cs = child_scope_at(rscope, ci);
+                        if (!cs) break;
+                        for (int si = 0; si < cs->signals.count; si++) {
+                            rt_signal_t *sig = cs->signals.items[si];
+                            const char *sn = istr(tree_ident(sig->where));
+                            for (int r = 0; r < *n_regs; r++) {
+                                if (ptrs[r]) continue;
+                                const char *rn = reg_names[r] + 1;
+                                if (sn && strstr(sn, rn)) {
+                                    ptrs[r] = (uint8_t *)sig->shared.data;
+                                    widths[r] = sig->nexus.width;
+                                    mapped++;
+                                    resolver_printf("accel:   %s -> %s (%d bits)",
+                                                 reg_names[r], sn, widths[r]);
+                                }
+                            }
+                        }
+                    }
+
+                    if (mapped == *n_regs) {
+                        init(ptrs, widths, *n_regs);
+                        resolver_printf("accel: %d/%d mapped — active",
+                                     mapped, *n_regs);
+                    }
+                    else {
+                        resolver_printf("accel: %d/%d mapped — JIT fallback",
+                                     mapped, *n_regs);
+                    }
+                    free(ptrs);
+                    free(widths);
+                }
+            }
+            else {
+                resolver_printf("accel: %s missing required symbols", so_path);
+                dlclose(dl);
+            }
+        }
+    }
 }
 
 static void resolver_startup(void)

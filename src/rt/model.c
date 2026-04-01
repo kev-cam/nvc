@@ -1038,6 +1038,153 @@ void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt)
    proc->vtable = vt;
 }
 
+// Load a compiled state machine .so and swap a process vtable.
+// The .so must export:
+//   sm_init_mapped(uint8_t **ptrs, int *widths, int n)
+//   sm_eval_mapped(void)
+//   sm_n_regs (int)
+//   sm_reg_names (const char *[])
+// Signal pointers are taken from the process scope's signals.
+#include <dlfcn.h>
+
+typedef void (*accel_eval_fn)(void);
+typedef void (*accel_init_fn)(uint8_t **, int *, int);
+
+// Per-process acceleration binding
+typedef struct {
+   rt_proc_vtable_t vtable;
+   accel_eval_fn    eval;
+   void            *dl_handle;
+} accel_binding_t;
+
+static void proc_eval_accel(rt_model_t *m, rt_proc_t *proc)
+{
+   // The vtable is the first field of accel_binding_t, so we can
+   // recover the binding from the vtable pointer
+   const accel_binding_t *binding =
+      (const accel_binding_t *)proc->vtable;
+   binding->eval();
+}
+
+bool accel_load(rt_model_t *m, const char *so_path)
+{
+   void *dl = dlopen(so_path, RTLD_NOW);
+   if (!dl) {
+      warnf("accel: cannot load %s: %s", so_path, dlerror());
+      return false;
+   }
+
+   accel_eval_fn eval = dlsym(dl, "sm_eval_mapped");
+   accel_init_fn init = dlsym(dl, "sm_init_mapped");
+   int *n_regs = dlsym(dl, "sm_n_regs");
+   const char **reg_names = dlsym(dl, "sm_reg_names");
+
+   if (!eval || !init || !n_regs || !reg_names) {
+      warnf("accel: %s missing sm_eval_mapped/sm_init_mapped/sm_n_regs/sm_reg_names",
+            so_path);
+      dlclose(dl);
+      return false;
+   }
+
+   notef("accel: loaded %s (%d registers)", so_path, *n_regs);
+
+   // Map signals: walk the scope tree, match register names to signals
+   rt_scope_t *root = root_scope(m);
+   uint8_t **ptrs = xcalloc_array(*n_regs, sizeof(uint8_t *));
+   int *widths = xcalloc_array(*n_regs, sizeof(int));
+   int mapped = 0;
+
+   // Walk all scopes and their signals
+   for (int ci = 0; ci < root->children.count; ci++) {
+      rt_scope_t *child = root->children.items[ci];
+      for (int si = 0; si < child->signals.count; si++) {
+         rt_signal_t *sig = child->signals.items[si];
+         const char *sname = istr(tree_ident(sig->where));
+         for (int r = 0; r < *n_regs; r++) {
+            if (ptrs[r]) continue;
+            const char *rn = reg_names[r];
+            while (*rn == '_') rn++;
+            if (sname && strcasestr(sname, rn)) {
+               ptrs[r] = (uint8_t *)sig->shared.data;
+               widths[r] = sig->nexus.width;
+               mapped++;
+               notef("accel:   %s -> %s (%d bits)", reg_names[r], sname, widths[r]);
+            }
+         }
+      }
+   }
+
+   if (mapped < *n_regs) {
+      warnf("accel: only %d/%d registers mapped — not activating", mapped, *n_regs);
+      free(ptrs);
+      free(widths);
+      dlclose(dl);
+      return false;
+   }
+
+   init(ptrs, widths, *n_regs);
+
+   // Find the process to swap — use the first always/assign process
+   rt_proc_t *target = NULL;
+   for (int ci = 0; ci < root->children.count && !target; ci++) {
+      rt_scope_t *child = root->children.items[ci];
+      for (int pi = 0; pi < child->procs.count; pi++) {
+         rt_proc_t *p = child->procs.items[pi];
+         if (p->wakeable.kind == W_PROC || p->wakeable.kind == W_ASSIGN) {
+            target = p;
+            break;
+         }
+      }
+   }
+
+   if (target) {
+      accel_binding_t *binding = xcalloc(sizeof(accel_binding_t));
+      binding->vtable.eval  = proc_eval_accel;
+      binding->vtable.reset = proc_reset_default;
+      binding->eval         = eval;
+      binding->dl_handle    = dl;
+
+      proc_set_vtable(target, &binding->vtable);
+      notef("accel: swapped process %s — acceleration ACTIVE", istr(target->name));
+   }
+   else {
+      warnf("accel: no process found to swap");
+   }
+
+   free(ptrs);
+   free(widths);
+   return target != NULL;
+}
+
+// Auto-discover and load acceleration .so files.
+// Looks for sm_<scope_name>.so in ~/.cache/nvc/accel/
+void accel_auto(rt_model_t *m)
+{
+   const char *home = getenv("HOME");
+   if (!home) home = "/tmp";
+
+   char accel_dir[512];
+   snprintf(accel_dir, sizeof(accel_dir), "%s/.cache/nvc/accel", home);
+
+   rt_scope_t *root = root_scope(m);
+   for (int ci = 0; ci < root->children.count; ci++) {
+      rt_scope_t *child = root->children.items[ci];
+      if (child->kind != SCOPE_INSTANCE) continue;
+
+      const char *name = istr(child->name);
+      char so_path[512];
+      snprintf(so_path, sizeof(so_path), "%s/sm_%s.so", accel_dir, name);
+
+      // Lowercase the module name part
+      char *p = strrchr(so_path, '/') + 4;  // skip "sm_"
+      for (; *p && *p != '.'; p++)
+         *p = tolower((unsigned char)*p);
+
+      if (access(so_path, F_OK) == 0)
+         accel_load(m, so_path);
+   }
+}
+
 void proc_reset_vtable(rt_proc_t *proc)
 {
    proc->vtable = &proc_default_vtable;
@@ -2688,6 +2835,11 @@ void model_reset(rt_model_t *m)
    // the thread local has been allocated and init is complete
    jit_thread_install_fast_path();
 
+   // Load compiled acceleration if available via environment
+   // (--accel command line option is handled in nvc.c after model_reset)
+   const char *accel_env = getenv("NVC_USE_ACCEL");
+   if (accel_env != NULL)
+      accel_load(m, accel_env);
 }
 
 static void update_property(rt_model_t *m, rt_prop_t *prop)
