@@ -1125,7 +1125,7 @@ static void *accel_bg_thread(void *arg)
    }
 
    snprintf(cmd, sizeof(cmd),
-            "gcc -O2 -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
+            "gcc -g -O3 -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
             bg->so_path, nvc_path, log_path);
 
    rc = system(cmd);
