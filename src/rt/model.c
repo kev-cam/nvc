@@ -19,6 +19,7 @@
 #include "array.h"
 #include "common.h"
 #include "debug.h"
+#include "diag.h"
 #include "hash.h"
 #include "jit/jit-exits.h"
 #include "jit/jit.h"
@@ -1050,6 +1051,114 @@ void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt)
 typedef void (*accel_eval_fn)(void);
 typedef void (*accel_init_fn)(uint8_t **, int *, int);
 
+#include <pthread.h>
+#include <sys/stat.h>
+
+// Background compile state
+typedef struct {
+   rt_model_t *model;
+   char        module[256];
+   char        src_file[512];
+   char        so_path[512];
+} accel_bg_t;
+
+static void *accel_bg_thread(void *arg)
+{
+   accel_bg_t *bg = arg;
+
+   // Ensure cache directory exists
+   char *dir = xstrdup(bg->so_path);
+   char *slash = strrchr(dir, '/');
+   if (slash) { *slash = '\0'; mkdir(dir, 0755); }
+   free(dir);
+
+   // Build paths for intermediate files
+   char c_path[512], nvc_path[512];
+   snprintf(c_path, sizeof(c_path), "%.*s.c",
+            (int)(strlen(bg->so_path) - 3), bg->so_path);
+   snprintf(nvc_path, sizeof(nvc_path), "%.*s_nvc.c",
+            (int)(strlen(bg->so_path) - 3), bg->so_path);
+
+   // Step 1: Run gen_statemachine (Yosys synthesis + C codegen)
+   // Look for gen_statemachine in common locations
+   const char *gen_sm = getenv("GEN_STATEMACHINE");
+   if (!gen_sm || access(gen_sm, X_OK) != 0) {
+      const char *paths[] = {
+         "gen_statemachine",
+         "/usr/local/src/sv2ghdl/yosys/gen_statemachine",
+         NULL
+      };
+      gen_sm = NULL;
+      for (const char **p = paths; *p; p++) {
+         if (access(*p, X_OK) == 0) { gen_sm = *p; break; }
+      }
+      if (!gen_sm) {
+         // Try PATH
+         gen_sm = "gen_statemachine";
+      }
+   }
+
+   // Log file for compile output
+   char log_path[512];
+   snprintf(log_path, sizeof(log_path), "%.*s.log",
+            (int)(strlen(bg->so_path) - 3), bg->so_path);
+
+   char cmd[2048];
+   snprintf(cmd, sizeof(cmd),
+            "%s '%s' '%s' '%s' >>'%s' 2>&1",
+            gen_sm, bg->src_file, bg->module, c_path, log_path);
+
+   notef("accel: compiling %s (log: %s)", bg->module, log_path);
+
+   int rc = system(cmd);
+   if (rc != 0) {
+      warnf("accel: synthesis failed for %s (see %s)", bg->module, log_path);
+      free(bg);
+      return NULL;
+   }
+
+   // Step 2: Compile .so from the NVC-mapped version
+   if (access(nvc_path, F_OK) != 0) {
+      warnf("accel: no NVC-mapped file generated for %s", bg->module);
+      free(bg);
+      return NULL;
+   }
+
+   snprintf(cmd, sizeof(cmd),
+            "gcc -O2 -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
+            bg->so_path, nvc_path, log_path);
+
+   rc = system(cmd);
+   if (rc != 0) {
+      warnf("accel: gcc failed for %s (rc=%d)", bg->module, rc);
+      free(bg);
+      return NULL;
+   }
+
+   notef("accel: compiled %s — loading", bg->so_path);
+
+   // Step 3: Load and swap vtable
+   accel_load(bg->model, bg->so_path);
+
+   free(bg);
+   return NULL;
+}
+
+static void accel_bg_compile(rt_model_t *m, const char *module,
+                             const char *src_file, const char *so_path)
+{
+   accel_bg_t *bg = xcalloc(sizeof(accel_bg_t));
+   bg->model = m;
+   snprintf(bg->module, sizeof(bg->module), "%s", module);
+   snprintf(bg->src_file, sizeof(bg->src_file), "%s", src_file);
+   snprintf(bg->so_path, sizeof(bg->so_path), "%s", so_path);
+
+   // For now, compile synchronously. The result is cached for next run.
+   // TODO: background compile with thread join before process exit
+   notef("accel: compiling module '%s' from %s", module, src_file);
+   accel_bg_thread(bg);
+}
+
 // Per-process acceleration binding
 typedef struct {
    rt_proc_vtable_t vtable;
@@ -1156,8 +1265,54 @@ bool accel_load(rt_model_t *m, const char *so_path)
    return target != NULL;
 }
 
+// Recursively scan scopes for acceleration .so files.
+static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
+                             const char *accel_dir)
+{
+   if (scope->kind == SCOPE_INSTANCE && scope->where != NULL
+       && tree_decls(scope->where) > 0) {
+      tree_t hier = tree_decl(scope->where, 0);
+      if (tree_kind(hier) == T_HIER) {
+         // hier ref points to the original entity/block
+         tree_t ref = tree_ref(hier);
+         const char *entity = istr(tree_ident(ref));
+
+         // Strip library prefix (e.g. "WORK.COUNTER8" -> "COUNTER8")
+         const char *dot = strrchr(entity, '.');
+         const char *modname = dot ? dot + 1 : entity;
+
+         char mod_lower[256];
+         snprintf(mod_lower, sizeof(mod_lower), "%s", modname);
+         for (char *p = mod_lower; *p; p++)
+            *p = tolower((unsigned char)*p);
+
+         char so_path[512];
+         snprintf(so_path, sizeof(so_path),
+                  "%s/accel-mod_%s-arch_from_verilog.so",
+                  accel_dir, mod_lower);
+
+         if (access(so_path, F_OK) == 0)
+            accel_load(m, so_path);
+         else {
+            // No cached .so — try to compile in background
+            const char *src_file = loc_file_str(tree_loc(ref));
+            if (src_file != NULL) {
+               accel_bg_compile(m, mod_lower, src_file, so_path);
+            }
+            else {
+               notef("accel: no .so for module '%s' and no source",
+                     mod_lower);
+            }
+         }
+      }
+   }
+
+   for (int ci = 0; ci < scope->children.count; ci++)
+      accel_scan_scope(m, scope->children.items[ci], accel_dir);
+}
+
 // Auto-discover and load acceleration .so files.
-// Looks for sm_<scope_name>.so in ~/.cache/nvc/accel/
+// Naming: ~/.cache/nvc/accel/accel-mod_<entity>-arch_<arch>.so
 void accel_auto(rt_model_t *m)
 {
    const char *home = getenv("HOME");
@@ -1166,23 +1321,7 @@ void accel_auto(rt_model_t *m)
    char accel_dir[512];
    snprintf(accel_dir, sizeof(accel_dir), "%s/.cache/nvc/accel", home);
 
-   rt_scope_t *root = root_scope(m);
-   for (int ci = 0; ci < root->children.count; ci++) {
-      rt_scope_t *child = root->children.items[ci];
-      if (child->kind != SCOPE_INSTANCE) continue;
-
-      const char *name = istr(child->name);
-      char so_path[512];
-      snprintf(so_path, sizeof(so_path), "%s/sm_%s.so", accel_dir, name);
-
-      // Lowercase the module name part
-      char *p = strrchr(so_path, '/') + 4;  // skip "sm_"
-      for (; *p && *p != '.'; p++)
-         *p = tolower((unsigned char)*p);
-
-      if (access(so_path, F_OK) == 0)
-         accel_load(m, so_path);
-   }
+   accel_scan_scope(m, root_scope(m), accel_dir);
 }
 
 void proc_reset_vtable(rt_proc_t *proc)
