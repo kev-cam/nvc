@@ -1153,9 +1153,57 @@ static void accel_bg_compile(rt_model_t *m, const char *module,
    snprintf(bg->src_file, sizeof(bg->src_file), "%s", src_file);
    snprintf(bg->so_path, sizeof(bg->so_path), "%s", so_path);
 
-   // For now, compile synchronously. The result is cached for next run.
-   // TODO: background compile with thread join before process exit
-   notef("accel: compiling module '%s' from %s", module, src_file);
+   // Try smak for background build, fall back to synchronous
+   typedef int (*smak_find_fn)(void);
+   typedef int (*smak_connect_fn)(int);
+   typedef int (*smak_submit_fn)(int, const char*, const char*, const char*);
+   typedef void (*smak_disconnect_fn)(int);
+
+   static void *smak_lib = NULL;
+   static int smak_checked = 0;
+   if (!smak_checked) {
+      smak_lib = dlopen("libsmak-client.so", RTLD_NOW);
+      if (!smak_lib)
+         smak_lib = dlopen("/usr/local/src/smak/libsmak-client.so", RTLD_NOW);
+      smak_checked = 1;
+   }
+
+   if (smak_lib) {
+      smak_find_fn find = dlsym(smak_lib, "smak_find_server");
+      smak_connect_fn conn = dlsym(smak_lib, "smak_connect");
+      smak_submit_fn submit = dlsym(smak_lib, "smak_submit");
+      smak_disconnect_fn disc = dlsym(smak_lib, "smak_disconnect");
+
+      if (find && conn && submit && disc) {
+         int port = find();
+         if (port > 0) {
+            int fd = conn(port);
+            if (fd >= 0) {
+               // Build the full command as a single shell command
+               char cmd[2048];
+               snprintf(cmd, sizeof(cmd),
+                        "cd '%s' && gen_statemachine '%s' '%s' '%s' && "
+                        "gcc -O2 -shared -fPIC -o '%s' '%s_nvc.c'",
+                        getenv("HOME"),
+                        bg->src_file, bg->module,
+                        bg->so_path,
+                        bg->so_path,
+                        bg->so_path);
+               // Remove .so suffix from the _nvc.c path
+               // Actually the path is already correct from gen_statemachine
+
+               submit(fd, bg->so_path, cmd, getenv("HOME"));
+               notef("accel: submitted '%s' to smak (port %d)", module, port);
+               disc(fd);
+               free(bg);
+               return;
+            }
+         }
+      }
+   }
+
+   // Fallback: synchronous compile
+   notef("accel: compiling module '%s' from %s (synchronous)", module, src_file);
    accel_bg_thread(bg);
 }
 
