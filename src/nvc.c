@@ -830,6 +830,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "xyce-netlist",     required_argument, 0, 'Y' },
       { "xyce-config",      required_argument, 0, 'Z' },
       { "accel",             no_argument,       0, 'A' },
+      { "launch-debug",      optional_argument, 0, 300 },
       { 0, 0, 0, 0 }
    };
 
@@ -843,12 +844,17 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
    bool          use_accel = false;
+   const char   *launch_debug = NULL;
 
    static bool have_run = false;
    if (have_run)
       fatal("multiple run commands are not supported");
 
    have_run = true;
+
+   // Save original args before getopt consumes them
+   const int orig_argc = argc;
+   char **orig_argv = argv;
 
    const int next_cmd = scan_cmd(2, argc, argv);
 
@@ -963,6 +969,10 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       case 'A':
          use_accel = true;
          break;
+      case 300:
+         launch_debug = optarg ? optarg : "ddd --gdb --args";
+         use_accel = true;  // debug implies accel
+         break;
       default:
          should_not_reach_here();
       }
@@ -1071,6 +1081,38 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (use_accel)
       accel_auto(state->model);
+
+   if (launch_debug != NULL) {
+      // The .so has been compiled by accel_auto above.
+      // Re-exec under the debugger with --accel (not --launch-debug)
+      // so the cached .so loads immediately.
+      char nvc_path[512];
+      ssize_t len = readlink("/proc/self/exe", nvc_path, sizeof(nvc_path) - 1);
+      if (len > 0) {
+         nvc_path[len] = '\0';
+      } else {
+         snprintf(nvc_path, sizeof(nvc_path), "%s",
+                  getenv("_") ?: "nvc");
+      }
+
+      char dbg_cmd[4096];
+      snprintf(dbg_cmd, sizeof(dbg_cmd), "%s %s", launch_debug, nvc_path);
+
+      // Reconstruct args: replace --launch-debug with --accel
+      for (int i = 1; i < orig_argc; i++) {
+         const char *arg = orig_argv[i];
+         if (strncmp(arg, "--launch-debug", 14) == 0) {
+            strcat(dbg_cmd, " --accel");
+            continue;
+         }
+         snprintf(dbg_cmd + strlen(dbg_cmd),
+                  sizeof(dbg_cmd) - strlen(dbg_cmd), " '%s'", arg);
+      }
+
+      notef("launching: %s", dbg_cmd);
+      int rc = system(dbg_cmd);
+      exit(WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);
+   }
 
    if (rcmode != NULL && strcmp(rcmode, "none") == 0) {
       // Run with stop_time=0 to fire START_OF_SIMULATION callbacks

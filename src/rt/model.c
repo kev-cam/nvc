@@ -1124,9 +1124,11 @@ static void *accel_bg_thread(void *arg)
       return NULL;
    }
 
+   const char *accel_cc = getenv("NVC_ACCEL_CC");
+   if (!accel_cc) accel_cc = "gcc -g -O3";
    snprintf(cmd, sizeof(cmd),
-            "gcc -g -O3 -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
-            bg->so_path, nvc_path, log_path);
+            "%s -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
+            accel_cc, bg->so_path, nvc_path, log_path);
 
    rc = system(cmd);
    if (rc != 0) {
