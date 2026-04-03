@@ -184,14 +184,18 @@ static void interpret_format(const char *fmt, vpiHandle it)
             format_string(it, fwidth);
             break;
          case 'd':
+         case 'D':
          case 'b':
+         case 'B':
          case 'x':
+         case 'X':
          case 'h':
+         case 'H':
          case 't':
          case 'f':
          case 'g':
          case 'e':
-            format_number(it, *p, fwidth, fprec);
+            format_number(it, tolower(*p), fwidth, fprec);
             break;
          case 'c':
             format_char(it, fwidth);
