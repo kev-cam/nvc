@@ -67,6 +67,8 @@ static parse_state_t    state;
 static vlog_kind_t      param_kind;
 static vlog_net_kind_t  implicit_kind;
 static vlog_symtab_t   *symtab;
+static uint64_t         vlog_timescale_unit = 1;  // default: 1fs
+static uint64_t         vlog_timescale_prec = 1;  // default: 1fs
 static vlog_node_t      last_attr;
 static vlog_node_t      atom_types[DT_BIT + 1];
 
@@ -385,7 +387,8 @@ static void set_timescale(uint64_t unit_value, const char *unit_name,
       args[i].parsed *= args[i].value;
    }
 
-   // TODO: do something with parsed scale/precision
+   vlog_timescale_unit = args[0].parsed;   // time unit in fs
+   vlog_timescale_prec = args[1].parsed;   // precision in fs
 }
 
 static void skip_over_attributes(void)
@@ -2046,6 +2049,33 @@ static vlog_node_t p_delay_value(void)
    }
 }
 
+// Scale a delay value node by the current `timescale unit.
+// For integer delays (#100 with `timescale 1ns/1ps), multiply by
+// the unit value in fs so delays are in absolute femtoseconds.
+static vlog_node_t scale_delay(vlog_node_t val)
+{
+   if (vlog_timescale_unit <= 1)
+      return val;   // Already in fs (default)
+
+   if (vlog_kind(val) == V_NUMBER) {
+      number_t num = vlog_number(val);
+      int64_t scaled = number_integer(num) * vlog_timescale_unit;
+      vlog_node_t sv = vlog_new(V_NUMBER);
+      vlog_set_number(sv, number_from_int(scaled));
+      vlog_set_loc(sv, vlog_loc(val));
+      return sv;
+   }
+   else if (vlog_kind(val) == V_REAL) {
+      double scaled = vlog_dval(val) * vlog_timescale_unit;
+      vlog_node_t sv = vlog_new(V_REAL);
+      vlog_set_dval(sv, scaled);
+      vlog_set_loc(sv, vlog_loc(val));
+      return sv;
+   }
+
+   return val;  // expression — can't scale statically
+}
+
 static vlog_node_t p_delay_control(void)
 {
    // # delay_value | # ( mintypmax_expression )
@@ -2056,10 +2086,13 @@ static vlog_node_t p_delay_control(void)
 
    vlog_node_t v = vlog_new(V_DELAY_CONTROL);
 
+   vlog_node_t dval;
    if (peek() != tLPAREN)
-      vlog_set_value(v, p_delay_value());
+      dval = p_delay_value();
    else
-      vlog_set_value(v, p_mintypmax_expression());
+      dval = p_mintypmax_expression();
+
+   vlog_set_value(v, scale_delay(dval));
 
    vlog_set_loc(v, CURRENT_LOC);
    return v;
