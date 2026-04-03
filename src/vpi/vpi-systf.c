@@ -17,6 +17,7 @@
 
 #include "util.h"
 #include "diag.h"
+#include <ctype.h>
 #include "jit/jit.h"
 #include "option.h"
 #include "rt/model.h"
