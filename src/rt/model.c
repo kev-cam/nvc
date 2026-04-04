@@ -1446,6 +1446,27 @@ void lazy_eval_install(rt_model_t *m)
          if (proc->wakeable.kind != W_PROC)
             continue;
 
+         // Only wrap event-sensitive always blocks (@posedge etc).
+         // Skip initial blocks and delay-based always (#N).
+         {
+            bool wrap_this = false;
+            if (proc->where != NULL && tree_kind(proc->where) == T_VERILOG) {
+               vlog_node_t vn = tree_vlog(proc->where);
+               if (vlog_kind(vn) == V_ALWAYS && vlog_stmts(vn) > 0) {
+                  vlog_node_t first = vlog_stmt(vn, 0);
+                  // V_TIMING with V_EVENT_CONTROL = event-sensitive
+                  // V_TIMING with V_DELAY_CONTROL = delay-based, don't wrap
+                  if (vlog_kind(first) == V_TIMING
+                      && vlog_kind(vlog_value(first)) == V_EVENT_CONTROL)
+                     wrap_this = true;
+               }
+            }
+            else if (proc->where != NULL && tree_kind(proc->where) == T_PROCESS)
+               wrap_this = true;  // VHDL process
+
+            if (!wrap_this) continue;
+         }
+
          lazy_proc_wrap_t *wrap = xcalloc(sizeof(lazy_proc_wrap_t));
          wrap->vtable.eval = proc_eval_lazy;  // armed initially
          wrap->vtable.reset = proc_reset_default;
