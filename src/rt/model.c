@@ -1412,13 +1412,18 @@ static void proc_eval_lazy(rt_model_t *m, rt_proc_t *proc)
 {
    lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
    wrap->real_eval(m, proc);
-   wrap->vtable.eval = proc_eval_nop;  // disarm until next deposit
+   // Disarm: next clock edge will be NOP unless re-armed by deposit
+   wrap->vtable.eval = proc_eval_nop;
 }
 
 static inline void lazy_arm_proc(rt_proc_t *proc)
 {
-   lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
-   wrap->vtable.eval = proc_eval_lazy;
+   // Only arm if this process has a lazy wrapper (mutable vtable)
+   if (proc->vtable->eval == proc_eval_nop
+       || proc->vtable->eval == proc_eval_lazy) {
+      lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
+      wrap->vtable.eval = proc_eval_lazy;
+   }
 }
 
 // Reader list per nexus
@@ -1427,6 +1432,7 @@ static ihash_t *g_lazy_readers = NULL;
 // Deposit that also arms reading processes
 static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
+   // Default deposit + arm readers on change
    unsigned char *eff = nexus_effective(n);
    unsigned char *last = nexus_last_value(n);
    const size_t valuesz = n->size * n->width;
@@ -1467,8 +1473,11 @@ void lazy_eval_install(rt_model_t *m)
          if (proc->wakeable.kind != W_PROC)
             continue;
 
-         // All processes always eval — no NOP wrapping yet.
-         // Just register as readers so deposit can arm them later.
+         lazy_proc_wrap_t *wrap = xcalloc(sizeof(lazy_proc_wrap_t));
+         wrap->vtable.eval = proc_eval_lazy;  // armed initially
+         wrap->vtable.reset = proc_reset_default;
+         wrap->real_eval = proc->vtable->eval;
+         proc->vtable = &wrap->vtable;
          n_wrapped++;
 
          // Register as reader of ALL nexuses (coarse — refine later)
