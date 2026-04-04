@@ -831,6 +831,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "xyce-config",      required_argument, 0, 'Z' },
       { "accel",             no_argument,       0, 'A' },
       { "launch-debug",      optional_argument, 0, 300 },
+      { "lazy-eval",         no_argument,       0, 301 },
       { 0, 0, 0, 0 }
    };
 
@@ -844,6 +845,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
    bool          use_accel = false;
+   bool          lazy_eval = false;
    const char   *launch_debug = NULL;
 
    static bool have_run = false;
@@ -973,6 +975,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          launch_debug = optarg ? optarg : "ddd --gdb --args";
          use_accel = true;  // debug implies accel
          break;
+      case 301:
+         lazy_eval = true;
+         break;
       default:
          should_not_reach_here();
       }
@@ -1081,6 +1086,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (use_accel)
       accel_auto(state->model);
+
+   if (lazy_eval)
+      lazy_eval_install(state->model);
 
    if (launch_debug != NULL) {
       // The .so has been compiled by accel_auto above.

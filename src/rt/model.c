@@ -174,12 +174,14 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset);
 static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value);
 static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value);
 static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n);
+static void notify_event_default(rt_model_t *m, rt_nexus_t *n);
 
 // Default nexus vtable — full general-case implementations
 static const rt_nexus_vtable_t nexus_default_vtable = {
    .update_driving = calculate_driving_value,
    .deposit        = put_effective,
    .read_source    = source_value,
+   .notify         = notify_event_default,
 };
 static void calculate_driving_single(rt_model_t *m, rt_nexus_t *n);
 static void calculate_driving_memo1(rt_model_t *m, rt_nexus_t *n);
@@ -1378,6 +1380,146 @@ void accel_auto(rt_model_t *m)
 void proc_reset_vtable(rt_proc_t *proc)
 {
    proc->vtable = &proc_default_vtable;
+}
+
+// --- Lazy eval ---
+#include "rt/lazy-eval.h"
+
+// Per-process lazy state, keyed by proc pointer
+typedef struct {
+   rt_proc_vtable_t   vtable;        // must be first (matches proc->vtable)
+   proc_eval_fn       real_eval;     // original JIT eval
+   lazy_proc_state_t  state;
+} lazy_proc_wrap_t;
+
+// Lazy eval: skip if not armed
+static void proc_eval_lazy(rt_model_t *m, rt_proc_t *proc)
+{
+   lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
+
+   // TODO: skip eval when !armed once bindings are correct
+   // For now, always eval (same as baseline) to verify correctness
+   wrap->real_eval(m, proc);
+}
+
+// Binding list head stored on the nexus (using free_value field
+// which is NULL during normal simulation)
+// Actually we need a proper place. Use a global hash for now.
+static ihash_t *g_lazy_bindings = NULL;   // nexus ptr -> lazy_binding_t *
+
+// Called from notify_event when lazy-eval is active:
+// prime all processes that read this signal, arm them
+static void notify_event_lazy(rt_model_t *m, rt_nexus_t *n)
+{
+   if (g_lazy_bindings) {
+      lazy_binding_t *b = ihash_get(g_lazy_bindings, (uintptr_t)n);
+      while (b != NULL) {
+         lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)b->proc->vtable;
+         lazy_pack_input(&wrap->state.inputs[b->slot]);
+         wrap->state.armed = true;
+         b = b->next;
+      }
+   }
+
+   // Still do normal notification (processes need to be queued)
+   wakeup_all(m, &(n->pending));
+}
+
+static const rt_nexus_vtable_t nexus_lazy_notify_vtable = {
+   .update_driving = calculate_driving_value,
+   .deposit        = put_effective,
+   .read_source    = source_value,
+   .notify         = notify_event_default,
+   .notify         = notify_event_lazy,
+};
+
+// Scan a scope for signals and create bindings for all processes
+// that are sensitive in that scope. Coarse: binds every signal
+// to every process in the scope.
+static void lazy_bind_scope(rt_scope_t *scope)
+{
+   for (int pi = 0; pi < scope->procs.count; pi++) {
+      rt_proc_t *proc = scope->procs.items[pi];
+      if (proc->wakeable.kind != W_PROC)
+         continue;
+
+      lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
+
+      // Bind this process to all signals in the same scope
+      int slot = 0;
+      for (int si = 0; si < scope->signals.count; si++) {
+         rt_signal_t *sig = scope->signals.items[si];
+         rt_nexus_t *n = &sig->nexus;
+
+         if (slot >= wrap->state.n_inputs)
+            break;
+
+         // Set up the input cache
+         wrap->state.inputs[slot].sig_data = (uint8_t *)sig->shared.data;
+         wrap->state.inputs[slot].width = n->width;
+
+         // Prime initial value
+         lazy_pack_input(&wrap->state.inputs[slot]);
+
+         // Add binding: this nexus -> this process slot
+         lazy_binding_t *b = xcalloc(sizeof(lazy_binding_t));
+         b->proc = proc;
+         b->slot = slot;
+         b->next = ihash_get(g_lazy_bindings, (uintptr_t)n);
+         ihash_put(g_lazy_bindings, (uintptr_t)n, b);
+
+         slot++;
+      }
+   }
+}
+
+void lazy_eval_install(rt_model_t *m)
+{
+   rt_scope_t *root = root_scope(m);
+   g_lazy_bindings = ihash_new(256);
+
+   int n_wrapped = 0;
+
+   // Wrap all processes with lazy eval
+   void wrap_procs(rt_scope_t *scope) {
+      for (int pi = 0; pi < scope->procs.count; pi++) {
+         rt_proc_t *proc = scope->procs.items[pi];
+         if (proc->wakeable.kind != W_PROC)
+            continue;
+
+         // Count signals in scope as max inputs
+         int n_inputs = scope->signals.count;
+         if (n_inputs == 0) continue;
+
+         lazy_proc_wrap_t *wrap = xcalloc(sizeof(lazy_proc_wrap_t));
+         wrap->vtable.eval = proc_eval_lazy;
+         wrap->vtable.reset = proc_reset_default;
+         wrap->real_eval = proc->vtable->eval;
+         wrap->state.n_inputs = n_inputs;
+         wrap->state.inputs = xcalloc_array(n_inputs, sizeof(lazy_input_t));
+         wrap->state.armed = true;   // run on first clock
+
+         proc->vtable = &wrap->vtable;
+         n_wrapped++;
+      }
+      for (int ci = 0; ci < scope->children.count; ci++)
+         wrap_procs(scope->children.items[ci]);
+   }
+   wrap_procs(root);
+
+   // Create bindings and install lazy notify on all nexuses
+   void bind_scopes(rt_scope_t *scope) {
+      lazy_bind_scope(scope);
+      for (int ci = 0; ci < scope->children.count; ci++)
+         bind_scopes(scope->children.items[ci]);
+   }
+   bind_scopes(root);
+
+   // Install lazy notify on all nexuses
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
+      n->vtable = &nexus_lazy_notify_vtable;
+
+   notef("lazy-eval: %d processes wrapped", n_wrapped);
 }
 
 static void run_process(rt_model_t *m, rt_proc_t *proc)
@@ -3579,6 +3721,11 @@ static void wakeup_all(rt_model_t *m, void **pending)
    }
 }
 
+static void notify_event_default(rt_model_t *m, rt_nexus_t *n)
+{
+   wakeup_all(m, &(n->pending));
+}
+
 static void notify_event(rt_model_t *m, rt_nexus_t *n)
 {
    n->last_event = m->now;
@@ -3587,7 +3734,7 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    if (n->flags & NET_F_CACHE_EVENT)
       n->signal->shared.flags |= SIG_F_EVENT_FLAG;
 
-   wakeup_all(m, &(n->pending));
+   n->vtable->notify(m, n);
 }
 
 static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value)
@@ -3691,6 +3838,7 @@ static const rt_nexus_vtable_t nexus_single_driver_vtable = {
    .update_driving = calculate_driving_single,
    .deposit        = put_effective,
    .read_source    = source_value,
+   .notify         = notify_event_default,
 };
 
 // Vtable for single-driver with memoised resolution
@@ -3698,6 +3846,7 @@ static const rt_nexus_vtable_t nexus_memo1_vtable = {
    .update_driving = calculate_driving_memo1,
    .deposit        = put_effective,
    .read_source    = source_value,
+   .notify         = notify_event_default,
 };
 
 static void defer_driving_update(rt_model_t *m, rt_nexus_t *n)

@@ -210,6 +210,7 @@ typedef struct _rt_nexus_vtable {
    void  (*update_driving)(rt_model_t *m, rt_nexus_t *n);
    void  (*deposit)(rt_model_t *m, rt_nexus_t *n, const void *value);
    void *(*read_source)(rt_nexus_t *nexus, rt_source_t *src);
+   void  (*notify)(rt_model_t *m, rt_nexus_t *n);
 } rt_nexus_vtable_t;
 
 typedef struct _rt_nexus {
