@@ -1393,41 +1393,35 @@ void proc_reset_vtable(rt_proc_t *proc)
 // armed processes eval, unarmed processes are NOPs. After eval,
 // the process disarms. The deposit re-arms when data changes again.
 
-typedef struct _lazy_reader {
-   rt_proc_t          *proc;
-   struct _lazy_reader *next;
-} lazy_reader_t;
-
 typedef struct {
    rt_proc_vtable_t vtable;
    proc_eval_fn     real_eval;
+   uint64_t         dirty;      // bitmap: bit per input, non-zero = armed
 } lazy_proc_wrap_t;
-
-static void proc_eval_nop(rt_model_t *m, rt_proc_t *proc)
-{
-   (void)m; (void)proc;
-}
 
 static void proc_eval_lazy(rt_model_t *m, rt_proc_t *proc)
 {
    lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
+   if (wrap->dirty == 0)
+      return;   // NOP — no inputs changed
+   wrap->dirty = 0;
    wrap->real_eval(m, proc);
-   // Disarm: next clock edge will be NOP unless re-armed by deposit
-   wrap->vtable.eval = proc_eval_nop;
 }
 
-static inline void lazy_arm_proc(rt_proc_t *proc)
-{
-   // Only arm if this process has a lazy wrapper (mutable vtable)
-   if (proc->vtable->eval == proc_eval_nop
-       || proc->vtable->eval == proc_eval_lazy) {
-      lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
-      wrap->vtable.eval = proc_eval_lazy;
-   }
-}
+// Per-nexus reader entry: which process to arm, which bit to set
+typedef struct {
+   lazy_proc_wrap_t *wrap;
+   uint64_t          bit;
+} lazy_nexus_reader_t;
 
-// Reader list per nexus
-static ihash_t *g_lazy_readers = NULL;
+// Per-nexus reader array (compact, no hash, no list)
+typedef struct {
+   int                   count;
+   lazy_nexus_reader_t  *readers;
+} lazy_nexus_readers_t;
+
+// Global: nexus -> readers mapping
+static ihash_t *g_lazy_nmap = NULL;
 
 // put_effective_lazy and nexus_lazy_vtable defined after inline helpers
 static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value);
@@ -1436,7 +1430,7 @@ static const rt_nexus_vtable_t nexus_lazy_vtable;
 void lazy_eval_install(rt_model_t *m)
 {
    rt_scope_t *root = root_scope(m);
-   g_lazy_readers = ihash_new(256);
+   g_lazy_nmap = ihash_new(256);
    int n_wrapped = 0;
 
    // Collect all W_PROC processes
@@ -1468,18 +1462,38 @@ void lazy_eval_install(rt_model_t *m)
          }
 
          lazy_proc_wrap_t *wrap = xcalloc(sizeof(lazy_proc_wrap_t));
-         wrap->vtable.eval = proc_eval_lazy;  // armed initially
+         wrap->vtable.eval = proc_eval_lazy;
          wrap->vtable.reset = proc_reset_default;
          wrap->real_eval = proc->vtable->eval;
+         wrap->dirty = ~(uint64_t)0;  // all bits set = armed initially
          proc->vtable = &wrap->vtable;
          n_wrapped++;
 
-         // Register as reader of ALL nexuses (coarse — refine later)
-         for (rt_nexus_t *nx = m->nexuses; nx != NULL; nx = nx->chain) {
-            lazy_reader_t *r = xcalloc(sizeof(lazy_reader_t));
-            r->proc = proc;
-            r->next = ihash_get(g_lazy_readers, (uintptr_t)nx);
-            ihash_put(g_lazy_readers, (uintptr_t)nx, r);
+         // Register this process on signals in its scope and parent.
+         // Each signal gets one bit in the dirty mask.
+         // Bit 0 = first signal, bit 1 = second, etc. (up to 64)
+         int bit_idx = 0;
+         for (int pass = 0; pass < 2; pass++) {
+            rt_scope_t *s = (pass == 0) ? scope : scope->parent;
+            if (s == NULL) continue;
+            for (int si = 0; si < s->signals.count && bit_idx < 64; si++) {
+               rt_signal_t *sig = s->signals.items[si];
+               rt_nexus_t *nx = &sig->nexus;
+               uint64_t bit = UINT64_C(1) << bit_idx;
+               bit_idx++;
+
+               // Add to nexus reader array
+               lazy_nexus_readers_t *nr = ihash_get(g_lazy_nmap, (uintptr_t)nx);
+               if (nr == NULL) {
+                  nr = xcalloc(sizeof(lazy_nexus_readers_t));
+                  ihash_put(g_lazy_nmap, (uintptr_t)nx, nr);
+               }
+               nr->readers = xrealloc(nr->readers,
+                  (nr->count + 1) * sizeof(lazy_nexus_reader_t));
+               nr->readers[nr->count].wrap = wrap;
+               nr->readers[nr->count].bit = bit;
+               nr->count++;
+            }
          }
       }
       for (int ci = 0; ci < scope->children.count; ci++)
@@ -1615,7 +1629,7 @@ static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value)
    n->vtable->deposit(m, n, value);
 }
 
-// Deposit that also arms reading processes (lazy eval)
+// Deposit that arms reading processes via bitmap (lazy eval)
 static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
    unsigned char *eff = nexus_effective(n);
@@ -1625,12 +1639,11 @@ static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
    if (!cmp_bytes(eff, value, valuesz)) {
       copy2(last, eff, value, valuesz);
 
-      if (g_lazy_readers) {
-         lazy_reader_t *r = ihash_get(g_lazy_readers, (uintptr_t)n);
-         while (r != NULL) {
-            lazy_arm_proc(r->proc);
-            r = r->next;
-         }
+      // Arm readers: one OR per process, no list walk, no hash
+      lazy_nexus_readers_t *nr = ihash_get(g_lazy_nmap, (uintptr_t)n);
+      if (nr != NULL) {
+         for (int i = 0; i < nr->count; i++)
+            nr->readers[i].wrap->dirty |= nr->readers[i].bit;
       }
 
       notify_event(m, n);
