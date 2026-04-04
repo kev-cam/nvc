@@ -1429,36 +1429,9 @@ static inline void lazy_arm_proc(rt_proc_t *proc)
 // Reader list per nexus
 static ihash_t *g_lazy_readers = NULL;
 
-// Deposit that also arms reading processes
-static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
-{
-   // Default deposit + arm readers on change
-   unsigned char *eff = nexus_effective(n);
-   unsigned char *last = nexus_last_value(n);
-   const size_t valuesz = n->size * n->width;
-
-   if (!cmp_bytes(eff, value, valuesz)) {
-      copy2(last, eff, value, valuesz);
-
-      // Arm reading processes
-      if (g_lazy_readers) {
-         lazy_reader_t *r = ihash_get(g_lazy_readers, (uintptr_t)n);
-         while (r != NULL) {
-            lazy_arm_proc(r->proc);
-            r = r->next;
-         }
-      }
-
-      notify_event(m, n);
-   }
-}
-
-static const rt_nexus_vtable_t nexus_lazy_vtable = {
-   .update_driving = calculate_driving_value,
-   .deposit        = put_effective_lazy,
-   .read_source    = source_value,
-   .notify         = notify_event_default,
-};
+// put_effective_lazy and nexus_lazy_vtable defined after inline helpers
+static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value);
+static const rt_nexus_vtable_t nexus_lazy_vtable;
 
 void lazy_eval_install(rt_model_t *m)
 {
@@ -1620,6 +1593,35 @@ static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
    n->vtable->deposit(m, n, value);
 }
+
+// Deposit that also arms reading processes (lazy eval)
+static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
+{
+   unsigned char *eff = nexus_effective(n);
+   unsigned char *last = nexus_last_value(n);
+   const size_t valuesz = n->size * n->width;
+
+   if (!cmp_bytes(eff, value, valuesz)) {
+      copy2(last, eff, value, valuesz);
+
+      if (g_lazy_readers) {
+         lazy_reader_t *r = ihash_get(g_lazy_readers, (uintptr_t)n);
+         while (r != NULL) {
+            lazy_arm_proc(r->proc);
+            r = r->next;
+         }
+      }
+
+      notify_event(m, n);
+   }
+}
+
+static const rt_nexus_vtable_t nexus_lazy_vtable = {
+   .update_driving = calculate_driving_value,
+   .deposit        = put_effective_lazy,
+   .read_source    = source_value,
+   .notify         = notify_event_default,
+};
 
 static rt_value_t alloc_value(rt_model_t *m, rt_nexus_t *n)
 {
