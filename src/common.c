@@ -17,6 +17,7 @@
 
 #include "util.h"
 #include "common.h"
+#include <unistd.h>
 #include "diag.h"
 #include "hash.h"
 #include "ident.h"
@@ -2626,6 +2627,58 @@ void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
                   mir_context_t *mc)
 {
    input_from_file(file);
+
+   // Check for file-type translator hook before using native parser
+   if (source_kind() == SOURCE_VERILOG) {
+      // Try to translate .v/.sv to VHDL via sv2ghdl/iverilog
+      static const char *translator_paths[] = {
+         "iverilog-sv2ghdl",
+         "/usr/local/src/sv2ghdl/bin/iverilog-sv2ghdl",
+         NULL
+      };
+
+      const char *translator = NULL;
+      for (const char **p = translator_paths; *p; p++) {
+         if (access(*p, X_OK) == 0) { translator = *p; break; }
+      }
+
+      // Also check SV2GHDL env var
+      const char *env_translator = getenv("SV2GHDL");
+      if (env_translator && access(env_translator, X_OK) == 0)
+         translator = env_translator;
+
+      if (translator != NULL) {
+         // Translate to VHDL in a temp directory, then analyse the VHDL
+         char tmpdir[512];
+         snprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_%d", getpid());
+
+         char cmd[2048];
+         snprintf(cmd, sizeof(cmd),
+                  "%s -o '%s' '%s' 2>&1", translator, tmpdir, file);
+
+         notef("translating %s via %s", file, translator);
+         int rc = system(cmd);
+         if (rc == 0) {
+            // Find and analyse the generated VHDL
+            char vhdl_path[512];
+            snprintf(vhdl_path, sizeof(vhdl_path), "%s/design.vhd", tmpdir);
+            if (access(vhdl_path, F_OK) == 0) {
+               analyse_file(vhdl_path, jit, ur, mc);
+               return;
+            }
+         }
+
+         warnf("translation of %s failed (rc=%d), trying native parser", file, rc);
+         // Fall through to native parser
+         input_from_file(file);  // re-open the original file
+      }
+      else {
+         warnf("Verilog file %s: for best results, install sv2ghdl", file);
+         warnf("  https://github.com/kev-cam/sv2ghdl");
+         warnf("  or set SV2GHDL=/path/to/iverilog-sv2ghdl");
+         // Fall through to native parser
+      }
+   }
 
    switch (source_kind()) {
    case SOURCE_VHDL:
