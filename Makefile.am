@@ -73,6 +73,7 @@ include lib/synopsys/Makemodule.am
 include lib/sv2vhdl/Makemodule.am
 include lib/photonics/Makemodule.am
 include lib/rf/Makemodule.am
+include lib/ncl/Makemodule.am
 include contrib/Makemodule.am
 include contrib/gui/Makemodule.am
 include contrib/msi/Makemodule.am

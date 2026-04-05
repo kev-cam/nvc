@@ -1,0 +1,28 @@
+ncldir = $(pkglibdir)/ncl
+
+# --- Compiled VHDL units ---
+
+ncl_DATA = \
+	lib/ncl/_NVC_LIB \
+	lib/ncl/_index \
+	lib/ncl/NCL.NCL \
+	lib/ncl/NCL.NCL-body
+
+EXTRA_DIST += \
+	lib/ncl/ncl.vhdl
+
+BOOTSTRAPLIBS += $(ncl_DATA)
+
+lib/ncl/_NVC_LIB:
+
+lib/ncl/_index:
+
+# --- Package ---
+
+lib/ncl/NCL.NCL: $(srcdir)/lib/ncl/ncl.vhdl @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2008 -L lib/ --work=lib/ncl -a --relative=$(srcdir) $(srcdir)/lib/ncl/ncl.vhdl
+
+lib/ncl/NCL.NCL-body: lib/ncl/NCL.NCL
+
+# --- Dependencies ---
+lib/ncl/NCL.NCL: lib/ieee/IEEE.STD_LOGIC_1164
