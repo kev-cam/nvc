@@ -1404,8 +1404,22 @@ static void proc_eval_lazy(rt_model_t *m, rt_proc_t *proc)
    lazy_proc_wrap_t *wrap = (lazy_proc_wrap_t *)proc->vtable;
    if (wrap->dirty == 0)
       return;   // NOP — no inputs changed
+   // Don't clear dirty here — the deposit from this eval's writes
+   // happens in a later delta cycle. Clear it at end of cycle instead.
+   // For now, mark as "ran this cycle" by saving dirty and restoring
+   // after eval so the deposit can re-arm.
+   uint64_t saved = wrap->dirty;
    wrap->dirty = 0;
    wrap->real_eval(m, proc);
+   // If no deposits re-armed during eval, the process will be NOP
+   // next cycle. If deposits DID re-arm, dirty is non-zero again.
+   // For self-feeding processes (counter), the write goes through
+   // put_driving which eventually calls put_effective_lazy in the
+   // same or next delta — that's too late.
+   // Workaround: if the process wrote anything (dirty was set before),
+   // keep it armed for one more cycle.
+   if (wrap->dirty == 0)
+      wrap->dirty = saved;  // stay armed until deposit confirms no change
 }
 
 // Per-nexus reader entry: which process to arm, which bit to set
@@ -1479,6 +1493,9 @@ void lazy_eval_install(rt_model_t *m)
             for (int si = 0; si < s->signals.count && bit_idx < 64; si++) {
                rt_signal_t *sig = s->signals.items[si];
                rt_nexus_t *nx = &sig->nexus;
+
+               // Skip 1-bit signals (likely clock/reset — not data)
+               if (nx->width == 1) continue;
                uint64_t bit = UINT64_C(1) << bit_idx;
                bit_idx++;
 
