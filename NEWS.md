@@ -11,6 +11,22 @@
 - The new `--relative=DIR` analysis option saves all file names relative
   to `DIR`.  This can be useful to ensure reproducibility of binary
   libraries (#1359).
+- New NCL (NULL Convention Logic) library for delay-insensitive
+  asynchronous design with dual-rail encoding and threshold gates.
+- New `--accel` option for Yosys-based compiled state machine
+  acceleration with auto-compilation and caching in `~/.cache/nvc/accel/`.
+- New `--lazy-eval` option for deposit-driven process arming with
+  per-process bitmap dirty tracking.
+- TLS shim for `jit_thread_local()` to avoid shared library overhead
+  (~12% speedup on RTL benchmarks).
+- Self-rewriting nexus vtables for resolution fast-path (single-driver
+  nets bypass the resolver).
+- Process and nexus vtable dispatch for hot-swappable behavior.
+- Auto-translation of `.v`/`.sv` files via sv2ghdl when available.
+- 24 Verilog math system functions (`$sqrt`, `$ln`, `$pow`, etc.)
+  implemented as VPI builtins.
+- Verilog `\`timescale` support with delay scaling at parse time.
+- Fixed `repeat(expr)` wrong iteration count when process suspends.
 - Several other minor bugs were resolved (#1237, #1350, #1351, #1353,
   #1366).
 
