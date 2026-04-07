@@ -13,28 +13,30 @@ Goals:
 
 ## Status
 
-**Working:**
-- New `nvc --cocotb=bridge.so` option loads the bridge after `model_reset`
-- C bridge implements ~25 GPI functions: signal read/write, hierarchy
-  navigation, callback registration (timed, value-change, phase)
-- Python shim (`nvc_simulator.py`) is a drop-in replacement for the
-  CocoTB simulator C extension, using ctypes to call the C bridge
-- Embedded Python via `dlopen("libpython3.10.so.1.0", RTLD_GLOBAL)`
-  to make `_contextvars` and other extension modules importable
-- CocoTB regression manager starts and runs `@cocotb.test()` async functions
-- Signal reads work (NVC byte-per-bit ↔ CocoTB binary string)
-- Hierarchy iteration works (`dut.iterate()`, `dut.signal_name`)
-- Clock generation via Python Timer callbacks works
-- Per-test pass/fail reporting works
+**Working (Phase 2 — sync mode):**
+- `translate_cocotb.py` AST transformer converts async/await CocoTB tests
+  to plain sequential Python with blocking C bridge calls
+- New blocking bridge functions: `nvcb_wait_time`, `nvcb_wait_edge`,
+  `nvcb_start_clock` — these synchronously advance the simulation
+- Free-running clocks driven by NVC timeouts (no Python in the loop)
+- `sched_deposit` (proper external API) for signal writes
+- `COCOTB_TRUST_INERTIAL_WRITES=1` set automatically so writes apply
+  immediately without ReadWrite phase
+- **2/3 bastion_gpio tests pass** (test_reset_values, test_input_read)
+- nexus_uart and other DUTs translate but fail at TL-UL bus reads
 
-**Limitations:**
-- Signal **writes** require either `COCOTB_TRUST_INERTIAL_WRITES=1` (which
-  also needs the GpiClock fast-path) OR proper ReadWrite phase callback
-  semantics (NVC's `LAST_KNOWN_DELTA_CYCLE` fires every cycle, but our
-  trampoline marks the slot inactive after first dispatch — this needs
-  rework so CocoTB's queued writes get applied)
-- `GpiClock` (the C++ fast-clock) is a stub — currently passes through
-  to the Python Timer-based path
+**Still working from Phase 1:**
+- `--cocotb=bridge.so` NVC option (no VPI/VHPI)
+- C bridge with ~25 GPI functions
+- Python shim drop-in for cocotb.simulator
+- Hierarchy navigation, signal read
+
+**Known issues:**
+- Some DUTs (nexus_uart) don't propagate TL-UL bus responses — likely
+  needs more delta cycles between write and read, or the DUT processes
+  aren't running at the right phase
+- `test_output_direction` reads back wrong value — DUT register write
+  doesn't show in output (timing/propagation issue)
 - No Nuitka compilation yet — Python is interpreted via embedded CPython
 - No gdb source-level Python debug yet (needs Nuitka stage)
 
