@@ -143,6 +143,22 @@ void      nvcb_deregister_cb(nvcb_cb_t cb);
 // Advances simulation until the next registered callback fires.
 nvcb_cb_t nvcb_run_until_cb(void);
 
+// ---- Synchronous (blocking) helpers ----
+// These advance the simulation and return when the condition is met.
+// Used by sync-mode CocoTB tests (no coroutines/async).
+
+// Advance simulation by `delta_fs` femtoseconds.
+void nvcb_wait_time(uint64_t delta_fs);
+
+// Advance simulation until `signal` has the given edge (RISING/FALLING/CHANGE).
+void nvcb_wait_edge(nvcb_hdl_t signal, int edge);
+
+// Start a free-running clock on `signal` with given period (femtoseconds).
+// Returns a clock handle that can be passed to nvcb_stop_clock.
+// The clock is driven by NVC's timeout mechanism — no Python involvement.
+int64_t nvcb_start_clock(nvcb_hdl_t signal, uint64_t period_fs);
+void nvcb_stop_clock(int64_t clock_id);
+
 // ---- Simulation control ----
 bool nvcb_is_running(void);
 void nvcb_stop(void);

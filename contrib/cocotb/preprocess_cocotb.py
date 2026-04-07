@@ -65,11 +65,11 @@ def preprocess(test_files, build_dir, bridge_dir):
     shutil.copy2(shim_src, shim_dst)
     print(f"  Installed nvc_simulator.py as cocotb/simulator.py")
 
-    # 3. Copy test files
+    # 3. Copy AND translate test files (async/await -> sync)
+    from translate_cocotb import translate
     for tf in test_files:
         dst = os.path.join(build_dir, os.path.basename(tf))
-        shutil.copy2(tf, dst)
-        print(f"  Copied {tf}")
+        translate(tf, dst)
 
     # 4. Create empty __init__.py if needed for test module discovery
     init_file = os.path.join(build_dir, '__init__.py')

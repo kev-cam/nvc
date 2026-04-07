@@ -107,6 +107,9 @@ static void free_cb_slot(int id)
 // Scratch buffer for value conversions
 static char g_valbuf[65536];
 
+// Forward declaration
+static void run_settling_deltas(void);
+
 // NVC std_logic encoding → ASCII character
 static const char nvc_to_char[] = "UX01ZWLH-";
 //  0=U, 1=X, 2='0', 3='1', 4=Z, 5=W, 6=L, 7=H, 8='-'
@@ -212,6 +215,8 @@ void nvcb_init(void *model)
    g_cb_free_count = 0;
    g_running = true;
    g_last_fired = -1;
+   // Run START_OF_SIMULATION callbacks
+   model_run_init(g_model);
 }
 
 void nvcb_fini(void)
@@ -457,24 +462,21 @@ int64_t nvcb_get_signal_val_long(nvcb_hdl_t hdl)
    uint32_t width = signal_width(sig);
    uint8_t size = signal_size(sig);
 
+   int64_t val = 0;
    if (size == 4) {
-      // 32-bit integer
-      int32_t val;
-      memcpy(&val, data, 4);
-      return val;
+      int32_t v;
+      memcpy(&v, data, 4);
+      val = v;
    }
    else if (size == 1) {
-      // std_logic_vector → integer, LSB first in NVC
-      int64_t val = 0;
       for (int i = (int)width - 1; i >= 0; i--) {
          val <<= 1;
-         if (data[i] == 3 || data[i] == 7)  // '1' or 'H'
+         if (data[i] == 3 || data[i] == 7)
             val |= 1;
       }
-      return val;
    }
 
-   return 0;
+   return val;
 }
 
 double nvcb_get_signal_val_real(nvcb_hdl_t hdl)
@@ -509,6 +511,7 @@ void nvcb_set_signal_val_binstr(nvcb_hdl_t hdl, int action, const char *val)
    uint32_t width = signal_width(sig);
    size_t vlen = strlen(val);
 
+
    // Allocate byte-per-bit buffer
    uint8_t *buf = alloca(width);
 
@@ -522,7 +525,7 @@ void nvcb_set_signal_val_binstr(nvcb_hdl_t hdl, int action, const char *val)
 
    switch (action) {
    case NVCB_DEPOSIT:
-      deposit_signal(g_model, sig, buf, 0, width);
+      sched_deposit(g_model, sig, buf, 0, width, 0, false);
       break;
    case NVCB_FORCE:
       force_signal(g_model, sig, buf, 0, width);
@@ -530,6 +533,23 @@ void nvcb_set_signal_val_binstr(nvcb_hdl_t hdl, int action, const char *val)
    case NVCB_RELEASE:
       release_signal(g_model, sig, 0, width);
       break;
+   }
+   run_settling_deltas();
+}
+
+// Run delta cycles until pending deposits settle (time advances)
+static void run_settling_deltas(void)
+{
+   if (!g_model) return;
+   unsigned d;
+   int64_t start = model_now(g_model, &d);
+   for (int i = 0; i < 16; i++) {
+      if (model_step(g_model)) {
+         g_running = false;
+         break;
+      }
+      int64_t now = model_now(g_model, &d);
+      if (now > start) break;  // Time advanced — done with this delta
    }
 }
 
@@ -546,22 +566,22 @@ void nvcb_set_signal_val_int(nvcb_hdl_t hdl, int action, int64_t val)
    if (size == 4) {
       int32_t ival = (int32_t)val;
       if (action == NVCB_DEPOSIT)
-         deposit_signal(g_model, sig, &ival, 0, 1);
+         sched_deposit(g_model, sig, &ival, 0, 1, 0, false);
       else if (action == NVCB_FORCE)
          force_signal(g_model, sig, &ival, 0, 1);
    }
    else if (size == 1) {
-      // Convert integer to bit array
       uint8_t *buf = alloca(width);
       for (uint32_t i = 0; i < width; i++) {
-         buf[i] = (val & 1) ? 3 : 2;  // '1' or '0'
+         buf[i] = (val & 1) ? 3 : 2;
          val >>= 1;
       }
       if (action == NVCB_DEPOSIT)
-         deposit_signal(g_model, sig, buf, 0, width);
+         sched_deposit(g_model, sig, buf, 0, width, 0, false);
       else if (action == NVCB_FORCE)
          force_signal(g_model, sig, buf, 0, width);
    }
+   run_settling_deltas();
 }
 
 void nvcb_set_signal_val_real(nvcb_hdl_t hdl, int action, double val)
@@ -861,6 +881,130 @@ nvcb_cb_t nvcb_run_until_cb(void)
    return g_last_fired;
 }
 
+// ---- Synchronous blocking helpers ----
+
+// Sentinel callback for blocking waits — sets a flag the caller polls.
+static volatile bool g_wait_done = false;
+
+static void wait_timeout_trampoline(rt_model_t *m, void *user)
+{
+   g_wait_done = true;
+}
+
+static void wait_edge_trampoline(uint64_t now, rt_signal_t *s,
+                                  rt_watch_t *w, void *user)
+{
+   int edge = (int)(intptr_t)user;
+   const uint8_t *val  = (const uint8_t *)signal_value(s);
+   const uint8_t *last = (const uint8_t *)signal_last_value(s);
+
+   if (edge == NVCB_VALUE_CHANGE) {
+      g_wait_done = true;
+      return;
+   }
+   bool is_rising  = (last[0] == 2 && val[0] == 3);
+   bool is_falling = (last[0] == 3 && val[0] == 2);
+   if ((edge == NVCB_RISING && is_rising) ||
+       (edge == NVCB_FALLING && is_falling)) {
+      g_wait_done = true;
+   }
+}
+
+void nvcb_wait_time(uint64_t delta_fs)
+{
+   if (!g_model) return;
+   unsigned deltas;
+   int64_t now = model_now(g_model, &deltas);
+   model_step_to(g_model, now + delta_fs);
+}
+
+void nvcb_wait_edge(nvcb_hdl_t signal, int edge)
+{
+   if (!g_model) return;
+   if (signal < 0 || signal >= g_num_handles) return;
+   if (g_handles[signal].kind != HDL_SIGNAL) return;
+
+   rt_signal_t *sig = g_handles[signal].u.signal;
+
+   g_wait_done = false;
+   rt_watch_t *w = watch_new(g_model, wait_edge_trampoline,
+                             (void *)(intptr_t)edge, WATCH_EVENT, 1);
+   model_set_event_cb(g_model, sig, w);
+
+   while (!g_wait_done && g_running) {
+      if (model_step(g_model)) {
+         g_running = false;
+         break;
+      }
+   }
+
+   watch_free(g_model, w);
+}
+
+// ---- Free-running clock (driven by NVC, no Python) ----
+
+#define MAX_CLOCKS 16
+
+typedef struct {
+   bool         active;
+   rt_signal_t *signal;
+   uint64_t     half_period;
+   bool         high;
+} nvcb_clock_t;
+
+static nvcb_clock_t g_clocks[MAX_CLOCKS];
+static int g_num_clocks = 0;
+
+static void clock_toggle_trampoline(rt_model_t *m, void *user)
+{
+   int idx = (int)(intptr_t)user;
+   if (idx < 0 || idx >= MAX_CLOCKS) return;
+   nvcb_clock_t *clk = &g_clocks[idx];
+   if (!clk->active) return;
+
+   // Toggle the signal via sched_deposit (proper API for external updates)
+   uint8_t new_val = clk->high ? 2 : 3;  // '0' or '1'
+   clk->high = !clk->high;
+   sched_deposit(m, clk->signal, &new_val, 0, 1, 0, false);
+
+   // Schedule next toggle
+   unsigned deltas;
+   int64_t now = model_now(m, &deltas);
+   model_set_timeout_cb(m, now + clk->half_period,
+                        clock_toggle_trampoline, (void *)(intptr_t)idx);
+}
+
+int64_t nvcb_start_clock(nvcb_hdl_t signal, uint64_t period_fs)
+{
+   if (!g_model) return -1;
+   if (signal < 0 || signal >= g_num_handles) return -1;
+   if (g_handles[signal].kind != HDL_SIGNAL) return -1;
+   if (g_num_clocks >= MAX_CLOCKS) return -1;
+
+   int idx = g_num_clocks++;
+   g_clocks[idx].active = true;
+   g_clocks[idx].signal = g_handles[signal].u.signal;
+   g_clocks[idx].half_period = period_fs / 2;
+   g_clocks[idx].high = true;  // start with first toggle going high
+
+   // Drive initial value low
+   uint8_t low = 2;  // '0'
+   sched_deposit(g_model, g_clocks[idx].signal, &low, 0, 1, 0, false);
+
+   unsigned deltas;
+   int64_t now = model_now(g_model, &deltas);
+   model_set_timeout_cb(g_model, now + g_clocks[idx].half_period,
+                        clock_toggle_trampoline, (void *)(intptr_t)idx);
+
+   return idx;
+}
+
+void nvcb_stop_clock(int64_t clock_id)
+{
+   if (clock_id < 0 || clock_id >= MAX_CLOCKS) return;
+   g_clocks[clock_id].active = false;
+}
+
 // ---- Simulation control ----
 
 bool nvcb_is_running(void)
@@ -922,28 +1066,51 @@ static void cocotb_sim_event(rt_model_t *m, void *user)
 
    fprintf(stderr, "nvc-cocotb: loading test module '%s'\n", module);
 
-   // Initialize cocotb and start regression manager.
-   // After this returns, tests have registered callbacks and we return
-   // to NVC's model_run() which drives the simulation.
+   // Sync mode: import the translated test module, find _NVCB_TESTS list,
+   // and call each test function sequentially. Each test runs to completion
+   // because all triggers are now blocking C calls.
    const char *pycmd =
       "import sys, os\n"
+      "# In sync mode, writes need to happen immediately (no scheduler)\n"
+      "os.environ['COCOTB_TRUST_INERTIAL_WRITES'] = '1'\n"
       "sys.stdout.flush()\n"
-      "\n"
-      "# Set defaults if user hasn't set them\n"
-      "if 'COCOTB_TEST_MODULES' not in os.environ:\n"
-      "    os.environ['COCOTB_TEST_MODULES'] = 'test_basic'\n"
       "\n"
       "import cocotb\n"
       "from cocotb import simulator\n"
+      "from cocotb._init import init_package_from_simulation\n"
+      "init_package_from_simulation([])\n"
       "\n"
-      "print(f'nvc-cocotb: bridge ready, top = {simulator.get_root_handle(None).get_name_string()}')\n"
+      "test_module = os.environ.get('COCOTB_TEST_MODULES', 'test_basic')\n"
+      "import importlib\n"
+      "mod = importlib.import_module(test_module)\n"
+      "\n"
+      "tests = getattr(mod, '_NVCB_TESTS', [])\n"
+      "if not tests:\n"
+      "    # Fallback: find functions starting with 'test_'\n"
+      "    tests = [getattr(mod, n) for n in dir(mod)\n"
+      "             if n.startswith('test_') and callable(getattr(mod, n))]\n"
+      "\n"
+      "print(f'nvc-cocotb: running {len(tests)} test(s)')\n"
       "sys.stdout.flush()\n"
       "\n"
-      "# Initialize cocotb and start the regression\n"
-      "from cocotb._init import init_package_from_simulation, run_regression\n"
-      "init_package_from_simulation([])\n"
-      "run_regression(None)\n"
-      "print('nvc-cocotb: regression started, returning to NVC event loop')\n"
+      "passed = 0\n"
+      "failed = 0\n"
+      "for test_func in tests:\n"
+      "    name = test_func.__name__\n"
+      "    print(f'\\n=== {name} ===')\n"
+      "    sys.stdout.flush()\n"
+      "    try:\n"
+      "        test_func(cocotb.top)\n"
+      "        print(f'  PASS')\n"
+      "        passed += 1\n"
+      "    except Exception as e:\n"
+      "        import traceback\n"
+      "        traceback.print_exc()\n"
+      "        print(f'  FAIL: {e}')\n"
+      "        failed += 1\n"
+      "    sys.stdout.flush()\n"
+      "\n"
+      "print(f'\\nnvc-cocotb: {passed} passed, {failed} failed')\n"
       "sys.stdout.flush()\n";
 
    if (PyRun_SimpleString(pycmd) != 0) {

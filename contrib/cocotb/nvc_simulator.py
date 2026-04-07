@@ -108,6 +108,39 @@ _DISPATCHER_T = ctypes.CFUNCTYPE(None, ctypes.c_int64)
 _lib.nvcb_set_dispatcher.argtypes = [ctypes.c_void_p]
 _lib.nvcb_set_dispatcher.restype = None
 
+# Synchronous (blocking) helpers — used by translated tests
+_lib.nvcb_wait_time.argtypes = [ctypes.c_uint64]
+_lib.nvcb_wait_time.restype = None
+_lib.nvcb_wait_edge.argtypes = [ctypes.c_int64, ctypes.c_int]
+_lib.nvcb_wait_edge.restype = None
+_lib.nvcb_start_clock.argtypes = [ctypes.c_int64, ctypes.c_uint64]
+_lib.nvcb_start_clock.restype = ctypes.c_int64
+_lib.nvcb_stop_clock.argtypes = [ctypes.c_int64]
+_lib.nvcb_stop_clock.restype = None
+
+
+def nvcb_wait_time(delta_fs):
+    """Block until simulation has advanced by delta_fs femtoseconds."""
+    _lib.nvcb_wait_time(int(delta_fs))
+
+
+def nvcb_wait_edge(signal_handle, edge):
+    """Block until the given signal has the requested edge."""
+    if hasattr(signal_handle, "_hdl"):
+        signal_handle = signal_handle._hdl
+    _lib.nvcb_wait_edge(int(signal_handle), int(edge))
+
+
+def nvcb_start_clock(signal_handle, period_fs):
+    """Start a free-running clock on the signal (NVC-driven, no Python)."""
+    if hasattr(signal_handle, "_hdl"):
+        signal_handle = signal_handle._hdl
+    return _lib.nvcb_start_clock(int(signal_handle), int(period_fs))
+
+
+def nvcb_stop_clock(clock_id):
+    _lib.nvcb_stop_clock(int(clock_id))
+
 # ---- GPI type constants (match cocotb.simulator) ----
 UNKNOWN = 0
 MODULE = 1
@@ -290,15 +323,53 @@ class gpi_iterator_hdl:
 
 
 class GpiClock:
-    """C++ clock using the GPI."""
+    """Clock generator using timed callbacks.
+
+    Schedules itself at half-period intervals to toggle the clock signal.
+    """
 
     def __init__(self, signal):
         self._signal = signal
         self._running = False
+        self._period_steps = 0
+        self._high_steps = 0
+        self._set_action = 0
+        self._next_high = True
 
     def start(self, period_steps, high_steps, start_high, set_action=0):
         self._running = True
-        # TODO: implement fast clock via C bridge
+        self._period_steps = period_steps
+        self._high_steps = high_steps
+        self._set_action = set_action
+
+        # Set initial value
+        if start_high:
+            self._signal.set_signal_val_int(set_action, 1)
+            self._next_high = False
+            delay = high_steps
+        else:
+            self._signal.set_signal_val_int(set_action, 0)
+            self._next_high = True
+            delay = period_steps - high_steps
+
+        self._schedule_toggle(delay)
+
+    def _schedule_toggle(self, delay):
+        cb_id = _lib.nvcb_register_timed_cb(delay)
+        if cb_id >= 0:
+            _callbacks[cb_id] = (self._toggle, ())
+
+    def _toggle(self):
+        if not self._running:
+            return
+        if self._next_high:
+            self._signal.set_signal_val_int(self._set_action, 1)
+            delay = self._high_steps
+        else:
+            self._signal.set_signal_val_int(self._set_action, 0)
+            delay = self._period_steps - self._high_steps
+        self._next_high = not self._next_high
+        self._schedule_toggle(delay)
 
     def stop(self):
         self._running = False
