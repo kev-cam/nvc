@@ -43,6 +43,7 @@
 #include "cosim.h"
 
 #include <getopt.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -832,6 +833,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "accel",             no_argument,       0, 'A' },
       { "launch-debug",      optional_argument, 0, 300 },
       { "lazy-eval",         no_argument,       0, 301 },
+      { "cocotb",            required_argument, 0, 302 },
       { 0, 0, 0, 0 }
    };
 
@@ -847,6 +849,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    bool          use_accel = false;
    bool          lazy_eval = false;
    const char   *launch_debug = NULL;
+   const char   *cocotb_so = NULL;
 
    static bool have_run = false;
    if (have_run)
@@ -978,6 +981,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       case 301:
          lazy_eval = true;
          break;
+      case 302:
+         cocotb_so = optarg;
+         break;
       default:
          should_not_reach_here();
       }
@@ -1089,6 +1095,19 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (lazy_eval)
       lazy_eval_install(state->model);
+
+   if (cocotb_so != NULL) {
+      // Load cocotb bridge .so and call its entry point with the model
+      void *dl = dlopen(cocotb_so, RTLD_NOW | RTLD_GLOBAL);
+      if (dl == NULL)
+         fatal("cannot load cocotb bridge %s: %s", cocotb_so, dlerror());
+
+      void (*entry)(rt_model_t *) = dlsym(dl, "nvc_cocotb_entry");
+      if (entry == NULL)
+         fatal("cocotb bridge %s missing nvc_cocotb_entry symbol", cocotb_so);
+
+      entry(state->model);
+   }
 
    if (launch_debug != NULL) {
       // The .so has been compiled by accel_auto above.
