@@ -5161,6 +5161,28 @@ void x_transfer_signal(sig_shared_t *target_ss, uint32_t toffset,
    t->wakeable.pending   = false;
    t->wakeable.delayed   = false;
 
+   // Ensure each target nexus has a SOURCE_DRIVER for the active process.
+   // Without this, async_transfer_signal -> sched_driver -> find_driver
+   // returns NULL and we crash. This handles iverilog-generated VHDL where
+   // the concurrent assignment doesn't pre-register a driver via x_drive_signal.
+   {
+      int tcount = count;
+      for (rt_nexus_t *n = t->target; tcount > 0; n = n->chain) {
+         rt_source_t *s;
+         for (s = &(n->sources); s; s = s->chain_input) {
+            if (s->tag == SOURCE_DRIVER && s->u.driver.proc == proc)
+               break;
+         }
+         if (s == NULL) {
+            s = add_source(m, n, SOURCE_DRIVER);
+            s->u.driver.waveforms.value = alloc_value(m, n);
+            s->u.driver.proc = proc;
+         }
+         tcount -= n->width;
+         assert(tcount >= 0);
+      }
+   }
+
    for (rt_nexus_t *n = t->source; count > 0; n = n->chain) {
       sched_event(m, &(n->pending), &(t->wakeable));
 
