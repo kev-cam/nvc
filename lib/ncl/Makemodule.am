@@ -25,4 +25,5 @@ lib/ncl/NCL.NCL: $(srcdir)/lib/ncl/ncl.vhdl @ifGNUmake@ | $(DRIVER)
 lib/ncl/NCL.NCL-body: lib/ncl/NCL.NCL
 
 # --- Dependencies ---
-lib/ncl/NCL.NCL: lib/ieee/IEEE.STD_LOGIC_1164
+# Built with --std=2008, so depend on the 2008 IEEE library
+lib/ncl/NCL.NCL: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.STD_LOGIC_1164-body

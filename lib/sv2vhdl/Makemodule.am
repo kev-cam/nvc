@@ -266,7 +266,7 @@ $(abs_top_builddir)/lib/sv2vhdl/libsv_analog.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/s
 # sv2vhdl packages depend on ieee.08 (for std_logic_1164)
 # Entity files depend on packages being compiled first
 
-lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
+lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.NUMERIC_STD
 lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.LOGIC3DA_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG lib/ieee.08/IEEE.MATH_REAL
 lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
@@ -276,6 +276,6 @@ lib/sv2vhdl/SV2VHDL.SV_NMOS: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_BUFIF0: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_PULLUP: lib/ieee.08/IEEE.STD_LOGIC_1164
 lib/sv2vhdl/SV2VHDL.SV_MATH_PKG: lib/ieee.08/IEEE.MATH_REAL
-lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
-lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164
+lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.NUMERIC_STD
+lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.NUMERIC_STD
 lib/sv2vhdl/SV2VHDL.SV_TRAN: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG
