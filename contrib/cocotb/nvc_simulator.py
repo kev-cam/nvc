@@ -141,6 +141,17 @@ def nvcb_start_clock(signal_handle, period_fs):
 def nvcb_stop_clock(clock_id):
     _lib.nvcb_stop_clock(int(clock_id))
 
+
+def nvcb_loc(loc):
+    """Source location sentinel — no-op in interpreted mode.
+
+    `loc` is a float: integer part = file index, fractional part * 1e6 = line.
+    The Nuitka post-processor finds these calls in the generated C code
+    and replaces them with #line directives so gdb can map breakpoints
+    back to the original Python source.
+    """
+    pass
+
 # ---- GPI type constants (match cocotb.simulator) ----
 UNKNOWN = 0
 MODULE = 1

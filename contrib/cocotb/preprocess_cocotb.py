@@ -66,10 +66,13 @@ def preprocess(test_files, build_dir, bridge_dir):
     print(f"  Installed nvc_simulator.py as cocotb/simulator.py")
 
     # 3. Copy AND translate test files (async/await -> sync)
-    from translate_cocotb import translate
+    from translate_cocotb import translate, write_locmap
     for tf in test_files:
         dst = os.path.join(build_dir, os.path.basename(tf))
         translate(tf, dst)
+    # Write consolidated file index registry
+    regfile = write_locmap(build_dir)
+    print(f"  wrote {regfile}")
 
     # 4. Create empty __init__.py if needed for test module discovery
     init_file = os.path.join(build_dir, '__init__.py')

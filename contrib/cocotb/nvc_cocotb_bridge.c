@@ -523,33 +523,35 @@ void nvcb_set_signal_val_binstr(nvcb_hdl_t hdl, int action, const char *val)
          buf[width - 1 - i] = 2;  // pad with '0'
    }
 
-   switch (action) {
-   case NVCB_DEPOSIT:
-      sched_deposit(g_model, sig, buf, 0, width, 0, false);
-      break;
-   case NVCB_FORCE:
-      force_signal(g_model, sig, buf, 0, width);
-      break;
-   case NVCB_RELEASE:
+   if (action == NVCB_RELEASE) {
       release_signal(g_model, sig, 0, width);
-      break;
+   } else {
+      sched_deposit(g_model, sig, buf, 0, width, 0, false);
    }
-   run_settling_deltas();
 }
 
-// Run delta cycles until pending deposits settle (time advances)
+// Run delta cycles until pending deposits settle.
+// Called after each set_signal_val* — applies the deposit and runs
+// any combinational logic that depends on the changed signal.
+// We do NOT advance time here, only run delta cycles.
 static void run_settling_deltas(void)
 {
    if (!g_model) return;
+   // model_step runs one delta cycle (or advances time if delta-stable).
+   // Run a few steps until either time advances or we've settled.
    unsigned d;
    int64_t start = model_now(g_model, &d);
-   for (int i = 0; i < 16; i++) {
+   unsigned start_iter = d;
+   for (int i = 0; i < 32; i++) {
       if (model_step(g_model)) {
          g_running = false;
          break;
       }
       int64_t now = model_now(g_model, &d);
-      if (now > start) break;  // Time advanced — done with this delta
+      // Stop when we've moved past the current delta cycle
+      // (either time advanced, or delta count went up and back to 0)
+      if (now > start || (now == start && d == 0 && start_iter > 0))
+         break;
    }
 }
 
@@ -563,12 +565,12 @@ void nvcb_set_signal_val_int(nvcb_hdl_t hdl, int action, int64_t val)
    uint32_t width = signal_width(sig);
    uint8_t size = signal_size(sig);
 
+   // sched_deposit is the proper API for external signal updates.
+   // It queues a SOURCE_DEPOSIT pseudo-source which is processed at
+   // the next delta cycle.
    if (size == 4) {
       int32_t ival = (int32_t)val;
-      if (action == NVCB_DEPOSIT)
-         sched_deposit(g_model, sig, &ival, 0, 1, 0, false);
-      else if (action == NVCB_FORCE)
-         force_signal(g_model, sig, &ival, 0, 1);
+      sched_deposit(g_model, sig, &ival, 0, 1, 0, false);
    }
    else if (size == 1) {
       uint8_t *buf = alloca(width);
@@ -576,12 +578,9 @@ void nvcb_set_signal_val_int(nvcb_hdl_t hdl, int action, int64_t val)
          buf[i] = (val & 1) ? 3 : 2;
          val >>= 1;
       }
-      if (action == NVCB_DEPOSIT)
-         sched_deposit(g_model, sig, buf, 0, width, 0, false);
-      else if (action == NVCB_FORCE)
-         force_signal(g_model, sig, buf, 0, width);
+      sched_deposit(g_model, sig, buf, 0, width, 0, false);
    }
-   run_settling_deltas();
+   // No settling here — let the next wait_time/wait_edge run the deltas
 }
 
 void nvcb_set_signal_val_real(nvcb_hdl_t hdl, int action, double val)
@@ -962,8 +961,8 @@ static void clock_toggle_trampoline(rt_model_t *m, void *user)
    nvcb_clock_t *clk = &g_clocks[idx];
    if (!clk->active) return;
 
-   // Toggle the signal via sched_deposit (proper API for external updates)
-   uint8_t new_val = clk->high ? 2 : 3;  // '0' or '1'
+   // Toggle via sched_deposit (proper API for external updates)
+   uint8_t new_val = clk->high ? 2 : 3;
    clk->high = !clk->high;
    sched_deposit(m, clk->signal, &new_val, 0, 1, 0, false);
 

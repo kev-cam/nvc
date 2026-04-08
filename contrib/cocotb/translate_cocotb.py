@@ -45,6 +45,73 @@ def _const_str(node):
     return None
 
 
+# Global file index registry — file_id (int) -> absolute path.
+# We choose file_ids that never end in 0 so the float repr doesn't lose
+# digits when Nuitka writes the constant name.
+_LOC_FILE_IDX = {}
+
+
+def _next_file_id():
+    """Pick the next file id that doesn't end in '0' (avoids ambiguity
+    when the float repr drops trailing zeros)."""
+    used = set(_LOC_FILE_IDX.values())
+    candidate = 1
+    while True:
+        if candidate not in used and (candidate % 10) != 0:
+            return candidate
+        candidate += 1
+
+
+def _register_file(path):
+    if path not in _LOC_FILE_IDX:
+        _LOC_FILE_IDX[path] = _next_file_id()
+    return _LOC_FILE_IDX[path]
+
+
+class LineSentinelInjector(ast.NodeTransformer):
+    """Inject _nvcb_loc(<line>.<file_id>) calls before every statement.
+
+    Encoding: float = line + (file_id / 10**ceil(log10(file_id+1))).
+    Simpler: a string of <line>.<file_id> as a float, e.g.
+    line 42 in file 1 -> 42.1, line 100 in file 13 -> 100.13.
+    Since file_id never ends in 0, the float repr preserves all digits.
+
+    These sentinels survive Nuitka compilation as recognisable constants
+    that the post-processor finds and replaces with #line directives.
+    """
+
+    def __init__(self, source_file):
+        self.file_id = _register_file(source_file)
+
+    def visit_FunctionDef(self, node):
+        node.body = self._inject(node.body)
+        return self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        node.body = self._inject(node.body)
+        return self.generic_visit(node)
+
+    def _inject(self, body):
+        out = []
+        for stmt in body:
+            if hasattr(stmt, 'lineno'):
+                # Build float "<line>.<file_id>" via string parse so the
+                # decimal places match the file_id digit count exactly.
+                loc = float(f"{stmt.lineno}.{self.file_id}")
+                sentinel = ast.Expr(value=ast.Call(
+                    func=ast.Name(id="_nvcb_loc", ctx=ast.Load()),
+                    args=[ast.Constant(value=loc)],
+                    keywords=[],
+                ))
+                ast.copy_location(sentinel, stmt)
+                ast.copy_location(sentinel.value, stmt)
+                ast.copy_location(sentinel.value.func, stmt)
+                ast.copy_location(sentinel.value.args[0], stmt)
+                out.append(sentinel)
+            out.append(stmt)
+        return out
+
+
 class CocotbToSync(ast.NodeTransformer):
     """Transform a CocoTB test module to sequential Python."""
 
@@ -56,7 +123,7 @@ class CocotbToSync(ast.NodeTransformer):
         # Visit all children first
         self.generic_visit(node)
 
-        # Prepend our bridge imports
+        # Prepend our bridge imports (including _nvcb_loc sentinel)
         prelude = ast.parse(
             "import sys as _sys\n"
             "from cocotb.simulator import (\n"
@@ -64,6 +131,7 @@ class CocotbToSync(ast.NodeTransformer):
             "    nvcb_wait_edge as _nvcb_wait_edge,\n"
             "    nvcb_start_clock as _nvcb_start_clock,\n"
             "    nvcb_stop_clock as _nvcb_stop_clock,\n"
+            "    nvcb_loc as _nvcb_loc,\n"
             "    RISING as _RISING,\n"
             "    FALLING as _FALLING,\n"
             "    VALUE_CHANGE as _CHANGE,\n"
@@ -104,7 +172,10 @@ class CocotbToSync(ast.NodeTransformer):
             type_comment=node.type_comment,
         )
         ast.copy_location(sync, node)
-        ast.fix_missing_locations(sync)
+        # Don't call fix_missing_locations here — it would propagate the
+        # function's lineno down to children that haven't been given one
+        # yet, breaking the source order. We call it once at the end of
+        # translate() instead.
 
         if is_test:
             self.test_funcs.append(node.name)
@@ -125,51 +196,57 @@ class CocotbToSync(ast.NodeTransformer):
         """Replace await TRIGGER with a blocking call."""
         self.generic_visit(node)
 
+        def with_loc(new_call):
+            ast.copy_location(new_call, node)
+            for arg in new_call.args:
+                ast.copy_location(arg, node)
+            ast.copy_location(new_call.func, node)
+            return new_call
+
         value = node.value
-        # Timer(N, "unit") or Timer(N, unit="unit")
         if isinstance(value, ast.Call):
             func_name = self._get_call_name(value)
 
             if func_name in ("Timer", "cocotb.triggers.Timer"):
                 fs = self._timer_to_fs(value)
-                return ast.Call(
+                return with_loc(ast.Call(
                     func=ast.Name(id="_nvcb_wait_time", ctx=ast.Load()),
                     args=[ast.Constant(value=fs)],
                     keywords=[],
-                )
+                ))
 
             if func_name in ("RisingEdge", "cocotb.triggers.RisingEdge"):
                 sig = value.args[0] if value.args else value.keywords[0].value
-                return ast.Call(
+                return with_loc(ast.Call(
                     func=ast.Name(id="_nvcb_wait_edge", ctx=ast.Load()),
                     args=[
                         ast.Attribute(value=sig, attr="_handle", ctx=ast.Load()),
                         ast.Name(id="_RISING", ctx=ast.Load()),
                     ],
                     keywords=[],
-                )
+                ))
 
             if func_name in ("FallingEdge", "cocotb.triggers.FallingEdge"):
                 sig = value.args[0] if value.args else value.keywords[0].value
-                return ast.Call(
+                return with_loc(ast.Call(
                     func=ast.Name(id="_nvcb_wait_edge", ctx=ast.Load()),
                     args=[
                         ast.Attribute(value=sig, attr="_handle", ctx=ast.Load()),
                         ast.Name(id="_FALLING", ctx=ast.Load()),
                     ],
                     keywords=[],
-                )
+                ))
 
             if func_name in ("Edge", "ValueChange"):
                 sig = value.args[0] if value.args else value.keywords[0].value
-                return ast.Call(
+                return with_loc(ast.Call(
                     func=ast.Name(id="_nvcb_wait_edge", ctx=ast.Load()),
                     args=[
                         ast.Attribute(value=sig, attr="_handle", ctx=ast.Load()),
                         ast.Name(id="_CHANGE", ctx=ast.Load()),
                     ],
                     keywords=[],
-                )
+                ))
 
         # Function call awaiting another async function (e.g. tl.reset())
         # Just call it directly — we transformed those to sync too
@@ -191,7 +268,12 @@ class CocotbToSync(ast.NodeTransformer):
                         if isinstance(clock_call, ast.Call):
                             clk_name = self._get_call_name(clock_call)
                             if clk_name == "Clock":
-                                return self._make_start_clock(clock_call)
+                                new_node = self._make_start_clock(clock_call)
+                                if new_node is not None:
+                                    # Preserve the original line number
+                                    ast.copy_location(new_node, node)
+                                    ast.copy_location(new_node.value, node)
+                                return new_node
         return node
 
     def _make_start_clock(self, clock_call):
@@ -261,16 +343,33 @@ class CocotbToSync(ast.NodeTransformer):
 
 
 def translate(src_path, dst_path):
+    import os
     with open(src_path) as f:
         src = f.read()
     tree = ast.parse(src)
     tree = CocotbToSync().visit(tree)
+    # Inject line-tracking sentinels (after sync transform so line numbers
+    # refer to the *original* source). Use the original src_path so gdb
+    # can find the source file.
+    src_abs = os.path.abspath(src_path)
+    tree = LineSentinelInjector(src_abs).visit(tree)
     ast.fix_missing_locations(tree)
     out = ast.unparse(tree)
     with open(dst_path, "w") as f:
         f.write("# Auto-translated from " + src_path + " by translate_cocotb.py\n")
         f.write(out)
     print(f"  translated {src_path} -> {dst_path}")
+
+
+def write_locmap(dst_dir):
+    """Write the consolidated file index registry for postprocess_c.py.
+    Call this AFTER translating all files in a build."""
+    import os
+    regfile = os.path.join(dst_dir, "nvcb.locmap")
+    with open(regfile, "w") as f:
+        for path, idx in sorted(_LOC_FILE_IDX.items(), key=lambda kv: kv[1]):
+            f.write(f"{idx}\t{path}\n")
+    return regfile
 
 
 if __name__ == "__main__":
