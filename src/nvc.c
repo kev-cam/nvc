@@ -78,9 +78,19 @@ typedef struct {
 
 const char copy_string[] =
    "Copyright (C) 2011-2025  Nick Gasson\n"
+   "Copyright (C) 2026        Kevin Cameron <kc@ieee.org>\n"
+   "Copyright (C) 2026        Claude Opus 4.7 (Anthropic)\n"
    "This program comes with ABSOLUTELY NO WARRANTY. This is free software, "
    "and\nyou are welcome to redistribute it under certain conditions. See "
-   "the GNU\nGeneral Public Licence for details.";
+   "the GNU\nGeneral Public Licence for details.\n"
+   "\n"
+   "This build contains modifications covered by patents\n"
+   "  US 9,923,840 B2\n"
+   "  JP 6,218,833 B2\n"
+   "  CN 104756078 B\n"
+   "Commercial use requires a separate license. See\n"
+   "  https://github.com/kev-cam/nvc\n"
+   "for details.";
 const char version_string[] =
    PACKAGE_STRING GIT_SHA_ONLY(" (" GIT_SHA ")")
    LLVM_ONLY(" (Using LLVM " LLVM_VERSION ")") DEBUG_ONLY(" [debug]");
