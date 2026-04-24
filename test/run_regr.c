@@ -679,7 +679,9 @@ static run_status_t run_cmd(FILE *log, arglist_t **args)
 
 static void push_std(test_t *test, arglist_t **args)
 {
-   if (test->flags & F_2000)
+   if (test->flags & (F_MIXED | F_VERILOG))
+      push_arg(args, "--std=2040");
+   else if (test->flags & F_2000)
       push_arg(args, "--std=2000");
    else if (test->flags & F_2002)
       push_arg(args, "--std=2002");
