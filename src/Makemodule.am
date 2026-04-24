@@ -65,7 +65,7 @@ endif
 
 # Build shared library from the same objects
 lib/libnvc.so: lib/libnvc.a lib/libthirdparty.a
-	$(AM_V_CCLD)$(CCLD) -shared -o $@ \
+	$(AM_V_CCLD)$(CCLD) -shared -fPIC -o $@ \
 		-Wl,--whole-archive lib/libnvc.a lib/libthirdparty.a -Wl,--no-whole-archive \
 		$(zlib_LIBS) $(libdw_LIBS) $(libdwarf_LIBS) $(libffi_LIBS) \
 		$(capstone_LIBS) $(libzstd_LIBS) $(jansson_LIBS) $(LLVM_LIBS) \
