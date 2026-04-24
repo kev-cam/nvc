@@ -2740,7 +2740,8 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       // value of S is unchanged from its previous value.
       if (n->signal->shared.flags & SIG_F_REGISTER)
          put_driving(m, n, nexus_effective(n));
-      else if (r == NULL || nonnull == 0 || is_pseudo_source(n->sources.tag))
+      else if (r == NULL || is_pseudo_source(n->sources.tag)
+               || (nonnull == 0 && standard() == STD_MX))
          put_driving(m, n, nexus_initial(n));
       else
          call_resolution(m, n, r, nonnull, s0);
@@ -3949,10 +3950,15 @@ static void update_driver(rt_model_t *m, rt_nexus_t *n, rt_source_t *source)
       update_driving(m, n, false);
    }
    else if (unlikely(w_next != NULL && w_next->when == -m->now)) {
-      // Disconnect source due to null transaction
+      // Disconnect source due to null transaction.  Revert any fast-path
+      // vtable (single-driver / memo1) so the next driving-value update
+      // runs the full resolution path, which for bus signals must call
+      // the resolution function with an empty input to yield the default
+      // (e.g. 'Z' for std_logic) rather than the driver's stale value.
       *w_now = *w_next;
       free_waveform(m, w_next);
       source->disconnected = 1;
+      n->vtable = &nexus_default_vtable;
       update_driving(m, n, false);
    }
 }
