@@ -2231,8 +2231,13 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
       else {
          rt_nexus_t *out_n;
          if (old_o->tag == SOURCE_IMPLICIT) {
-            if (old_o->u.port.output->width == offset)
-               out_n = old_o->u.port.output->chain;  // Cycle breaking
+            // Cycle break only when the output has a matching chain (paired
+            // split, e.g. STD_MX RECEIVER).  For fan-in implicit signals
+            // (e.g. 'stable where dst is scalar) the output has no chain
+            // and every src nexus feeds the same dst nexus.
+            if (old_o->u.port.output->width == offset
+                && old_o->u.port.output->chain != NULL)
+               out_n = old_o->u.port.output->chain;
             else
                out_n = old_o->u.port.output;
          }
@@ -5472,8 +5477,14 @@ void x_map_implicit(sig_shared_t *src_ss, uint32_t src_offset,
 
    rt_model_t *m = get_model();
    rt_nexus_t *src_n = split_nexus(m, src_s, src_offset, count);
-   rt_nexus_t *dst_n = split_nexus(m, dst_s, dst_offset, count);
-   for (; count > 0; src_n = src_n->chain, dst_n = dst_n->chain) {
+
+   // For implicit signals like 'stable/'quiet the destination is a scalar
+   // fan-in from every source nexus: its width is 1 even when the prefix is
+   // wider.  Split dst using its actual total width, not the src count.
+   const uint32_t dst_total = dst_s->shared.size / dst_s->nexus.size;
+   rt_nexus_t *dst_n = split_nexus(m, dst_s, dst_offset, MIN(count, dst_total));
+
+   for (; count > 0; src_n = src_n->chain) {
       count -= src_n->width;
       assert(count >= 0);
 
@@ -5485,6 +5496,9 @@ void x_map_implicit(sig_shared_t *src_ss, uint32_t src_offset,
 
       src_n->flags |= NET_F_EFFECTIVE;   // Update outputs when active
       src_n->flags &= ~NET_F_FAST_DRIVER;
+
+      if (count > 0 && dst_n->chain != NULL)
+         dst_n = dst_n->chain;
    }
 }
 
