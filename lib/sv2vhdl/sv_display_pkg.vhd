@@ -40,11 +40,20 @@ package body sv_display_pkg is
     function sv_hstr(v : std_logic_vector) return string is
         constant h : string := to_hstring(v);
         variable result : string(1 to h'length);
+        variable start : integer := 0;
     begin
+        -- Convert to lowercase
         for i in h'range loop
             result(i - h'low + 1) := to_lower(h(i));
         end loop;
-        return result;
+        -- Strip leading zeros (Verilog %h convention)
+        for i in 1 to result'length - 1 loop
+            if result(i) /= '0' then
+                return result(i to result'length);
+            end if;
+        end loop;
+        -- All zeros: return single "0"
+        return result(result'length to result'length);
     end function;
 
     function sv_ostr(v : std_logic_vector) return string is
