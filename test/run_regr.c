@@ -139,6 +139,7 @@ struct test {
    char      *define;
    char      *export;
    char      *plusarg;
+   char      *deps;
    unsigned   arrays;
    int        seed;
    double     duration;
@@ -499,6 +500,13 @@ static bool parse_test_list(void)
 
             test->params = p;
          }
+         else if (strncmp(opt, "deps=", 5) == 0) {
+            // Comma-separated list of sibling test base-names whose .vhd
+            // files must be analysed before this test (e.g. logic3d9
+            // depends on the package defined in logic3d8).  No effect on
+            // verilog/mixed tests.
+            test->deps = strdup(opt + 5);
+         }
          else if (strcmp(opt, "relaxed") == 0)
             test->flags |= F_RELAXED;
          else if (strncmp(opt, "relax", 5) == 0) {
@@ -679,7 +687,9 @@ static run_status_t run_cmd(FILE *log, arglist_t **args)
 
 static void push_std(test_t *test, arglist_t **args)
 {
-   if (test->flags & F_2000)
+   if (test->flags & (F_MIXED | F_VERILOG))
+      push_arg(args, "--std=2040");
+   else if (test->flags & F_2000)
       push_arg(args, "--std=2000");
    else if (test->flags & F_2002)
       push_arg(args, "--std=2002");
@@ -932,6 +942,14 @@ static bool run_test(test_t *test)
          push_arg(&args, "--seed=%u", test->seed);
 
       push_arg(&args, "-a");
+
+      if (test->deps != NULL) {
+         char *deps = strdup(test->deps);
+         for (char *tok = strtok(deps, ","); tok; tok = strtok(NULL, ","))
+            push_arg(&args, "%s" DIR_SEP "regress" DIR_SEP "%s.vhd",
+                     test_dir, tok);
+         free(deps);
+      }
 
       if (!(test->flags & F_VERILOG))
          push_arg(&args, "%s" DIR_SEP "regress" DIR_SEP "%s.vhd",
@@ -1345,6 +1363,18 @@ static bool run_test(test_t *test)
       bool found_passed = false, found_failed = false;
       char line[256];
       while (fgets(line, sizeof(line), outf)) {
+         // Skip nvc source-context lines like `  48 |   report "FAILED ...";`
+         // — they echo verilog/vhdl source containing the literal words
+         // PASSED/FAILED but are not the runtime report we care about.
+         const char *p = line;
+         while (*p == ' ' || *p == '\t') p++;
+         if (isdigit((unsigned char)*p)) {
+            const char *q = p;
+            while (isdigit((unsigned char)*q)) q++;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '|')
+               continue;
+         }
          found_passed |= (strstr(line, "PASSED") != NULL);
          found_failed |= (strstr(line, "FAILED") != NULL);
       }

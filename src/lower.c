@@ -8675,19 +8675,23 @@ static void lower_implicit_decl(lower_unit_t *parent, tree_t decl)
          // initial value so forward implicit propagation doesn't poison
          // the parent with 'U' at time 0.
          vcode_reg_t init_reg;
-         if (type_is_scalar(type)) {
-            if (standard() == STD_MX && kind == IMPLICIT_DRIVER
-                && tree_has_value(decl)) {
-               tree_t psig = tree_ref(tree_value(decl));
-               if (tree_kind(psig) == T_SIGNAL_DECL
-                   && tree_has_value(psig))
-                  init_reg = lower_rvalue(parent, tree_value(psig));
-               else
-                  init_reg = emit_const(lower_type(type), 0);
-            }
-            else
+         if (standard() == STD_MX && kind == IMPLICIT_DRIVER
+             && tree_has_value(decl)) {
+            // Auto-created 'driver: inherit parent signal's declared
+            // initial value so forward implicit propagation doesn't
+            // poison the parent with 'U' at time 0.  Works for both
+            // scalars and homogeneous array types.
+            tree_t psig = tree_ref(tree_value(decl));
+            if (tree_kind(psig) == T_SIGNAL_DECL
+                && tree_has_value(psig))
+               init_reg = lower_rvalue(parent, tree_value(psig));
+            else if (type_is_scalar(type))
                init_reg = emit_const(lower_type(type), 0);
+            else
+               init_reg = VCODE_INVALID_REG;
          }
+         else if (type_is_scalar(type))
+            init_reg = emit_const(lower_type(type), 0);
          else
             init_reg = VCODE_INVALID_REG;
 

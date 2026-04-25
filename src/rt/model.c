@@ -2231,8 +2231,13 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
       else {
          rt_nexus_t *out_n;
          if (old_o->tag == SOURCE_IMPLICIT) {
-            if (old_o->u.port.output->width == offset)
-               out_n = old_o->u.port.output->chain;  // Cycle breaking
+            // Cycle break only when the output has a matching chain (paired
+            // split, e.g. STD_MX RECEIVER).  For fan-in implicit signals
+            // (e.g. 'stable where dst is scalar) the output has no chain
+            // and every src nexus feeds the same dst nexus.
+            if (old_o->u.port.output->width == offset
+                && old_o->u.port.output->chain != NULL)
+               out_n = old_o->u.port.output->chain;
             else
                out_n = old_o->u.port.output;
          }
@@ -2652,6 +2657,7 @@ static void schedule_implicit_update(rt_model_t *m, rt_nexus_t *n)
 
 static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
 {
+
    // Algorithm for driving values is in LRM 08 section 14.7.3.2
 
    // If S has no source, then the driving value of S is given by the
@@ -2735,7 +2741,8 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       // value of S is unchanged from its previous value.
       if (n->signal->shared.flags & SIG_F_REGISTER)
          put_driving(m, n, nexus_effective(n));
-      else if (r == NULL || nonnull == 0 || is_pseudo_source(n->sources.tag))
+      else if (r == NULL || is_pseudo_source(n->sources.tag)
+               || (nonnull == 0 && standard() == STD_MX))
          put_driving(m, n, nexus_initial(n));
       else
          call_resolution(m, n, r, nonnull, s0);
@@ -3944,10 +3951,15 @@ static void update_driver(rt_model_t *m, rt_nexus_t *n, rt_source_t *source)
       update_driving(m, n, false);
    }
    else if (unlikely(w_next != NULL && w_next->when == -m->now)) {
-      // Disconnect source due to null transaction
+      // Disconnect source due to null transaction.  Revert any fast-path
+      // vtable (single-driver / memo1) so the next driving-value update
+      // runs the full resolution path, which for bus signals must call
+      // the resolution function with an empty input to yield the default
+      // (e.g. 'Z' for std_logic) rather than the driver's stale value.
       *w_now = *w_next;
       free_waveform(m, w_next);
       source->disconnected = 1;
+      n->vtable = &nexus_default_vtable;
       update_driving(m, n, false);
    }
 }
@@ -4467,6 +4479,12 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
       copy_value_ptr(n, &(src->u.pseudo.value), vptr);
       src->disconnected = 0;
 
+      // A previous release may have left the nexus on a fast-path vtable
+      // that ignores SOURCE_FORCING (e.g. nexus_single_driver_vtable when
+      // there is a regular driver underneath).  Revert to the full driving-
+      // value algorithm so this re-force is observed.
+      n->vtable = &nexus_default_vtable;
+
       if (!src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);
          src->pseudoqueued = 1;
@@ -4493,6 +4511,7 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
       src->disconnected = 1;
+      n->vtable = &nexus_default_vtable;
 
       if (!src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);
@@ -5472,8 +5491,14 @@ void x_map_implicit(sig_shared_t *src_ss, uint32_t src_offset,
 
    rt_model_t *m = get_model();
    rt_nexus_t *src_n = split_nexus(m, src_s, src_offset, count);
-   rt_nexus_t *dst_n = split_nexus(m, dst_s, dst_offset, count);
-   for (; count > 0; src_n = src_n->chain, dst_n = dst_n->chain) {
+
+   // For implicit signals like 'stable/'quiet the destination is a scalar
+   // fan-in from every source nexus: its width is 1 even when the prefix is
+   // wider.  Split dst using its actual total width, not the src count.
+   const uint32_t dst_total = dst_s->shared.size / dst_s->nexus.size;
+   rt_nexus_t *dst_n = split_nexus(m, dst_s, dst_offset, MIN(count, dst_total));
+
+   for (; count > 0; src_n = src_n->chain) {
       count -= src_n->width;
       assert(count >= 0);
 
@@ -5485,6 +5510,9 @@ void x_map_implicit(sig_shared_t *src_ss, uint32_t src_offset,
 
       src_n->flags |= NET_F_EFFECTIVE;   // Update outputs when active
       src_n->flags &= ~NET_F_FAST_DRIVER;
+
+      if (count > 0 && dst_n->chain != NULL)
+         dst_n = dst_n->chain;
    }
 }
 
