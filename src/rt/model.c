@@ -2657,6 +2657,7 @@ static void schedule_implicit_update(rt_model_t *m, rt_nexus_t *n)
 
 static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
 {
+
    // Algorithm for driving values is in LRM 08 section 14.7.3.2
 
    // If S has no source, then the driving value of S is given by the
@@ -4478,6 +4479,12 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
       copy_value_ptr(n, &(src->u.pseudo.value), vptr);
       src->disconnected = 0;
 
+      // A previous release may have left the nexus on a fast-path vtable
+      // that ignores SOURCE_FORCING (e.g. nexus_single_driver_vtable when
+      // there is a regular driver underneath).  Revert to the full driving-
+      // value algorithm so this re-force is observed.
+      n->vtable = &nexus_default_vtable;
+
       if (!src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);
          src->pseudoqueued = 1;
@@ -4504,6 +4511,7 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
       src->disconnected = 1;
+      n->vtable = &nexus_default_vtable;
 
       if (!src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);

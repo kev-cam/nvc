@@ -139,6 +139,7 @@ struct test {
    char      *define;
    char      *export;
    char      *plusarg;
+   char      *deps;
    unsigned   arrays;
    int        seed;
    double     duration;
@@ -498,6 +499,13 @@ static bool parse_test_list(void)
             p->kind = opt[0] == 'g' ? P_GENERIC : P_ENVVAR;
 
             test->params = p;
+         }
+         else if (strncmp(opt, "deps=", 5) == 0) {
+            // Comma-separated list of sibling test base-names whose .vhd
+            // files must be analysed before this test (e.g. logic3d9
+            // depends on the package defined in logic3d8).  No effect on
+            // verilog/mixed tests.
+            test->deps = strdup(opt + 5);
          }
          else if (strcmp(opt, "relaxed") == 0)
             test->flags |= F_RELAXED;
@@ -934,6 +942,14 @@ static bool run_test(test_t *test)
          push_arg(&args, "--seed=%u", test->seed);
 
       push_arg(&args, "-a");
+
+      if (test->deps != NULL) {
+         char *deps = strdup(test->deps);
+         for (char *tok = strtok(deps, ","); tok; tok = strtok(NULL, ","))
+            push_arg(&args, "%s" DIR_SEP "regress" DIR_SEP "%s.vhd",
+                     test_dir, tok);
+         free(deps);
+      }
 
       if (!(test->flags & F_VERILOG))
          push_arg(&args, "%s" DIR_SEP "regress" DIR_SEP "%s.vhd",
