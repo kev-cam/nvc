@@ -5,7 +5,7 @@ ACLOCAL_AMFLAGS = -I m4
 man_MANS = nvc.1
 
 AM_CPPFLAGS = -I$(top_srcdir)/thirdparty -I$(top_srcdir)/src
-AM_CFLAGS   = -Wall $(EXTRA_CFLAGS) $(LTO_FLAG)
+AM_CFLAGS   = -Wall $(EXTRA_CFLAGS) $(LTO_FLAG) $(SHLIB_CFLAGS)
 AM_CXXFLAGS = -Wall $(EXTRA_CFLAGS) $(LTO_FLAG)
 AM_LDFLAGS  = $(EXTRA_LDFLAGS) $(LLVM_LDFLAGS)
 AM_YFLAGS   = --locations $(EXTRA_YFLAGS)
