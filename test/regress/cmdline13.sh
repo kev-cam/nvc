@@ -42,4 +42,4 @@ nvc --preprocess --single-unit -DMSG='"PASSED"' -DFLAG file1.v file2.v \
 # Workaround bug in LLVM 14
 unset NVC_JIT_THRESHOLD
 
-nvc -a --single-unit -DMSG='"PASSED"' -DFLAG file1.v file2.v -e mod2 -r
+nvc --std=2040 -a --single-unit -DMSG='"PASSED"' -DFLAG file1.v file2.v -e mod2 -r
