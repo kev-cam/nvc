@@ -1363,6 +1363,18 @@ static bool run_test(test_t *test)
       bool found_passed = false, found_failed = false;
       char line[256];
       while (fgets(line, sizeof(line), outf)) {
+         // Skip nvc source-context lines like `  48 |   report "FAILED ...";`
+         // — they echo verilog/vhdl source containing the literal words
+         // PASSED/FAILED but are not the runtime report we care about.
+         const char *p = line;
+         while (*p == ' ' || *p == '\t') p++;
+         if (isdigit((unsigned char)*p)) {
+            const char *q = p;
+            while (isdigit((unsigned char)*q)) q++;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '|')
+               continue;
+         }
          found_passed |= (strstr(line, "PASSED") != NULL);
          found_failed |= (strstr(line, "FAILED") != NULL);
       }
