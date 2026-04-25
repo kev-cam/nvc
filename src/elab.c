@@ -2099,6 +2099,9 @@ static void elab_auto_receivers(tree_t block)
    // In STD_MX mode, auto-create 'receiver implicit signals for all
    // architecture-level signals so the resolver network can write to
    // them via external names (.signal.receiver).
+   // Disabled: auto-receivers break normal concurrent assignment propagation.
+   // The resolver plugin creates its own receivers via VHPI when needed.
+   return;
    if (standard() != STD_MX)
       return;
 
@@ -2137,13 +2140,17 @@ static void elab_auto_receivers(tree_t block)
 
 static void elab_auto_drivers(tree_t block)
 {
-   // In STD_MX mode, auto-create 'driver implicit signals for all
-   // architecture-level signals so that VHDL signal assignments can
-   // be redirected to write to the 'driver instead of the signal.
-   // This separates the driving and receiving nexuses, allowing the
-   // resolver network to bridge them.
+   // In STD_MX mode, auto-create 'driver implicit signals for signals
+   // that explicitly use 'driver in the source. Don't auto-create for
+   // all signals, as it breaks normal concurrent signal assignments by
+   // redirecting writes to the driver implicit signal.
    if (standard() != STD_MX)
       return;
+
+   // Only create auto-drivers for signals that already have an explicit
+   // 'driver reference in the architecture declarations.
+   // The resolver plugin handles its own driver creation via VHPI.
+   return;  // Disabled: let explicit 'driver references create their own
 
    const int ndecls = tree_decls(block);
    for (int i = 0; i < ndecls; i++) {

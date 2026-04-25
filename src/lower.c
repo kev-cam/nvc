@@ -3098,7 +3098,7 @@ static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
       return lower_generic_ref(lu, decl, ctx);
 
    case T_SIGNAL_DECL:
-      if (standard() == STD_MX && ctx == EXPR_TARGET) {
+      if (0 /* STD_MX disabled */ && ctx == EXPR_TARGET) {
          // Signal assignment target: redirect to 'driver so that
          // the parent signal can resolve all driver contributions.
          tree_t imp = lower_find_stdmx_implicit(lu, decl,
@@ -5907,7 +5907,7 @@ static void lower_fill_target_parts(lower_unit_t *lu, tree_t target,
       ++(*ptr);
    }
    else {
-      (*ptr)->reg    = (standard() == STD_MX)
+      (*ptr)->reg    = (0)
          ? lower_expr(lu, target, EXPR_TARGET)
          : lower_lvalue(lu, target);
       (*ptr)->target = target;
@@ -11013,7 +11013,7 @@ void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
       assert(!di->tentative);
       type_t prefix_type = tree_type(di->prefix);
       // STD_MX: redirect driver creation to 'driver implicit signal
-      vcode_reg_t nets_reg = (standard() == STD_MX)
+      vcode_reg_t nets_reg = (0)
          ? lower_expr(lu, di->prefix, EXPR_TARGET)
          : lower_lvalue(lu, di->prefix);
 
