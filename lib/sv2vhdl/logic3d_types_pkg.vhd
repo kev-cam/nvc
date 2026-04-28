@@ -226,6 +226,17 @@ package logic3d_types_pkg is
     function rising_edge(signal s : logic3d) return boolean;
     function falling_edge(signal s : logic3d) return boolean;
 
+    ---------------------------------------------------------------------------
+    -- Vector operations (element-wise)
+    ---------------------------------------------------------------------------
+    function l3d_not(a : logic3d_vector) return logic3d_vector;
+    function l3d_and(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_or(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_xor(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_nand(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_nor(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_xnor(a, b : logic3d_vector) return logic3d_vector;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -417,6 +428,70 @@ package body logic3d_types_pkg is
     function falling_edge(signal s : logic3d) return boolean is
     begin
         return s'event and is_zero(s) and not is_zero(s'last_value);
+    end function;
+
+    -- Vector overloads (element-wise)
+    function l3d_not(a : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := NOT_LUT(a(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_and(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := AND_LUT(a(i), b(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_or(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := OR_LUT(a(i), b(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_xor(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := XOR_LUT(a(i), b(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_nand(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := NAND_LUT(a(i), b(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_nor(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := NOR_LUT(a(i), b(i));
+        end loop;
+        return result;
+    end function;
+
+    function l3d_xnor(a, b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := XNOR_LUT(a(i), b(i));
+        end loop;
+        return result;
     end function;
 
 end package body;
