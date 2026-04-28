@@ -222,6 +222,10 @@ package logic3d_types_pkg is
     function is_x(a : logic3d) return boolean;         -- uncertain and strong
     function is_z(a : logic3d) return boolean;         -- uncertain and not strong
 
+    -- Edge detection for logic3d signals (matches std_logic rising_edge/falling_edge)
+    function rising_edge(signal s : logic3d) return boolean;
+    function falling_edge(signal s : logic3d) return boolean;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -403,6 +407,16 @@ package body logic3d_types_pkg is
     function is_z(a : logic3d) return boolean is
     begin
         return is_uncertain(a) and not is_strong(a);
+    end function;
+
+    function rising_edge(signal s : logic3d) return boolean is
+    begin
+        return s'event and is_one(s) and not is_one(s'last_value);
+    end function;
+
+    function falling_edge(signal s : logic3d) return boolean is
+    begin
+        return s'event and is_zero(s) and not is_zero(s'last_value);
     end function;
 
 end package body;
