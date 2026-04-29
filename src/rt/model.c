@@ -1746,6 +1746,13 @@ static void check_multiple_sources(rt_nexus_t *n, source_kind_t kind)
    if (n->signal->shared.flags & SIG_F_PIPE)
       return;
 
+   // In STD_MX mode, allow multiple sources on unresolved types.
+   // Verilog regs share a single driver across all processes; the
+   // translated VHDL may create multiple sources that need
+   // last-writer-wins semantics.
+   if (standard() == STD_MX)
+      return;
+
    diag_t *d;
    if (is_signal_scope(n->signal->parent)) {
       rt_scope_t *root = n->signal->parent;
