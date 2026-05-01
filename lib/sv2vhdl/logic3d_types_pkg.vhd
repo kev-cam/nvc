@@ -9,6 +9,7 @@
 
 library ieee;
 use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
 package logic3d_types_pkg is
 
@@ -236,6 +237,23 @@ package logic3d_types_pkg is
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector;
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector;
     function l3d_xnor(a, b : logic3d_vector) return logic3d_vector;
+
+    -- Arithmetic: convert to/from unsigned for +, -, comparisons
+    function l3d_to_unsigned(a : logic3d_vector) return unsigned;
+    function unsigned_to_l3d(a : unsigned) return logic3d_vector;
+    function "+"(a, b : logic3d_vector) return logic3d_vector;
+    function "-"(a, b : logic3d_vector) return logic3d_vector;
+    function "+"(a : logic3d_vector; b : natural) return logic3d_vector;
+
+    -- Integer conversion
+    function to_integer(a : logic3d_vector) return natural;
+
+    -- Shift operators
+    function "sll"(a : logic3d_vector; n : natural) return logic3d_vector;
+    function "srl"(a : logic3d_vector; n : natural) return logic3d_vector;
+
+    -- Multiplication
+    function "*"(a, b : logic3d_vector) return logic3d_vector;
 
 end package;
 
@@ -492,6 +510,71 @@ package body logic3d_types_pkg is
             result(i) := XNOR_LUT(a(i), b(i));
         end loop;
         return result;
+    end function;
+
+    -- Convert logic3d_vector to unsigned (extract value bits)
+    function l3d_to_unsigned(a : logic3d_vector) return unsigned is
+        variable result : unsigned(a'range);
+    begin
+        for i in a'range loop
+            if is_one(a(i)) then
+                result(i) := '1';
+            else
+                result(i) := '0';
+            end if;
+        end loop;
+        return result;
+    end function;
+
+    -- Convert unsigned to logic3d_vector (strong driven values)
+    function unsigned_to_l3d(a : unsigned) return logic3d_vector is
+        variable result : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            if a(i) = '1' then
+                result(i) := L3D_1;
+            else
+                result(i) := L3D_0;
+            end if;
+        end loop;
+        return result;
+    end function;
+
+    function "+"(a, b : logic3d_vector) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) + l3d_to_unsigned(b));
+    end function;
+
+    function "-"(a, b : logic3d_vector) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) - l3d_to_unsigned(b));
+    end function;
+
+    function "+"(a : logic3d_vector; b : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) + b);
+    end function;
+
+    function to_integer(a : logic3d_vector) return natural is
+    begin
+        return ieee.numeric_std.to_integer(l3d_to_unsigned(a));
+    end function;
+
+    function "sll"(a : logic3d_vector; n : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) sll n);
+    end function;
+
+    function "srl"(a : logic3d_vector; n : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) srl n);
+    end function;
+
+    function "*"(a, b : logic3d_vector) return logic3d_vector is
+        variable result : unsigned(a'length + b'length - 1 downto 0);
+    begin
+        result := l3d_to_unsigned(a) * l3d_to_unsigned(b);
+        return unsigned_to_l3d(result(a'length - 1 downto 0));
     end function;
 
 end package body;
