@@ -255,6 +255,9 @@ package logic3d_types_pkg is
     -- Multiplication
     function "*"(a, b : logic3d_vector) return logic3d_vector;
 
+    -- Resize (extend or truncate)
+    function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -575,6 +578,17 @@ package body logic3d_types_pkg is
     begin
         result := l3d_to_unsigned(a) * l3d_to_unsigned(b);
         return unsigned_to_l3d(result(a'length - 1 downto 0));
+    end function;
+
+    function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
+        variable result : logic3d_vector(new_size - 1 downto 0) := (others => L3D_0);
+    begin
+        if new_size <= a'length then
+            result := a(new_size - 1 downto 0);
+        else
+            result(a'length - 1 downto 0) := a;
+        end if;
+        return result;
     end function;
 
 end package body;

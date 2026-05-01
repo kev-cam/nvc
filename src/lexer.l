@@ -1257,11 +1257,15 @@ static int report_unterminated_string(const char *str)
 
 static int report_bad_identifier(char *str)
 {
-   diag_t *d = diag_new(DIAG_ERROR, &yylloc);
-   diag_printf(d, "a VHDL basic identifier must not start or end with an "
-               "underscore, or contain multiple consecutive underscores");
-   diag_lrm(d, STD_08, "15.4.2");
-   diag_emit(d);
+   // In STD_MX mode, tolerate non-standard identifiers (e.g. double
+   // underscores from parameterized entity naming).
+   if (standard() != STD_MX) {
+      diag_t *d = diag_new(DIAG_ERROR, &yylloc);
+      diag_printf(d, "a VHDL basic identifier must not start or end with an "
+                  "underscore, or contain multiple consecutive underscores");
+      diag_lrm(d, STD_08, "15.4.2");
+      diag_emit(d);
+   }
 
    return parse_id(str);
 }
