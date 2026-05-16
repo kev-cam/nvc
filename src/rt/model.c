@@ -2444,16 +2444,33 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
    case SOURCE_PORT:
       if (unlikely(standard() == STD_MX)) {
          // Mixed mode: a port with no real driver is not a source.
-         // Only count SOURCE_DRIVER as proof of a real driver.
-         // SOURCE_PORT on the input nexus may be circular back-ref
-         // from inout bidirectional mapping.
+         // Walk SOURCE_PORT chain transitively until we find a
+         // SOURCE_DRIVER (real driver) or detect a cycle (circular
+         // back-ref from inout bidirectional mapping).
          rt_nexus_t *input = src->u.port.input;
+         rt_nexus_t *seen[8];   // small bounded cycle-guard
+         int n_seen = 0;
+         seen[n_seen++] = nexus;
          bool has_driver = false;
-         if (input->n_sources > 0) {
-            for (rt_source_t *s = &(input->sources); s; s = s->chain_input)
+         while (input != NULL && n_seen < 8) {
+            bool already = false;
+            for (int k = 0; k < n_seen; k++)
+               if (seen[k] == input) { already = true; break; }
+            if (already)
+               break;   // cycle (e.g. inout back-ref); abandon this port
+            seen[n_seen++] = input;
+            rt_nexus_t *next = NULL;
+            for (rt_source_t *s = &(input->sources); s; s = s->chain_input) {
                if (s->tag == SOURCE_DRIVER) {
-                  has_driver = true; break;
+                  has_driver = true;
+                  break;
                }
+               else if (s->tag == SOURCE_PORT && next == NULL)
+                  next = s->u.port.input;
+            }
+            if (has_driver)
+               break;
+            input = next;
          }
          if (!has_driver)
             return NULL;
@@ -2717,20 +2734,36 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       else if (unlikely(standard() == STD_MX
                         && s->tag == SOURCE_PORT)) {
          // Mixed mode: skip port with no real driver.
-         // Count SOURCE_DRIVER or SOURCE_IMPLICIT as proof of a real
-         // driver.  SOURCE_IMPLICIT covers auto-driver signals in
-         // STD_MX mode where assignments are redirected to 'driver.
-         // Ports with no such source on their input nexus are either
-         // circular inout back-refs or undriven ports.
+         // Walk SOURCE_PORT chain transitively: a nested port-binding
+         // (inner OUT → outer OUT → tb signal) has no SOURCE_DRIVER on
+         // the immediate input, only further along the chain.  Cycle
+         // guard handles the inout back-ref case.
          rt_nexus_t *input = s->u.port.input;
+         rt_nexus_t *seen[8];
+         int n_seen = 0;
+         seen[n_seen++] = n;
          bool has_driver = false;
-         if (input != NULL && input->n_sources > 0) {
+         while (input != NULL && n_seen < 8) {
+            bool already = false;
+            for (int k = 0; k < n_seen; k++)
+               if (seen[k] == input) { already = true; break; }
+            if (already)
+               break;
+            seen[n_seen++] = input;
+            rt_nexus_t *next = NULL;
             for (rt_source_t *si = &(input->sources);
-                 si; si = si->chain_input)
+                 si; si = si->chain_input) {
                if (si->tag == SOURCE_DRIVER
                    || si->tag == SOURCE_IMPLICIT) {
-                  has_driver = true; break;
+                  has_driver = true;
+                  break;
                }
+               else if (si->tag == SOURCE_PORT && next == NULL)
+                  next = si->u.port.input;
+            }
+            if (has_driver)
+               break;
+            input = next;
          }
          if (!has_driver)
             continue;
