@@ -7116,7 +7116,12 @@ static void lower_case_array(lower_unit_t *lu, tree_t stmt, loop_stack_t *loops)
       type_t c0_type = tree_type(c0);
 
       int64_t c0_length;
-      if (folded_length(range_of(c0_type, 0), &c0_length))
+      // Unconstrained choice types have no statically-known range:
+      // skip the folded_length attempt and use the runtime path.
+      // This shows up in STD_MX mode when iverilog-generated VHDL
+      // dispatches `case` on a slice of an unresolved_unsigned signal.
+      if (!type_is_unconstrained(c0_type)
+          && folded_length(range_of(c0_type, 0), &c0_length))
          c0_length_reg = emit_const(voffset, c0_length);
       else {
          c0_reg = lower_rvalue(lu, c0);
