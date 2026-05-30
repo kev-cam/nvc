@@ -263,6 +263,23 @@ package logic3d_types_pkg is
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
 
+    -- Concatenation overloads for mixed logic3d / logic3d_vector operands.
+    -- VHDL doesn't auto-coerce, so iverilog's `(L3D_0,…) & l3d_and(bit, bit)`
+    -- needs explicit overloads when one operand is a single logic3d.
+    function "&"(a : logic3d_vector; b : logic3d) return logic3d_vector;
+    function "&"(a : logic3d; b : logic3d_vector) return logic3d_vector;
+    function "&"(a : logic3d; b : logic3d) return logic3d_vector;
+
+    -- Same concatenations but returning std_logic_vector for contexts where
+    -- the LHS or surrounding expression is typed as std_logic_vector (e.g.
+    -- iverilog UDP temporaries declared `U_Tmp : std_logic_vector := a & b;`
+    -- — std_logic_vector is required because `with..select' needs a
+    -- discrete/character-array selector and logic3d_vector is integer-array).
+    function "&"(a : logic3d_vector; b : logic3d_vector) return std_logic_vector;
+    function "&"(a : logic3d_vector; b : logic3d) return std_logic_vector;
+    function "&"(a : logic3d; b : logic3d_vector) return std_logic_vector;
+    function "&"(a : logic3d; b : logic3d) return std_logic_vector;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -618,6 +635,65 @@ package body logic3d_types_pkg is
         else
             result(a'length - 1 downto 0) := a;
         end if;
+        return result;
+    end function;
+
+    function "&"(a : logic3d_vector; b : logic3d) return logic3d_vector is
+        variable result : logic3d_vector(a'length downto 0);
+    begin
+        result(a'length downto 1) := a;
+        result(0) := b;
+        return result;
+    end function;
+
+    function "&"(a : logic3d; b : logic3d_vector) return logic3d_vector is
+        variable result : logic3d_vector(b'length downto 0);
+    begin
+        result(b'length) := a;
+        result(b'length - 1 downto 0) := b;
+        return result;
+    end function;
+
+    function "&"(a : logic3d; b : logic3d) return logic3d_vector is
+        variable result : logic3d_vector(1 downto 0);
+    begin
+        result(1) := a;
+        result(0) := b;
+        return result;
+    end function;
+
+    function "&"(a : logic3d_vector; b : logic3d_vector) return std_logic_vector is
+        variable result : std_logic_vector(a'length + b'length - 1 downto 0);
+        variable i : integer := result'high;
+    begin
+        for j in a'range loop result(i) := to_std_logic(a(j)); i := i - 1; end loop;
+        for j in b'range loop result(i) := to_std_logic(b(j)); i := i - 1; end loop;
+        return result;
+    end function;
+
+    function "&"(a : logic3d_vector; b : logic3d) return std_logic_vector is
+        variable result : std_logic_vector(a'length downto 0);
+        variable i : integer := result'high;
+    begin
+        for j in a'range loop result(i) := to_std_logic(a(j)); i := i - 1; end loop;
+        result(0) := to_std_logic(b);
+        return result;
+    end function;
+
+    function "&"(a : logic3d; b : logic3d_vector) return std_logic_vector is
+        variable result : std_logic_vector(b'length downto 0);
+        variable i : integer := result'high - 1;
+    begin
+        result(result'high) := to_std_logic(a);
+        for j in b'range loop result(i) := to_std_logic(b(j)); i := i - 1; end loop;
+        return result;
+    end function;
+
+    function "&"(a : logic3d; b : logic3d) return std_logic_vector is
+        variable result : std_logic_vector(1 downto 0);
+    begin
+        result(1) := to_std_logic(a);
+        result(0) := to_std_logic(b);
         return result;
     end function;
 
