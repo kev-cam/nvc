@@ -320,11 +320,64 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    else if (optind == next_cmd)
       fatal("missing file name");
 
+   // Batch-translate all Verilog source files TOGETHER via sv2ghdl, so cross-
+   // module instantiations resolve consistently. Per-file translation (the hook
+   // in analyse_file) leaves some modules as VHDL and others as native Verilog
+   // when a file references a module defined elsewhere — the "2040 cross-
+   // instantiation" bug ("unit X is not a Verilog module" at elaborate). One
+   // sv2ghdl call over the whole set makes every module a VHDL entity.
+   bool vlog_batched = false;
+   {
+      const char *translator = getenv("SV2GHDL");
+      if (!(translator && access(translator, X_OK) == 0)) {
+         translator = NULL;
+         static const char *cand[] = { "iverilog-sv2ghdl",
+            "/usr/local/src/sv2ghdl/bin/iverilog-sv2ghdl", NULL };
+         for (const char **p = cand; *p; p++)
+            if (access(*p, X_OK) == 0) { translator = *p; break; }
+      }
+      char vfiles[8192] = ""; int nv = 0;
+      for (int i = optind; i < next_cmd; i++) {
+         if (argv[i][0] == '@') continue;
+         const char *e = strrchr(argv[i], '.');
+         if (e && (!strcmp(e, ".v") || !strcmp(e, ".sv")
+                   || !strcmp(e, ".vh") || !strcmp(e, ".svh"))) {
+            strncat(vfiles, " '", sizeof(vfiles) - strlen(vfiles) - 1);
+            strncat(vfiles, argv[i], sizeof(vfiles) - strlen(vfiles) - 1);
+            strncat(vfiles, "'", sizeof(vfiles) - strlen(vfiles) - 1);
+            nv++;
+         }
+      }
+      if (translator != NULL && nv > 1) {
+         char tmpdir[512];
+         checked_sprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_batch_%d", getpid());
+         char cmd[9000];
+         checked_sprintf(cmd, sizeof(cmd), "%s -o '%s'%s 2>&1", translator, tmpdir, vfiles);
+         notef("translating %d Verilog files together via %s", nv, translator);
+         if (system(cmd) == 0) {
+            char vhd[600];
+            checked_sprintf(vhd, sizeof(vhd), "%s/design.vhd", tmpdir);
+            if (access(vhd, F_OK) == 0) {
+               analyse_file(vhd, jit, state->registry, state->mir);
+               vlog_batched = true;
+            }
+         }
+         if (!vlog_batched)
+            warnf("batch Verilog translation failed; falling back to per-file");
+      }
+   }
+
    for (int i = optind; i < next_cmd; i++) {
       if (argv[i][0] == '@')
          do_file_list(argv[i] + 1, jit, state->registry, state->mir);
-      else
+      else {
+         const char *e = strrchr(argv[i], '.');
+         const bool isv = e && (!strcmp(e, ".v") || !strcmp(e, ".sv")
+                                || !strcmp(e, ".vh") || !strcmp(e, ".svh"));
+         if (isv && vlog_batched)
+            continue;   // already analysed via the batch translation above
          analyse_file(argv[i], jit, state->registry, state->mir);
+      }
    }
 
    jit_free(jit);
