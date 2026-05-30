@@ -32,6 +32,7 @@
 #include "rt/copy.h"
 #include "rt/heap.h"
 #include "rt/model.h"
+#include "vhdl2vlog.h"
 #include "rt/random.h"
 #include "rt/structs.h"
 #include "thread.h"
@@ -1340,8 +1341,10 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
 
          char mod_lower[256];
          snprintf(mod_lower, sizeof(mod_lower), "%s", modname);
-         for (char *p = mod_lower; *p; p++)
-            *p = tolower((unsigned char)*p);
+         for (char *p = mod_lower; *p; p++) {
+            char c = tolower((unsigned char)*p);
+            *p = (isalnum((unsigned char)c) || c == '_') ? c : '_';   // valid Verilog id
+         }
 
          char so_path[512];
          snprintf(so_path, sizeof(so_path),
@@ -1351,8 +1354,46 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
          if (access(so_path, F_OK) == 0)
             accel_load(m, so_path);
          else {
-            // No cached .so — try to compile in background
+            // No cached .so — try to compile in background.
             const char *src_file = loc_file_str(tree_loc(ref));
+            // If the source is not Verilog (VHDL, or SV via sv2ghdl), emit
+            // synthesizable Verilog from the elaborated tree so gen_statemachine
+            // has something to read. This makes --accel work for VHDL too.
+            const char *ext = src_file ? strrchr(src_file, '.') : NULL;
+            bool is_vlog = ext != NULL
+               && (strcmp(ext, ".v") == 0 || strcmp(ext, ".sv") == 0
+                   || strcmp(ext, ".vh") == 0 || strcmp(ext, ".svh") == 0);
+            char emitted[600];
+            if (!is_vlog) {
+               // Only attempt LEAF instances: vhdl2vlog emits a single module,
+               // so a hierarchy node's child instances wouldn't be defined.
+               // Children are accelerated on their own via the recursion below.
+               int child_insts = 0;
+               for (int ci = 0; ci < scope->children.count; ci++)
+                  if (scope->children.items[ci]->kind == SCOPE_INSTANCE)
+                     child_insts++;
+
+               if (child_insts > 0) {
+                  src_file = NULL;   // not a leaf — leave to its children / nvc
+               }
+               else {
+                  snprintf(emitted, sizeof(emitted), "%s/%s_from_vhdl.v",
+                           accel_dir, mod_lower);
+                  // Best-effort: only accelerate if FULLY translatable. A wrong
+                  // but parseable model would silently corrupt results, so on any
+                  // unhandled construct we decline and the leaf stays in nvc.
+                  if (vhdl2vlog(scope->where, mod_lower, emitted)) {
+                     notef("accel: emitted Verilog for leaf '%s' -> %s",
+                           mod_lower, emitted);
+                     src_file = emitted;
+                  }
+                  else {
+                     notef("accel: '%s' not fully translatable — staying in nvc sim",
+                           mod_lower);
+                     src_file = NULL;
+                  }
+               }
+            }
             if (src_file != NULL) {
                accel_bg_compile(m, mod_lower, src_file, so_path);
             }

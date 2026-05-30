@@ -14,6 +14,7 @@ lib_libnvc_a_SOURCES = \
 	src/simp.c \
 	src/dump.c \
 	src/common.c \
+	src/vhdl2vlog.c \
 	src/fbuf.c \
 	src/hash.c \
 	src/bounds.c \
