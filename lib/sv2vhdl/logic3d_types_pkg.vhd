@@ -251,9 +251,14 @@ package logic3d_types_pkg is
     -- Shift operators
     function "sll"(a : logic3d_vector; n : natural) return logic3d_vector;
     function "srl"(a : logic3d_vector; n : natural) return logic3d_vector;
+    function shift_left (a : logic3d_vector; n : natural) return logic3d_vector;
+    function shift_right(a : logic3d_vector; n : natural) return logic3d_vector;
 
     -- Multiplication
-    function "*"(a, b : logic3d_vector) return logic3d_vector;
+    function "*"  (a, b : logic3d_vector) return logic3d_vector;
+    function "/"  (a, b : logic3d_vector) return logic3d_vector;
+    function "mod"(a, b : logic3d_vector) return logic3d_vector;
+    function "rem"(a, b : logic3d_vector) return logic3d_vector;
 
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
@@ -573,11 +578,36 @@ package body logic3d_types_pkg is
         return unsigned_to_l3d(l3d_to_unsigned(a) srl n);
     end function;
 
+    function shift_left(a : logic3d_vector; n : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(ieee.numeric_std.shift_left(l3d_to_unsigned(a), n));
+    end function;
+
+    function shift_right(a : logic3d_vector; n : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(ieee.numeric_std.shift_right(l3d_to_unsigned(a), n));
+    end function;
+
     function "*"(a, b : logic3d_vector) return logic3d_vector is
         variable result : unsigned(a'length + b'length - 1 downto 0);
     begin
         result := l3d_to_unsigned(a) * l3d_to_unsigned(b);
         return unsigned_to_l3d(result(a'length - 1 downto 0));
+    end function;
+
+    function "/"(a, b : logic3d_vector) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) / l3d_to_unsigned(b));
+    end function;
+
+    function "mod"(a, b : logic3d_vector) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) mod l3d_to_unsigned(b));
+    end function;
+
+    function "rem"(a, b : logic3d_vector) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(l3d_to_unsigned(a) rem l3d_to_unsigned(b));
     end function;
 
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
