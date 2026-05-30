@@ -237,6 +237,7 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    const char *file_list = NULL;
    const char *spec = ":D:f:I:";
    bool no_save = false;
+   char incdir_args[4096] = "", define_args[4096] = "";   // forwarded to sv2ghdl batch
 
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
       switch (c) {
@@ -269,6 +270,8 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          break;
       case 'D':
          parse_pp_define(optarg);
+         strncat(define_args, " -D", sizeof(define_args) - strlen(define_args) - 1);
+         strncat(define_args, optarg, sizeof(define_args) - strlen(define_args) - 1);
          break;
       case 'f':
          file_list = optarg;
@@ -281,6 +284,8 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          break;
       case 'I':
          add_include_dir(optarg);
+         strncat(incdir_args, " -I", sizeof(incdir_args) - strlen(incdir_args) - 1);
+         strncat(incdir_args, optarg, sizeof(incdir_args) - strlen(incdir_args) - 1);
          break;
       case 'u':
          opt_set_int(OPT_SINGLE_UNIT, 1);
@@ -351,8 +356,9 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
       if (translator != NULL && nv > 1) {
          char tmpdir[512];
          checked_sprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_batch_%d", getpid());
-         char cmd[9000];
-         checked_sprintf(cmd, sizeof(cmd), "%s -o '%s'%s 2>&1", translator, tmpdir, vfiles);
+         char cmd[18000];
+         checked_sprintf(cmd, sizeof(cmd), "%s -o '%s'%s%s%s 2>&1",
+                         translator, tmpdir, incdir_args, define_args, vfiles);
          notef("translating %d Verilog files together via %s", nv, translator);
          if (system(cmd) == 0) {
             char vhd[600];
