@@ -44,6 +44,7 @@
 
 #include <getopt.h>
 #include <dlfcn.h>
+#include <glob.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -364,8 +365,47 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
             char vhd[600];
             checked_sprintf(vhd, sizeof(vhd), "%s/design.vhd", tmpdir);
             if (access(vhd, F_OK) == 0) {
+               // Single combined VHDL file (iverilog-sv2ghdl stage 1).
                analyse_file(vhd, jit, state->registry, state->mir);
                vlog_batched = true;
+            }
+            else {
+               // No single design.vhd: the translator emitted per-module VHDL
+               // (one <module>.vhd per module, the stage-2 fallback). Analyse
+               // them all, with the top entity's file last so the entities it
+               // instantiates are already in the library when it is processed.
+               char topfile[700] = "";
+               char metapath[600];
+               checked_sprintf(metapath, sizeof(metapath), "%s/_metadata", tmpdir);
+               FILE *mf = fopen(metapath, "r");
+               if (mf != NULL) {
+                  char line[256];
+                  while (fgets(line, sizeof(line), mf) != NULL) {
+                     char top[128];
+                     if (sscanf(line, "TOP_ENTITY=\"%127[^\"]\"", top) == 1) {
+                        checked_sprintf(topfile, sizeof(topfile),
+                                        "%s/%s.vhd", tmpdir, top);
+                        break;
+                     }
+                  }
+                  fclose(mf);
+               }
+               char pat[600];
+               checked_sprintf(pat, sizeof(pat), "%s/*.vhd", tmpdir);
+               glob_t g;
+               if (glob(pat, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+                  for (size_t k = 0; k < g.gl_pathc; k++) {
+                     if (topfile[0] != '\0'
+                         && strcmp(g.gl_pathv[k], topfile) == 0)
+                        continue;   // defer top file to last
+                     analyse_file(g.gl_pathv[k], jit, state->registry,
+                                  state->mir);
+                  }
+                  if (topfile[0] != '\0' && access(topfile, F_OK) == 0)
+                     analyse_file(topfile, jit, state->registry, state->mir);
+                  vlog_batched = true;
+                  globfree(&g);
+               }
             }
          }
          if (!vlog_batched)
