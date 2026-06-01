@@ -2306,6 +2306,7 @@ static void implicit_signal_attribute(tree_t aref)
 
    tree_add_decl(b, imp);
    tree_set_value(aref, make_ref(imp));
+
 }
 
 static attr_kind_t parse_predefined_attr(ident_t ident)

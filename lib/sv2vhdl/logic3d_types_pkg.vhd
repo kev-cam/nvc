@@ -34,14 +34,28 @@ package logic3d_types_pkg is
     constant L3D_VALUE     : natural := 1;  -- bit 0
 
     -- State constants
-    constant L3D_L : logic3d := 0;  -- 000: undriven 0
-    constant L3D_H : logic3d := 1;  -- 001: undriven 1
-    constant L3D_0 : logic3d := 2;  -- 010: driven 0
-    constant L3D_1 : logic3d := 3;  -- 011: driven 1
-    constant L3D_Z : logic3d := 4;  -- 100: high-Z
-    constant L3D_W : logic3d := 5;  -- 101: uncertain 1
-    constant L3D_X : logic3d := 6;  -- 110: uncertain 0
-    constant L3D_U : logic3d := 7;  -- 111: uninitialized
+    -- Encoding: bit2 = uncertain, bit1 = driven, bit0 = value.
+    -- The value bit propagates through gates regardless of certainty;
+    -- certainty is metadata indicating "this value wasn't explicitly set".
+    -- Naming: L3D_<value>{Z?}{X?}
+    --   0/1 = value bit
+    --   Z   = undriven (no driver — Verilog 'L'/'H' or pass-gate output)
+    --   X   = uncertain (Verilog 'X' — value is suspect)
+    constant L3D_0   : logic3d := 2;  -- 010: driven, certain 0
+    constant L3D_1   : logic3d := 3;  -- 011: driven, certain 1
+    constant L3D_0Z  : logic3d := 0;  -- 000: undriven, certain 0
+    constant L3D_1Z  : logic3d := 1;  -- 001: undriven, certain 1
+    constant L3D_0X  : logic3d := 6;  -- 110: driven, uncertain 0
+    constant L3D_1X  : logic3d := 7;  -- 111: driven, uncertain 1
+    constant L3D_0ZX : logic3d := 4;  -- 100: undriven, uncertain 0
+    constant L3D_1ZX : logic3d := 5;  -- 101: undriven, uncertain 1
+    -- Legacy aliases (std_logic-style names) for back-compat.
+    constant L3D_L : logic3d := 0;  -- alias of L3D_0Z (undriven 0, 'L')
+    constant L3D_H : logic3d := 1;  -- alias of L3D_1Z (undriven 1, 'H')
+    constant L3D_Z : logic3d := 4;  -- alias of L3D_0ZX (high-Z)
+    constant L3D_W : logic3d := 5;  -- alias of L3D_1ZX (weak X 1)
+    constant L3D_X : logic3d := 6;  -- alias of L3D_0X (driven uncertain 0)
+    constant L3D_U : logic3d := 7;  -- alias of L3D_1X (uninitialized)
 
     ---------------------------------------------------------------------------
     -- Vector type for resolution functions
@@ -79,8 +93,18 @@ package logic3d_types_pkg is
     type lut1_t is array (0 to 7) of logic3d;
     type lut2_t is array (0 to 7, 0 to 7) of logic3d;
 
+    -- NOT semantics: copy strength + certainty, flip the value bit.
+    -- For CERTAIN inputs this is straightforward (NOT 0 = 1).
+    -- For UNCERTAIN inputs we COULD flip the value bit, but iverilog's
+    -- tgt-vhdl translates always_comb blocks with `<=` + `wait for 0 ns`
+    -- between bit assignments, and includes self-driven signals in the
+    -- wait list. With value-flip, the deltas oscillate forever on any
+    -- self-referencing combinational block. Until iverilog uses VHDL
+    -- variables for procedural locals, collapse uncertain NOT to L3D_0X.
     --                        L  H  0  1  Z  W  X  U
-    constant NOT_LUT : lut1_t := (3, 2, 3, 2, 6, 6, 6, 6);
+    --                        ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓
+    --                        H  L  1  0  X  X  X  X
+    constant NOT_LUT : lut1_t := (1, 0, 3, 2, 6, 6, 6, 6);
 
     constant AND_LUT : lut2_t := (
     --                  L  H  0  1  Z  W  X  U
@@ -240,6 +264,8 @@ package logic3d_types_pkg is
 
     -- Arithmetic: convert to/from unsigned for +, -, comparisons
     function l3d_to_unsigned(a : logic3d_vector) return unsigned;
+    function l3d_to_unsigned(a : logic3d) return unsigned;        -- 1-bit
+    function to_integer(a : logic3d) return natural;              -- 0 or 1
     function unsigned_to_l3d(a : unsigned) return logic3d_vector;
     function "+"(a, b : logic3d_vector) return logic3d_vector;
     function "-"(a, b : logic3d_vector) return logic3d_vector;
@@ -254,7 +280,7 @@ package logic3d_types_pkg is
     function shift_left (a : logic3d_vector; n : natural) return logic3d_vector;
     function shift_right(a : logic3d_vector; n : natural) return logic3d_vector;
 
-    -- Multiplication
+    -- Multiplication, division, modulus
     function "*"  (a, b : logic3d_vector) return logic3d_vector;
     function "/"  (a, b : logic3d_vector) return logic3d_vector;
     function "mod"(a, b : logic3d_vector) return logic3d_vector;
@@ -263,22 +289,45 @@ package logic3d_types_pkg is
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
 
+    -- Comparisons against integer (Verilog "if vec != 0" pattern)
+    function "/="(a : logic3d_vector; b : integer) return boolean;
+    function "="(a : logic3d_vector; b : integer) return boolean;
+
+    -- Boolean⇄logic3d coercions (iverilog emits `bool and bool` where the
+    -- surrounding context expects logic3d).
+    function "and"(a, b : boolean) return logic3d;
+    function "or"(a, b : boolean) return logic3d;
+    function "xor"(a, b : boolean) return logic3d;
+    function "not"(a : boolean) return logic3d;
+
     -- Concatenation overloads for mixed logic3d / logic3d_vector operands.
-    -- VHDL doesn't auto-coerce, so iverilog's `(L3D_0,…) & l3d_and(bit, bit)`
-    -- needs explicit overloads when one operand is a single logic3d.
+    -- Iverilog emits `(L3D_0,…) & l3d_and(bit, bit)` where the second operand
+    -- is a single logic3d. VHDL doesn't auto-coerce.
     function "&"(a : logic3d_vector; b : logic3d) return logic3d_vector;
     function "&"(a : logic3d; b : logic3d_vector) return logic3d_vector;
     function "&"(a : logic3d; b : logic3d) return logic3d_vector;
 
     -- Same concatenations but returning std_logic_vector for contexts where
     -- the LHS or surrounding expression is typed as std_logic_vector (e.g.
-    -- iverilog UDP temporaries declared `U_Tmp : std_logic_vector := a & b;`
-    -- — std_logic_vector is required because `with..select' needs a
-    -- discrete/character-array selector and logic3d_vector is integer-array).
+    -- iverilog temporaries like `U_Tmp : std_logic_vector := a & b;`).
+    -- NVC's overload resolution picks the matching return type from context.
     function "&"(a : logic3d_vector; b : logic3d_vector) return std_logic_vector;
     function "&"(a : logic3d_vector; b : logic3d) return std_logic_vector;
     function "&"(a : logic3d; b : logic3d_vector) return std_logic_vector;
     function "&"(a : logic3d; b : logic3d) return std_logic_vector;
+
+    -- Comparisons between logic3d_vector operands.
+    function "<" (a, b : logic3d_vector) return boolean;
+    function "<="(a, b : logic3d_vector) return boolean;
+    function ">" (a, b : logic3d_vector) return boolean;
+    function ">="(a, b : logic3d_vector) return boolean;
+    function "=" (a, b : logic3d_vector) return boolean;
+    function "/="(a, b : logic3d_vector) return boolean;
+
+    -- Reduce an N-bit unsigned to a single logic3d (the LSB). iverilog's
+    -- to_std_logic path uses this in sv2vhdl mode to keep results in the
+    -- logic3d family so comparisons against logic3d operands type-check.
+    function unsigned_to_l3d_bit(a : unsigned) return logic3d;
 
 end package;
 
@@ -483,56 +532,84 @@ package body logic3d_types_pkg is
         return result;
     end function;
 
+    -- Helper: align two vectors of possibly-different ranges to common
+    -- 0-based positions and apply a bit-wise op via LUT lookup. Iverilog
+    -- sometimes emits ops with mismatched index ranges (e.g. a is [19:16]
+    -- and b is [3:0]) — both are 4 bits, just rebased differently.
     function l3d_and(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := AND_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := AND_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
 
     function l3d_or(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := OR_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := OR_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
 
     function l3d_xor(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := XOR_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := XOR_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
 
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := NAND_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := NAND_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
 
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := NOR_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := NOR_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
 
     function l3d_xnor(a, b : logic3d_vector) return logic3d_vector is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
     begin
-        for i in a'range loop
-            result(i) := XNOR_LUT(a(i), b(i));
+        result := (others => L3D_0);
+        for i in 0 to n-1 loop
+            result(result'low + i) := XNOR_LUT(aa(i), bb(i));
         end loop;
         return result;
     end function;
@@ -549,6 +626,23 @@ package body logic3d_types_pkg is
             end if;
         end loop;
         return result;
+    end function;
+
+    -- Convert single logic3d to 1-bit unsigned
+    function l3d_to_unsigned(a : logic3d) return unsigned is
+        variable result : unsigned(0 downto 0);
+    begin
+        if is_one(a) then
+            result(0) := '1';
+        else
+            result(0) := '0';
+        end if;
+        return result;
+    end function;
+
+    function to_integer(a : logic3d) return natural is
+    begin
+        if is_one(a) then return 1; else return 0; end if;
     end function;
 
     -- Convert unsigned to logic3d_vector (strong driven values)
@@ -638,6 +732,36 @@ package body logic3d_types_pkg is
         return result;
     end function;
 
+    function "/="(a : logic3d_vector; b : integer) return boolean is
+    begin
+        return to_integer(a) /= b;
+    end function;
+
+    function "="(a : logic3d_vector; b : integer) return boolean is
+    begin
+        return to_integer(a) = b;
+    end function;
+
+    function "and"(a, b : boolean) return logic3d is
+    begin
+        if a and b then return L3D_1; else return L3D_0; end if;
+    end function;
+
+    function "or"(a, b : boolean) return logic3d is
+    begin
+        if a or b then return L3D_1; else return L3D_0; end if;
+    end function;
+
+    function "xor"(a, b : boolean) return logic3d is
+    begin
+        if a xor b then return L3D_1; else return L3D_0; end if;
+    end function;
+
+    function "not"(a : boolean) return logic3d is
+    begin
+        if a then return L3D_0; else return L3D_1; end if;
+    end function;
+
     function "&"(a : logic3d_vector; b : logic3d) return logic3d_vector is
         variable result : logic3d_vector(a'length downto 0);
     begin
@@ -662,6 +786,9 @@ package body logic3d_types_pkg is
         return result;
     end function;
 
+    -- std_logic_vector-returning variants for contexts where the LHS is
+    -- typed as std_logic_vector (iverilog temporaries created from $bits
+    -- operands, or testbench wires declared with std_logic_vector).
     function "&"(a : logic3d_vector; b : logic3d_vector) return std_logic_vector is
         variable result : std_logic_vector(a'length + b'length - 1 downto 0);
         variable i : integer := result'high;
@@ -695,6 +822,41 @@ package body logic3d_types_pkg is
         result(1) := to_std_logic(a);
         result(0) := to_std_logic(b);
         return result;
+    end function;
+
+    function "<"(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) < l3d_to_unsigned(b);
+    end function;
+
+    function "<="(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) <= l3d_to_unsigned(b);
+    end function;
+
+    function ">"(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) > l3d_to_unsigned(b);
+    end function;
+
+    function ">="(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) >= l3d_to_unsigned(b);
+    end function;
+
+    function "="(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) = l3d_to_unsigned(b);
+    end function;
+
+    function "/="(a, b : logic3d_vector) return boolean is
+    begin
+        return l3d_to_unsigned(a) /= l3d_to_unsigned(b);
+    end function;
+
+    function unsigned_to_l3d_bit(a : unsigned) return logic3d is
+    begin
+        if a(a'right) = '1' then return L3D_1; else return L3D_0; end if;
     end function;
 
 end package body;

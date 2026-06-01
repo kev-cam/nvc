@@ -2011,6 +2011,8 @@ tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
       return NULL;  // Suppress cascading errors
    else if ((sym->mask & N_ERROR) || tab->top_scope->suppress)
       return NULL;    // Was an earlier error
+   else if (standard() == STD_MX)
+      return NULL;    // STD_MX: tolerate ambiguous names from generated VHDL
 
    tree_kind_t what = T_LAST_TREE_KIND;
    for (unsigned i = 0; i < sym->ndecls; i++) {
@@ -2873,7 +2875,9 @@ static void begin_overload_resolution(overload_t *o)
    }
 
    if (o->candidates.count == 0 && !o->error && !o->trial) {
-      diag_t *d = diag_new(DIAG_ERROR, tree_loc(o->tree));
+      const bool mx_tolerant = (standard() == STD_MX);
+      diag_t *d = diag_new(mx_tolerant ? DIAG_WARN : DIAG_ERROR,
+                            tree_loc(o->tree));
 
       if (o->symbol != NULL) {
          const bool hinted = diag_hints(d) > 0;
@@ -2914,7 +2918,8 @@ static void begin_overload_resolution(overload_t *o)
 
       diag_suppress(d, o->nametab->top_scope->suppress);
       diag_emit(d);
-      o->error = true;
+      if (!mx_tolerant)
+         o->error = true;
    }
 
    // Determine if this expression could be interpreted as an indexed name
