@@ -5821,7 +5821,18 @@ void x_deposit_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    rt_model_t *m = get_model();
 
-   deposit_signal(m, s, values, offset, count);
+   // A synchronous deposit_signal() sets last_event/event_delta in the current
+   // iteration but wakes receivers in the next one, so their S'event reads
+   // false and edge-sensitive code (rising_edge) never fires — a blocking-
+   // assigned clock would toggle silently. During simulation, schedule the
+   // deposit on the delta queue (after=0) so the value-change and its event are
+   // applied together in the iteration the receivers run, exactly like a normal
+   // signal update. At initialization (no delta cycles yet, no receivers
+   // waiting) fall back to the immediate deposit.
+   if (m->can_create_delta)
+      sched_deposit(m, s, values, offset, count, 0, false);
+   else
+      deposit_signal(m, s, values, offset, count);
 }
 
 void x_sched_deposit(sig_shared_t *ss, uint32_t offset, int32_t count,
