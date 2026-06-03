@@ -1255,6 +1255,17 @@ bool accel_load(rt_model_t *m, const char *so_path)
 
    notef("accel: loaded %s (%d registers)", so_path, *n_regs);
 
+   // A module that synthesised to zero sequential state has nothing to
+   // accelerate (it is pure wiring / structural). Activating it would just
+   // swap out an arbitrary process for a no-op eval — historically this grabbed
+   // the testbench clock generator and stalled the whole run at time 0. Decline.
+   if (*n_regs == 0) {
+      notef("accel: %s has no registers — nothing to accelerate, staying in nvc",
+            so_path);
+      dlclose(dl);
+      return false;
+   }
+
    // Map signals: walk the scope tree, match register names to signals
    rt_scope_t *root = root_scope(m);
    uint8_t **ptrs = xcalloc_array(*n_regs, sizeof(uint8_t *));
@@ -1323,10 +1334,443 @@ bool accel_load(rt_model_t *m, const char *so_path)
    return target != NULL;
 }
 
+// Recover the original Verilog source path from the nvc_verilog_src attribute
+// that iverilog's VHDL backend attaches to each translated entity ("file:line").
+// Returns the file path (without the :line suffix) in `out`, or false if the
+// attribute is absent. Lets --accel feed the original Verilog to yosys rather
+// than regenerating it from the elaborated VHDL.
+// Look for an NVC_VERILOG_SRC attribute spec directly on this unit's decls.
+static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz)
+{
+   const int ndecls = tree_decls(unit);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(unit, i);
+      if (tree_kind(d) != T_ATTR_SPEC)
+         continue;
+      if (!icmp(tree_ident(d), "NVC_VERILOG_SRC"))
+         continue;
+
+      tree_t val = tree_value(d);
+      if (tree_kind(val) != T_STRING)
+         return false;
+
+      const unsigned nchars = tree_chars(val);
+      size_t j = 0;
+      for (unsigned k = 0; k < nchars && j + 1 < outsz; k++) {
+         ident_t cid = tree_ident(tree_ref(tree_char(val, k)));
+         out[j++] = ident_char(cid, 1);   // 'x' enum literal -> x
+      }
+      out[j] = '\0';
+
+      char *colon = strrchr(out, ':');   // drop the trailing :line
+      if (colon != NULL)
+         *colon = '\0';
+
+      return j > 0;
+   }
+   return false;
+}
+
+// Recover the original Verilog source file recorded by sv2vhdl as an
+// NVC_VERILOG_SRC attribute.  The attribute is emitted on the entity, but
+// accel sees the architecture, so check the architecture's primary unit too.
+static bool accel_verilog_src(tree_t unit, char *out, size_t outsz)
+{
+   if (unit == NULL)
+      return false;
+
+   if (accel_verilog_src_one(unit, out, outsz))
+      return true;
+
+   if (tree_kind(unit) == T_ARCH) {
+      tree_t prim = tree_primary(unit);
+      if (prim != NULL && accel_verilog_src_one(prim, out, outsz))
+         return true;
+   }
+
+   return false;
+}
+
+// Read the NVC_VERILOG_PARAMS attribute ("name=value name=value"), emitted by
+// tgt-vhdl, so --accel re-synthesizes with the elaboration's actual generics.
+static bool accel_verilog_params_one(tree_t unit, char *out, size_t outsz)
+{
+   const int ndecls = tree_decls(unit);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(unit, i);
+      if (tree_kind(d) != T_ATTR_SPEC)
+         continue;
+      if (!icmp(tree_ident(d), "NVC_VERILOG_PARAMS"))
+         continue;
+      tree_t val = tree_value(d);
+      if (tree_kind(val) != T_STRING)
+         return false;
+      const unsigned nchars = tree_chars(val);
+      size_t j = 0;
+      for (unsigned k = 0; k < nchars && j + 1 < outsz; k++)
+         out[j++] = ident_char(tree_ident(tree_ref(tree_char(val, k))), 1);
+      out[j] = '\0';
+      return j > 0;
+   }
+   return false;
+}
+
+static bool accel_verilog_params(tree_t unit, char *out, size_t outsz)
+{
+   if (unit == NULL)
+      return false;
+   if (accel_verilog_params_one(unit, out, outsz))
+      return true;
+   if (tree_kind(unit) == T_ARCH) {
+      tree_t prim = tree_primary(unit);
+      if (prim != NULL && accel_verilog_params_one(prim, out, outsz))
+         return true;
+   }
+   return false;
+}
+
+// ===================================================================
+// JIT subtree acceleration  (NVC_ACCEL_JIT=1)
+//
+// cxxrtl-style: synthesize a whole RTL subtree (flattened) to native code
+// via gen_statemachine, then reroute that subtree's process evaluation to it.
+// State lives INSIDE the compiled model; only the subtree's top ports (ins &
+// outs) are bridged. Because we run JIT, post-elaboration, the port signals
+// already exist at known addresses — so the bridge BAKES those addresses in,
+// with no load-time name mapping. logic3d<->bit is the only adaptation.
+// ===================================================================
+
+void x_deposit_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
+                      void *values);   // forward (defined later in this file)
+void x_force(sig_shared_t *ss, uint32_t offset, int32_t count, void *values);
+void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
+                    int offset, size_t count);   // immediate (blocking) deposit
+
+// One accel model per run is enough for the bet; rerouted procs all call this.
+static void (*g_aj_eval)(void) = NULL;
+static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
+{
+   // Establish the active-process context (run_process does not — only the
+   // default JIT eval does), so the bridge can call deposit_signal()/etc.
+   model_thread_t *thread = model_thread(m);
+   rt_wakeable_t *save_obj   = thread->active_obj;
+   rt_scope_t    *save_scope = thread->active_scope;
+   thread->active_obj   = &proc->wakeable;
+   thread->active_scope = proc->scope;
+   if (g_aj_eval) g_aj_eval();
+   thread->active_obj   = save_obj;
+   thread->active_scope = save_scope;
+}
+static const rt_proc_vtable_t aj_eval_vtable = { .eval = aj_proc_eval };
+
+typedef struct {
+   char          name[64];     // lowercased port name, e.g. "a_data"
+   bool          is_output;
+   int           width;        // bits (sub-elements)
+   int           elem;         // bytes per sub-element (logic3d = natural)
+   uint8_t      *data;         // shared.data (read inputs)
+   rt_signal_t  *sig;          // signal (force outputs via force_signal)
+} aj_pin_t;
+
+static tree_t aj_scope_ref(rt_scope_t *scope)
+{
+   if (scope->where == NULL || tree_decls(scope->where) == 0)
+      return NULL;
+   tree_t hier = tree_decl(scope->where, 0);
+   if (tree_kind(hier) != T_HIER)
+      return NULL;
+   return tree_ref(hier);
+}
+
+static void aj_lower(char *dst, const char *src, size_t n)
+{
+   const char *dot = strrchr(src, '.');     // strip WORK. prefix
+   if (dot) src = dot + 1;
+   size_t i = 0;
+   for (; src[i] && i + 1 < n; i++)
+      dst[i] = tolower((unsigned char)src[i]);
+   dst[i] = '\0';
+}
+
+// Find a port signal by (lowercased) name in this scope or its parent.
+static rt_signal_t *aj_find_signal(rt_scope_t *scope, const char *lname)
+{
+   for (rt_scope_t *s = scope; s != NULL; s = s->parent) {
+      for (int i = 0; i < s->signals.count; i++) {
+         rt_signal_t *sig = s->signals.items[i];
+         char sn[64];
+         aj_lower(sn, istr(tree_ident(sig->where)), sizeof sn);
+         if (strcmp(sn, lname) == 0)
+            return sig;
+      }
+      if (s == scope->parent) break;        // only this scope + immediate parent
+   }
+   return NULL;
+}
+
+// Collect distinct recovered-Verilog source files across the subtree.
+static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
+                               int *nsrc, int max)
+{
+   tree_t r = aj_scope_ref(scope);
+   char buf[512];
+   if (r != NULL && accel_verilog_src(r, buf, sizeof buf)) {
+      bool dup = false;
+      for (int i = 0; i < *nsrc; i++)
+         if (strcmp(srcs[i], buf) == 0) { dup = true; break; }
+      if (!dup && *nsrc < max)
+         snprintf(srcs[(*nsrc)++], 512, "%s", buf);
+   }
+   for (int ci = 0; ci < scope->children.count; ci++)
+      aj_collect_sources(scope->children.items[ci], srcs, nsrc, max);
+}
+
+// Reroute every process in the subtree to the accel eval (gate makes
+// non-posedge calls harmless).
+static void aj_reroute(rt_scope_t *scope)
+{
+   for (int pi = 0; pi < scope->procs.count; pi++)
+      proc_set_vtable(scope->procs.items[pi], &aj_eval_vtable);
+   for (int ci = 0; ci < scope->children.count; ci++)
+      aj_reroute(scope->children.items[ci]);
+}
+
+static char *aj_read_file(const char *path)
+{
+   FILE *f = fopen(path, "rb");
+   if (!f) return NULL;
+   fseek(f, 0, SEEK_END);
+   long n = ftell(f);
+   fseek(f, 0, SEEK_SET);
+   char *buf = xmalloc(n + 1);
+   if (fread(buf, 1, n, f) != (size_t)n) { fclose(f); free(buf); return NULL; }
+   buf[n] = '\0';
+   fclose(f);
+   return buf;
+}
+
+// gen_statemachine declares each scalar/vector port as "uint64_t _<name>;".
+static bool aj_model_has_field(const char *dutc_text, const char *name)
+{
+   char needle[80];
+   snprintf(needle, sizeof needle, "uint64_t _%s;", name);
+   return strstr(dutc_text, needle) != NULL;
+}
+
+// Emit the address-baked bridge .c around the generated model.
+static bool aj_emit_bridge(const char *path, const char *dutc,
+                           aj_pin_t *pins, int npins, aj_pin_t *clk,
+                           aj_pin_t *rst, rt_model_t *m)
+{
+   char *dut_text = aj_read_file(dutc);
+   if (!dut_text) return false;
+
+   FILE *f = fopen(path, "w");
+   if (!f) { free(dut_text); return false; }
+
+   fprintf(f, "#define SM_NO_MAIN 1\n");
+   fprintf(f, "#include <stdint.h>\n#include <string.h>\n");
+   fprintf(f, "#include \"%s\"\n\n", dutc);
+   fprintf(f, "typedef long long (*now_fn)(void*,unsigned*);\n");
+   // Outputs use deposit_signal() — the IMMEDIATE (blocking) path: it writes the
+   // effective value and notifies receivers in the SAME iteration (no delta
+   // delay), so the testbench's same-cycle posedge read sees this cycle's value.
+   // Called directly (not the x_deposit_signal JIT wrapper, which routes to the
+   // delta queue during simulation).
+   fprintf(f, "typedef void (*force_fn)(void*,void*,const void*,int,unsigned long);\n");
+   fprintf(f, "static const force_fn FORCE = (force_fn)%#lxUL;\n",
+           (unsigned long)(uintptr_t)&deposit_signal);
+   fprintf(f, "static const now_fn NOW = (now_fn)%#lxUL;\n",
+           (unsigned long)(uintptr_t)&model_now);
+   fprintf(f, "static void *const MDL = (void*)%#lxUL;\n",
+           (unsigned long)(uintptr_t)m);
+   fprintf(f, "static state_t S;\nstatic long long last_t = -1;\n\n");
+   fprintf(f, "void accel_reset(void){ sm_reset(&S); last_t = -1; }\n\n");
+
+   fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n");
+   fprintf(f, "static int g_dbg = -1;\n");
+   fprintf(f, "void accel_eval(void){\n");
+   fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
+   fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
+   // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
+   fprintf(f, "  int _clk = ((uint8_t*)%#lxUL)[0]&1;\n",
+           (unsigned long)(uintptr_t)clk->data);
+   fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
+   fprintf(f, "  if(!_clk) return;                        /* clk low */\n");
+   fprintf(f, "  if(t==last_t) return;                    /* one eval/cycle */\n");
+   fprintf(f, "  last_t = t;\n");
+   fprintf(f, "  inputs_t in; outputs_t o;\n");
+   fprintf(f, "  memset(&in,0,sizeof in); memset(&o,0,sizeof o);\n");
+
+   int bridged_in = 0, bridged_out = 0;
+   // inputs: each sub-element is `elem` bytes (logic3d = natural); the value bit
+   // is bit 0 of the element's low byte (little-endian), so step by `elem`.
+   for (int i = 0; i < npins; i++) {
+      if (pins[i].is_output) continue;
+      if (!aj_model_has_field(dut_text, pins[i].name)) continue;
+      fprintf(f, "  { uint8_t*p=(uint8_t*)%#lxUL; uint64_t v=0;"
+                 " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<b; in._%s=v; }\n",
+              (unsigned long)(uintptr_t)pins[i].data, pins[i].width,
+              pins[i].elem, pins[i].name);
+      bridged_in++;
+   }
+   // Honour synchronous reset: gen_statemachine folds rst into sm_reset (it is
+   // not an input port of the model), so when the net rst is asserted at the
+   // posedge we reset the state instead of advancing it — matching the real DUT.
+   if (rst != NULL)
+      fprintf(f, "  if(((uint8_t*)%#lxUL)[0]&1) sm_reset(&S); else\n",
+              (unsigned long)(uintptr_t)rst->data);
+   // Advance the real state for this cycle with the real inputs.
+   fprintf(f, "  sm_eval(&S,&in,&o);\n");
+   // The testbench scoreboard reads our outputs at the NEXT posedge (it runs
+   // before our eval each cycle), so present the outputs of the POST-advance
+   // state — i.e. one cycle of lookahead. The FIFO handshake outputs are Moore
+   // (pure functions of state: a_ready=!full, sum_valid=!empty, sum_data=mem),
+   // so a throwaway eval of a state copy with zeroed inputs yields them exactly.
+   fprintf(f, "  state_t S2 = S; inputs_t z; memset(&z,0,sizeof z);\n");
+   fprintf(f, "  sm_eval(&S2,&z,&o);\n");
+   fprintf(f, "  if(g_dbg>0){ fprintf(stderr,\"AJ   in: a_v=%%lu a_d=%%lu b_v=%%lu b_d=%%lu s_rdy=%%lu | out: a_rdy=%%lu b_rdy=%%lu s_v=%%lu s_d=%%lu\\n\","
+              "(unsigned long)in._a_valid,(unsigned long)in._a_data,(unsigned long)in._b_valid,(unsigned long)in._b_data,(unsigned long)in._sum_ready,"
+              "(unsigned long)o._a_ready,(unsigned long)o._b_ready,(unsigned long)o._sum_valid,(unsigned long)o._sum_data); }\n");
+   // outputs: driven-certain logic3d (L3D_0=2 / L3D_1=3) in the low byte of each
+   // `elem`-byte sub-element; upper bytes stay 0 (value fits in 0..7).
+   for (int i = 0; i < npins; i++) {
+      if (!pins[i].is_output) continue;
+      if (!aj_model_has_field(dut_text, pins[i].name)) continue;
+      fprintf(f, "  { uint8_t buf[256]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+                 " for(int b=0;b<%d;b++) buf[b*%d]=2|((v>>b)&1);"
+                 " FORCE(MDL,(void*)%#lxUL,buf,0,%d); }\n",
+              pins[i].name, pins[i].width, pins[i].elem,
+              (unsigned long)(uintptr_t)pins[i].sig, pins[i].width);
+      bridged_out++;
+   }
+   fprintf(f, "}\n");
+   fclose(f);
+   free(dut_text);
+
+   notef("accel-jit: bridge %d inputs, %d outputs", bridged_in, bridged_out);
+   return bridged_in > 0 && bridged_out > 0;
+}
+
+static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
+                                  tree_t ref, const char *accel_dir)
+{
+   // 1. gather the subtree's Verilog sources
+   static char srcs[64][512];
+   int nsrc = 0;
+   aj_collect_sources(scope, srcs, &nsrc, 64);
+   if (nsrc == 0)
+      return false;
+
+   // Verilog top module name = entity (without -ARCH suffix), lowercased
+   tree_t ent = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
+   char top[128];
+   aj_lower(top, istr(tree_ident(ent)), sizeof top);
+
+   char dutc[600], bridge[600], so[600];
+   snprintf(dutc,   sizeof dutc,   "%s/aj_%s.c", accel_dir, top);
+   snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, top);
+   snprintf(so,     sizeof so,     "%s/aj_%s.so", accel_dir, top);
+
+   // 2. synthesize the flattened model (gen_statemachine, cwd = source dir for includes)
+   char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
+   char *slash = strrchr(dir, '/'); if (slash) *slash = '\0';
+   char cmd[8192];
+   int off = snprintf(cmd, sizeof cmd, "cd '%s' && gen_statemachine", dir);
+   for (int i = 0; i < nsrc; i++)
+      off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
+   // Re-synthesize with the elaboration's actual generics (width/depth/...).
+   char params[256];
+   if (accel_verilog_params(ref, params, sizeof params) && params[0]) {
+      off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
+      notef("accel-jit: params %s", params);
+   }
+   off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top, dutc);
+   notef("accel-jit: synth '%s' from %d source(s)", top, nsrc);
+   if (system(cmd) != 0 || access(dutc, F_OK) != 0) {
+      notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
+      return false;
+   }
+
+   // 3. capture the port boundary (post-elab addresses)
+   static aj_pin_t pins[64];
+   int npins = 0;
+   aj_pin_t clk = {0}, rst = {0};
+   bool have_clk = false, have_rst = false;
+   const int nports = tree_ports(ent);
+   for (int i = 0; i < nports && npins < 64; i++) {
+      tree_t p = tree_port(ent, i);
+      char lname[64];
+      aj_lower(lname, istr(tree_ident(p)), sizeof lname);
+      rt_signal_t *sig = aj_find_signal(scope, lname);
+      if (sig == NULL)
+         continue;
+      aj_pin_t pin = {0};
+      snprintf(pin.name, sizeof pin.name, "%s", lname);
+      pin.width    = sig->nexus.width;
+      pin.elem     = pin.width ? (int)(sig->shared.size / pin.width) : 1;
+      pin.data     = (uint8_t *)sig->shared.data;
+      pin.sig      = sig;
+      pin.is_output = (tree_subkind(p) == PORT_OUT);
+      notef("accel-jit:   port %-10s %-3s width=%d elem=%d", lname,
+            pin.is_output ? "out" : "in", pin.width, pin.elem);
+      if (strcmp(lname, "clk") == 0) { clk = pin; have_clk = true; }
+      else if (strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
+      else pins[npins++] = pin;
+   }
+   if (!have_clk) {
+      notef("accel-jit: no clk port found for '%s' — leaving in nvc", top);
+      return false;
+   }
+
+   // 4. emit the address-baked bridge and compile
+   if (!aj_emit_bridge(bridge, dutc, pins, npins, &clk,
+                       have_rst ? &rst : NULL, m))
+      return false;
+   const char *cc = getenv("NVC_ACCEL_CC");
+   if (!cc) cc = "gcc -g -O3";
+   snprintf(cmd, sizeof cmd, "%s -shared -fPIC -o '%s' '%s'", cc, so, bridge);
+   if (system(cmd) != 0 || access(so, F_OK) != 0) {
+      notef("accel-jit: compile failed for '%s'", top);
+      return false;
+   }
+
+   // 5. load, reroute the subtree, reset the model
+   void *dl = dlopen(so, RTLD_NOW);
+   if (!dl) { warnf("accel-jit: dlopen %s: %s", so, dlerror()); return false; }
+   void (*eval)(void)  = dlsym(dl, "accel_eval");
+   void (*reset)(void) = dlsym(dl, "accel_reset");
+   if (!eval || !reset) {
+      warnf("accel-jit: missing accel_eval/accel_reset in %s", so);
+      dlclose(dl);
+      return false;
+   }
+   g_aj_eval = eval;
+   reset();
+   aj_reroute(scope);
+   notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
+   return true;
+}
+
 // Recursively scan scopes for acceleration .so files.
 static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
                              const char *accel_dir)
 {
+   // JIT subtree path: work down from the top, accelerate the first
+   // synthesizable subtree that compiles, and don't recurse into it.
+   if (getenv("NVC_ACCEL_JIT") != NULL) {
+      if (scope->kind == SCOPE_INSTANCE) {
+         tree_t r = aj_scope_ref(scope);
+         char tmp[512];
+         if (r != NULL && accel_verilog_src(r, tmp, sizeof tmp)
+             && accel_install_subtree(m, scope, r, accel_dir))
+            return;   // whole subtree accelerated
+      }
+      for (int ci = 0; ci < scope->children.count; ci++)
+         accel_scan_scope(m, scope->children.items[ci], accel_dir);
+      return;
+   }
+
    if (scope->kind == SCOPE_INSTANCE && scope->where != NULL
        && tree_decls(scope->where) > 0) {
       tree_t hier = tree_decl(scope->where, 0);
@@ -1355,7 +1799,32 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
             accel_load(m, so_path);
          else {
             // No cached .so — try to compile in background.
-            const char *src_file = loc_file_str(tree_loc(ref));
+            // Prefer the original Verilog source recovered from the
+            // nvc_verilog_src attribute (Mode 1); fall back to the elaborated
+            // unit's location otherwise.
+            char vsrc_buf[600];
+            const char *src_file;
+            // synth_top is the module name handed to gen_statemachine. For the
+            // VHDL-emitted path it is mod_lower (vhdl2vlog names the module so).
+            // For recovered Verilog it must be the ORIGINAL Verilog module name
+            // (the entity, without the "-FROM_VERILOG" arch suffix), not the
+            // entity-arch combined name that mod_lower encodes.
+            const char *synth_top = mod_lower;
+            char vlog_top[256];
+            if (accel_verilog_src(ref, vsrc_buf, sizeof(vsrc_buf))) {
+               src_file = vsrc_buf;
+               tree_t ent = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
+               const char *ename = istr(tree_ident(ent));
+               const char *edot = strrchr(ename, '.');
+               snprintf(vlog_top, sizeof(vlog_top), "%s", edot ? edot + 1 : ename);
+               for (char *p = vlog_top; *p; p++) {
+                  char c = tolower((unsigned char)*p);
+                  *p = (isalnum((unsigned char)c) || c == '_') ? c : '_';
+               }
+               synth_top = vlog_top;
+            }
+            else
+               src_file = loc_file_str(tree_loc(ref));
             // If the source is not Verilog (VHDL, or SV via sv2ghdl), emit
             // synthesizable Verilog from the elaborated tree so gen_statemachine
             // has something to read. This makes --accel work for VHDL too.
@@ -1395,7 +1864,7 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
                }
             }
             if (src_file != NULL) {
-               accel_bg_compile(m, mod_lower, src_file, so_path);
+               accel_bg_compile(m, synth_top, src_file, so_path);
             }
             else {
                notef("accel: no .so for module '%s' and no source",
