@@ -51,10 +51,13 @@ extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
 #define MAX_TYPE  128
 #define MAX_VAL   1024
 
-/* Tran-like entity names (bidirectional switches using 'driver/'other) */
+/* Tran-like entity names (bidirectional switches using 'driver/'other).
+ * SV_ALIAS is a permanent wire join (the SystemVerilog 'alias' short); it
+ * uses the same 'driver/'other endpoint mechanism, so it resolves identically. */
 static const char *tran_entities[] = {
     "SV_TRAN", "SV_TRANIF0", "SV_TRANIF1",
     "SV_RTRAN", "SV_RTRANIF0", "SV_RTRANIF1",
+    "SV_ALIAS",
     NULL
 };
 
@@ -563,8 +566,25 @@ static void analyze_nets(void)
                 safe_copy(ep->driver_ename, n->net_name,
                           sizeof(ep->driver_ename));
                 ep->receiver_ename[0] = '\0';
-                safe_copy(ep->type_name, "std_logic",
-                          sizeof(ep->type_name));
+                /* Type the signal endpoint by the net's actual declared type
+                 * (e.g. logic3d), not a hardcoded std_logic. The generated
+                 * resolver assigns between this signal and a tran/alias port's
+                 * driver/other (integer-based logic3d), so a std_logic signal
+                 * would be a type mismatch (STD_LOGIC vs INTEGER). */
+                const char *path = n->net_name;
+                if (*path == '.') path++;
+                vhpiHandleT sh = vhpi_handle_by_name(path, NULL);
+                if (sh) {
+                    char st[MAX_TYPE], et[MAX_TYPE];
+                    get_type_info(sh, st, sizeof st, et, sizeof et);
+                    safe_copy(ep->type_name,
+                              (st[0] && st[0] != '?') ? st : "std_logic",
+                              sizeof(ep->type_name));
+                    vhpi_release_handle(sh);
+                } else {
+                    safe_copy(ep->type_name, "std_logic",
+                              sizeof(ep->type_name));
+                }
                 ep->is_signal = 1;
             }
             n->needs_resolution = 1;

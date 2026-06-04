@@ -90,10 +90,10 @@ def _type_info(net):
 
     if ep_type == "logic3ds":
         return ("l3ds_resolve", "logic3ds_vector",
-                ["use work.logic3ds_pkg.all;"])
+                ["use sv2vhdl.logic3ds_pkg.all;"])
     elif ep_type == "logic3d":
         return ("l3d_resolve", "logic3d_vector",
-                ["use work.logic3d_types_pkg.all;"])
+                ["use sv2vhdl.logic3d_types_pkg.all;"])
     else:
         return ("resolved", "std_ulogic_vector", [])
 
@@ -314,6 +314,22 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
 
     resolve_func, vec_type, extra_uses = _type_info(net)
 
+    # Make the package for ANY endpoint's logic3d/logic3ds type visible, not
+    # just the resolution driver's: a tran/alias port driver is typed 'integer'
+    # (universal implicit signal) while the net signal endpoint is 'logic3d',
+    # so without this the external name `: logic3d` has no visible declaration.
+    def _pkg_for(t):
+        t = (t or "").lower()
+        if "logic3ds" in t:
+            return "use sv2vhdl.logic3ds_pkg.all;"
+        if "logic3d" in t:
+            return "use sv2vhdl.logic3d_types_pkg.all;"
+        return None
+    for _ep in net["drivers"] + net["receivers"]:
+        _p = _pkg_for(_ep.get("type"))
+        if _p and _p not in extra_uses:
+            extra_uses.append(_p)
+
     # Determine the tran endpoint type (for conversion decisions)
     tran_type = "std_logic"
     for i in tran_indices:
@@ -327,6 +343,11 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
     lines.append(f"")
     lines.append(f"library ieee;")
     lines.append(f"use ieee.std_logic_1164.all;")
+    # The logic3d/logic3ds packages live in the standard sv2vhdl library that
+    # production designs reference (not work, where the resolver's own tests
+    # compile them). Declare it so the use clauses below resolve.
+    if extra_uses:
+        lines.append(f"library sv2vhdl;")
     for use in extra_uses:
         lines.append(use)
     lines.append(f"")
