@@ -5070,8 +5070,9 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
    }
 }
 
-void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
-                    int offset, size_t count)
+static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
+                                const void *values, int offset, size_t count,
+                                bool wake_next)
 {
    RT_LOCK(s->lock);
 
@@ -5096,9 +5097,26 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
          m->trigger_epoch++;
 
          n->last_event = m->now;
-         n->event_delta = m->iteration;
 
-         assert(!(n->flags & NET_F_CACHE_EVENT));
+         // A deposit applied from within a running process (wake_next) writes
+         // the value immediately -- so a concurrent <= driver and same-time
+         // reads are not perturbed -- but its woken receivers do not run until
+         // the next delta iteration (the procq is swapped before it is
+         // drained). Attribute the event to iteration+1 so S'event /
+         // rising_edge read true when those receivers actually run; otherwise a
+         // blocking-assigned clock toggles its value but produces no edge. The
+         // bridge/immediate callers (wake_next=false) notify in the current
+         // iteration as before. Set the cached event flag directly because
+         // sync_event_cache only clears it -- notify_event normally sets it.
+         n->event_delta = m->iteration + (wake_next ? 1 : 0);
+
+         if (wake_next) {
+            if (n->flags & NET_F_CACHE_EVENT)
+               n->signal->shared.flags |= SIG_F_EVENT_FLAG;
+            m->next_is_delta = true;
+         }
+         else
+            assert(!(n->flags & NET_F_CACHE_EVENT));
 
          wakeup_all(m, &(n->pending));
 
@@ -5120,6 +5138,13 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
 
       vptr += valuesz;
    }
+}
+
+void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
+                    int offset, size_t count)
+{
+   // Public/bridge entry point: immediate notify in the current iteration.
+   deposit_signal_impl(m, s, values, offset, count, false);
 }
 
 void sched_deposit(rt_model_t *m, rt_signal_t *s, const void *values,
@@ -6290,18 +6315,19 @@ void x_deposit_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    rt_model_t *m = get_model();
 
-   // A synchronous deposit_signal() sets last_event/event_delta in the current
-   // iteration but wakes receivers in the next one, so their S'event reads
-   // false and edge-sensitive code (rising_edge) never fires — a blocking-
-   // assigned clock would toggle silently. During simulation, schedule the
-   // deposit on the delta queue (after=0) so the value-change and its event are
-   // applied together in the iteration the receivers run, exactly like a normal
-   // signal update. At initialization (no delta cycles yet, no receivers
-   // waiting) fall back to the immediate deposit.
-   if (m->can_create_delta)
-      sched_deposit(m, s, values, offset, count, 0, false);
-   else
-      deposit_signal(m, s, values, offset, count);
+   // A blocking-assigned signal (Verilog := / T_DEPOSIT) must (a) take its new
+   // value immediately, so a concurrent <= driver on the same signal and any
+   // same-time reads are not perturbed, and (b) wake edge-sensitive receivers
+   // with S'event true. A plain deposit_signal() sets event_delta in the
+   // current iteration, but the receivers it wakes do not run until the next
+   // delta cycle, where S'event reads false -- so a blocking-assigned clock
+   // toggled its value but never produced an edge. Routing through the delta
+   // queue (sched_deposit) fixes the event but leaves a persistent DEPOSIT
+   // pseudo-source that resolves against a real <= driver to 'U'. Instead apply
+   // the value immediately and attribute the event to the next iteration
+   // (wake_next), which the receivers actually run in. At initialization (no
+   // delta cycles yet, no receivers waiting) notify in the current iteration.
+   deposit_signal_impl(m, s, values, offset, count, m->can_create_delta);
 }
 
 void x_sched_deposit(sig_shared_t *ss, uint32_t offset, int32_t count,
