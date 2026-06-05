@@ -1605,13 +1605,17 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    int bridged_in = 0, bridged_out = 0;
    // inputs: each sub-element is `elem` bytes (logic3d = natural); the value bit
    // is bit 0 of the element's low byte (little-endian), so step by `elem`.
+   // nvc stores a `(width-1 downto 0)` vector MSB-first: element offset 0 is the
+   // leftmost bit (width-1), offset width-1 is the LSB. The synth model packs bit
+   // b at position b, so element offset e maps to bit (width-1-e) — without this
+   // reversal every multi-bit input arrives bit-reversed (din=1 read as 0x80).
    for (int i = 0; i < npins; i++) {
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       fprintf(f, "  { uint8_t*p=(uint8_t*)%#lxUL; uint64_t v=0;"
-                 " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<b; in._%s=v; }\n",
+                 " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
               (unsigned long)(uintptr_t)pins[i].data, pins[i].width,
-              pins[i].elem, pins[i].name);
+              pins[i].elem, pins[i].width, pins[i].name);
       bridged_in++;
    }
    // Honour synchronous reset: gen_statemachine folds rst into sm_reset (it is
@@ -1629,18 +1633,33 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // so a throwaway eval of a state copy with zeroed inputs yields them exactly.
    fprintf(f, "  state_t S2 = S; inputs_t z; memset(&z,0,sizeof z);\n");
    fprintf(f, "  sm_eval(&S2,&z,&o);\n");
-   fprintf(f, "  if(g_dbg>0){ fprintf(stderr,\"AJ   in: a_v=%%lu a_d=%%lu b_v=%%lu b_d=%%lu s_rdy=%%lu | out: a_rdy=%%lu b_rdy=%%lu s_v=%%lu s_d=%%lu\\n\","
-              "(unsigned long)in._a_valid,(unsigned long)in._a_data,(unsigned long)in._b_valid,(unsigned long)in._b_data,(unsigned long)in._sum_ready,"
-              "(unsigned long)o._a_ready,(unsigned long)o._b_ready,(unsigned long)o._sum_valid,(unsigned long)o._sum_data); }\n");
+   // Generic per-pin trace (only fields the synth model actually declares, so it
+   // compiles for any DUT — not just the a_plus_b ports it was first written for).
+   fprintf(f, "  if(g_dbg>0){ fprintf(stderr,\"AJ   in:");
+   for (int i = 0; i < npins; i++)
+      if (!pins[i].is_output && aj_model_has_field(dut_text, pins[i].name))
+         fprintf(f, " %s=%%lu", pins[i].name);
+   fprintf(f, " | out:");
+   for (int i = 0; i < npins; i++)
+      if (pins[i].is_output && aj_model_has_field(dut_text, pins[i].name))
+         fprintf(f, " %s=%%lu", pins[i].name);
+   fprintf(f, "\\n\"");
+   for (int i = 0; i < npins; i++)
+      if (!pins[i].is_output && aj_model_has_field(dut_text, pins[i].name))
+         fprintf(f, ",(unsigned long)in._%s", pins[i].name);
+   for (int i = 0; i < npins; i++)
+      if (pins[i].is_output && aj_model_has_field(dut_text, pins[i].name))
+         fprintf(f, ",(unsigned long)o._%s", pins[i].name);
+   fprintf(f, "); }\n");
    // outputs: driven-certain logic3d (L3D_0=2 / L3D_1=3) in the low byte of each
    // `elem`-byte sub-element; upper bytes stay 0 (value fits in 0..7).
    for (int i = 0; i < npins; i++) {
       if (!pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       fprintf(f, "  { uint8_t buf[256]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
-                 " for(int b=0;b<%d;b++) buf[b*%d]=2|((v>>b)&1);"
+                 " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|((v>>b)&1);"
                  " FORCE(MDL,(void*)%#lxUL,buf,0,%d); }\n",
-              pins[i].name, pins[i].width, pins[i].elem,
+              pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
               (unsigned long)(uintptr_t)pins[i].sig, pins[i].width);
       bridged_out++;
    }
@@ -1674,7 +1693,9 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
 
    // 2. synthesize the flattened model (gen_statemachine, cwd = source dir for includes)
    char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
-   char *slash = strrchr(dir, '/'); if (slash) *slash = '\0';
+   char *slash = strrchr(dir, '/');
+   if (slash) *slash = '\0';
+   else snprintf(dir, sizeof dir, ".");   // bare filename: sources relative to cwd
    char cmd[8192];
    int off = snprintf(cmd, sizeof cmd, "cd '%s' && gen_statemachine", dir);
    for (int i = 0; i < nsrc; i++)
