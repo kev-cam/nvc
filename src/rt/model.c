@@ -1671,6 +1671,33 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    return bridged_in > 0 && bridged_out > 0;
 }
 
+// Resolve the gen_statemachine binary without relying on $PATH: honour
+// $GEN_STATEMACHINE, then the in-tree install location, then fall back to PATH.
+// (A standalone board may not have sv2ghdl/yosys on its login PATH.)
+static const char *aj_gen_sm(void)
+{
+   const char *g = getenv("GEN_STATEMACHINE");
+   if (g != NULL && access(g, X_OK) == 0)
+      return g;
+   static const char *const cand[] = {
+      "/usr/local/src/sv2ghdl/yosys/gen_statemachine", NULL };
+   for (const char *const *p = cand; *p != NULL; p++)
+      if (access(*p, X_OK) == 0)
+         return *p;
+   return "gen_statemachine";   // last resort: hope it's on PATH
+}
+
+// mkdir -p: create each component of path (best effort; ignore EEXIST).
+static void aj_mkdir_p(const char *path)
+{
+   char tmp[512];
+   snprintf(tmp, sizeof tmp, "%s", path);
+   for (char *p = tmp + 1; *p != '\0'; p++) {
+      if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+   }
+   mkdir(tmp, 0755);
+}
+
 static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                                   tree_t ref, const char *accel_dir)
 {
@@ -1697,7 +1724,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    if (slash) *slash = '\0';
    else snprintf(dir, sizeof dir, ".");   // bare filename: sources relative to cwd
    char cmd[8192];
-   int off = snprintf(cmd, sizeof cmd, "cd '%s' && gen_statemachine", dir);
+   int off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
    for (int i = 0; i < nsrc; i++)
       off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
    // Re-synthesize with the elaboration's actual generics (width/depth/...).
@@ -1908,6 +1935,7 @@ void accel_auto(rt_model_t *m)
 
    char accel_dir[512];
    snprintf(accel_dir, sizeof(accel_dir), "%s/.cache/nvc/accel", home);
+   aj_mkdir_p(accel_dir);   // JIT writes aj_*.c/.so here; may not exist yet
 
    accel_scan_scope(m, root_scope(m), accel_dir);
 }
