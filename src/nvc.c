@@ -955,7 +955,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *resolver_dir = NULL;
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
-   bool          use_accel = false;
+   // NVC_ACCEL in the environment is the equivalent of the --accel option
+   // (auto-compile + engage via accel_auto), so test harnesses/scripts can opt
+   // in without being modified. NVC_ACCEL=0 / empty / unset = off. This is
+   // distinct from NVC_USE_ACCEL, which names a prebuilt .so for accel_load.
+   const char   *accel_env = getenv("NVC_ACCEL");
+   bool          use_accel = (accel_env != NULL && accel_env[0] != '\0'
+                              && strcmp(accel_env, "0") != 0);
    bool          lazy_eval = false;
    const char   *launch_debug = NULL;
    const char   *cocotb_so = NULL;
