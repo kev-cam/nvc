@@ -78,6 +78,7 @@ typedef enum {
    OPT_RANDOM_SEED,
    OPT_ELAB_STATS,
    OPT_RELATIVE_PATH,
+   OPT_EMIT_CPP,
 
    OPT_LAST_NAME
 } opt_name_t;

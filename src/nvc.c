@@ -556,6 +556,7 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
    static struct option long_options[] = {
       { "dump-llvm",       no_argument,       0, 'd' },
       { "dump-vcode",      optional_argument, 0, 'v' },
+      { "emit-cpp",        optional_argument, 0, 'P' },
       { "cover",           optional_argument, 0, 'c' },
       { "cover-file",      required_argument, 0, 'F' },
       { "cover-spec",      required_argument, 0, 's' },
@@ -588,6 +589,9 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
          break;
       case 'v':
          opt_set_str(OPT_LOWER_VERBOSE, optarg ?: "");
+         break;
+      case 'P':
+         opt_set_str(OPT_EMIT_CPP, optarg ?: ".");
          break;
       case 'c':
          if (optarg)
@@ -734,6 +738,10 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    if (!no_save)
       cgen(top, state->registry, state->mir, state->jit);
+
+   const char *cppdir = opt_get_str(OPT_EMIT_CPP);
+   if (cppdir != NULL)
+      cppgen(top, state->registry, state->mir, cppdir);
 
    argc -= next_cmd - 1;
    argv += next_cmd - 1;

@@ -57,6 +57,7 @@ lib_libnvc_a_SOURCES = \
 	src/inst.h \
 	src/inst.c \
 	src/cgen.c \
+	src/cppgen.c \
 	src/printf.h \
 	src/printf.c
 
