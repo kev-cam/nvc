@@ -48,6 +48,10 @@ void elab_set_generic(const char *name, const char *value);
 // Serialise JIT code to disk
 void cgen(tree_t top, unit_registry_t *ur, mir_context_t *mc, jit_t *jit);
 
+// Emit portable C++ for the ldx RISC-V array (one function per process)
+void cppgen(tree_t top, unit_registry_t *ur, mir_context_t *mc,
+            const char *outdir);
+
 // Dump out a VHDL representation of the given unit
 void dump(tree_t top);
 
