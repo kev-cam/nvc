@@ -78,12 +78,15 @@ static mir_unit_t *cppgen_get_func(ident_t id)
 static mir_unit_t *cppgen_callable(ident_t callee, int nvalargs)
 {
    mir_unit_t *fu = cppgen_get_func(callee);
-   if (fu == NULL || mir_get_kind(fu) != MIR_UNIT_FUNCTION) return NULL;
+   if (fu == NULL) return NULL;
+   const int knd = mir_get_kind(fu);
+   if (knd != MIR_UNIT_FUNCTION && knd != MIR_UNIT_PROCEDURE) return NULL;
    const mir_type_t rt = mir_get_result(fu);
-   if (mir_is_null(rt)) return NULL;
-   const int cls = mir_get_class(fu, rt);
-   if (cls != MIR_TYPE_INT && cls != MIR_TYPE_OFFSET && cls != MIR_TYPE_REAL)
-      return NULL;
+   if (!mir_is_null(rt)) {                    // a value-returning fn: scalar only
+      const int cls = mir_get_class(fu, rt);
+      if (cls != MIR_TYPE_INT && cls != MIR_TYPE_OFFSET && cls != MIR_TYPE_REAL)
+         return NULL;
+   }                                          // else void (a non-suspending proc)
    if ((int)mir_count_params(fu) != nvalargs) return NULL;
 
    // params must be a single C value: scalar, or a pointer-passable composite
@@ -113,8 +116,10 @@ static mir_unit_t *cppgen_callable(ident_t callee, int nvalargs)
          case MIR_OP_CMP_TRIGGER:  case MIR_OP_ADD_TRIGGER:
          case MIR_OP_INIT_SIGNAL:
          case MIR_OP_WAIT:         case MIR_OP_PCALL:
-         case MIR_OP_CONTEXT_UPREF:case MIR_OP_LINK_PACKAGE:
-         case MIR_OP_LINK_VAR:
+         case MIR_OP_LINK_PACKAGE: case MIR_OP_LINK_VAR:
+            // NB CONTEXT_UPREF is allowed: a recursive/nested call passes the
+            // scope context around (stubbed to scratch) but never derefs it for
+            // a variable -- that would be VAR_UPREF, which stays rejected.
             return NULL;
          default: break;
          }
@@ -791,7 +796,8 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
 
    case MIR_OP_RETURN:
       if (g_infunc) {
-         if (na > 0) { fprintf(f, "   return "); ARG(0); fprintf(f, ";\n"); }
+         if (mir_is_null(mir_get_result(mu)))  fprintf(f, "   return;\n");  // void proc
+         else if (na > 0) { fprintf(f, "   return "); ARG(0); fprintf(f, ";\n"); }
          else fprintf(f, "   return 0;\n");
       }
       else fprintf(f, "   s->__state = 1; return;\n");
@@ -835,16 +841,22 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
             cppgen_assign(f, c, node);
             fprintf(f, "%s(hal", cs);             // hal first: lets fns report
             for (int i = 1; i < na; i++) {
-               // cast each arg to the param's C type so a void*/int64 mismatch
-               // at the call boundary (composite params) is explicit, not an error
                fprintf(f, ", ");
+               mir_value_t arg = mir_get_arg(mu, node, i);
                if (i - 1 < np) {
-                  fprintf(f, "(%s)(",
-                          cppgen_ctype(fu, mir_get_type(fu, mir_get_param(fu, i-1))));
-                  cppgen_val(f, mu, mir_get_arg(mu, node, i));
+                  mir_type_t pt = mir_get_type(fu, mir_get_param(fu, i-1));
+                  // An inout/out scalar is a POINTER param taking a VAR by
+                  // reference -> pass its address; a composite var is already a
+                  // byte-buffer address.  Cast to the param type either way so a
+                  // void*/int64/double mismatch is explicit, not a compile error.
+                  const bool byref = mir_get_class(fu, pt) == MIR_TYPE_POINTER
+                     && arg.tag == MIR_TAG_VAR
+                     && !cppgen_is_composite(mu, mir_get_var_type(mu, arg));
+                  fprintf(f, byref ? "(%s)&(" : "(%s)(", cppgen_ctype(fu, pt));
+                  cppgen_val(f, mu, arg);
                   fprintf(f, ")");
                }
-               else cppgen_val(f, mu, mir_get_arg(mu, node, i));
+               else cppgen_val(f, mu, arg);
             }
             fprintf(f, ");\n");
          }
@@ -1125,7 +1137,9 @@ static void cppgen_function(FILE *f, mir_unit_t *mu, const char *csym, bool decl
    cppgen_build_maps(&c);
 
    const int nparams = mir_count_params(mu);
-   fprintf(f, "%s %s(ldx_hal_t *hal", cppgen_ctype(mu, mir_get_result(mu)), csym);
+   const mir_type_t res = mir_get_result(mu);
+   const char *rct = mir_is_null(res) ? "void" : cppgen_ctype(mu, res);
+   fprintf(f, "%s %s(ldx_hal_t *hal", rct, csym);
    for (int i = 0; i < nparams; i++) {
       mir_value_t p = mir_get_param(mu, i);
       fprintf(f, ", %s p%u", cppgen_ctype(mu, mir_get_type(mu, p)), p.id);
@@ -1160,7 +1174,7 @@ static void cppgen_function(FILE *f, mir_unit_t *mu, const char *csym, bool decl
       }
    }
    g_infunc = false;
-   fprintf(f, "   return 0;\n}\n\n");
+   fprintf(f, mir_is_null(res) ? "   return;\n}\n\n" : "   return 0;\n}\n\n");
    cppgen_free_maps(&c);
 }
 
