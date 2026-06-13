@@ -453,10 +453,15 @@ static char cppgen_image(cppgen_ctx_t *c, mir_value_t v, mir_value_t *valout)
 // or unwrap(fcall INTEGER'image(value)). Build a printf format ("text %lld") and
 // return the single integer value in *valout. NULL if it isn't this shape (or has
 // !=1 value / a non-integer image). Caller frees the result.
-static char *cppgen_format(cppgen_ctx_t *c, mir_value_t msg, mir_value_t *valout)
+// Build a host format string (literal bytes + \001<typecode> per value) for a
+// computed concat message, and fill vals[0..*nvals-1] with the value pieces in
+// left-to-right order.  Caller frees the returned string.
+#define CPPGEN_MAXVALS 16
+static char *cppgen_format(cppgen_ctx_t *c, mir_value_t msg,
+                           mir_value_t *vals, int *nvals)
 {
    mir_unit_t *mu = c->mu;
-   *valout = MIR_NULL_VALUE;
+   *nvals = 0;
    if (msg.tag != MIR_TAG_NODE || msg.id > (unsigned)c->maxid || !c->isdef[msg.id])
       return NULL;
    if (mir_get_op(mu, c->defs[msg.id]) != MIR_OP_ALLOC) return NULL;
@@ -483,7 +488,6 @@ static char *cppgen_format(cppgen_ctx_t *c, mir_value_t msg, mir_value_t *valout
    // sort by offset (offsets after a dynamic-length image piece are non-const).
 
    char fmt[512]; int fl = 0;
-   bool have_val = false;
    for (int i = 0; i < npc; i++) {
       char *lit = cppgen_literal(c, pc[i].src);
       if (lit != NULL) {                            // literal piece -> verbatim
@@ -493,12 +497,12 @@ static char *cppgen_format(cppgen_ctx_t *c, mir_value_t msg, mir_value_t *valout
       }
       mir_value_t val;                              // value piece -> \x01<typecode>
       const char code = cppgen_image(c, pc[i].src, &val);
-      if (code == 0 || have_val) return NULL;        // not renderable, or >1 value
-      *valout = val; have_val = true;
+      if (code == 0 || *nvals >= CPPGEN_MAXVALS) return NULL;  // not renderable / too many
+      vals[(*nvals)++] = val;
       if (fl < 507) { fmt[fl++] = '\x01'; fmt[fl++] = code; }
    }
    fmt[fl] = '\0';
-   if (!have_val) return NULL;     // pure-literal concat already handled elsewhere
+   if (*nvals == 0) return NULL;   // pure-literal concat already handled elsewhere
    return xstrdup(fmt);
 }
 
@@ -571,29 +575,32 @@ static void cppgen_emit_report(FILE *f, cppgen_ctx_t *c, mir_value_t msg)
 {
    mir_unit_t *mu = c->mu;
    char *lit = mir_is_null(msg) ? NULL : cppgen_literal(c, msg);
-   mir_value_t fval = MIR_NULL_VALUE;
+   mir_value_t vals[CPPGEN_MAXVALS]; int nv = 0;
    char *fmt = NULL;
-   if (lit != NULL) {
+   if (lit != NULL) {                               // pure literal: no args
       const uint32_t id = cppgen_intern2(lit, 'L');
-      fprintf(f, "ldx_io_emit(hal, %u, (int64_t)(0));\n", id);
+      fprintf(f, "ldx_io_emit(hal, %u, 0, 0);\n", id);
       free(lit);
    }
-   else if (!mir_is_null(msg) && (fmt = cppgen_format(c, msg, &fval)) != NULL) {
-      const uint32_t id = cppgen_intern2(fmt, 'F');
-      fprintf(f, "ldx_io_emit(hal, %u, (int64_t)(", id);
-      cppgen_val(f, mu, fval);
-      fprintf(f, "));\n");
+   else if (!mir_is_null(msg) && (fmt = cppgen_format(c, msg, vals, &nv)) != NULL) {
+      const uint32_t id = cppgen_intern2(fmt, 'F');     // literal + N value pieces
+      fprintf(f, "{ int64_t _a[] = {");
+      for (int k = 0; k < nv; k++) {
+         if (k) fprintf(f, ", ");
+         fprintf(f, "(int64_t)("); cppgen_val(f, mu, vals[k]); fprintf(f, ")");
+      }
+      fprintf(f, "}; ldx_io_emit(hal, %u, _a, %d); }\n", id, nv);
       free(fmt);
    }
-   else {
+   else {                                           // single image value (or raw)
       mir_value_t ival = MIR_NULL_VALUE;
       char code = mir_is_null(msg) ? 0 : cppgen_image(c, msg, &ival);
       if (code == 0) { code = 'I'; ival = mir_is_null(msg) ? MIR_NULL_VALUE : cppgen_trace_raw(c, msg); }
       const char f2[3] = { '\x01', code, '\0' };
       const uint32_t id = cppgen_intern2(f2, 'F');
-      fprintf(f, "ldx_io_emit(hal, %u, (int64_t)(", id);
+      fprintf(f, "{ int64_t _a[] = {(int64_t)(");
       if (mir_is_null(ival)) fprintf(f, "0"); else cppgen_val(f, mu, ival);
-      fprintf(f, "));\n");
+      fprintf(f, ")}; ldx_io_emit(hal, %u, _a, 1); }\n", id);
    }
 }
 
@@ -822,7 +829,7 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
          if (!mir_is_null(msg))
             cppgen_emit_report(f, c, msg);          // the report clause text
          else                                       // nvc's default for a bare assert
-            fprintf(f, "ldx_io_emit(hal, %u, (int64_t)(0));\n",
+            fprintf(f, "ldx_io_emit(hal, %u, 0, 0);\n",
                     cppgen_intern2("Assertion violation.", 'L'));
          if (sev >= 3)                               // only FAILURE aborts (nvc default)
             fprintf(f, "      ldx_fail(hal);\n");
@@ -1054,6 +1061,40 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
       }
       else fprintf(f, "; // %s -> host\n", mir_op_string(op));
       break;
+
+   case MIR_OP_PCALL:
+      {
+         // Find the callee (LINKAGE) and value args (skip block + linkage).
+         ident_t callee = NULL;
+         mir_value_t vargs[8]; int nv = 0;
+         for (int i = 0; i < na; i++) {
+            mir_value_t a = mir_get_arg(mu, node, i);
+            if (a.tag == MIR_TAG_LINKAGE) callee = mir_get_name(mu, a);
+            else if (a.tag != MIR_TAG_BLOCK && nv < 8) vargs[nv++] = a;
+         }
+         const char *cn = callee ? istr(callee) : "";
+         const bool isstop = strstr(cn, "STD.ENV.STOP") != NULL;
+         const bool isfin  = strstr(cn, "STD.ENV.FINISH") != NULL;
+         if (isstop || isfin) {
+            // std.env.stop/finish: report "<STOP|FINISH> called[ with status N]"
+            // then halt -- matches nvc's _std_env_stop (which aborts the sim).
+            const char *word = isfin ? "FINISH" : "STOP";
+            // the INTEGER overload carries a status value arg (the last one)
+            const bool have_status = strstr(cn, "(I)") || strstr(cn, "INTEGER") || nv > 1;
+            if (have_status && nv > 0) {
+               char lbl[64]; snprintf(lbl, sizeof lbl, "%s called with status \001I", word);
+               fprintf(f, "   { int64_t _a[] = {(int64_t)(");
+               cppgen_val(f, mu, vargs[nv - 1]);
+               fprintf(f, ")}; ldx_io_emit(hal, %u, _a, 1); }\n", cppgen_intern2(lbl, 'F'));
+            }
+            else {
+               char lbl[32]; snprintf(lbl, sizeof lbl, "%s called", word);
+               fprintf(f, "   ldx_io_emit(hal, %u, 0, 0);\n", cppgen_intern2(lbl, 'L'));
+            }
+            fprintf(f, "   ldx_fail(hal);\n");
+         }
+         break;
+      }
 
    default:
       if (cppgen_assign(f, c, node)) {
