@@ -82,10 +82,14 @@ static mir_unit_t *cppgen_callable(ident_t callee, int nvalargs)
    const int knd = mir_get_kind(fu);
    if (knd != MIR_UNIT_FUNCTION && knd != MIR_UNIT_PROCEDURE) return NULL;
    const mir_type_t rt = mir_get_result(fu);
-   if (!mir_is_null(rt)) {                    // a value-returning fn: scalar only
-      const int cls = mir_get_class(fu, rt);
-      if (cls != MIR_TYPE_INT && cls != MIR_TYPE_OFFSET && cls != MIR_TYPE_REAL)
-         return NULL;
+   if (!mir_is_null(rt)) {                    // a value-returning fn
+      switch (mir_get_class(fu, rt)) {
+      case MIR_TYPE_INT: case MIR_TYPE_OFFSET: case MIR_TYPE_REAL:
+      case MIR_TYPE_UARRAY:                   // a string/unconstrained-array result
+         break;                               // (heap fat-pointer; reported via \001S)
+      default:                                // record/carray-by-value returns are
+         return NULL;                         // not modelled -> keep stubbing them
+      }
    }                                          // else void (a non-suspending proc)
    if ((int)mir_count_params(fu) != nvalargs) return NULL;
 
@@ -571,12 +575,19 @@ static bool cppgen_cond_ok(cppgen_ctx_t *c, mir_value_t v, int depth)
 // Emit `ldx_io_emit(...)` for a report/assert message: literal text, a concat
 // format (\001<code> markers), an image-only value, or a raw value. Caller has
 // already written any leading indentation/guard.
-static void cppgen_emit_report(FILE *f, cppgen_ctx_t *c, mir_value_t msg)
+// A report/assert message is a VHDL string: msg = data pointer (already
+// unwrapped by the front end), len = its length (may be null).  Render it as a
+// literal, a concat format, a single 'image value, a computed-string (the raw
+// bytes at msg/len), or a raw scalar -- in that priority.
+static void cppgen_emit_report(FILE *f, cppgen_ctx_t *c, mir_value_t msg,
+                               mir_value_t len)
 {
    mir_unit_t *mu = c->mu;
    char *lit = mir_is_null(msg) ? NULL : cppgen_literal(c, msg);
    mir_value_t vals[CPPGEN_MAXVALS]; int nv = 0;
    char *fmt = NULL;
+   mir_value_t ival = MIR_NULL_VALUE;
+   char icode;
    if (lit != NULL) {                               // pure literal: no args
       const uint32_t id = cppgen_intern2(lit, 'L');
       fprintf(f, "ldx_io_emit(hal, %u, 0, 0);\n", id);
@@ -592,14 +603,30 @@ static void cppgen_emit_report(FILE *f, cppgen_ctx_t *c, mir_value_t msg)
       fprintf(f, "}; ldx_io_emit(hal, %u, _a, %d); }\n", id, nv);
       free(fmt);
    }
-   else {                                           // single image value (or raw)
-      mir_value_t ival = MIR_NULL_VALUE;
-      char code = mir_is_null(msg) ? 0 : cppgen_image(c, msg, &ival);
-      if (code == 0) { code = 'I'; ival = mir_is_null(msg) ? MIR_NULL_VALUE : cppgen_trace_raw(c, msg); }
-      const char f2[3] = { '\x01', code, '\0' };
+   else if (!mir_is_null(msg) && (icode = cppgen_image(c, msg, &ival)) != 0) {
+      const char f2[3] = { '\x01', icode, '\0' };       // a single 'image value
       const uint32_t id = cppgen_intern2(f2, 'F');
       fprintf(f, "{ int64_t _a[] = {(int64_t)(");
-      if (mir_is_null(ival)) fprintf(f, "0"); else cppgen_val(f, mu, ival);
+      cppgen_val(f, mu, ival);
+      fprintf(f, ")}; ldx_io_emit(hal, %u, _a, 1); }\n", id);
+   }
+   else if (!mir_is_null(msg) && !mir_is_null(len)) {
+      // computed string (e.g. a user fn returning string): ship the data ptr +
+      // length; the host prints the bytes (\001S consumes the two args).
+      const char sfmt[3] = { '\x01', 'S', '\0' };
+      const uint32_t id = cppgen_intern2(sfmt, 'F');
+      fprintf(f, "{ int64_t _a[] = { (int64_t)(void*)(");
+      cppgen_val(f, mu, msg);
+      fprintf(f, "), (int64_t)(");
+      cppgen_val(f, mu, len);
+      fprintf(f, ") }; ldx_io_emit(hal, %u, _a, 2); }\n", id);
+   }
+   else {                                           // last resort: a raw scalar
+      const char f2[3] = { '\x01', 'I', '\0' };
+      const uint32_t id = cppgen_intern2(f2, 'F');
+      mir_value_t raw = mir_is_null(msg) ? MIR_NULL_VALUE : cppgen_trace_raw(c, msg);
+      fprintf(f, "{ int64_t _a[] = {(int64_t)(");
+      if (mir_is_null(raw)) fprintf(f, "0"); else cppgen_val(f, mu, raw);
       fprintf(f, ")}; ldx_io_emit(hal, %u, _a, 1); }\n", id);
    }
 }
@@ -810,9 +837,10 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
       else fprintf(f, "   s->__state = 1; return;\n");
       break;
 
-   case MIR_OP_REPORT:
+   case MIR_OP_REPORT:                     // arg0=severity, arg1=msg ptr, arg2=length
       fprintf(f, "   ");                   // emitted fns take `hal` -> can report
-      cppgen_emit_report(f, c, (na > 1) ? mir_get_arg(mu, node, 1) : MIR_NULL_VALUE);
+      cppgen_emit_report(f, c, (na > 1) ? mir_get_arg(mu, node, 1) : MIR_NULL_VALUE,
+                               (na > 2) ? mir_get_arg(mu, node, 2) : MIR_NULL_VALUE);
       break;
 
    case MIR_OP_ASSERT:
@@ -826,8 +854,9 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
          fprintf(f, "   if (!(");
          cppgen_val(f, mu, mir_get_arg(mu, node, 0));
          fprintf(f, ")) {\n      ");
-         if (!mir_is_null(msg))
-            cppgen_emit_report(f, c, msg);          // the report clause text
+         if (!mir_is_null(msg))                      // arg2=msg ptr, arg3=length
+            cppgen_emit_report(f, c, msg,
+                               (na > 3) ? mir_get_arg(mu, node, 3) : MIR_NULL_VALUE);
          else                                       // nvc's default for a bare assert
             fprintf(f, "ldx_io_emit(hal, %u, 0, 0);\n",
                     cppgen_intern2("Assertion violation.", 'L'));
