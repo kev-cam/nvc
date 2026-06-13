@@ -447,7 +447,16 @@ static char cppgen_image(cppgen_ctx_t *c, mir_value_t v, mir_value_t *valout)
    else if (strstr(s, "BOOLEAN"))   code = 'B';
    else if (strstr(s, "TIME"))      code = 'T';
    else if (strstr(s, "INTEGER") || strstr(s, "NATURAL") || strstr(s, "POSITIVE")) code = 'I';
-   if (code == 0) return 0;
+   if (code == 0) {
+      // A user INTEGER subtype's 'image is a foreign builtin (renders decimal)
+      // and is NOT an emittable function; an ENUM's 'image IS an emittable fn
+      // (builds the literal name) -> leave that to the computed-string path.
+      if (cppgen_callable(cn, fna - 1) != NULL) return 0;
+      mir_value_t v0 = mir_get_arg(mu, fc, fna - 1);
+      const int vc = mir_get_class(mu, mir_get_type(mu, v0));
+      if (vc == MIR_TYPE_INT || vc == MIR_TYPE_OFFSET) { *valout = v0; return 'I'; }
+      return 0;
+   }
    *valout = mir_get_arg(mu, fc, fna - 1);
    return code;
 }
@@ -869,6 +878,11 @@ static void cppgen_lower_node(FILE *f, cppgen_ctx_t *c, mir_value_t node)
    case MIR_OP_FCALL:
       {
          ident_t callee = (na > 0) ? mir_get_name(mu, mir_get_arg(mu, node, 0)) : NULL;
+         if (callee != NULL && strstr(istr(callee), "STD.STANDARD.NOW") != NULL) {
+            cppgen_assign(f, c, node);     // 'now': current sim time (fs) from the HAL
+            fprintf(f, "ldx_now(hal);\n");
+            break;
+         }
          mir_unit_t *fu = (callee != NULL) ? cppgen_callable(callee, na - 1) : NULL;
          if (fu != NULL) {
             cppgen_need_func(callee);
