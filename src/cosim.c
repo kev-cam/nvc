@@ -142,7 +142,13 @@ static bool xyce_load(xyce_handle_t *x)
    };
 
    for (const char **p = libnames; *p != NULL; p++) {
-      x->lib = dlopen(*p, RTLD_NOW | RTLD_GLOBAL);
+      // RTLD_LAZY (not RTLD_NOW): libXyceLib pulls in the Trilinos amesos2/
+      // tpetra chain transitively, and that chain has uninstantiated Kokkos
+      // ETI symbols (e.g. KokkosBlas::Impl::NrmInf) that are never called on
+      // Xyce's default KLU/basker solver path. The Xyce executable itself
+      // loads these lazily and runs fine; RTLD_NOW here would force-resolve
+      // them and fail the load. Match Xyce's own lazy binding.
+      x->lib = dlopen(*p, RTLD_LAZY | RTLD_GLOBAL);
       if (x->lib != NULL)
          break;
    }
@@ -489,6 +495,9 @@ static void update_d2a_bridges(cosim_state_t *cs, rt_model_t *m,
       // For next_voltage we use the same value — the actual next value
       // isn't known until NVC processes the event.  The breakpoint
       // at next_time_s ensures a re-sync happens then.
+      if (getenv("COSIM_DEBUG"))
+         fprintf(stderr, "[d2a-upd] %s V=%.3f next_evt=%.3gns\n",
+                 b->xyce_name, voltage, next_time_s * 1e9);
       bridge.update(b->bridge_idx, voltage, voltage, next_time_s);
    }
 }
@@ -571,8 +580,13 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
 
    while (xyce_time < stop_time_s) {
 
-      // Step NVC to current analog time
-      uint64_t nvc_target = (uint64_t)(xyce_time * FS_PER_SEC);
+      // Step NVC to current analog time.  model_step_to() processes events
+      // STRICTLY before its target (should_stop_now uses next_time >= stop),
+      // so a digital event scheduled at exactly the analog sync time (e.g. a
+      // clock edge that Xyce stopped on via the D2A breakpoint) would never
+      // fire — NVC would stall one event behind at every boundary.  Step to
+      // +1 fs so events at the current time are processed inclusively.
+      uint64_t nvc_target = (uint64_t)(xyce_time * FS_PER_SEC) + 1;
       int64_t next_digital = model_step_to(m, nvc_target);
 
       // Update bridge with current NVC signal values
