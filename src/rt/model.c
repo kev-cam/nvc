@@ -143,7 +143,31 @@ typedef struct _rt_model {
    bool               shuffle;
    bool               liveness;
    rt_trigger_t      *triggertab[TRIGGER_TAB_SIZE];
+
+   // Stage-1 parallel-sim profiling (NVC_PROFILE_PROCS): per-delta
+   // process-queue depth distribution + time-in-bucket. The depth is the
+   // parallelism width available that delta; the time-weighted view gives
+   // the parallelizable fraction (Amdahl ceiling) for the SMP scheduler.
+   bool               prof_enabled;
+   uint64_t           prof_deltas;        // deltas that ran the proc queue
+   uint64_t           prof_activations;   // total process activations
+   uint64_t           prof_proc_ns;       // total ns in process execution
+   uint64_t           prof_depth_hist[8]; // delta count by depth bucket
+   uint64_t           prof_depth_ns[8];   // ns by depth bucket
 } rt_model_t;
+
+// Depth bucket: 0, 1, 2-3, 4-15, 16-63, 64-255, 256-1023, 1024+
+static inline int prof_bucket(unsigned d)
+{
+   if (d == 0)    return 0;
+   if (d == 1)    return 1;
+   if (d < 4)     return 2;
+   if (d < 16)    return 3;
+   if (d < 64)    return 4;
+   if (d < 256)   return 5;
+   if (d < 1024)  return 6;
+   return 7;
+}
 
 #define FMT_VALUES_SZ   128
 #define NEXUS_INDEX_MIN 8
@@ -521,6 +545,8 @@ rt_model_t *model_new(jit_t *jit, cover_data_t *cover)
 
    m->threads[thread_id()] = static_alloc(m, sizeof(model_thread_t));
 
+   m->prof_enabled = (getenv("NVC_PROFILE_PROCS") != NULL);
+
    __trace_on = opt_get_int(OPT_RT_TRACE);
 
    return m;
@@ -634,6 +660,28 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
 
 void model_free(rt_model_t *m)
 {
+   if (unlikely(m->prof_enabled) && m->prof_deltas > 0) {
+      static const char *const label[8] = {
+         "       0", "       1", "    2-3", "   4-15",
+         "  16-63", " 64-255", "256-1023", "  1024+" };
+      const double tot_ns = MAX(m->prof_proc_ns, 1);
+      uint64_t wide_ns = 0, wide_act = 0;   // depth >= 16 (bucket >= 4)
+      for (int i = 4; i < 8; i++) wide_ns += m->prof_depth_ns[i];
+      notef("NVC_PROFILE_PROCS: %"PRIu64" proc-running deltas, "
+            "%"PRIu64" activations, %.1f ms in process eval",
+            m->prof_deltas, m->prof_activations, m->prof_proc_ns / 1e6);
+      notef("  depth      deltas        activ?   %%eval-time");
+      for (int i = 0; i < 8; i++) {
+         if (m->prof_depth_hist[i] == 0) continue;
+         notef("  %s  %10"PRIu64"   %10s   %6.2f%%", label[i],
+               m->prof_depth_hist[i], "",
+               100.0 * m->prof_depth_ns[i] / tot_ns);
+      }
+      notef("  parallelizable fraction (depth>=16): %.1f%% of eval time",
+            100.0 * wide_ns / tot_ns);
+      (void)wide_act;
+   }
+
    if (opt_get_int(OPT_RT_STATS)) {
       nvc_rusage_t ru;
       nvc_rusage(&ru);
@@ -4892,7 +4940,20 @@ static void model_cycle(rt_model_t *m)
 
    // Run all non-postponed processes and event callbacks
    swap_deferq(&m->next_procq, &m->procq);
-   deferq_run(m, &m->next_procq);
+   if (unlikely(m->prof_enabled)) {
+      const unsigned depth = m->next_procq.count;
+      const int b = prof_bucket(depth);
+      const uint64_t t0 = get_timestamp_ns();
+      deferq_run(m, &m->next_procq);
+      const uint64_t dt = get_timestamp_ns() - t0;
+      m->prof_deltas++;
+      m->prof_activations += depth;
+      m->prof_proc_ns += dt;
+      m->prof_depth_hist[b]++;
+      m->prof_depth_ns[b] += dt;
+   }
+   else
+      deferq_run(m, &m->next_procq);
 
    run_callbacks(m, END_OF_PROCESSES);
 

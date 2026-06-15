@@ -39,6 +39,50 @@ What is *not* automatically safe (see Caveats): VHDL shared variables /
 protected types (updates are not deferred → order-dependent), and
 foreign/VHPI side-effecting processes.
 
+## Measured ceiling — stage 1a (VeeR-EH1:default:hello)
+
+The first instrumentation increment (`NVC_PROFILE_PROCS`, model-level
+per-delta proc-queue depth histogram + time-in-bucket; zero overhead when
+off) confirms the workload is near-ideal for the split:
+
+| woken procs / delta | deltas | % of process-eval time |
+|---|---|---|
+| 2–3   |  2 948 |  0.01% |
+| 4–15  |  8 189 |  0.05% |
+| 16–63 | 14 728 |  2.23% |
+| 64–255 | 16 147 | 12.78% |
+| 256–1023 | 13 201 | **69.45%** |
+| 1024+ |  1 598 | 15.48% |
+
+61 249 proc-running deltas, 13.3 M activations, 48.4 s in process eval.
+**99.9% of eval time is in deltas that wake ≥16 processes** (≈85% in deltas
+waking ≥256). So the serial fraction is negligible and the Amdahl ceiling is
+set by the per-delta barrier and the GC stop-the-world, not by a lack of
+width. Determinism held (cycles=1033, unchanged). Conclusion: parallelism is
+well worth it here; the open question stage 1c answers is whether we are
+GC-bound.
+
+## Single-core table executor + the vtable scheme-switch
+
+Two refinements that pay off before any threads:
+
+- **Table-driven execution beats lists even single-core** (cache locality;
+  `deferq_run` already prefetches `tasks[i+1].arg` because the work is
+  cache-miss bound). So the reformed flat tables (§1) are a baseline win on
+  one core, not only the substrate for the split.
+- **Use the vtable hack to switch schemes — nvc already does this.**
+  `rt_nexus_vtable_t` (`update_driving`/`deposit`/`read_source`/`notify`) is
+  swapped per nexus between `nexus_default`/`single_driver`/`memo1`/`lazy`
+  schemes via `n->vtable = &…`; `rt_proc_vtable_t` swaps process eval, and the
+  `--accel` path *already* injects a synthesized statemachine by setting
+  `proc->vtable = &wrap->vtable` instead of interpreting. So the scheme-switch
+  for the executor (list ↔ table ↔ parallel, the fast/slow swap of §5) is the
+  same idiom lifted to the queue executor: a `run_procq` function pointer (or
+  a tiny executor vtable) selected at the barrier. It composes orthogonally
+  with the per-proc eval vtable — the **table is the iteration scheme**, the
+  **proc vtable is the per-proc eval scheme** (interpret or accel), so a
+  table executor and accelerated processes coexist with no special-casing.
+
 ## Current structures (grounded in the code)
 
 - `deferq_run(m, dq)` (`rt/model.c`): serial dispatch loop; already prefetches
