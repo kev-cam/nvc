@@ -39,6 +39,25 @@ What is *not* automatically safe (see Caveats): VHDL shared variables /
 protected types (updates are not deferred → order-dependent), and
 foreign/VHPI side-effecting processes.
 
+## RT_MULTITHREADED — the runtime is already lock-annotated
+
+The single biggest enabler: nvc is written thread-safe throughout but
+compiled single-threaded by default. `RT_MULTITHREADED` (`src/rt/rt.h`) gates
+**`RT_LOCK`** itself — when 0, `RT_LOCK(x)` is a no-op; when 1 it is a real
+`SCOPED_LOCK(x)`. The runtime already carries the lock annotations in the
+right places (`RT_LOCK(signal->lock)` around per-signal updates,
+`RT_LOCK(m->memlock)` around the allocator, etc.) and the per-thread model
+state path (`model_thread` lazy-alloc, gated on the same flag); they are just
+disabled to avoid lock overhead in the serial build.
+
+**The default build is now multithreaded** (`RT_MULTITHREADED 1`), which
+activates those locks and the per-thread state so process bodies can run on
+worker threads safely. The serial path stays correct (the locks are simply
+uncontended when only thread 0 runs); the cost is uncontended-lock overhead,
+which the parallel speedup must overcome. This is why stage 1c is "locked,
+correct but contended" out of the box — the locks already exist; stage 2 then
+removes the hot ones via per-core accumulation.
+
 ## Measured ceiling — stage 1a (VeeR-EH1:default:hello)
 
 The first instrumentation increment (`NVC_PROFILE_PROCS`, model-level
@@ -132,16 +151,50 @@ is the hot path every delta. Build-once / scan-many. Row indices double as
 the **stable proc IDs** the tuner needs, and a fixed row order gives a
 canonical (reproducible) execution order.
 
-### 2. Parallel dispatch mechanism
+### 2. Parallel dispatch mechanism — per-core hot-spinning SPSC mailbox
 
-In `deferq_run` (or a parallel variant), when the woken-process count exceeds
-a threshold, dispatch each core's table slice to the `workq` instead of
-running the serial loop. Because the partition is precomputed and each core
-owns its slice, the wake step **marks** into a core-owned region rather than
-appending to a shared queue — which sidesteps concurrent enqueue races on the
-global `procq`/`driverq`. Cross-core driver updates are accumulated into
-per-core `next_*` queues and merged at the delta **barrier** (the only safe
-mutation point). The update/resolution phase can stay serial initially.
+The dispatch is a **dedicated event-processing worker set**, separate from
+the existing `workq` (which keeps doing JIT background compile + GC,
+unchanged — this is event-processing-specific). Workers are nvc pool threads
+(`thread_create`, so each has a valid `thread_id()` and gets per-thread model
+state via the `model_thread` lazy-alloc + its own `tlab`), **pinned** to
+cores and **hot-spinning** — no futex/condvar anywhere on this path.
+
+Hand-off unit is a **slice**, not a process: each delta, thread 0 partitions
+the reformed proc table into per-core contiguous ranges, so the number of
+hand-offs per delta is *cores*, not *processes* (hundreds–thousands). Each
+worker owns a single-producer/single-consumer mailbox:
+
+- **Inbound line** (dispatcher → worker, one cache line): `{epoch,
+  slice_base, start, end}`. Worker busy-loops reading `epoch` (using
+  `spin_wait()` as the relax primitive); on change it runs `[start,end)` then
+  publishes completion. The **only** thing that stops a worker spinning is an
+  explicit STOP/release epoch — the §6 fallback path — never an autonomous
+  sleep.
+- **Outbound word** (worker → dispatcher, separate line): `done_epoch`.
+  Thread 0 spins until every worker's `done_epoch == published epoch` — the
+  BSP barrier — then runs the serial update/resolution phase. Thread 0 also
+  takes a slice so it isn't idle.
+- **Publish `epoch` last** (release store), slice fields first. Assuming
+  cache-line-atomic writes (per design) the worker reads the descriptor in
+  one shot; publishing `epoch` last keeps it correct even where a 64-byte
+  write isn't architecturally atomic. Worker reads `epoch` (acquire) then the
+  slice.
+
+Because hot-spinners never deschedule voluntarily, an OS-preempted spinner
+becomes the straggler that gates the barrier — so this makes the core budget
+(§7) a performance-correctness requirement: pin the workers, keep their count
+under `nproc`, leave cores for the OS and nvc's own JIT/GC threads.
+
+**Per-process correctness rests on the now-active `RT_LOCK` annotations**
+(see "RT_MULTITHREADED" above): a process body's shared mutations —
+`sched_driver` touching `m->driverq`, `signal->shared.flags`, nexus
+`active_delta`; allocation via `mspace` — are already guarded by
+`RT_LOCK(signal->lock)` / `RT_LOCK(m->memlock)` etc., which become real locks
+under the multithreaded build. Stage 1c starts with these as-is ("locked,
+correct but contended") to measure the ceiling; stage 2 replaces the hottest
+shared queues with per-core `next_*` accumulation merged at the barrier to
+remove the contention.
 
 ### 3. Per-slot execution profiling — the timed "second processor"
 

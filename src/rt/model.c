@@ -5487,7 +5487,7 @@ static uint64_t nexus_last_active(rt_model_t *m, rt_nexus_t *nexus)
             }
             else {
                for (int i = 0; i < cf->ninputs; i++) {
-                  RT_LOCK(cf->inputs[i]->signal->lock);
+                  RT_LOCK(cf->inputs[i].nexus->signal->lock);
                   last = MIN(last, nexus_last_active(m, cf->inputs[i].nexus));
                }
             }
