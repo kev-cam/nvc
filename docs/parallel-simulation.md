@@ -315,6 +315,38 @@ a prerequisite for the parallel split to scale**, not an independent task — it
 helps single-thread today and unblocks SMP later. Stage-1 measurement will
 show whether a run is GC-bound (if locked-parallel barely helps, it is).
 
+## Stage 1c status — dispatch works; the real blocker is lazy nexus splitting
+
+The hot-spinning mailbox dispatch (per-core slices, barrier, per-worker
+tlab) is built and runs (`NVC_PARALLEL_PROCS=<n>`, default off). Bringing up
+worker-thread process execution shook out two per-thread-state gaps, both
+fixed: the JIT thread-local fast-path cached thread 0's TL for all threads
+(`jit_thread_install_fast_path`, now skipped under parallel), and `__model`
+is `__thread` in the MT build and was NULL on workers (each worker now sets
+`__model = m`).
+
+What it then hit is **not** a value-read race — and that matters. For RTL,
+inputs are settled at the active edge and all evaluation completes before any
+update (VHDL signals; Verilog NBAs carry the same delta delay), so concurrent
+eval reads are safe by construction. The corruption (garbage logic3d values,
+"length 32 vs target 0", and *different* each run = a race) comes from
+**`split_nexus`**: nvc lazily splits a signal's nexus on first sub-range
+access — on the **read** path too (`split_nexus_slow`/`clone_nexus`,
+unlocked) — reshaping `n->width` and the nexus list mid-delta. Two workers
+first-touching different sub-ranges of one signal restructure it concurrently
+→ readers see a half-rebuilt structure. The *values* are settled; the
+*structure describing them* is being mutated during eval.
+
+Fix options (the nexus structure must be immutable during the parallel
+region): (a) **pre-split / freeze the structure** before going parallel — for
+synthesizable RTL the access pattern is static, so all splits occur in the
+first cycle; warm up serially until splits stop, then dispatch in parallel
+(reads are then lock-free, matching the settled-value model exactly); or
+(b) make `split_nexus` thread-safe with double-checked locking so the rare
+post-warmup split serializes. (a) is the cleaner match for RTL and is the
+intended next step. The default (serial) build is unaffected and verified
+(`cycles=1033`); parallel is opt-in and experimental until this lands.
+
 ## Caveats / unsupported constructs
 
 Fall back to serial for processes that touch:

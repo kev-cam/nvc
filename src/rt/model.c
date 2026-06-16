@@ -221,6 +221,7 @@ static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
 static void reset_scope(rt_model_t *m, rt_scope_t *s);
 static void async_run_process(rt_model_t *m, void *arg);
+static void evproc_shutdown(void);
 static void async_update_property(rt_model_t *m, void *arg);
 static void async_update_driver(rt_model_t *m, void *arg);
 static void async_fast_driver(rt_model_t *m, void *arg);
@@ -425,12 +426,31 @@ static void deferq_grow(deferq_t *dq)
    dq->tasks = xrealloc_array(dq->tasks, dq->max, sizeof(defer_task_t));
 }
 
-static inline void deferq_do(deferq_t *dq, defer_fn_t fn, void *arg)
+// Stage-1c parallel process dispatch: process eval runs lock-free (reads
+// settled values, writes its own driver), but EVENT SCHEDULING into the
+// global queues must be serialized while worker cores run process slices.
+// g_par_active gates the (otherwise zero-cost) lock; g_sched_lock is the
+// single global schedule lock taken only around the queue/heap appends.
+static int        g_par_active = 0;
+static nvc_lock_t g_sched_lock = 0;
+
+static inline void deferq_append(deferq_t *dq, defer_fn_t fn, void *arg)
 {
    if (unlikely(dq->count == dq->max))
       deferq_grow(dq);
 
    dq->tasks[dq->count++] = (defer_task_t){ fn, arg };
+}
+
+static inline void deferq_do(deferq_t *dq, defer_fn_t fn, void *arg)
+{
+   if (unlikely(relaxed_load(&g_par_active))) {
+      nvc_lock(&g_sched_lock);
+      deferq_append(dq, fn, arg);
+      nvc_unlock(&g_sched_lock);
+   }
+   else
+      deferq_append(dq, fn, arg);
 }
 
 static void deferq_scan(deferq_t *dq, scan_fn_t fn, void *arg)
@@ -660,6 +680,8 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
 
 void model_free(rt_model_t *m)
 {
+   evproc_shutdown();
+
    if (unlikely(m->prof_enabled) && m->prof_deltas > 0) {
       static const char *const label[8] = {
          "       0", "       1", "    2-3", "   4-15",
@@ -947,7 +969,13 @@ static void deltaq_insert_proc(rt_model_t *m, uint64_t delta, rt_proc_t *proc)
       proc->wakeable.delayed = true;
 
       void *e = tag_pointer(proc, EVENT_PROCESS);
-      heap_insert(m->eventq_heap, m->now + delta, e);
+      if (unlikely(relaxed_load(&g_par_active))) {
+         nvc_lock(&g_sched_lock);
+         heap_insert(m->eventq_heap, m->now + delta, e);
+         nvc_unlock(&g_sched_lock);
+      }
+      else
+         heap_insert(m->eventq_heap, m->now + delta, e);
    }
 }
 
@@ -3854,9 +3882,13 @@ void model_reset(rt_model_t *m)
 
    run_callbacks(m, END_OF_INITIALISATION);
 
-   // Install fast path for thread context access now that
-   // the thread local has been allocated and init is complete
-   jit_thread_install_fast_path();
+   // Install fast path for thread context access now that the thread local
+   // has been allocated and init is complete. NB this caches thread 0's JIT
+   // thread-local for ALL threads, which is only valid single-threaded; skip
+   // it when the parallel process scheduler will run process bodies on worker
+   // threads (each needs its own per-thread JIT state via jit_thread_local).
+   if (getenv("NVC_PARALLEL_PROCS") == NULL)
+      jit_thread_install_fast_path();
 
    // Load compiled acceleration if available via environment
    // (--accel command line option is handled in nvc.c after model_reset)
@@ -4836,6 +4868,142 @@ static void swap_deferq(deferq_t *a, deferq_t *b)
    *b = tmp;
 }
 
+// ---------------------------------------------------------------------------
+// Stage-1c parallel process dispatch — per-core hot-spinning SPSC mailbox.
+// Workers are nvc pool threads (thread_create gives a thread_id so
+// model_thread + a per-worker tlab work). Each delta thread 0 partitions the
+// woken-process table into per-worker contiguous slices, publishes an epoch,
+// runs its own slice, then spins on the workers' done flags (the BSP
+// barrier). Process eval is lock-free; only event scheduling locks (see
+// deferq_do / deltaq_insert_proc). Enabled by NVC_PARALLEL_PROCS=<nthreads>;
+// default off (serial). NB this "locked" form is the contended lower bound;
+// the lock-free form has thread 0 drain per-worker scheduling-request pages.
+// ---------------------------------------------------------------------------
+typedef struct {
+   uint64_t      epoch __attribute__((aligned(64)));   // inbound (dispatcher)
+   defer_task_t *tasks;
+   unsigned      start;
+   unsigned      end;
+   uint64_t      done  __attribute__((aligned(64)));   // outbound (worker)
+} evproc_mb_t;
+
+#define EVPROC_STOP  UINT_MAX     // slice.end sentinel: worker should exit
+#define EVPROC_MIN   64           // don't parallelise tiny proc queues
+
+static struct {
+   bool          started;
+   int           nthreads;        // total participating incl thread 0
+   rt_model_t   *model;
+   uint64_t      epoch;
+   nvc_thread_t *threads[MAX_THREADS];
+   evproc_mb_t   mb[MAX_THREADS];
+} g_evproc;
+
+static void evproc_run_slice(rt_model_t *m, defer_task_t *t,
+                             unsigned s, unsigned e)
+{
+   for (unsigned i = s; i < e; i++)
+      (*t[i].fn)(m, t[i].arg);
+}
+
+static void *evproc_worker(void *arg)
+{
+   evproc_mb_t *mb = arg;
+   rt_model_t *m = g_evproc.model;
+
+   // Per-thread runtime state the process bodies need on this worker:
+   //   __model      — get_model()/get_active_wakeable() read it (__thread in MT)
+   //   thread->tlab — proc_eval_jit's transient allocation buffer
+   __model = m;
+   model_thread(m)->tlab = tlab_acquire(m->mspace);
+
+   uint64_t seen = 0;
+   for (;;) {
+      uint64_t e;
+      while ((e = atomic_load(&mb->epoch)) == seen)
+         spin_wait();
+      seen = e;
+      if (mb->end == EVPROC_STOP)
+         break;
+      evproc_run_slice(m, mb->tasks, mb->start, mb->end);
+      atomic_store(&mb->done, e);
+   }
+   return NULL;
+}
+
+static void evproc_ensure_started(rt_model_t *m)
+{
+   if (likely(g_evproc.started))
+      return;
+   g_evproc.started = true;
+
+   const char *env = getenv("NVC_PARALLEL_PROCS");
+   int nt = env ? atoi(env) : 0;
+   if (nt < 2) { g_evproc.nthreads = 1; return; }   // disabled
+   if (nt > MAX_THREADS) nt = MAX_THREADS;
+
+   g_evproc.nthreads = nt;
+   g_evproc.model    = m;
+   for (int t = 1; t < nt; t++) {
+      g_evproc.mb[t].epoch = 0;
+      g_evproc.mb[t].done  = 0;
+      g_evproc.threads[t]  =
+         thread_create(evproc_worker, &g_evproc.mb[t], "evproc%d", t);
+   }
+   notef("NVC_PARALLEL_PROCS: %d-way parallel process dispatch", nt);
+}
+
+static void evproc_dispatch(rt_model_t *m, deferq_t *dq)
+{
+   const unsigned n  = dq->count;
+   const int      nt = g_evproc.nthreads;
+   const unsigned per = (n + nt - 1) / nt;
+
+   const uint64_t e = ++g_evproc.epoch;
+   atomic_store(&g_par_active, 1);
+
+   for (int t = 1; t < nt; t++) {
+      evproc_mb_t *mb = &g_evproc.mb[t];
+      const unsigned s = MIN(per * (unsigned)t, n);
+      mb->tasks = dq->tasks;
+      mb->start = s;
+      mb->end   = MIN(s + per, n);
+      atomic_store(&mb->epoch, e);          // publish epoch last
+   }
+
+   evproc_run_slice(m, dq->tasks, 0, MIN(per, n));   // thread 0's own slice
+
+   for (int t = 1; t < nt; t++) {
+      while (atomic_load(&g_evproc.mb[t].done) != e)
+         spin_wait();
+   }
+
+   atomic_store(&g_par_active, 0);
+   dq->count = 0;
+}
+
+static void evproc_shutdown(void)
+{
+   if (!g_evproc.started || g_evproc.nthreads <= 1)
+      return;
+   const uint64_t e = ++g_evproc.epoch;
+   for (int t = 1; t < g_evproc.nthreads; t++) {
+      g_evproc.mb[t].end = EVPROC_STOP;
+      atomic_store(&g_evproc.mb[t].epoch, e);
+   }
+   for (int t = 1; t < g_evproc.nthreads; t++)
+      thread_join(g_evproc.threads[t]);
+   g_evproc.started = false;
+}
+
+static inline void run_procq(rt_model_t *m, deferq_t *dq)
+{
+   if (g_evproc.nthreads > 1 && dq->count >= EVPROC_MIN)
+      evproc_dispatch(m, dq);
+   else
+      deferq_run(m, dq);
+}
+
 static void model_cycle(rt_model_t *m)
 {
    // Simulation cycle is described in LRM 93 section 12.6.4
@@ -4940,11 +5108,12 @@ static void model_cycle(rt_model_t *m)
 
    // Run all non-postponed processes and event callbacks
    swap_deferq(&m->next_procq, &m->procq);
+   evproc_ensure_started(m);
    if (unlikely(m->prof_enabled)) {
       const unsigned depth = m->next_procq.count;
       const int b = prof_bucket(depth);
       const uint64_t t0 = get_timestamp_ns();
-      deferq_run(m, &m->next_procq);
+      run_procq(m, &m->next_procq);
       const uint64_t dt = get_timestamp_ns() - t0;
       m->prof_deltas++;
       m->prof_activations += depth;
@@ -4953,7 +5122,7 @@ static void model_cycle(rt_model_t *m)
       m->prof_depth_ns[b] += dt;
    }
    else
-      deferq_run(m, &m->next_procq);
+      run_procq(m, &m->next_procq);
 
    run_callbacks(m, END_OF_PROCESSES);
 
