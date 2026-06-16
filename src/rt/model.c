@@ -433,6 +433,12 @@ static void deferq_grow(deferq_t *dq)
 // single global schedule lock taken only around the queue/heap appends.
 static int        g_par_active = 0;
 static nvc_lock_t g_sched_lock = 0;
+// Count of nexus splits (clone_nexus). For synthesizable RTL the access
+// pattern is static, so all splits happen in the first cycle(s); the parallel
+// dispatch waits until this stops changing (structure frozen) before running
+// process slices concurrently, so the nexus tree is immutable during eval.
+static uint64_t   g_split_count = 0;
+static uint64_t   g_split_last  = 0;   // sim time (fs) of the most recent split
 
 static inline void deferq_append(deferq_t *dq, defer_fn_t fn, void *arg)
 {
@@ -681,6 +687,10 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
 void model_free(rt_model_t *m)
 {
    evproc_shutdown();
+
+   if (unlikely(m->prof_enabled))
+      notef("nexus splits: %"PRIu64" total, last at %"PRIu64" ns",
+            g_split_count, g_split_last / 1000000);
 
    if (unlikely(m->prof_enabled) && m->prof_deltas > 0) {
       static const char *const label[8] = {
@@ -2816,6 +2826,19 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
 
    rt_signal_t *signal = old->signal;
    MULTITHREADED_ONLY(assert_lock_held(&signal->lock));
+
+   relaxed_add(&g_split_count, 1);
+   g_split_last = m->now;
+   // Thread 0 is the sole propagator, so it legitimately splits during the
+   // parallel region; a split on a WORKER means an eval-path split slipped
+   // through (e.g. a sub-range 'event) and would race — flag it.
+   if (unlikely(relaxed_load(&g_par_active)) && thread_id() != 0) {
+      static bool warned = false;
+      if (!warned) { warned = true;
+         warnf("nexus split on a worker during eval — would race; "
+               "results may be incorrect"); }
+   }
+
    signal->n_nexus++;
 
    if (signal->n_nexus == 2 && (old->flags & NET_F_FAST_DRIVER))
@@ -4869,35 +4892,114 @@ static void swap_deferq(deferq_t *a, deferq_t *b)
 }
 
 // ---------------------------------------------------------------------------
-// Stage-1c parallel process dispatch — per-core hot-spinning SPSC mailbox.
-// Workers are nvc pool threads (thread_create gives a thread_id so
-// model_thread + a per-worker tlab work). Each delta thread 0 partitions the
-// woken-process table into per-worker contiguous slices, publishes an epoch,
-// runs its own slice, then spins on the workers' done flags (the BSP
-// barrier). Process eval is lock-free; only event scheduling locks (see
-// deferq_do / deltaq_insert_proc). Enabled by NVC_PARALLEL_PROCS=<nthreads>;
-// default off (serial). NB this "locked" form is the contended lower bound;
-// the lock-free form has thread 0 drain per-worker scheduling-request pages.
+// Stage-1c parallel process dispatch — eval on workers, propagate on thread 0.
+//
+// At a wide delta, thread 0 partitions the woken-process table into per-worker
+// slices and the hot-spinning workers EVALUATE their processes (reads of
+// settled values are lock-free). A process that drives a signal does NOT touch
+// shared signal/nexus state on the worker: x_sched_waveform pushes a
+// propagation record into the worker's SPSC pipe and returns, so eval never
+// blocks. Thread 0 is the sole propagator — it drains every pipe concurrently
+// and replays each driver update via sched_driver, so all nexus splitting and
+// driver-queue mutation happen single-threaded. Within a delta driver updates
+// are order-independent (resolution is at delta end), so drain order doesn't
+// affect the result. Enabled by NVC_PARALLEL_PROCS=<nthreads>; default off.
 // ---------------------------------------------------------------------------
 typedef struct {
    uint64_t      epoch __attribute__((aligned(64)));   // inbound (dispatcher)
    defer_task_t *tasks;
    unsigned      start;
    unsigned      end;
-   uint64_t      done  __attribute__((aligned(64)));   // outbound (worker)
+   int           tid;     // worker's nvc thread_id (NOT the array index)
+   int           ready;   // worker has set up its pipe/tlab
 } evproc_mb_t;
 
 #define EVPROC_STOP  UINT_MAX     // slice.end sentinel: worker should exit
 #define EVPROC_MIN   64           // don't parallelise tiny proc queues
+#define PROP_VALSZ   256          // inline driver value bytes; wider -> heap
+
+// One deferred driver write (x_sched_waveform), captured on a worker and
+// replayed by thread 0.
+typedef struct {
+   sig_shared_t *ss;
+   uint32_t      offset;
+   int32_t       count;        // nexus element count (1 for the scalar form)
+   int64_t       after;
+   int64_t       reject;
+   rt_proc_t    *proc;
+   bool          scalar;       // true: value in `sval`; false: inline/heap bytes
+   uint64_t      sval;
+   uint32_t      nbytes;
+   uint8_t      *heapval;      // non-NULL when value is too wide for `value`
+   uint8_t       value[PROP_VALSZ];
+} prop_rec_t;
+
+// Per-worker propagation buffer: the worker appends during eval (never
+// blocks — grows on demand), thread 0 drains it after the eval barrier. No
+// atomics on count/recs: the remaining-countdown is the happens-before edge
+// between a worker's appends and thread 0's drain.
+typedef struct {
+   prop_rec_t *recs;
+   uint32_t    count;
+   uint32_t    max;
+} prop_pipe_t;
 
 static struct {
    bool          started;
    int           nthreads;        // total participating incl thread 0
    rt_model_t   *model;
    uint64_t      epoch;
+   int           remaining __attribute__((aligned(64)));  // workers still in eval
    nvc_thread_t *threads[MAX_THREADS];
+   prop_pipe_t  *pipes[MAX_THREADS];
    evproc_mb_t   mb[MAX_THREADS];
 } g_evproc;
+
+// Worker push (single producer): append, growing on demand. Never blocks.
+static inline prop_rec_t *prop_reserve(int tid)
+{
+   prop_pipe_t *p = g_evproc.pipes[tid];
+   if (unlikely(p->count == p->max)) {
+      p->max = p->max ? p->max * 2 : 1024;
+      p->recs = xrealloc_array(p->recs, p->max, sizeof(prop_rec_t));
+   }
+   return &p->recs[p->count];
+}
+
+static inline void prop_commit(int tid)
+{
+   g_evproc.pipes[tid]->count++;
+}
+
+// Thread 0: apply one record — the sole site where split_nexus/sched_driver run.
+static void prop_apply(rt_model_t *m, prop_rec_t *r)
+{
+   rt_signal_t *s = container_of(r->ss, rt_signal_t, shared);
+   RT_LOCK(s->lock);   // clone_nexus asserts this; uncontended (sole propagator)
+   if (r->scalar) {
+      rt_nexus_t *n = split_nexus(m, s, r->offset, 1);
+      sched_driver(m, n, r->after, r->reject, &r->sval, r->proc);
+   }
+   else {
+      rt_nexus_t *n = split_nexus(m, s, r->offset, r->count);
+      uint8_t *vptr = r->heapval ? r->heapval : r->value;
+      int count = r->count;
+      for (; count > 0; n = n->chain) {
+         count -= n->width;
+         sched_driver(m, n, r->after, r->reject, vptr, r->proc);
+         vptr += n->width * n->size;
+      }
+      if (r->heapval) free(r->heapval);
+   }
+}
+
+// Thread 0, after the eval barrier: apply all of a worker's records, reset.
+static void prop_drain(rt_model_t *m, prop_pipe_t *p)
+{
+   for (uint32_t i = 0; i < p->count; i++)
+      prop_apply(m, &p->recs[i]);
+   p->count = 0;
+}
 
 static void evproc_run_slice(rt_model_t *m, defer_task_t *t,
                              unsigned s, unsigned e)
@@ -4911,11 +5013,18 @@ static void *evproc_worker(void *arg)
    evproc_mb_t *mb = arg;
    rt_model_t *m = g_evproc.model;
 
-   // Per-thread runtime state the process bodies need on this worker:
+   // Per-thread runtime state the process bodies need on this worker. NB the
+   // nvc thread_id is assigned by the pool and is NOT the mailbox index (the
+   // JIT/GC pool may already hold low ids), so the pipe is keyed by thread_id
+   // and the id is recorded for thread 0 to find.
    //   __model      — get_model()/get_active_wakeable() read it (__thread in MT)
    //   thread->tlab — proc_eval_jit's transient allocation buffer
+   const int tid = thread_id();
    __model = m;
    model_thread(m)->tlab = tlab_acquire(m->mspace);
+   g_evproc.pipes[tid] = xcalloc(sizeof(prop_pipe_t));
+   mb->tid = tid;
+   atomic_store(&mb->ready, 1);
 
    uint64_t seen = 0;
    for (;;) {
@@ -4926,7 +5035,7 @@ static void *evproc_worker(void *arg)
       if (mb->end == EVPROC_STOP)
          break;
       evproc_run_slice(m, mb->tasks, mb->start, mb->end);
-      atomic_store(&mb->done, e);
+      atomic_add(&g_evproc.remaining, -1);   // done-handler: count this worker out
    }
    return NULL;
 }
@@ -4946,39 +5055,51 @@ static void evproc_ensure_started(rt_model_t *m)
    g_evproc.model    = m;
    for (int t = 1; t < nt; t++) {
       g_evproc.mb[t].epoch = 0;
-      g_evproc.mb[t].done  = 0;
-      g_evproc.threads[t]  =
+      g_evproc.mb[t].ready = 0;
+      g_evproc.threads[t] =
          thread_create(evproc_worker, &g_evproc.mb[t], "evproc%d", t);
    }
-   notef("NVC_PARALLEL_PROCS: %d-way parallel process dispatch", nt);
+   // Wait until every worker has allocated its pipe + recorded its tid, so the
+   // first dispatch can drain them safely.
+   for (int t = 1; t < nt; t++)
+      while (!atomic_load(&g_evproc.mb[t].ready))
+         spin_wait();
+   notef("NVC_PARALLEL_PROCS: %d-way (eval on %d workers, propagate on thread 0)",
+         nt, nt - 1);
 }
 
 static void evproc_dispatch(rt_model_t *m, deferq_t *dq)
 {
    const unsigned n  = dq->count;
-   const int      nt = g_evproc.nthreads;
-   const unsigned per = (n + nt - 1) / nt;
+   const int      nw = g_evproc.nthreads - 1;   // workers; thread 0 propagates
+   const unsigned per = (n + nw - 1) / nw;
 
    const uint64_t e = ++g_evproc.epoch;
+   atomic_store(&g_evproc.remaining, nw);
    atomic_store(&g_par_active, 1);
 
-   for (int t = 1; t < nt; t++) {
+   for (int t = 1; t < g_evproc.nthreads; t++) {
       evproc_mb_t *mb = &g_evproc.mb[t];
-      const unsigned s = MIN(per * (unsigned)t, n);
+      const unsigned s = MIN(per * (unsigned)(t - 1), n);
       mb->tasks = dq->tasks;
       mb->start = s;
       mb->end   = MIN(s + per, n);
       atomic_store(&mb->epoch, e);          // publish epoch last
    }
 
-   evproc_run_slice(m, dq->tasks, 0, MIN(per, n));   // thread 0's own slice
+   // Barrier: wait until every worker has finished eval. "All evaluation
+   // completes before any update" — so we do NOT propagate during eval (that
+   // would write signal state under concurrent reads); drain afterwards.
+   while (atomic_load(&g_evproc.remaining) != 0)
+      spin_wait();
 
-   for (int t = 1; t < nt; t++) {
-      while (atomic_load(&g_evproc.mb[t].done) != e)
-         spin_wait();
-   }
-
+   // Propagate phase: thread 0 is now the only runner, so clear g_par_active
+   // (no scheduling locks needed) and apply every deferred driver update —
+   // the sole site where split_nexus / sched_driver run.
    atomic_store(&g_par_active, 0);
+   for (int t = 1; t < g_evproc.nthreads; t++)
+      prop_drain(m, g_evproc.pipes[g_evproc.mb[t].tid]);
+
    dq->count = 0;
 }
 
@@ -5954,6 +6075,17 @@ void x_sched_inactive(void)
 void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject)
 {
+   if (unlikely(relaxed_load(&g_par_active))) {
+      // Worker eval: defer the driver write to thread 0 via the pipe.
+      const int tid = thread_id();
+      prop_rec_t *r = prop_reserve(tid);
+      r->ss = ss; r->offset = offset; r->count = 1;
+      r->after = after; r->reject = reject; r->proc = get_active_proc();
+      r->scalar = true; r->sval = scalar; r->heapval = NULL;
+      prop_commit(tid);
+      return;
+   }
+
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    RT_LOCK(s->lock);
 
@@ -5977,6 +6109,29 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
                       int32_t count, int64_t after, int64_t reject)
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   if (unlikely(relaxed_load(&g_par_active))) {
+      // Worker eval: defer the driver write to thread 0 via the pipe. Copy the
+      // value (transient on the worker); wide values go to a heap buffer the
+      // applier frees.
+      const int tid = thread_id();
+      const uint32_t nbytes = count * s->nexus.size;
+      prop_rec_t *r = prop_reserve(tid);
+      r->ss = ss; r->offset = offset; r->count = count;
+      r->after = after; r->reject = reject; r->proc = get_active_proc();
+      r->scalar = false; r->nbytes = nbytes;
+      if (likely(nbytes <= PROP_VALSZ)) {
+         r->heapval = NULL;
+         memcpy(r->value, values, nbytes);
+      }
+      else {
+         r->heapval = xmalloc(nbytes);
+         memcpy(r->heapval, values, nbytes);
+      }
+      prop_commit(tid);
+      return;
+   }
+
    RT_LOCK(s->lock);
 
    TRACE("_sched_waveform %s+%d value=%s count=%d after=%s reject=%s",

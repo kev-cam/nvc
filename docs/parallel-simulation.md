@@ -337,15 +337,80 @@ first-touching different sub-ranges of one signal restructure it concurrently
 → readers see a half-rebuilt structure. The *values* are settled; the
 *structure describing them* is being mutated during eval.
 
-Fix options (the nexus structure must be immutable during the parallel
-region): (a) **pre-split / freeze the structure** before going parallel — for
-synthesizable RTL the access pattern is static, so all splits occur in the
-first cycle; warm up serially until splits stop, then dispatch in parallel
-(reads are then lock-free, matching the settled-value model exactly); or
-(b) make `split_nexus` thread-safe with double-checked locking so the rare
-post-warmup split serializes. (a) is the cleaner match for RTL and is the
-intended next step. The default (serial) build is unaffected and verified
-(`cycles=1033`); parallel is opt-in and experimental until this lands.
+**Warm-up is infeasible (measured).** The hypothesis was that splits front-load
+(static RTL → all splits in the first cycle), so warming up serially until
+they stop would freeze the structure. Instrumenting it disproves that for a
+CPU: VeeR-EH1 has **7394 nexus splits, the last at 10295 ns of a 10415 ns
+run** — splits trickle to the very end, because the core keeps first-exercising
+new logic paths (each new sub-range access splits a nexus) throughout the
+program. There is no point past which the structure freezes, so a time/reset
+gate or a splits-stable gate can never safely engage. (Implemented and
+confirmed: `NVC_PARALLEL_AFTER` time gate + splits-stable gate; the
+"nexus split during parallel region" warning still fires.)
+
+So the structure must be made immutable *without* waiting:
+- (a) **Eager pre-split at elaboration** — split every nexus up front to the
+  union of access boundaries the static netlist requires, so the runtime does
+  zero splits and concurrent reads see a fixed structure (lock-free, matching
+  the settled-value model). The correct foundation; needs nvc to enumerate all
+  access sub-ranges at elab rather than splitting lazily on first access.
+- (b) **Thread-safe `split_nexus`** (double-checked / per-signal lock) — keeps
+  lazy splitting but serializes it; this puts a lock on the read path, against
+  the "eval needs no locking" goal, though a min-cut partition (few cross-core
+  shared signals) would keep contention low.
+
+(a) is the recommended path. The default (serial) build is unaffected and
+verified (`cycles=1033`); parallel is opt-in and experimental until this lands.
+
+## Stage 1c RESULT — parallel eval works; the number
+
+The pipe design works and gives the first parallel number on VeeR-EH1. Final
+architecture: thread 0 partitions the woken-process table into per-worker
+slices; hot-spinning workers **evaluate** (reads of settled values are
+lock-free) and a process that drives a signal pushes a propagation record into
+its own growable per-worker buffer (never blocks) instead of touching shared
+state; at the eval **barrier** thread 0 — the sole propagator — drains the
+buffers and replays each `sched_driver`, so all `split_nexus`/driver-queue
+mutation is single-threaded ("all eval completes before any update", as for
+NBAs). Bring-up fixed three single-thread assumptions on the workers: the JIT
+thread-local fast-path cache, `__model` (`__thread`), and the pipe keyed by the
+pool-assigned `thread_id` (not the mailbox index).
+
+**Measurement caveat (recorded so it isn't repeated):** the VeeR testbench
+opens `program.hex` by **relative path** (`gen-veer-tb` → `file_open(…,
+"program.hex", …)`), so every run **must** be launched from the `run/`
+directory that holds it. A batch run from the parent dir silently loads 0 bytes
+("could not open program.hex"), the core spins on the reset vector, and *every*
+config — serial included — dead-ends at `WATCHDOG: 1ms, cycles=99992`. The real
+oracle is `loaded 65615 bytes` → `TEST_PASSED cycles=1033`.
+
+**Numbers (VeeR-EH1 hello, 16-core host, `cycles=1033` in every correct run):**
+
+| config | heap | wall | result |
+|--------|------|------|--------|
+| serial | 16 MB (default) | 52 s | ✓ cycles=1033 |
+| 2-way (1 eval worker)  | default | 52 s | ✓ — no gain (1 evaluator + 1 propagator ≈ serial) |
+| **4-way (3 eval workers)** | **`-H 4g`** | **24 s** | **✓ — 2.2× over serial** |
+| 8-way (7 eval workers) | `-H 4g` | 35 s | ✓ — slower than 4-way |
+| 4-way | default | crash @1 s | ✗ `Fatal: 2147483647 + 2147483647` (overflow) |
+
+**4-way (3 eval workers) is the sweet spot: 52 s → 24 s, 2.2×.** 8-way is
+*slower* (35 s) on 16 cores — not oversubscription; this design just doesn't
+have 7-way independent eval width at 1033 cycles, and the per-cycle barrier +
+single-threaded propagation cost grows with worker count.
+
+**The one caveat — and it's the alloc-churn again.** Correct parallel eval
+currently needs the **GC suppressed** (`-H 4g`). The default heap is only
+**16 MB**; under the logic3d alloc-churn it GCs almost continuously. A
+stop-the-world GC that fires mid-parallel-eval corrupts a live value — here an
+integer signal reads back `INT_MAX`, tripping the VHDL `+` overflow trap at
+~1 s. The churn is dominantly the logic3d ops returning unconstrained vectors
+by value (per-call heap allocation; `alloc_waveform` is free-listed, not
+churned). So the two real next steps converge: (a) reduce the logic3d
+alloc-churn (in-place / preallocated results — "designs are static, reuse in
+place"), which both speeds single-thread *and* stops the GC firing; and/or
+(b) make the GC's stop-the-world suspend/scan the evproc workers correctly so
+parallel is safe on the default heap.
 
 ## Caveats / unsupported constructs
 
