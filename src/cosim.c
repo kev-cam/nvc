@@ -578,42 +578,48 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
 
    notef("starting co-simulation loop (stop_time=%.3g s)", stop_time_s);
 
+   // Event-driven lock-step (analog master, digital evaluated AFTER the analog
+   // model eval so it sees the fresh node voltages).  Each cycle:
+   //   1. Propose acceptance = xyce_time + dt_max, but PULL IT IN to the next
+   //      pending digital event (the next D2A / PWL update) so the analog
+   //      stops where the digital is about to change.
+   //   2. Push the current D2A values (held across the analog step).
+   //   3. Advance/accept Xyce to that time — A2D callbacks deposit the node
+   //      voltages into NVC during the solve.
+   //   4. Step the digital up to the new analog time: it processes the
+   //      just-deposited A2D inputs and schedules its next D2A event, which
+   //      caps the next analog step.  (The digital never runs ahead of the
+   //      analog, so no A2D deposit is missed.)
    while (xyce_time < stop_time_s) {
 
-      // Step NVC to current analog time.  model_step_to() processes events
-      // STRICTLY before its target (should_stop_now uses next_time >= stop),
-      // so a digital event scheduled at exactly the analog sync time (e.g. a
-      // clock edge that Xyce stopped on via the D2A breakpoint) would never
-      // fire — NVC would stall one event behind at every boundary.  Step to
-      // +1 fs so events at the current time are processed inclusively.
-      uint64_t nvc_target = (uint64_t)(xyce_time * FS_PER_SEC) + 1;
-      int64_t next_digital = model_step_to(m, nvc_target);
+      // 1. acceptance time
+      double accept = xyce_time + cs.dt_max;
+      int64_t next_evt = model_next_time(m);
+      if (next_evt >= 0) {
+         double ne = (double)next_evt / FS_PER_SEC;
+         if (ne > xyce_time && ne < accept)
+            accept = ne;                              // pull in to next digital event
+      }
+      if (accept > stop_time_s) accept = stop_time_s;
+      if (accept <= xyce_time)   accept = xyce_time + cs.dt_min;
 
-      // Update bridge with current NVC signal values
-      update_d2a_bridges(&cs, m, next_digital);
+      // 2. push current D2A values
+      update_d2a_bridges(&cs, m, next_evt);
 
-      // Determine next sync point
-      double next_d_sec = (next_digital > 0)
-         ? (double)next_digital / FS_PER_SEC
-         : xyce_time + cs.dt_max;
-      double target = fmin(next_d_sec, xyce_time + cs.dt_max);
-      if (target <= xyce_time)
-         target = xyce_time + cs.dt_min;
-
-      // Advance Xyce — DPWL callbacks fire during this call:
-      //   D2A sources read NVC values from the bridge
-      //   A2D sources detect voltage changes and deposit into NVC directly
+      // 3. advance/accept Xyce
       double actual_time = 0.0;
-      rc = cs.xyce.simulateUntil(&cs.xyce.ptr, target, &actual_time);
+      rc = cs.xyce.simulateUntil(&cs.xyce.ptr, accept, &actual_time);
       if (rc == 0) {
          if (cs.xyce.simulationComplete(&cs.xyce.ptr))
             notef("Xyce simulation complete at time %.6g s", xyce_time);
          else
-            warnf("xyce_simulateUntil(%.6g) failed at cycle %d",
-                  target, cycle);
+            warnf("xyce_simulateUntil(%.6g) failed at cycle %d", accept, cycle);
          break;
       }
       xyce_time = actual_time;
+
+      // 4. evaluate the digital up to the accepted analog time (inclusive)
+      model_step_to(m, (uint64_t)(xyce_time * FS_PER_SEC) + 1);
 
       cycle++;
       if (cycle <= 10 || cycle % 100 == 0)
