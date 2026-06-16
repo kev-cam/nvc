@@ -592,19 +592,20 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
    //      analog, so no A2D deposit is missed.)
    while (xyce_time < stop_time_s) {
 
-      // 1. acceptance time
+      // 1. acceptance time = t + dt_max.  NB we do NOT pull in to the next
+      //    *any* digital event: the A2D deposits during an analog ramp
+      //    re-trigger digital processes (adc threshold re-eval, etc.) that do
+      //    NOT change a D2A output, and capping on those pins the analog step
+      //    tiny.  Only a real D2A change matters, and that is resolved within
+      //    one dt_max step (the digital catches up in step 4 and the new value
+      //    is applied next cycle).  [TODO: exact pull-in needs a per-signal
+      //    next-event query to break only on scheduled D2A transitions.]
       double accept = xyce_time + cs.dt_max;
-      int64_t next_evt = model_next_time(m);
-      if (next_evt >= 0) {
-         double ne = (double)next_evt / FS_PER_SEC;
-         if (ne > xyce_time && ne < accept)
-            accept = ne;                              // pull in to next digital event
-      }
       if (accept > stop_time_s) accept = stop_time_s;
       if (accept <= xyce_time)   accept = xyce_time + cs.dt_min;
 
-      // 2. push current D2A values
-      update_d2a_bridges(&cs, m, next_evt);
+      // 2. push current D2A values (held over the step; -1 = no extra breakpoint)
+      update_d2a_bridges(&cs, m, -1);
 
       // 3. advance/accept Xyce
       double actual_time = 0.0;
