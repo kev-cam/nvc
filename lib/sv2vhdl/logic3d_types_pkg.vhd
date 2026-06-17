@@ -659,24 +659,50 @@ package body logic3d_types_pkg is
         return result;
     end function;
 
-    function "+"(a, b : logic3d_vector) return logic3d_vector is
+    -- Fill a constrained unsigned (declared by the caller, so it lives in the
+    -- call frame / tlab, not the escaping heap) from a logic3d_vector, with
+    -- a'left as the MSB to match numeric_std. No allocation.
+    procedure to_u(a : logic3d_vector; u : out unsigned) is
+        variable k : natural := u'high;
     begin
-        return unsigned_to_l3d(l3d_to_unsigned(a) + l3d_to_unsigned(b));
+        for i in a'range loop
+            if is_one(a(i)) then u(k) := '1'; else u(k) := '0'; end if;
+            if k > u'low then k := k - 1; end if;
+        end loop;
+    end procedure;
+
+    function "+"(a, b : logic3d_vector) return logic3d_vector is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
+    begin
+        to_u(a, ua); to_u(b, ub);
+        return unsigned_to_l3d(ua + ub);
     end function;
 
     function "-"(a, b : logic3d_vector) return logic3d_vector is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return unsigned_to_l3d(l3d_to_unsigned(a) - l3d_to_unsigned(b));
+        to_u(a, ua); to_u(b, ub);
+        return unsigned_to_l3d(ua - ub);
     end function;
 
     function "+"(a : logic3d_vector; b : natural) return logic3d_vector is
+        variable ua : unsigned(a'length - 1 downto 0);
     begin
-        return unsigned_to_l3d(l3d_to_unsigned(a) + b);
+        to_u(a, ua);
+        return unsigned_to_l3d(ua + b);
     end function;
 
+    -- Accumulate the value directly (a'left = MSB); no unsigned temporary.
     function to_integer(a : logic3d_vector) return natural is
+        variable result : natural := 0;
     begin
-        return ieee.numeric_std.to_integer(l3d_to_unsigned(a));
+        for i in a'range loop
+            result := result * 2;
+            if is_one(a(i)) then result := result + 1; end if;
+        end loop;
+        return result;
     end function;
 
     function "sll"(a : logic3d_vector; n : natural) return logic3d_vector is
@@ -825,33 +851,51 @@ package body logic3d_types_pkg is
     end function;
 
     function "<"(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) < l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua < ub;
     end function;
 
     function "<="(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) <= l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua <= ub;
     end function;
 
     function ">"(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) > l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua > ub;
     end function;
 
     function ">="(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) >= l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua >= ub;
     end function;
 
     function "="(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) = l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua = ub;
     end function;
 
     function "/="(a, b : logic3d_vector) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+        variable ub : unsigned(b'length - 1 downto 0);
     begin
-        return l3d_to_unsigned(a) /= l3d_to_unsigned(b);
+        to_u(a, ua); to_u(b, ub);
+        return ua /= ub;
     end function;
 
     function unsigned_to_l3d_bit(a : unsigned) return logic3d is
