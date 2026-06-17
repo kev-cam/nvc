@@ -30,6 +30,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+// monotonic wall-clock seconds (for COSIM_PROFILE timing)
+static double prof_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 // Bridge function pointers (loaded via dlopen of libcosim_bridge.so)
 typedef void (*bridge_deposit_fn)(void *ctx, double voltage, double time_s);
@@ -590,6 +599,14 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
    //      just-deposited A2D inputs and schedules its next D2A event, which
    //      caps the next analog step.  (The digital never runs ahead of the
    //      analog, so no A2D deposit is missed.)
+   // COSIM_PROFILE: per-cycle wall-clock breakdown of simulateUntil (analog)
+   // vs model_step_to (digital), to localise where the time goes.
+   const bool prof = getenv("COSIM_PROFILE") != NULL;
+   double prof_sim = 0.0, prof_dig = 0.0;     // accumulated seconds
+   double prof_worst_sim = 0.0, prof_worst_dig = 0.0;
+   int prof_worst_cyc = -1;
+   double prof_t0 = prof ? prof_now() : 0.0;
+
    while (xyce_time < stop_time_s) {
 
       // 1. acceptance time = t + dt_max.  NB we do NOT pull in to the next
@@ -608,8 +625,10 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
       update_d2a_bridges(&cs, m, -1);
 
       // 3. advance/accept Xyce
+      double t_a = prof ? prof_now() : 0.0;
       double actual_time = 0.0;
       rc = cs.xyce.simulateUntil(&cs.xyce.ptr, accept, &actual_time);
+      double dt_sim = prof ? prof_now() - t_a : 0.0;
       if (rc == 0) {
          if (cs.xyce.simulationComplete(&cs.xyce.ptr))
             notef("Xyce simulation complete at time %.6g s", xyce_time);
@@ -620,11 +639,38 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
       xyce_time = actual_time;
 
       // 4. evaluate the digital up to the accepted analog time (inclusive)
+      double t_d = prof ? prof_now() : 0.0;
       model_step_to(m, (uint64_t)(xyce_time * FS_PER_SEC) + 1);
+      double dt_dig = prof ? prof_now() - t_d : 0.0;
+
+      if (prof) {
+         prof_sim += dt_sim;  prof_dig += dt_dig;
+         if (dt_sim + dt_dig > prof_worst_sim + prof_worst_dig) {
+            prof_worst_sim = dt_sim; prof_worst_dig = dt_dig; prof_worst_cyc = cycle;
+         }
+         // flag any individually slow cycle (>20 ms): which phase, and whether
+         // the analog actually advanced the full step (substepping shows as a
+         // tiny advance for a large simulateUntil cost).
+         if (dt_sim + dt_dig > 20e-3)
+            notef("[prof] cycle %d t=%.4gns  sim=%.1fms dig=%.1fms  "
+                  "advance=%.3gns/%.3gns", cycle, xyce_time*1e9,
+                  dt_sim*1e3, dt_dig*1e3,
+                  (actual_time - (accept - cs.dt_max))*1e9, cs.dt_max*1e9);
+      }
 
       cycle++;
       if (cycle <= 10 || cycle % 100 == 0)
          notef("cycle %d t=%.3gns", cycle, xyce_time * 1e9);
+   }
+
+   if (prof) {
+      double wall = prof_now() - prof_t0;
+      notef("[prof] %d cycles in %.2fs wall: simulateUntil %.2fs (%.0f%%), "
+            "model_step_to %.2fs (%.0f%%); worst cycle %d "
+            "(sim=%.1fms dig=%.1fms)",
+            cycle, wall, prof_sim, 100*prof_sim/(wall>0?wall:1),
+            prof_dig, 100*prof_dig/(wall>0?wall:1), prof_worst_cyc,
+            prof_worst_sim*1e3, prof_worst_dig*1e3);
    }
 
    notef("co-simulation complete: %d cycles, final_time=%.6g s",
