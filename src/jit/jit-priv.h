@@ -381,6 +381,7 @@ struct _jit_thread_local {
    jit_jmpbuf_t           abort_env;
    volatile sig_atomic_t  jmp_buf_valid;
    jit_anchor_t          *anchor;
+   eval_arena_t          *eval_arena;   // non-NULL: route __nvc_mspace_alloc here
 };
 
 typedef struct _code_cache code_cache_t;

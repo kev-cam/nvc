@@ -74,6 +74,14 @@ void jit_check_interrupt(jit_t *j);
 void jit_reset(jit_t *j);
 bool jit_is_shutdown(jit_t *j);
 
+// Per-thread eval-lifetime arena for the simulation runtime. When enabled,
+// __nvc_mspace_alloc (escaping unconstrained results) is served from a
+// growable arena that is reset each process eval instead of the collected
+// heap — eliminating GC churn for static (RTL) designs. Enable only after
+// initialisation, on the thread that will run process bodies.
+void jit_eval_arena_enable(bool on);
+void jit_eval_arena_reset(void);
+
 void *jit_mspace_alloc(size_t size) RETURNS_NONNULL;
 jit_stack_trace_t *jit_stack_trace(void);
 jit_t *jit_for_thread(void);

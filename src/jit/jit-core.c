@@ -120,6 +120,24 @@ jit_thread_local_t *jit_thread_local(void)
    return *ptr;
 }
 
+void jit_eval_arena_enable(bool on)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   if (on && thread->eval_arena == NULL)
+      thread->eval_arena = eval_arena_new();
+   else if (!on && thread->eval_arena != NULL) {
+      eval_arena_free(thread->eval_arena);
+      thread->eval_arena = NULL;
+   }
+}
+
+void jit_eval_arena_reset(void)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   if (thread->eval_arena != NULL)
+      eval_arena_reset(thread->eval_arena);
+}
+
 // Shim: initially routes through jit_thread_local (TLS lookup).
 // After jit_thread_shim_register(), points directly at the cached
 // return, bypassing the .so PLT thunk and __tls_get_addr entirely.

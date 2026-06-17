@@ -1361,7 +1361,9 @@ void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor)
    else if (size == 0)
       size = 1;   // Never return a NULL pointer
 
-   void *ptr = jit_mspace_alloc(size);
+   void *ptr = thread->eval_arena != NULL
+      ? eval_arena_alloc(thread->eval_arena, size)
+      : jit_mspace_alloc(size);
 
    thread->anchor = NULL;
    return ptr;

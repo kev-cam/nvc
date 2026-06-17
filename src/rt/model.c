@@ -1083,6 +1083,10 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
    assert(thread->tlab != NULL);
    assert(thread->tlab->alloc == 0);
 
+   // Reclaim the previous eval's escaping unconstrained results in O(1) (no-op
+   // unless the eval arena is enabled).
+   jit_eval_arena_reset();
+
    thread->active_obj = &(proc->wakeable);
    thread->active_scope = proc->scope;
 
@@ -3905,6 +3909,13 @@ void model_reset(rt_model_t *m)
 
    run_callbacks(m, END_OF_INITIALISATION);
 
+   // Route escaping unconstrained results (the per-eval logic3d churn) into a
+   // reset-per-eval arena instead of the collected heap, so GC never fires
+   // during the run. Installed only AFTER init so the persistent live set
+   // (allocated above) stays on the heap. RTL-only; gated.
+   if (getenv("NVC_EVAL_ARENA") != NULL)
+      jit_eval_arena_enable(true);
+
    // Install fast path for thread context access now that the thread local
    // has been allocated and init is complete. NB this caches thread 0's JIT
    // thread-local for ALL threads, which is only valid single-threaded; skip
@@ -5024,6 +5035,12 @@ static void *evproc_worker(void *arg)
    model_thread(m)->tlab = tlab_acquire(m->mspace);
    g_evproc.pipes[tid] = xcalloc(sizeof(prop_pipe_t));
    mb->tid = tid;
+
+   // Each worker gets its own eval arena so escaping results never touch the
+   // shared collected heap (no GC stop-the-world to race the eval).
+   if (getenv("NVC_EVAL_ARENA") != NULL)
+      jit_eval_arena_enable(true);
+
    atomic_store(&mb->ready, 1);
 
    uint64_t seen = 0;
