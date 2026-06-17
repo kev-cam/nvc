@@ -134,7 +134,8 @@ static void emit_expr(FILE *f, tree_t e)
       }
       break;
    case T_AGGREGATE:
-      fputs("0", f);   // (others => '0') and friends -> 0 (first cut)
+      // Not faithfully translated — decline rather than silently emit 0.
+      g_unhandled++; fputs("/*agg*/0", f);
       break;
    default:
       g_unhandled++; fprintf(f, "/*?expr k=%d*/0", tree_kind(e));
@@ -324,9 +325,82 @@ static bool is_reg(tree_t block, tree_t decl)
    return false;
 }
 
+// A standard 1-bit-like enumeration (std_logic family, bit, boolean): the only
+// enums emit_range/emit_lit model correctly as a single Verilog bit.
+static bool enum_is_bitlike(type_t t)
+{
+   for (int i = 0; i < 8 && t != NULL; i++) {
+      const char *nm = istr(type_ident(t));
+      const char *dot = strrchr(nm, '.');
+      if (dot) nm = dot + 1;
+      if (!strcasecmp(nm, "STD_ULOGIC") || !strcasecmp(nm, "STD_LOGIC")
+          || !strcasecmp(nm, "BIT") || !strcasecmp(nm, "BOOLEAN"))
+         return true;
+      if (type_kind(t) != T_SUBTYPE)   // type_base is only valid for subtypes
+         break;
+      t = type_base(t);
+   }
+   return false;
+}
+
+// Conservative synthesizability test: vhdl2vlog only models integers, the
+// std_logic/bit/boolean enums, and arrays thereof. Anything else (real,
+// physical/time, file, access, record, protected, string/character arrays,
+// user enums) would be silently mistranslated by emit_range into a plausible
+// but wrong bit vector — so decline and leave the leaf in the nvc kernel.
+static bool type_synth_ok(type_t t)
+{
+   if (type_is_array(t)) {
+      if (type_is_character_array(t)) return false;   // strings
+      return type_synth_ok(type_elem(t));
+   }
+   if (type_is_integer(t)) return true;
+   if (type_is_enum(t)) return enum_is_bitlike(t);
+   return false;   // real, physical, file, access, record, protected, ...
+}
+
+// Only value-bearing decl kinds carry a type item; calling tree_type/
+// tree_has_type on others (hierarchy markers, attr specs, ...) asserts.
+static bool decl_type_synth(tree_t d)
+{
+   switch (tree_kind(d)) {
+   case T_SIGNAL_DECL:
+   case T_VAR_DECL:
+   case T_CONST_DECL:
+   case T_PORT_DECL:
+      return type_synth_ok(tree_type(d));
+   default:
+      return true;   // no synthesis-relevant value type
+   }
+}
+
+// Reject the whole leaf if any port, signal, or process variable uses a
+// non-synthesizable type — the silent-mistranslation class that g_unhandled
+// (statement-level) does not catch.
+static bool block_types_synth(tree_t block)
+{
+   for (int i = 0; i < tree_ports(block); i++)
+      if (!type_synth_ok(tree_type(tree_port(block, i)))) return false;
+   for (int i = 0; i < tree_decls(block); i++)
+      if (!decl_type_synth(tree_decl(block, i))) return false;
+   for (int i = 0; i < tree_stmts(block); i++) {
+      tree_t s = tree_stmt(block, i);
+      if (tree_kind(s) != T_PROCESS) continue;
+      for (int j = 0; j < tree_decls(s); j++)
+         if (!decl_type_synth(tree_decl(s, j))) return false;
+   }
+   return true;
+}
+
 bool vhdl2vlog(tree_t block, const char *modname, const char *path)
 {
    g_unhandled = 0;
+
+   // Decline non-synthesizable leaves up front (see block_types_synth): a wrong
+   // but parseable model would silently corrupt results.
+   if (!block_types_synth(block))
+      return false;
+
    FILE *f = fopen(path, "w");
    if (f == NULL) { warnf("vhdl2vlog: cannot open %s", path); return false; }
 
