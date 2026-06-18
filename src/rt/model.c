@@ -1432,6 +1432,17 @@ bool accel_load(rt_model_t *m, const char *so_path)
 // Look for an NVC_VERILOG_SRC attribute spec directly on this unit's decls.
 static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz)
 {
+   // Only entity/arch/block carry the NVC_VERILOG_SRC attr and have an I_DECLS
+   // item; other scope kinds (e.g. T_COMPONENT) would assert in tree_decls.
+   switch (tree_kind(unit)) {
+   case T_ENTITY:
+   case T_ARCH:
+   case T_BLOCK:
+      break;
+   default:
+      return false;
+   }
+
    const int ndecls = tree_decls(unit);
    for (int i = 0; i < ndecls; i++) {
       tree_t d = tree_decl(unit, i);
