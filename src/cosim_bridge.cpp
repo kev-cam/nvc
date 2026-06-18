@@ -15,8 +15,54 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 #include <utility>
+
+// Verbose co-sim tracing.  Flip to 1 (or build with -DCOSIM_DEBUG=1) to enable;
+// 0 lets the compiler dead-strip every trace.  See also cosim.c.
+#ifndef COSIM_DEBUG
+#define COSIM_DEBUG 0
+#endif
+
+// A2D voltage resolution: the I-PWL probes predict, from the node's dV/dt, when
+// it will next move this many volts ("the next crossing point"); the co-sim
+// loop reins its analog timestep in to that time -- so the digital is sampled
+// finely where the analog moves and the step free-runs where it is flat. No
+// fixed dt_max. Override with COSIM_A2D_DV (volts); default 0.1 V.
+static double a2d_dv(void)
+{
+   static double v = -1.0;
+   if (v < 0.0) {
+      const char *e = getenv("COSIM_A2D_DV");
+      v = (e != nullptr) ? atof(e) : 0.1;
+   }
+   return v;
+}
+
+// Floor on the predicted step-to-crossing (seconds).  Keeps a transient huge
+// dV/dt (off Xyce's predictor near a breakpoint) from demanding a sub-ns step
+// and spiralling.  Match the Xyce-side getMaxTimeStepSize floor (COSIM_A2D_DTMIN).
+static double a2d_dtmin(void)
+{
+   static double v = -1.0;
+   if (v < 0.0) {
+      const char *e = getenv("COSIM_A2D_DTMIN");
+      v = (e != nullptr) ? atof(e) : 1e-9;
+   }
+   return v;
+}
+
+// Earliest predicted "next significant A2D change" time (absolute seconds)
+// across all A2D probes this analog step.  The co-sim loop reads-and-resets it
+// to bound its next simulateUntil target.  < 0 => no node moving (free-run).
+static double g_a2d_next = -1.0;
+extern "C" double cosim_bridge_a2d_next_time(void)
+{
+   double v = g_a2d_next;
+   g_a2d_next = -1.0;
+   return v;
+}
 
 // --- Signal registry ---
 
@@ -219,8 +265,9 @@ static int a2d_callback(PWLinDynData *pwl, void *ext_data,
 
    if (op == OP_Init) {
       ctx->dev_inst = (DeviceInstance *)op_data;
-      fprintf(stderr, "[a2d] Init '%s' dev_inst=%p\n",
-              ctx->sig->name, (void *)op_data);
+      if (COSIM_DEBUG)
+         fprintf(stderr, "[a2d] Init '%s' dev_inst=%p\n",
+                 ctx->sig->name, (void *)op_data);
       return 0;
    }
 
@@ -228,7 +275,8 @@ static int a2d_callback(PWLinDynData *pwl, void *ext_data,
       return 0;
 
    void **fns = ctx->fns;
-   fprintf(stderr, "[a2d] Update '%s'\n", ctx->sig->name);
+   if (COSIM_DEBUG)
+      fprintf(stderr, "[a2d] Update '%s'\n", ctx->sig->name);
 
    // Read node voltage via InstanceGetIsrcV
    // ret[]: 0=currTime, 1=V(pos)_curr, 2=V(neg)_curr,
@@ -240,13 +288,52 @@ static int a2d_callback(PWLinDynData *pwl, void *ext_data,
       if (sts) {
          double v_now  = ret[1] - ret[2];
          double t_now  = ret[0];
+         double v_next = ret[4] - ret[5];   // Xyce's projected next-step voltage
+         double t_next = ret[3];            // ... and its time
 
-         // Deposit into NVC if voltage changed
+         if (COSIM_DEBUG)
+            fprintf(stderr, "[a2d-rd] v_now=%.3f t_now=%.4gns v_next=%.3f "
+                    "t_next=%.4gns cache=%.3f dep_fn=%p\n",
+                    v_now, t_now*1e9, v_next, t_next*1e9,
+                    ctx->sig->voltage, (void*)ctx->sig->deposit_fn);
+
+         // Deposit into NVC if voltage changed (Xyce calls this probe on every
+         // timestep, so the analog node is sampled each step automatically).
          if (fabs(v_now - ctx->sig->voltage) > 1e-6) {
             ctx->sig->voltage = v_now;
             if (ctx->sig->deposit_fn)
                ctx->sig->deposit_fn(ctx->sig->deposit_ctx,
                                     v_now, t_now);
+         }
+
+         // Predict the next "crossing point": from dV/dt, the time for this node
+         // to move A2D_DV volts.  Record the earliest such time across all
+         // probes so the co-sim loop can rein its next step in to it (the loop
+         // target -- not add_break -- is what makes simulateUntil return).  Also
+         // drop a breakpoint there so Xyce lands on it.  Flat node -> nothing.
+         if (t_next > t_now) {
+            double dvdt = fabs(v_next - v_now) / (t_next - t_now);
+            if (dvdt > 1e-9) {
+               // time for the node to move A2D_DV volts, but never closer than
+               // A2D_DTMIN: a tiny prediction (huge transient dV/dt off Xyce's
+               // not-yet-converged predictor) would place the breakpoint right
+               // on top of currTime and collapse the step.  Small overshoot of
+               // the threshold is expected of an analog solver anyway.
+               double dt_pred = a2d_dv() / dvdt;
+               if (dt_pred < a2d_dtmin()) dt_pred = a2d_dtmin();
+               double t_pred = t_now + dt_pred;
+               // Keep the earliest prediction across probes, but DISCARD a value
+               // the simulation has already advanced past: a2d_callback fires at
+               // every analog step, so an early step's t_pred (~start+dt) is
+               // stale by the time the call returns.  Without this guard
+               // g_a2d_next ends ~= the just-returned time, fails the loop's
+               // "a2d_next > xyce_time" test, and the loop free-runs to stop --
+               // letting the whole ramp pass in one cycle.  Refresh so it stays
+               // ~dt_pred ahead of the latest analog time.
+               if (g_a2d_next < 0.0 || t_pred < g_a2d_next || g_a2d_next <= t_now)
+                  g_a2d_next = t_pred;
+               ((fn_add_break_t)fns[FN_ADD_BREAK])(pwl, t_pred);
+            }
          }
       }
    }
