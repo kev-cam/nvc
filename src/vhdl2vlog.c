@@ -84,6 +84,10 @@ static void emit_lit(FILE *f, tree_t e)
 
 static void emit_expr(FILE *f, tree_t e)
 {
+   if (e == NULL) {   // e.g. a null/unaffected waveform value — decline, don't crash
+      g_unhandled++; fputs("/*null*/0", f);
+      return;
+   }
    switch (tree_kind(e)) {
    case T_REF:
       {
