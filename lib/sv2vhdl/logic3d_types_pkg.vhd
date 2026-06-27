@@ -257,6 +257,12 @@ package logic3d_types_pkg is
     function l3d_not(a : logic3d_vector) return logic3d_vector;
     function l3d_and(a, b : logic3d_vector) return logic3d_vector;
     function l3d_or(a, b : logic3d_vector) return logic3d_vector;
+
+    -- Mixed vector & scalar reducing to a scalar. iverilog emits these when a
+    -- wider operand (e.g. an N-bit parameter literal) is combined with a 1-bit
+    -- signal in a scalar (boolean / nonzero-test) context: Verilog sizes both
+    -- to the wider width, applies the op, then the scalar lvalue keeps bit 0.
+    function l3d_and(a : logic3d_vector; b : logic3d) return logic3d;
     function l3d_xor(a, b : logic3d_vector) return logic3d_vector;
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector;
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector;
@@ -270,6 +276,13 @@ package logic3d_types_pkg is
     function "+"(a, b : logic3d_vector) return logic3d_vector;
     function "-"(a, b : logic3d_vector) return logic3d_vector;
     function "+"(a : logic3d_vector; b : natural) return logic3d_vector;
+
+    -- Vector equality reducing to a 1-bit logic3d (Verilog '=='): iverilog emits
+    -- a bare "=" on two logic3d_vectors but uses the result where a logic3d is
+    -- expected (e.g. as an l3d_or operand). AND-reduce of bitwise XNOR, so X/Z
+    -- propagate per Verilog's x-pessimistic equality. Coexists with the implicit
+    -- boolean "=" (resolved by context / return type).
+    function "="(a, b : logic3d_vector) return logic3d;
 
     -- Integer conversion
     function to_integer(a : logic3d_vector) return natural;
@@ -547,6 +560,31 @@ package body logic3d_types_pkg is
             result(result'low + i) := AND_LUT(aa(i), bb(i));
         end loop;
         return result;
+    end function;
+
+    -- (vec & scalar) reduced to the scalar lvalue keeps bit 0:
+    --   (vec & scalar)[0] = vec[0] and scalar.
+    -- Rebase to (length-1 downto 0) so index 0 is the LSB regardless of the
+    -- literal's declared range, matching the vector-vector bodies above.
+    function l3d_and(a : logic3d_vector; b : logic3d) return logic3d is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+    begin
+        return AND_LUT(aa(0), b);
+    end function;
+
+    -- Verilog '==' on two vectors -> 1-bit result. AND-reduce of bitwise XNOR
+    -- (X/Z propagate through the LUTs, matching x-pessimistic equality). Length
+    -- mismatch compares the common low bits (operands are same-width in practice).
+    function "="(a, b : logic3d_vector) return logic3d is
+        variable aa : logic3d_vector(a'length-1 downto 0) := a;
+        variable bb : logic3d_vector(b'length-1 downto 0) := b;
+        constant n  : natural := minimum(a'length, b'length);
+        variable r  : logic3d := L3D_1;
+    begin
+        for i in 0 to n-1 loop
+            r := AND_LUT(r, XNOR_LUT(aa(i), bb(i)));
+        end loop;
+        return r;
     end function;
 
     function l3d_or(a, b : logic3d_vector) return logic3d_vector is
