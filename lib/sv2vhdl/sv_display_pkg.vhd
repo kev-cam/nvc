@@ -40,20 +40,16 @@ package body sv_display_pkg is
     function sv_hstr(v : std_logic_vector) return string is
         constant h : string := to_hstring(v);
         variable result : string(1 to h'length);
-        variable start : integer := 0;
     begin
-        -- Convert to lowercase
+        -- Verilog $display %h/%x ZERO-PADS to ceil(width/4) hex digits — verified
+        -- against iverilog vvp (e.g. a 100-bit value prints 25 digits with
+        -- leading zeros, matching test/regress/gold). Keep to_hstring's full
+        -- width; only lowercase. (The earlier "strip leading zeros" assumed the
+        -- %0h minimum-width convention, but the bare %h/%x default pads.)
         for i in h'range loop
             result(i - h'low + 1) := to_lower(h(i));
         end loop;
-        -- Strip leading zeros (Verilog %h convention)
-        for i in 1 to result'length - 1 loop
-            if result(i) /= '0' then
-                return result(i to result'length);
-            end if;
-        end loop;
-        -- All zeros: return single "0"
-        return result(result'length to result'length);
+        return result;
     end function;
 
     function sv_ostr(v : std_logic_vector) return string is
