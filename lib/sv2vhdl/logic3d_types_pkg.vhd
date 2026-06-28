@@ -263,6 +263,10 @@ package logic3d_types_pkg is
     -- signal in a scalar (boolean / nonzero-test) context: Verilog sizes both
     -- to the wider width, applies the op, then the scalar lvalue keeps bit 0.
     function l3d_and(a : logic3d_vector; b : logic3d) return logic3d;
+    -- logic3d AND std_logic: tgt-vhdl can emit a mixed-type AND (a logic3d bit
+    -- ANDed with a Ternary_Logic/expr that resolved to std_logic). Lift the
+    -- std_logic operand to logic3d so the bit-true LUT applies.
+    function l3d_and(a : logic3d; b : std_logic) return logic3d;
     function l3d_xor(a, b : logic3d_vector) return logic3d_vector;
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector;
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector;
@@ -570,6 +574,11 @@ package body logic3d_types_pkg is
         variable aa : logic3d_vector(a'length-1 downto 0) := a;
     begin
         return AND_LUT(aa(0), b);
+    end function;
+
+    function l3d_and(a : logic3d; b : std_logic) return logic3d is
+    begin
+        return AND_LUT(a, to_logic3d(b));
     end function;
 
     -- Verilog '==' on two vectors -> 1-bit result. AND-reduce of bitwise XNOR
