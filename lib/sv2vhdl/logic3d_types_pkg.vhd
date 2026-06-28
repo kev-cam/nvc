@@ -835,8 +835,11 @@ package body logic3d_types_pkg is
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
         variable result : logic3d_vector(new_size - 1 downto 0) := (others => L3D_0);
     begin
+        -- `a` may be a non-zero-based slice (e.g. ic_data(851 downto 568)), so
+        -- index from a'low, not 0 -- a(new_size-1 downto 0) would be out of
+        -- range. Truncate/extend LSB-aligned.
         if new_size <= a'length then
-            result := a(new_size - 1 downto 0);
+            result := a(a'low + new_size - 1 downto a'low);
         else
             result(a'length - 1 downto 0) := a;
         end if;
