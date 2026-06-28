@@ -303,6 +303,12 @@ package logic3d_types_pkg is
     function "mod"(a, b : logic3d_vector) return logic3d_vector;
     function "rem"(a, b : logic3d_vector) return logic3d_vector;
 
+    -- Verilog $random(seed): one deterministic step of a seeded RNG. A pure
+    -- function (no inout) returning the next value; tgt-vhdl assigns it to the
+    -- target AND re-applies it to the seed, so it composes with any lvalue and
+    -- with a signal- or variable-class seed.
+    function sv_random(seed : logic3d_vector) return logic3d_vector;
+
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
 
@@ -801,6 +807,17 @@ package body logic3d_types_pkg is
     begin
         if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) rem l3d_to_unsigned(b));
+    end function;
+
+    function sv_random(seed : logic3d_vector) return logic3d_vector is
+        variable s : unsigned(31 downto 0);
+    begin
+        -- Deterministic 32-bit LCG (glibc constants). Verilog $random's exact
+        -- sequence is not required: the self-checking tests verify reproducibility
+        -- for a given seed and a non-zero seed advance. seed=0 -> 12345.
+        s := resize(l3d_to_unsigned(seed), 32);
+        s := resize(s * to_unsigned(1103515245, 32), 32) + to_unsigned(12345, 32);
+        return unsigned_to_l3d(resize(s, seed'length));
     end function;
 
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
