@@ -192,7 +192,9 @@ static jit_ir_t *irgen_append(jit_irgen_t *g)
 
 static jit_value_t irgen_alloc_reg(jit_irgen_t *g, int slots)
 {
-   if (unlikely(g->next_reg + slots > JIT_REG_INVALID))
+   // Evaluate in 64 bits: with a 32-bit jit_reg_t, next_reg + slots would wrap
+   // modulo 2^32 and the guard could never fire (JIT_REG_INVALID == UINT32_MAX).
+   if (unlikely((uint64_t)g->next_reg + slots > JIT_REG_INVALID))
       fatal("unit %s is too big to compile", istr(g->func->name));
    else {
       jit_value_t result = { .kind = JIT_VALUE_REG, .reg = g->next_reg };

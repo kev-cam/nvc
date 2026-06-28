@@ -191,8 +191,13 @@ typedef enum {
    JIT_EXIT_PIPE_EMPTY,
 } jit_exit_t;
 
-typedef uint16_t jit_reg_t;
-#define JIT_REG_INVALID UINT16_MAX
+// 32-bit virtual register index: very large elaborated units (e.g. a VeeR
+// branch predictor) need more than 65535 JIT registers. jit_reg_t lives in the
+// 8-byte union of jit_value_t and fills existing padding in jit_ir_t, so both
+// sizeof() static asserts below are unchanged; the on-disk pack format encodes
+// registers as varints, so it stays backward compatible.
+typedef uint32_t jit_reg_t;
+#define JIT_REG_INVALID UINT32_MAX
 
 typedef enum {
    JIT_VALUE_INVALID,
