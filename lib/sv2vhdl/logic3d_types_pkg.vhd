@@ -302,6 +302,8 @@ package logic3d_types_pkg is
     function "/"  (a, b : logic3d_vector) return logic3d_vector;
     function "mod"(a, b : logic3d_vector) return logic3d_vector;
     function "rem"(a, b : logic3d_vector) return logic3d_vector;
+    -- Verilog $random(seed): deterministic seeded RNG that updates seed (inout).
+    procedure sv_random(seed : inout logic3d_vector; result : out logic3d_vector);
 
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
@@ -802,6 +804,18 @@ package body logic3d_types_pkg is
         if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) rem l3d_to_unsigned(b));
     end function;
+
+    procedure sv_random(seed : inout logic3d_vector; result : out logic3d_vector) is
+        variable s : unsigned(31 downto 0);
+    begin
+        -- Deterministic 32-bit LCG (glibc constants). Verilog $random's exact
+        -- sequence is not required: the regress tests self-check determinism and
+        -- a non-zero seed update, not specific values. seed=0 -> 12345 (nonzero).
+        s := resize(l3d_to_unsigned(seed), 32);
+        s := resize(s * to_unsigned(1103515245, 32), 32) + to_unsigned(12345, 32);
+        seed   := unsigned_to_l3d(resize(s, seed'length));
+        result := unsigned_to_l3d(resize(s, result'length));
+    end procedure;
 
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
         variable result : logic3d_vector(new_size - 1 downto 0) := (others => L3D_0);
