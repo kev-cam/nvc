@@ -747,13 +747,25 @@ package body logic3d_types_pkg is
         return unsigned_to_l3d(ua + b);
     end function;
 
-    -- Accumulate the value directly (a'left = MSB); no unsigned temporary.
+    -- LSB-first, low 31 bits only. A VHDL natural holds 31 value bits, so a
+    -- wider operand (or an uninitialized/X index at time 0, e.g. a slice base
+    -- before reset) must not overflow the accumulator: the old MSB-first
+    -- result*2 traps the instant result reaches 2**31. Building from the LSB
+    -- with 2**p (p<31) gives the same low-31-bit value with no overflow.
     function to_integer(a : logic3d_vector) return natural is
         variable result : natural := 0;
+        variable p      : natural := 0;
     begin
-        for i in a'range loop
-            result := result * 2;
-            if is_one(a(i)) then result := result + 1; end if;
+        for i in a'reverse_range loop
+            if p < 31 then
+                -- An uncertain (X/Z) bit in the low 31 makes the index value
+                -- undefined; return a safe in-range 0 instead of trapping on an
+                -- out-of-range slice (Verilog yields X for an X index). Almost
+                -- always a time-0 / pre-reset artifact before index regs settle.
+                if is_uncertain(a(i)) then return 0; end if;
+                if is_one(a(i)) then result := result + 2**p; end if;
+            end if;
+            p := p + 1;
         end loop;
         return result;
     end function;
