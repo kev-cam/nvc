@@ -779,18 +779,27 @@ package body logic3d_types_pkg is
         return unsigned_to_l3d(result(a'length - 1 downto 0));
     end function;
 
+    -- Verilog defines a/0, a%0 (and rem) as x (all bits unknown). numeric_std
+    -- happens to return all-X for "/" by zero but the DIVIDEND for "mod"/"rem"
+    -- by zero, so guard the zero divisor explicitly and return all-x.
     function "/"(a, b : logic3d_vector) return logic3d_vector is
+        variable allx : logic3d_vector(a'range) := (others => L3D_X);
     begin
+        if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) / l3d_to_unsigned(b));
     end function;
 
     function "mod"(a, b : logic3d_vector) return logic3d_vector is
+        variable allx : logic3d_vector(a'range) := (others => L3D_X);
     begin
+        if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) mod l3d_to_unsigned(b));
     end function;
 
     function "rem"(a, b : logic3d_vector) return logic3d_vector is
+        variable allx : logic3d_vector(a'range) := (others => L3D_X);
     begin
+        if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) rem l3d_to_unsigned(b));
     end function;
 
