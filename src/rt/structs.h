@@ -51,6 +51,7 @@ typedef struct {
    unsigned        postponed : 1;
    unsigned        delayed : 1;
    unsigned        zombie : 1;
+   unsigned        fastclk : 1;   // NVC_FAST_CLK: clk-only, dispatched by table
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
 

@@ -154,6 +154,19 @@ typedef struct _rt_model {
    uint64_t           prof_proc_ns;       // total ns in process execution
    uint64_t           prof_depth_hist[8]; // delta count by depth bucket
    uint64_t           prof_depth_ns[8];   // ns by depth bucket
+
+   // NVC_FAST_CLK: flat posedge-fanout dispatch table. The clk-ONLY processes
+   // that fan out from the clock nexus are skipped in wakeup_one (never queued)
+   // and instead run directly via this table on the posedge — bypassing the
+   // event-queue/procq round-trip (~67% of the per-cycle cost on synthesized
+   // clocked RTL). Built once at accel install; off unless the env is set and
+   // at least one clk-only proc survives the filter.
+   bool               fastclk_on;
+   bool               fastclk_hit;     // a clk-only proc woke this delta
+   rt_proc_t        **fastclk_table;
+   unsigned           fastclk_count;
+   rt_nexus_t        *fastclk_nexus;
+   uint8_t           *fastclk_data;    // clk effective bytes (bit0 = level)
 } rt_model_t;
 
 // Depth bucket: 0, 1, 2-3, 4-15, 16-63, 64-255, 256-1023, 1024+
@@ -1604,9 +1617,49 @@ static rt_signal_t *aj_find_signal(rt_scope_t *scope, const char *lname)
          if (strcmp(sn, lname) == 0)
             return sig;
       }
+      // A direct-mapped (collapsed) port — e.g. a clk wired straight through the
+      // hierarchy — has NO rt_signal_t in this scope; it is an ALIAS to the
+      // parent's signal. find_signal() walks aliases; this clone must too, or a
+      // collapsed clk/port is invisible ("no clk port found" on dec).
+      for (int i = 0; i < s->aliases.count; i++) {
+         rt_alias_t *a = s->aliases.items[i];
+         char an[64];
+         aj_lower(an, istr(tree_ident(a->where)), sizeof an);
+         if (strcmp(an, lname) == 0)
+            return a->signal;
+      }
       if (s == scope->parent) break;        // only this scope + immediate parent
    }
    return NULL;
+}
+
+// Does `t` (walking the subtype chain) have leaf base name `want`?
+static bool aj_type_named(type_t t, const char *want)
+{
+   for (int i = 0; i < 8 && t != NULL; i++) {
+      if (type_has_ident(t)) {
+         const char *nm = istr(type_ident(t));
+         const char *dot = strrchr(nm, '.');
+         if (strcasecmp(dot ? dot + 1 : nm, want) == 0) return true;
+      }
+      if (type_kind(t) != T_SUBTYPE) break;
+      t = type_base(t);
+   }
+   return false;
+}
+
+// Can the value-bit bridge marshal this port losslessly? The bridge packs ONE
+// value bit (bit0 of each element) per element into a uint64_t, so only logic3d
+// (a `natural 0..7` subtype, value in bit0) and the std_logic/bit family (1-byte
+// enum, code 2/3) work. A record / integer / real boundary port would be
+// silently corrupted (the dec_tlu_ic_diag_pkt class), so a chunk with one must
+// stay interpreted — sound, just not accelerated.
+static bool aj_marshallable_type(type_t t)
+{
+   type_t et = type_is_array(t) ? type_elem(t) : t;
+   return aj_type_named(et, "LOGIC3D") || aj_type_named(et, "STD_LOGIC")
+       || aj_type_named(et, "STD_ULOGIC") || aj_type_named(et, "BIT")
+       || aj_type_named(et, "BOOLEAN");
 }
 
 // Collect distinct recovered-Verilog source files across the subtree.
@@ -1634,6 +1687,87 @@ static void aj_reroute(rt_scope_t *scope)
       proc_set_vtable(scope->procs.items[pi], &aj_eval_vtable);
    for (int ci = 0; ci < scope->children.count; ci++)
       aj_reroute(scope->children.items[ci]);
+}
+
+// ---- NVC_FAST_CLK posedge-table dispatch -----------------------------------
+// Apply CB to every non-postponed W_PROC wakeable on a nexus' pending list.
+// pending is a tagged pointer (util.h): tag==1 -> a single waiter; otherwise an
+// rt_pending_t* with a NULL-skipping wake[] array (see wakeup_all).
+static void aj_pending_foreach(void *pending,
+                               void (*cb)(rt_wakeable_t *, void *), void *ctx)
+{
+   if (pointer_tag(pending) == 1) {
+      rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
+      if (w->kind == W_PROC && !w->postponed) cb(w, ctx);
+   }
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      for (int i = 0; i < p->count; i++) {
+         rt_wakeable_t *w = p->wake[i];
+         if (w != NULL && w->kind == W_PROC && !w->postponed) cb(w, ctx);
+      }
+   }
+}
+
+static void aj_flag_cb(rt_wakeable_t *w, void *ctx)   { w->fastclk = 1; }
+static void aj_unflag_cb(rt_wakeable_t *w, void *ctx) { w->fastclk = 0; }
+
+static void aj_collect_cb(rt_wakeable_t *w, void *ctx)
+{
+   if (!w->fastclk) return;
+   rt_model_t *m = ctx;
+   m->fastclk_table[m->fastclk_count++] = container_of(w, rt_proc_t, wakeable);
+}
+
+// Upper bound on the number of procs on a nexus' pending list.
+static unsigned aj_pending_count(void *pending)
+{
+   if (pointer_tag(pending) == 1)
+      return 1;
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      return p->count;
+   }
+   return 0;
+}
+
+// Build the dispatch table of clk-ONLY processes (statically sensitive to the
+// clock nexus and nothing else). A proc also sensitive to rst / another clock /
+// driving clk itself (the `clk <= not clk` generator) is filtered out and stays
+// on the normal procq — only an optimisation, never a correctness lever.
+static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdata)
+{
+   m->fastclk_on = false;
+   m->fastclk_count = 0;
+   if (!getenv("NVC_FAST_CLK")) return;
+   if (clksig->n_nexus != 1) return;        // single-bit clock only
+   rt_nexus_t *clkn = &clksig->nexus;
+
+   // Pass 0: provisionally flag every clk-pending proc.
+   aj_pending_foreach(clkn->pending, aj_flag_cb, NULL);
+
+   // Pass 1: un-flag any that also appear on a different nexus (not clk-only).
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      if (n == clkn) continue;
+      aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
+   }
+
+   // Pass 2: collect the survivors into the table.
+   const unsigned maxn = aj_pending_count(clkn->pending);
+   if (maxn == 0) return;
+   m->fastclk_table = xmalloc_array(maxn, sizeof(rt_proc_t *));
+   aj_pending_foreach(clkn->pending, aj_collect_cb, m);
+
+   if (m->fastclk_count == 0) {
+      free(m->fastclk_table);
+      m->fastclk_table = NULL;
+      return;
+   }
+   m->fastclk_nexus = clkn;
+   m->fastclk_data  = clkdata;
+   m->fastclk_on    = true;
+   notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
+         m->fastclk_count);
 }
 
 static char *aj_read_file(const char *path)
@@ -1697,9 +1831,20 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "  int _clk = ((uint8_t*)%#lxUL)[0]&1;\n",
            (unsigned long)(uintptr_t)clk->data);
    fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
-   fprintf(f, "  if(!_clk) return;                        /* clk low */\n");
-   fprintf(f, "  if(t==last_t) return;                    /* one eval/cycle */\n");
-   fprintf(f, "  last_t = t;\n");
+   // The bridge now runs on EVERY boundary-input-change delta (the rerouted
+   // combinational processes wake it), not just the clock edge. ADVANCE the
+   // registers once per clock cycle — at the first call with clk high at a NEW
+   // simulation time (the posedge); last_t holds the time we last advanced (a
+   // level edge-detect would need the bridge to also run during clk-low, which a
+   // posedge-optimized clocked process does NOT). COMB outputs re-settle on every
+   // call regardless (below).
+   fprintf(f, "  int posedge = (_clk && t != last_t);\n");
+   fprintf(f, "  if(posedge) last_t = t;\n");
+   // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
+   // behaviour (no combinational re-settle on input-change deltas) — wrong for a
+   // Mealy boundary, used to demonstrate the settling fix.
+   if (getenv("NVC_ACCEL_NO_SETTLE"))
+      fprintf(f, "  if(!posedge) return;\n");
    fprintf(f, "  inputs_t in; outputs_t o;\n");
    fprintf(f, "  memset(&in,0,sizeof in); memset(&o,0,sizeof o);\n");
 
@@ -1719,21 +1864,25 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
               pins[i].elem, pins[i].width, pins[i].name);
       bridged_in++;
    }
-   // Honour synchronous reset: gen_statemachine folds rst into sm_reset (it is
-   // not an input port of the model), so when the net rst is asserted at the
-   // posedge we reset the state instead of advancing it — matching the real DUT.
-   if (rst != NULL)
-      fprintf(f, "  if(((uint8_t*)%#lxUL)[0]&1) sm_reset(&S); else\n",
+   // Advance the registers to the next state ONLY on the clock posedge
+   // (sm_clock). An async reset port (rst) resets immediately whenever asserted
+   // (any delta), matching real async-reset hardware; otherwise advance on the
+   // edge. gen_statemachine folds a SYNC reset into the model's logic (it reads
+   // the reset as a normal input), so sm_clock handles that itself.
+   if (rst != NULL) {
+      fprintf(f, "  if(((uint8_t*)%#lxUL)[0]&1) sm_reset(&S);\n",
               (unsigned long)(uintptr_t)rst->data);
-   // Advance the real state for this cycle with the real inputs.
-   fprintf(f, "  sm_eval(&S,&in,&o);\n");
-   // The testbench scoreboard reads our outputs at the NEXT posedge (it runs
-   // before our eval each cycle), so present the outputs of the POST-advance
-   // state — i.e. one cycle of lookahead. The FIFO handshake outputs are Moore
-   // (pure functions of state: a_ready=!full, sum_valid=!empty, sum_data=mem),
-   // so a throwaway eval of a state copy with zeroed inputs yields them exactly.
-   fprintf(f, "  state_t S2 = S; inputs_t z; memset(&z,0,sizeof z);\n");
-   fprintf(f, "  sm_eval(&S2,&z,&o);\n");
+      fprintf(f, "  else if(posedge) sm_clock(&S,&in);\n");
+   }
+   else
+      fprintf(f, "  if(posedge) sm_clock(&S,&in);\n");
+   // ALWAYS re-settle the combinational outputs against the CURRENT state +
+   // inputs. This runs on the posedge (after the register advance, so outputs
+   // reflect the new state) AND on every boundary-input-change delta in the
+   // cycle — intra-cycle combinational settling that converges to the same
+   // fixpoint nvc's interpreted delta loop reaches. No lookahead needed: outputs
+   // are deposited THIS delta (below) and propagate immediately via wakeup.
+   fprintf(f, "  sm_comb(&S,&in,&o);\n");
    // Generic per-pin trace (only fields the synth model actually declares, so it
    // compiles for any DUT — not just the a_plus_b ports it was first written for).
    fprintf(f, "  if(g_dbg>0){ fprintf(stderr,\"AJ   in:");
@@ -1757,10 +1906,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    for (int i = 0; i < npins; i++) {
       if (!pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
-      fprintf(f, "  { uint8_t buf[256]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+      const int bufsz = pins[i].width * pins[i].elem > 0
+                        ? pins[i].width * pins[i].elem : 1;   // FORCE reads width*elem bytes
+      fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
                  " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|((v>>b)&1);"
                  " FORCE(MDL,(void*)%#lxUL,buf,0,%d); }\n",
-              pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
+              bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
               (unsigned long)(uintptr_t)pins[i].sig, pins[i].width);
       bridged_out++;
    }
@@ -1799,20 +1950,99 @@ static void aj_mkdir_p(const char *path)
    mkdir(tmp, 0755);
 }
 
+// Emit a scope's whole subtree to one open .v file via vhdl2vlog (logic3d->
+// 2-state), each unique module once. Returns true iff every module fully
+// translates. Module names + the dedup key use vhdl2vlog_variant_name (per
+// (entity,generics)) so generic width-variants emit separately and instance refs
+// resolve when gen_statemachine flattens the top.
+static bool emit_subtree_v(rt_scope_t *scope, FILE *f,
+                           ident_t *seen, int *nseen, int maxseen)
+{
+   if (scope->kind == SCOPE_INSTANCE && scope->where != NULL) {
+      tree_t r = aj_scope_ref(scope);
+      if (r != NULL) {
+         tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
+         // Dedup by the per-(entity,generics) VARIANT name, not the entity ident,
+         // so a generic module instantiated at multiple widths emits one module
+         // PER width (matching what emit_stmt instantiates from the same block).
+         char mod[320];
+         snprintf(mod, sizeof mod, "%s",
+                  vhdl2vlog_variant_name(tree_ident(ent), scope->where));
+         ident_t key = ident_new(mod);
+         bool dup = false;
+         for (int i = 0; i < *nseen; i++)
+            if (seen[i] == key) { dup = true; break; }
+         if (!dup) {
+            if (*nseen < maxseen) seen[(*nseen)++] = key;
+            if (!vhdl2vlog_module(f, scope->where, mod))
+               return false;
+         }
+      }
+   }
+   for (int ci = 0; ci < scope->children.count; ci++)
+      if (!emit_subtree_v(scope->children.items[ci], f, seen, nseen, maxseen))
+         return false;
+   return true;
+}
+
 static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                                   tree_t ref, const char *accel_dir)
 {
+   tree_t ent0 = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
+   char top0[128];
+   aj_lower(top0, istr(tree_ident(ent0)), sizeof top0);
+
    // 1. gather the subtree's Verilog sources
    static char srcs[64][512];
    int nsrc = 0;
-   aj_collect_sources(scope, srcs, &nsrc, 64);
+   // VHDL->Verilog path: emit the whole subtree via vhdl2vlog (logic3d->2-state)
+   // into one .v. Used when the original SV won't parse in yosys (sv2ghdl).
+   if (getenv("NVC_ACCEL_FROM_VHDL")) {
+      char vpath[512];
+      snprintf(vpath, sizeof vpath, "%s/aj_%s_subtree.v", accel_dir, top0);
+      FILE *vf = fopen(vpath, "w");
+      if (vf == NULL) return false;
+      ident_t seen[512];
+      int nseen = 0;
+      const bool ok = emit_subtree_v(scope, vf, seen, &nseen, 512);
+      fclose(vf);
+      if (!ok) {
+         notef("accel-jit: subtree '%s' not fully translatable (%d modules)",
+               top0, nseen);
+         return false;
+      }
+      // Skip trivial subtrees (a lone flop, a clock gate, ...): accelerating one
+      // costs a synth + compile + a per-cycle bridge crossing for ~no compute,
+      // and the clk-alias fix made thousands of them installable -> a synth
+      // explosion (10k+). Only chunks with real datapath are worth a .so. Gate
+      // on module count (env NVC_ACCEL_MIN_MODULES, default 8) BEFORE synth.
+      const char *minenv = getenv("NVC_ACCEL_MIN_MODULES");
+      const int min_mod = minenv ? atoi(minenv) : 8;
+      if (nseen < min_mod) {
+         notef("accel-jit: subtree '%s' too small (%d modules) — leaving in nvc",
+               top0, nseen);
+         return false;
+      }
+      notef("accel-jit: emitted subtree '%s' -> %d modules -> %s",
+            top0, nseen, vpath);
+      snprintf(srcs[0], sizeof srcs[0], "%s", vpath);
+      nsrc = 1;
+   }
+   else
+      aj_collect_sources(scope, srcs, &nsrc, 64);
    if (nsrc == 0)
       return false;
 
-   // Verilog top module name = entity (without -ARCH suffix), lowercased
+   // Verilog top module name = entity (without -ARCH suffix), lowercased.
+   // `top` is used only for FILE PATHS below. The gen_statemachine top-module
+   // ARG must instead be the variant name emit_subtree_v gives the top module
+   // (same helper, same block) — else flatten can't find the top.
    tree_t ent = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
    char top[128];
    aj_lower(top, istr(tree_ident(ent)), sizeof top);
+   char top_mod[320];
+   snprintf(top_mod, sizeof top_mod, "%s",
+            vhdl2vlog_variant_name(tree_ident(ent), scope->where));
 
    char dutc[600], bridge[600], so[600];
    snprintf(dutc,   sizeof dutc,   "%s/aj_%s.c", accel_dir, top);
@@ -1829,25 +2059,32 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    for (int i = 0; i < nsrc; i++)
       off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
    // Re-synthesize with the elaboration's actual generics (width/depth/...).
+   // The vhdl2vlog path emits already-elaborated modules (generics baked in),
+   // so passing them would chparam a non-existent defparam and error.
    char params[256];
-   if (accel_verilog_params(ref, params, sizeof params) && params[0]) {
+   if (!getenv("NVC_ACCEL_FROM_VHDL")
+       && accel_verilog_params(ref, params, sizeof params) && params[0]) {
       off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
       notef("accel-jit: params %s", params);
    }
-   off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top, dutc);
-   notef("accel-jit: synth '%s' from %d source(s)", top, nsrc);
+   off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top_mod, dutc);
+   notef("accel-jit: synth '%s' (top module '%s') from %d source(s)", top, top_mod, nsrc);
    if (system(cmd) != 0 || access(dutc, F_OK) != 0) {
       notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
       return false;
    }
 
-   // 3. capture the port boundary (post-elab addresses)
-   static aj_pin_t pins[64];
+   // 3. capture the port boundary (post-elab addresses). A big datapath chunk
+   // (dec) has hundreds of ports; a 64-pin cap silently dropped most of them ->
+   // the chunk ran on stale inputs / undriven outputs. Size by the real port
+   // count and decline (don't silently truncate) if a module is absurdly wide.
+   #define AJ_MAX_PINS 4096
+   static aj_pin_t pins[AJ_MAX_PINS];
    int npins = 0;
    aj_pin_t clk = {0}, rst = {0};
    bool have_clk = false, have_rst = false;
    const int nports = tree_ports(ent);
-   for (int i = 0; i < nports && npins < 64; i++) {
+   for (int i = 0; i < nports; i++) {
       tree_t p = tree_port(ent, i);
       char lname[64];
       aj_lower(lname, istr(tree_ident(p)), sizeof lname);
@@ -1856,16 +2093,36 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          continue;
       aj_pin_t pin = {0};
       snprintf(pin.name, sizeof pin.name, "%s", lname);
-      pin.width    = sig->nexus.width;
-      pin.elem     = pin.width ? (int)(sig->shared.size / pin.width) : 1;
+      // Element size is the per-nexus byte stride; the element COUNT is
+      // shared.size/elem. Using sig->nexus.width here was WRONG for a sliced
+      // (multi-nexus) signal — nexus.width is only the FIRST slice's width, so
+      // elem=size/width inflated and the FORCE buffer stride mismatched what
+      // deposit_signal reads (a 2 landing at byte 2 -> 0x20000 logic3d fatal).
+      pin.elem     = (int)sig->nexus.size;
+      pin.width    = pin.elem ? (int)(sig->shared.size / pin.elem) : 1;
       pin.data     = (uint8_t *)sig->shared.data;
       pin.sig      = sig;
       pin.is_output = (tree_subkind(p) == PORT_OUT);
       notef("accel-jit:   port %-10s %-3s width=%d elem=%d", lname,
             pin.is_output ? "out" : "in", pin.width, pin.elem);
+      // Soundness gate: the bit0-per-element value-bit bridge only handles
+      // logic3d (elem=4) / std_logic (elem=1) vectors of <=64 value-bits. A
+      // record / integer / wide port would silently corrupt — decline the whole
+      // chunk (stays interpreted) rather than produce wrong results.
+      if (pin.width < 1 || pin.width > 64 || (pin.elem != 1 && pin.elem != 4)
+          || !aj_marshallable_type(tree_type(p))) {
+         notef("accel-jit: subtree '%s' port '%s' not value-bit marshallable "
+               "(width=%d elem=%d) — leaving in nvc", top, lname, pin.width, pin.elem);
+         return false;
+      }
       if (strcmp(lname, "clk") == 0) { clk = pin; have_clk = true; }
       else if (strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
-      else pins[npins++] = pin;
+      else if (npins < AJ_MAX_PINS) pins[npins++] = pin;
+      else {
+         notef("accel-jit: subtree '%s' exceeds %d boundary pins — leaving in nvc",
+               top, AJ_MAX_PINS);
+         return false;
+      }
    }
    if (!have_clk) {
       notef("accel-jit: no clk port found for '%s' — leaving in nvc", top);
@@ -1897,6 +2154,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    g_aj_eval = eval;
    reset();
    aj_reroute(scope);
+   aj_build_fastclk(m, clk.sig, clk.data);
    notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
    return true;
 }
@@ -1911,7 +2169,12 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
       if (scope->kind == SCOPE_INSTANCE) {
          tree_t r = aj_scope_ref(scope);
          char tmp[512];
-         if (r != NULL && accel_verilog_src(r, tmp, sizeof tmp)
+         // NVC_ACCEL_FROM_VHDL emits the subtree via vhdl2vlog (not the original
+         // SV), so the SV-source gate doesn't apply -- plain VHDL has no
+         // nvc_verilog_src attr either.
+         if (r != NULL
+             && (getenv("NVC_ACCEL_FROM_VHDL")
+                 || accel_verilog_src(r, tmp, sizeof tmp))
              && accel_install_subtree(m, scope, r, accel_dir))
             return;   // whole subtree accelerated
       }
@@ -1960,7 +2223,12 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
             // entity-arch combined name that mod_lower encodes.
             const char *synth_top = mod_lower;
             char vlog_top[256];
-            if (accel_verilog_src(ref, vsrc_buf, sizeof(vsrc_buf))) {
+            // NVC_ACCEL_FROM_VHDL forces the vhdl2vlog path (emit clean
+            // Verilog from the elaborated tree) instead of recovering the
+            // original source, which for sv2ghdl designs is heavy SV that
+            // yosys's read_verilog can't parse (structs/typedefs/imports).
+            if (!getenv("NVC_ACCEL_FROM_VHDL")
+                && accel_verilog_src(ref, vsrc_buf, sizeof(vsrc_buf))) {
                src_file = vsrc_buf;
                tree_t ent = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
                const char *ename = istr(tree_ident(ent));
@@ -4380,6 +4648,13 @@ static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
 
 static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
 {
+   if (obj->fastclk && m->fastclk_on) {
+      // Clk-only process: never queued. Latch that the clock fanout fired this
+      // delta; the posedge table runs it directly at the proc-dispatch site.
+      m->fastclk_hit = true;
+      return;
+   }
+
    if (obj->pending)
       return;   // Already scheduled
 
@@ -5251,6 +5526,22 @@ static void model_cycle(rt_model_t *m)
    deferq_run(m, &m->triggerq);  // Sensitivity list filter
 
    run_callbacks(m, START_OF_PROCESSES);
+
+   // NVC_FAST_CLK fast path. A clk-only process woke this delta (latched in
+   // wakeup_one, those procs were not queued). If clk is now high it was a
+   // rising edge, so run the flat fanout table directly — at the exact point
+   // run_procq would have run them (after the driving/effective heaps and the
+   // trigger filter), so each proc reads the same settled values it would on
+   // the normal path; only the dispatch mechanism differs. Bit-identical, but
+   // skips the wakeup_all/procq_do/deferq/async_run_process round-trip.
+   if (m->fastclk_hit) {
+      m->fastclk_hit = false;
+      if (m->fastclk_data[0] & 1) {   // rising edge (event fired + now high)
+         rt_proc_t **pr = m->fastclk_table;
+         for (unsigned i = 0; i < m->fastclk_count; i++, pr++)
+            run_process(m, *pr);
+      }
+   }
 
    if (m->shuffle)
       deferq_shuffle(&m->procq);
