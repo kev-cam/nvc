@@ -2244,12 +2244,33 @@ static bool emit_subtree_v(rt_scope_t *scope, FILE *f,
    return true;
 }
 
+// Cheap recursive instance count for a subtree (no translation). Used as a
+// PRE-gate before the expensive emit: instance count >= unique-module count
+// (nseen), so instances < min_mod implies the subtree is "too small" anyway.
+static int aj_count_instances(rt_scope_t *scope)
+{
+   int n = (scope->kind == SCOPE_INSTANCE) ? 1 : 0;
+   for (int i = 0; i < scope->children.count; i++)
+      n += aj_count_instances(scope->children.items[i]);
+   return n;
+}
+
 static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                                   tree_t ref, const char *accel_dir)
 {
    tree_t ent0 = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
    char top0[128];
    aj_lower(top0, istr(tree_ident(ent0)), sizeof top0);
+
+   // Pre-gate: skip the expensive emit/translate entirely for subtrees that
+   // cannot reach min_mod modules. This skips the ~21k tiny primitive-cell
+   // (sv_and / rvdff) emit attempts that dominated the scan on real designs.
+   {
+      const char *minenv = getenv("NVC_ACCEL_MIN_MODULES");
+      const int min_mod = minenv ? atoi(minenv) : 8;
+      if (aj_count_instances(scope) < min_mod)
+         return false;
+   }
 
    // 1. gather the subtree's Verilog sources
    static char srcs[64][512];
