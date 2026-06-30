@@ -1988,12 +1988,15 @@ static char *aj_read_file(const char *path)
    return buf;
 }
 
-// gen_statemachine declares each scalar/vector port as "uint64_t _<name>;".
+// gen_statemachine declares each scalar/vector port as "uint64_t _<name>;" (or
+// "unsigned __int128 _<name>;" for a >64-bit port). Match either spelling — a
+// wide port that fails this check would pass the gate but never get bridged.
 static bool aj_model_has_field(const char *dutc_text, const char *name)
 {
-   char needle[80];
-   snprintf(needle, sizeof needle, "uint64_t _%s;", name);
-   return strstr(dutc_text, needle) != NULL;
+   char n1[80], n2[96];
+   snprintf(n1, sizeof n1, "uint64_t _%s;", name);
+   snprintf(n2, sizeof n2, "unsigned __int128 _%s;", name);
+   return strstr(dutc_text, n1) != NULL || strstr(dutc_text, n2) != NULL;
 }
 
 // Emit the address-baked bridge .c around the generated model.
@@ -2088,10 +2091,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       chunk->bindtab[6 + bridged_in] = pins[i].data;
-      fprintf(f, "  { uint8_t*p=IN_ADDR(%d); uint64_t v=0;"
-                 " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
-              bridged_in, pins[i].width,
-              pins[i].elem, pins[i].width, pins[i].name);
+      const char *invt = pins[i].width > 64 ? "unsigned __int128" : "uint64_t";
+      fprintf(f, "  { uint8_t*p=IN_ADDR(%d); %s v=0;"
+                 " for(int b=0;b<%d;b++) v|=(%s)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
+              bridged_in, invt, pins[i].width,
+              invt, pins[i].elem, pins[i].width, pins[i].name);
       bridged_in++;
    }
    // Advance the registers to the next state ONLY on the clock posedge
@@ -2161,11 +2165,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          deferred++;
       }
       chunk->bindtab[6 + ni + ord] = pins[i].sig;
+      const char *outvt = pins[i].width > 64 ? "unsigned __int128" : "uint64_t";
       if (!no_force)
-         fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
-                    " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|((v>>b)&1);"
+         fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); %s v=o._%s;"
+                    " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
                     " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
-                 bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
+                 bufsz, outvt, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
                  ord, ord, pins[i].width);
       ord++;
       bridged_out++;
@@ -2330,6 +2335,11 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // only re-runs when it actually changes. Override with NVC_ACCEL_NO_CACHE.
    uint64_t vhash = 1469598103934665603ULL;   // FNV-1a
    vhash = (vhash ^ 3u) * 1099511628211ULL;    // cache version — bump on codegen change
+   // Mix gen_statemachine's mtime so a synth-tool change invalidates the cache
+   // (the cached dutc/.so are the synth output; a stale one would miscompile).
+   { struct stat gst;
+     if (stat(aj_gen_sm(), &gst) == 0)
+        vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    for (int i = 0; i < nsrc; i++) {
       char *vtext = aj_read_file(srcs[i]);
@@ -2415,7 +2425,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // logic3d (elem=4) / std_logic (elem=1) vectors of <=64 value-bits. A
       // record / integer / wide port would silently corrupt — decline the whole
       // chunk (stays interpreted) rather than produce wrong results.
-      if (pin.width < 1 || pin.width > 64 || (pin.elem != 1 && pin.elem != 4)
+      if (pin.width < 1 || pin.width > 128 || (pin.elem != 1 && pin.elem != 4)
           || !aj_marshallable_type(tree_type(p))) {
          notef("accel-jit: subtree '%s' port '%s' not value-bit marshallable "
                "(width=%d elem=%d) — leaving in nvc", top, lname, pin.width, pin.elem);
