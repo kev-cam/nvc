@@ -1584,8 +1584,9 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
 // deferred-output table, so multiple chunks can be live at once.
 struct _aj_chunk {
    rt_proc_vtable_t vtable;          // FIRST — recover chunk from proc->vtable
-   void           (*eval)(void);     // this .so's accel_eval
-   void           (*reset)(void);    // this .so's accel_reset
+   void           (*eval)(void *, void **);  // .so's accel_eval(state, bindtab)
+   void           (*reset)(void *);          // this .so's accel_reset(state)
+   void            *state;           // per-chunk state (sized by accel_state_size)
    void            *dl;              // dlopen handle
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
@@ -1612,7 +1613,7 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    thread->active_obj   = &proc->wakeable;
    thread->active_scope = proc->scope;
    g_aj_cur_chunk       = chunk;
-   if (chunk->eval) chunk->eval();
+   if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
    g_aj_cur_chunk       = save_chunk;
    thread->active_obj   = save_obj;
    thread->active_scope = save_scope;
@@ -1967,6 +1968,7 @@ static void aj_accel_teardown(rt_model_t *m)
          free(c->defer_outs);
       }
       free(c->bindtab);
+      free(c->state);
       if (c->dl != NULL) dlclose(c->dl);
       free(c);
    }
@@ -2022,7 +2024,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "typedef long long (*now_fn)(void*,unsigned*);\n");
    fprintf(f, "typedef void (*force_fn)(void*,void*,const void*,int,unsigned long);\n");
    fprintf(f, "typedef void (*ajout_fn)(int,void*,const void*,int,int);\n");
-   fprintf(f, "void **AJB;\n");
+   // AJB is a PARAMETER of accel_eval (not a global) so an identical-logic .so
+   // shared by N chunks stays reentrant — each call uses its own address table.
    fprintf(f, "#define FORCE  ((force_fn)AJB[0])\n");
    fprintf(f, "#define NOW    ((now_fn)AJB[1])\n");
    fprintf(f, "#define MDL    (AJB[2])\n");
@@ -2031,8 +2034,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "#define RST    ((uint8_t*)AJB[5])\n");
    fprintf(f, "#define IN_ADDR(i) ((uint8_t*)AJB[6+(i)])\n");
    fprintf(f, "#define OUT_SIG(j) (AJB[%d+(j)])\n", 6 + ni);
-   fprintf(f, "static state_t S;\nstatic long long last_t = -1;\n\n");
-   fprintf(f, "void accel_reset(void){ sm_reset(&S); last_t = -1; }\n\n");
+   // Per-chunk state lives OUTSIDE the .so (passed in), so an identical-logic .so
+   // can be shared by many instances (one synth, N chunks) each with its OWN
+   // state. accel_eval/accel_reset take the chunk's state pointer; S and last_t
+   // are macros over it so the generated body below is unchanged.
+   fprintf(f, "typedef struct { state_t S; long long last_t; } aj_cs_t;\n");
+   fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
+   fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
+   fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
+              " sm_reset(&S); last_t = -1; }\n\n");
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
    chunk->bindtab[0] = (void *)&deposit_signal;
@@ -2044,7 +2054,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
-   fprintf(f, "void accel_eval(void){\n");
+   fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
    fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
    fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
    // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
@@ -2298,6 +2308,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // reused when the logic is unchanged (in-place update) and gen_statemachine
    // only re-runs when it actually changes. Override with NVC_ACCEL_NO_CACHE.
    uint64_t vhash = 1469598103934665603ULL;   // FNV-1a
+   vhash = (vhash ^ 3u) * 1099511628211ULL;    // cache version — bump on codegen change
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    for (int i = 0; i < nsrc; i++) {
       char *vtext = aj_read_file(srcs[i]);
@@ -2438,21 +2449,21 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    void *dl = dlopen(so, RTLD_NOW);
    if (!dl) { warnf("accel-jit: dlopen %s: %s", so, dlerror());
               aj_accel_teardown(m); return false; }
-   void (*eval)(void)  = dlsym(dl, "accel_eval");
-   void (*reset)(void) = dlsym(dl, "accel_reset");
-   void ***ajb         = (void ***)dlsym(dl, "AJB");
-   if (!eval || !reset || !ajb) {
-      warnf("accel-jit: missing accel_eval/accel_reset/AJB in %s", so);
+   void (*eval)(void *, void **) = dlsym(dl, "accel_eval");
+   void (*reset)(void *)         = dlsym(dl, "accel_reset");
+   unsigned long (*ssize)(void)  = dlsym(dl, "accel_state_size");
+   if (!eval || !reset || !ssize) {
+      warnf("accel-jit: missing accel_eval/reset/state_size in %s", so);
       dlclose(dl);
       aj_accel_teardown(m);
       return false;
    }
-   *ajb = chunk->bindtab;   // de-baked binding: .so AJB -> per-run address table
    chunk->eval  = eval;
    chunk->reset = reset;
    chunk->dl    = dl;
+   chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
    g_aj_model   = m;
-   reset();
+   chunk->reset(chunk->state);
    aj_reroute(scope, chunk);
    notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
    return true;
