@@ -1838,6 +1838,8 @@ static unsigned aj_pending_count(void *pending)
 // on the normal procq — only an optimisation, never a correctness lever.
 static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdata)
 {
+   free(m->fastclk_table);    // rebuilt per install (multi-chunk) — free the old
+   m->fastclk_table = NULL;
    m->fastclk_on = false;
    m->fastclk_count = 0;
    if (!getenv("NVC_FAST_CLK")) return;
@@ -2463,17 +2465,30 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
    // JIT subtree path: work down from the top, accelerate the first
    // synthesizable subtree that compiles, and don't recurse into it.
    if (getenv("NVC_ACCEL_JIT") != NULL) {
+      // NVC_ACCEL_PER_INSTANCE: install each LEAF instance (one with no instance
+      // children) as its own chunk, so siblings become separate cacheable .so's
+      // (finest-grained in-place rebuild) and the inter-instance signals become
+      // chunk-to-chunk boundaries — instead of flattening the whole subtree into
+      // one chunk. Default (whole-subtree) installs the largest synth subtree.
+      const bool per_inst = getenv("NVC_ACCEL_PER_INSTANCE") != NULL;
       if (scope->kind == SCOPE_INSTANCE) {
+         bool leaf = true;
+         if (per_inst)
+            for (int ci = 0; ci < scope->children.count; ci++)
+               if (scope->children.items[ci]->kind == SCOPE_INSTANCE) {
+                  leaf = false; break;
+               }
          tree_t r = aj_scope_ref(scope);
          char tmp[512];
          // NVC_ACCEL_FROM_VHDL emits the subtree via vhdl2vlog (not the original
          // SV), so the SV-source gate doesn't apply -- plain VHDL has no
          // nvc_verilog_src attr either.
-         if (r != NULL
+         if ((!per_inst || leaf) && r != NULL
              && (getenv("NVC_ACCEL_FROM_VHDL")
                  || accel_verilog_src(r, tmp, sizeof tmp))
-             && accel_install_subtree(m, scope, r, accel_dir))
-            return;   // whole subtree accelerated
+             && accel_install_subtree(m, scope, r, accel_dir)
+             && !per_inst)
+            return;   // whole subtree accelerated; don't recurse into it
       }
       for (int ci = 0; ci < scope->children.count; ci++)
          accel_scan_scope(m, scope->children.items[ci], accel_dir);
