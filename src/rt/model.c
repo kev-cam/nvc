@@ -2011,6 +2011,43 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    char *dut_text = aj_read_file(dutc);
    if (!dut_text) return false;
 
+   // Multi-clock: gen_statemachine emits `const char *sm_extra_clocks[] = {...};`
+   // listing the non-main clock INPUT field base-names. The bridge edge-detects
+   // each across deltas to advance the right flop group (sm_clock_masked). Text-
+   // scrape it (same convention as aj_model_has_field). Single-clock -> {0} -> 0.
+   char extra_clk[16][64];
+   int nck = 0;
+   {
+      const char *start = strstr(dut_text, "const char *sm_extra_clocks[] = {");
+      if (start != NULL) {
+         start += strlen("const char *sm_extra_clocks[] = {");
+         const char *end = strchr(start, '}');
+         const char *p = start;
+         while (end != NULL && nck < 16) {
+            const char *q = strchr(p, '"');
+            if (q == NULL || q >= end) break;
+            const char *e = strchr(q + 1, '"');
+            if (e == NULL || e >= end) break;
+            int len = (int)(e - q - 1);
+            if (len > 0 && len < 64) {
+               memcpy(extra_clk[nck], q + 1, len);
+               extra_clk[nck][len] = '\0';
+               nck++;
+            }
+            p = e + 1;
+         }
+      }
+      // Each extra clock must be a marshalled input field, else the bridge cannot
+      // edge-detect it from the boundary — decline (leave the chunk interpreted).
+      for (int k = 0; k < nck; k++)
+         if (!aj_model_has_field(dut_text, extra_clk[k])) {
+            notef("accel-jit: extra clock '%s' not a marshalled input — declining",
+                  extra_clk[k]);
+            free(dut_text);
+            return false;
+         }
+   }
+
    FILE *f = fopen(path, "w");
    if (!f) { free(dut_text); return false; }
 
@@ -2045,11 +2082,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // can be shared by many instances (one synth, N chunks) each with its OWN
    // state. accel_eval/accel_reset take the chunk's state pointer; S and last_t
    // are macros over it so the generated body below is unchanged.
-   fprintf(f, "typedef struct { state_t S; long long last_t; } aj_cs_t;\n");
+   if (nck == 0)
+      fprintf(f, "typedef struct { state_t S; long long last_t; } aj_cs_t;\n");
+   else
+      // per-extra-clock last value, for value-edge detection across deltas.
+      fprintf(f, "typedef struct { state_t S; long long last_t;"
+                 " unsigned char ck_last[%d]; } aj_cs_t;\n", nck);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
-   fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
-              " sm_reset(&S); last_t = -1; }\n\n");
+   if (nck == 0)
+      fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
+                 " sm_reset(&S); last_t = -1; }\n\n");
+   else
+      fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
+                 " sm_reset(&S); last_t = -1;"
+                 " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
    chunk->bindtab[0] = (void *)&deposit_signal;
@@ -2118,12 +2165,37 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // (any delta), matching real async-reset hardware; otherwise advance on the
    // edge. gen_statemachine folds a SYNC reset into the model's logic (it reads
    // the reset as a normal input), so sm_clock handles that itself.
-   if (rst != NULL) {
-      fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
-      fprintf(f, "  else if(posedge) sm_clock(&S,&in);\n");
+   if (nck == 0) {
+      if (rst != NULL) {
+         fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
+         fprintf(f, "  else if(posedge) sm_clock(&S,&in);\n");
+      }
+      else
+         fprintf(f, "  if(posedge) sm_clock(&S,&in);\n");
    }
-   else
-      fprintf(f, "  if(posedge) sm_clock(&S,&in);\n");
+   else {
+      // Multi-clock: build a per-group posedge mask. Bit0 = main clk (time-edge,
+      // posedge). Bit 1+k = extra clock k, VALUE-edge (now && !last) across the
+      // bridge's per-delta re-runs — because the rvclkhdr gater drives free_clk/
+      // active_clk in a LATER delta than clk (same sim time), they read stale-low
+      // at the clk delta, so we advance each extra group in whatever delta its
+      // clock actually rises. Each advance reads the LIVE state S at its own delta
+      // (an extra clock lagging clk sees the post-clk-advance state, as nvc's
+      // interpreted delta loop does); the top-of-sm_clock snapshot gives NBA.
+      fprintf(f, "  unsigned posedge_mask = 0;\n");
+      fprintf(f, "  if(posedge) posedge_mask |= 1u;\n");
+      for (int k = 0; k < nck; k++)
+         fprintf(f, "  { int _n=(in._%s&1);"
+                    " if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
+                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k);
+      fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
+      if (rst != NULL) {
+         fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
+         fprintf(f, "  else if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
+      }
+      else
+         fprintf(f, "  if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
+   }
    // ALWAYS re-settle the combinational outputs against the CURRENT state +
    // inputs. This runs on the posedge (after the register advance, so outputs
    // reflect the new state) AND on every boundary-input-change delta in the
@@ -2154,6 +2226,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // NVC_ACCEL_NO_FORCE: compute outputs but skip the deposit (measurement only;
    // produces wrong results — used to isolate the boundary-deposit per-cycle cost).
    const bool no_force = getenv("NVC_ACCEL_NO_FORCE") != NULL;
+   // The posedge flag handed to AJ_OUT classifies a registered-output change as an
+   // edge change (kept in the deferred bank) vs a Mealy off-edge change. With
+   // multi-clock, an output registered on free_clk changes in a delta where bit0
+   // (main posedge) is 0; pass `aj_pe = (posedge_mask!=0)` so any-group advance
+   // still counts as an edge. Single-clock keeps the literal `posedge`.
+   const char *pe_arg = (nck > 0) ? "aj_pe" : "posedge";
    // Build the deferred-output table in emit order so the bridge's per-output
    // ordinal matches m->aj_defer_outs[ord]. Each output is classified now (the
    // fast-clk table already exists — aj_build_fastclk runs before emit); a
@@ -2187,15 +2265,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf);"
                        " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
                        "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
-                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
+                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                     bufsz, pins[i].width, pins[i].width, pins[i].elem,
-                    pins[i].name, ord, ord, pins[i].width);
+                    pins[i].name, ord, ord, pins[i].width, pe_arg);
          else
             fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
                        " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
-                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
+                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                     bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-                    ord, ord, pins[i].width);
+                    ord, ord, pins[i].width, pe_arg);
       }
       ord++;
       bridged_out++;
