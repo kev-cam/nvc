@@ -101,6 +101,9 @@ typedef struct {
    unsigned      max;
 } deferq_t;
 
+typedef struct _aj_defer_out aj_defer_out_t;   // NVC_ACCEL_BANK 2-bank output
+typedef struct _aj_chunk     aj_chunk_t;       // one installed accel subtree
+
 typedef struct _rt_model {
    tree_t             top;
    hash_t            *scopes;
@@ -167,6 +170,20 @@ typedef struct _rt_model {
    unsigned           fastclk_count;
    rt_nexus_t        *fastclk_nexus;
    uint8_t           *fastclk_data;    // clk effective bytes (bit0 = level)
+
+   // NVC_ACCEL_BANK: per-output 2-bank deferred write (VHDL delta / Verilog
+   // NBA). The chunk STAGEs its computed output into a private shadow on the
+   // posedge (not the signal); after the fast-clk table has dispatched (every
+   // clk-reader read the OLD effective value), the swap publishes shadow->
+   // effective. Replaces deposit_signal's lock/split/wakeup/extra-delta cost
+   // with a pointer-cached cmp+copy. Only for outputs that pass the gate
+   // (readers all clk-only fast-clk procs); others fall back to deposit_signal.
+   // Per-chunk registry: each installed accel subtree is one aj_chunk_t, routed
+   // to via its own vtable (recovered by container_of from proc->vtable) so >1
+   // chunk can be live. Replaces the old single global g_aj_eval.
+   aj_chunk_t       **aj_chunks;   // pointer array — chunks have stable address
+   unsigned           aj_chunk_count;
+   unsigned           aj_chunk_max;
 } rt_model_t;
 
 // Depth bucket: 0, 1, 2-3, 4-15, 16-63, 64-255, 256-1023, 1024+
@@ -1561,21 +1578,45 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
                     int offset, size_t count);   // immediate (blocking) deposit
 
 // One accel model per run is enough for the bet; rerouted procs all call this.
-static void (*g_aj_eval)(void) = NULL;
+// One installed accel subtree. The vtable is the FIRST field so a rerouted proc
+// recovers its chunk via (aj_chunk_t *)proc->vtable (the accel_binding_t
+// pattern). Each chunk has its own compiled eval/state/reset and its own
+// deferred-output table, so multiple chunks can be live at once.
+struct _aj_chunk {
+   rt_proc_vtable_t vtable;          // FIRST — recover chunk from proc->vtable
+   void           (*eval)(void);     // this .so's accel_eval
+   void           (*reset)(void);    // this .so's accel_reset
+   void            *dl;              // dlopen handle
+   rt_scope_t      *scope;           // installed subtree root
+   aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
+   unsigned         defer_count;
+   bool             defer_pending;
+   void           **bindtab;         // per-run address table (the .so's AJB -> here)
+   uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
+   int              order;           // topological eval order (later)
+};
+
+static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
+static aj_chunk_t *g_aj_cur_chunk = NULL;  // chunk whose eval is running
+
 static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
 {
-   // Establish the active-process context (run_process does not — only the
-   // default JIT eval does), so the bridge can call deposit_signal()/etc.
+   // Recover this proc's chunk from its vtable (first field), establish the
+   // active-process context (run_process does not — only the default JIT eval
+   // does, and the bridge needs it for deposit_signal()/AJ_OUT), run the chunk.
+   aj_chunk_t *chunk = (aj_chunk_t *)proc->vtable;
    model_thread_t *thread = model_thread(m);
    rt_wakeable_t *save_obj   = thread->active_obj;
    rt_scope_t    *save_scope = thread->active_scope;
+   aj_chunk_t    *save_chunk = g_aj_cur_chunk;
    thread->active_obj   = &proc->wakeable;
    thread->active_scope = proc->scope;
-   if (g_aj_eval) g_aj_eval();
+   g_aj_cur_chunk       = chunk;
+   if (chunk->eval) chunk->eval();
+   g_aj_cur_chunk       = save_chunk;
    thread->active_obj   = save_obj;
    thread->active_scope = save_scope;
 }
-static const rt_proc_vtable_t aj_eval_vtable = { .eval = aj_proc_eval };
 
 typedef struct {
    char          name[64];     // lowercased port name, e.g. "a_data"
@@ -1585,6 +1626,51 @@ typedef struct {
    uint8_t      *data;         // shared.data (read inputs)
    rt_signal_t  *sig;          // signal (force outputs via force_signal)
 } aj_pin_t;
+
+// NVC_ACCEL_BANK 2-bank deferred output. One per bridged output; `defer`
+// distinguishes the bank-switched outputs (staged into `shadow`, published by
+// the post-dispatch swap) from the fall-back outputs (deposited immediately).
+struct _aj_defer_out {
+   rt_nexus_t    *nexus;      // consumer-visible target nexus (after port hop)
+   unsigned char *eff;        // nexus_effective (cached at install)
+   unsigned char *last;       // nexus_last_value (cached at install)
+   size_t         valuesz;    // width * elem bytes
+   unsigned char *shadow;     // staged value (malloc valuesz) — NULL if !defer
+   bool           cache_event;
+   bool           defer;      // bank-switch this output (vs deposit_signal)
+   bool           dirty;      // shadow staged this cycle, awaiting swap
+};
+
+// Baked into the bridge as AJ_OUT: called once per output with the logic3d
+// bytes the chunk computed. Routed to the CURRENTLY-running chunk's deferred-
+// output table (g_aj_cur_chunk, set by aj_proc_eval). A deferred output is
+// copied into its shadow (the swap publishes it later); a non-deferred output
+// falls back to the immediate deposit, exactly as before.
+static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
+{
+   rt_model_t *m = g_aj_model;
+   aj_chunk_t *c = g_aj_cur_chunk;
+   if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
+       && c->defer_outs[ord].defer) {
+      aj_defer_out_t *d = &c->defer_outs[ord];
+      // A deferred output that CHANGES on a non-posedge (combinational settle)
+      // delta is Mealy: the swap only publishes at the posedge, so the post-edge
+      // re-settle would be lost. Detect it and permanently fall back to the
+      // immediate deposit for that output (registered outputs never change off
+      // the edge, so this never fires for them — e.g. churn's y).
+      if (!posedge && !cmp_bytes(d->eff, buf, d->valuesz)) {
+         d->defer = false;
+         d->dirty = false;
+         deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+         return;
+      }
+      memcpy(d->shadow, buf, d->valuesz);
+      d->dirty = true;
+      c->defer_pending = true;
+   }
+   else
+      deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+}
 
 static tree_t aj_scope_ref(rt_scope_t *scope)
 {
@@ -1681,12 +1767,27 @@ static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
 
 // Reroute every process in the subtree to the accel eval (gate makes
 // non-posedge calls harmless).
-static void aj_reroute(rt_scope_t *scope)
+static aj_chunk_t *aj_chunk_new(rt_model_t *m)
+{
+   if (m->aj_chunk_count == m->aj_chunk_max) {
+      m->aj_chunk_max = m->aj_chunk_max ? m->aj_chunk_max * 2 : 4;
+      m->aj_chunks = xrealloc_array(m->aj_chunks, m->aj_chunk_max,
+                                    sizeof(aj_chunk_t *));
+   }
+   aj_chunk_t *c = xcalloc(sizeof(aj_chunk_t));
+   c->vtable.eval = aj_proc_eval;
+   m->aj_chunks[m->aj_chunk_count++] = c;
+   return c;
+}
+
+// Route every process in a subtree to ITS chunk's vtable (recovered later by
+// aj_proc_eval via the vtable-first-field trick).
+static void aj_reroute(rt_scope_t *scope, aj_chunk_t *chunk)
 {
    for (int pi = 0; pi < scope->procs.count; pi++)
-      proc_set_vtable(scope->procs.items[pi], &aj_eval_vtable);
+      proc_set_vtable(scope->procs.items[pi], &chunk->vtable);
    for (int ci = 0; ci < scope->children.count; ci++)
-      aj_reroute(scope->children.items[ci]);
+      aj_reroute(scope->children.items[ci], chunk);
 }
 
 // ---- NVC_FAST_CLK posedge-table dispatch -----------------------------------
@@ -1770,6 +1871,105 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
          m->fastclk_count);
 }
 
+// True iff every static waiter on this output nexus is a clk-only fast-clk
+// proc (so it is dispatched off the clock edge and reads the OLD effective
+// value before the swap). Any non-W_PROC waiter, or a W_PROC that did not
+// survive the clk-only filter (fastclk==0), means a same-delta reader could
+// observe the new value -> not deferrable.
+static bool aj_out_pending_ok(void *pending)
+{
+   if (pointer_tag(pending) == 1) {
+      rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
+      return w->kind == W_PROC && w->fastclk;
+   }
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      for (int i = 0; i < p->count; i++) {
+         rt_wakeable_t *w = p->wake[i];
+         if (w == NULL) continue;
+         if (w->kind != W_PROC || !w->fastclk) return false;
+      }
+   }
+   return true;
+}
+
+// No static waiter at all on this nexus (used for the chunk-side output nexus,
+// which must only feed its output port — anything reading it directly would see
+// a stale value since the swap writes the consumer-side nexus).
+static bool aj_pending_empty(void *pending)
+{
+   if (pointer_tag(pending) == 1) return false;
+   if (pending == NULL) return true;
+   rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+   for (int i = 0; i < p->count; i++)
+      if (p->wake[i] != NULL) return false;
+   return true;
+}
+
+// Decide whether a chunk output may be bank-switched (deferred). Conservative
+// smallest-correct gate: NVC_FAST_CLK active, NVC_ACCEL_BANK not disabled,
+// single full-width nexus, no downstream port fan-out, and every static
+// reader a clk-only fast-clk proc. Anything else falls back to deposit_signal.
+// Returns the consumer-visible nexus to bank-switch into, or NULL to decline.
+// An accel chunk output always feeds its parent via an output port, so we follow
+// at most ONE direct (no-conversion) port hop to the nexus the readers actually
+// read, and bank-switch into THAT. Conservative: single full-width nexus on both
+// sides, no further fan-out, all readers clk-only fast-clk procs.
+static rt_nexus_t *aj_classify_output(rt_model_t *m, rt_signal_t *sig)
+{
+   const bool dbg = getenv("NVC_ACCEL_BANK_DBG") != NULL;
+   #define BANK_DECLINE(why) do { \
+      if (dbg) notef("accel-jit: bank decline %s — " why, \
+                     istr(tree_ident(sig->where))); return NULL; } while (0)
+
+   if (!m->fastclk_on) return NULL;
+   // Opt-in: on the single-chunk / interpreted-consumer path the deferred bank
+   // is bit-identical but net-neutral (the consumer reads a fixed effective
+   // location, so one copy is unavoidable and deposit_signal already does it).
+   // Its payoff is chunk-to-chunk handoff (a future, compiled consumer that can
+   // read a bank-select bit with zero copy). Off unless NVC_ACCEL_BANK=1.
+   const char *bank = getenv("NVC_ACCEL_BANK");
+   if (bank == NULL || atoi(bank) == 0) return NULL;
+   if (sig->n_nexus != 1) BANK_DECLINE("multi-nexus chunk output");
+   rt_nexus_t *n = &sig->nexus;
+
+   if (n->outputs != NULL) {
+      // follow one direct output-port hop to the consumer-visible nexus
+      rt_source_t *o = n->outputs;
+      if (o->chain_output != NULL)       BANK_DECLINE("multiple output fan-out");
+      if (o->tag != SOURCE_PORT)         BANK_DECLINE("non-port output source");
+      if (o->u.port.conv_func != NULL)   BANK_DECLINE("output port has conversion");
+      if (!aj_pending_empty(n->pending)) BANK_DECLINE("chunk-side nexus has readers");
+      n = o->u.port.output;              // the parent / consumer-visible nexus
+      if (n->signal->n_nexus != 1)       BANK_DECLINE("multi-nexus consumer signal");
+      if (n->outputs != NULL)            BANK_DECLINE("consumer nexus fans out further");
+   }
+   if (!aj_out_pending_ok(n->pending))   BANK_DECLINE("non-clk-only reader on consumer");
+   return n;
+   #undef BANK_DECLINE
+}
+
+// Undo aj_build_fastclk + the partially-built chunk when an install fails after
+// they were created, so a non-installed chunk leaves no active state.
+static void aj_accel_teardown(rt_model_t *m)
+{
+   free(m->fastclk_table);
+   m->fastclk_table = NULL;
+   m->fastclk_count = 0;
+   m->fastclk_on    = false;
+   if (m->aj_chunk_count > 0) {
+      aj_chunk_t *c = m->aj_chunks[--m->aj_chunk_count];
+      if (c->defer_outs != NULL) {
+         for (unsigned i = 0; i < c->defer_count; i++)
+            free(c->defer_outs[i].shadow);
+         free(c->defer_outs);
+      }
+      free(c->bindtab);
+      if (c->dl != NULL) dlclose(c->dl);
+      free(c);
+   }
+}
+
 static char *aj_read_file(const char *path)
 {
    FILE *f = fopen(path, "rb");
@@ -1795,7 +1995,7 @@ static bool aj_model_has_field(const char *dutc_text, const char *name)
 // Emit the address-baked bridge .c around the generated model.
 static bool aj_emit_bridge(const char *path, const char *dutc,
                            aj_pin_t *pins, int npins, aj_pin_t *clk,
-                           aj_pin_t *rst, rt_model_t *m)
+                           aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk)
 {
    char *dut_text = aj_read_file(dutc);
    if (!dut_text) return false;
@@ -1806,21 +2006,39 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "#define SM_NO_MAIN 1\n");
    fprintf(f, "#include <stdint.h>\n#include <string.h>\n");
    fprintf(f, "#include \"%s\"\n\n", dutc);
+   // DE-BAKED BINDING. The .so contains NO run-specific addresses: the install
+   // points the exported AJB table at a per-run array of {deposit_signal,
+   // model_now, model, aj_out, clk-data, rst-data, input-data..., output-sig...}.
+   // So an unchanged-logic .so is content-only and is cached/reused across runs
+   // and edits (in-place update — skip both synth AND compile). Everything below
+   // reads its addresses through AJB via these macros, so the call sites are the
+   // same as the previously-baked versions.
+   int ni = 0;
+   for (int i = 0; i < npins; i++)
+      if (!pins[i].is_output && aj_model_has_field(dut_text, pins[i].name)) ni++;
+
    fprintf(f, "typedef long long (*now_fn)(void*,unsigned*);\n");
-   // Outputs use deposit_signal() — the IMMEDIATE (blocking) path: it writes the
-   // effective value and notifies receivers in the SAME iteration (no delta
-   // delay), so the testbench's same-cycle posedge read sees this cycle's value.
-   // Called directly (not the x_deposit_signal JIT wrapper, which routes to the
-   // delta queue during simulation).
    fprintf(f, "typedef void (*force_fn)(void*,void*,const void*,int,unsigned long);\n");
-   fprintf(f, "static const force_fn FORCE = (force_fn)%#lxUL;\n",
-           (unsigned long)(uintptr_t)&deposit_signal);
-   fprintf(f, "static const now_fn NOW = (now_fn)%#lxUL;\n",
-           (unsigned long)(uintptr_t)&model_now);
-   fprintf(f, "static void *const MDL = (void*)%#lxUL;\n",
-           (unsigned long)(uintptr_t)m);
+   fprintf(f, "typedef void (*ajout_fn)(int,void*,const void*,int,int);\n");
+   fprintf(f, "void **AJB;\n");
+   fprintf(f, "#define FORCE  ((force_fn)AJB[0])\n");
+   fprintf(f, "#define NOW    ((now_fn)AJB[1])\n");
+   fprintf(f, "#define MDL    (AJB[2])\n");
+   fprintf(f, "#define AJ_OUT ((ajout_fn)AJB[3])\n");
+   fprintf(f, "#define CLK    ((uint8_t*)AJB[4])\n");
+   fprintf(f, "#define RST    ((uint8_t*)AJB[5])\n");
+   fprintf(f, "#define IN_ADDR(i) ((uint8_t*)AJB[6+(i)])\n");
+   fprintf(f, "#define OUT_SIG(j) (AJB[%d+(j)])\n", 6 + ni);
    fprintf(f, "static state_t S;\nstatic long long last_t = -1;\n\n");
    fprintf(f, "void accel_reset(void){ sm_reset(&S); last_t = -1; }\n\n");
+
+   // Fill the scalar table slots (the per-pin slots are filled in the loops).
+   chunk->bindtab[0] = (void *)&deposit_signal;
+   chunk->bindtab[1] = (void *)&model_now;
+   chunk->bindtab[2] = m;
+   chunk->bindtab[3] = (void *)&aj_out;
+   chunk->bindtab[4] = clk->data;
+   chunk->bindtab[5] = rst ? rst->data : NULL;
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
@@ -1828,8 +2046,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
    fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
    // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
-   fprintf(f, "  int _clk = ((uint8_t*)%#lxUL)[0]&1;\n",
-           (unsigned long)(uintptr_t)clk->data);
+   fprintf(f, "  int _clk = CLK[0]&1;\n");
    fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
    // The bridge now runs on EVERY boundary-input-change delta (the rerouted
    // combinational processes wake it), not just the clock edge. ADVANCE the
@@ -1858,9 +2075,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    for (int i = 0; i < npins; i++) {
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
-      fprintf(f, "  { uint8_t*p=(uint8_t*)%#lxUL; uint64_t v=0;"
+      chunk->bindtab[6 + bridged_in] = pins[i].data;
+      fprintf(f, "  { uint8_t*p=IN_ADDR(%d); uint64_t v=0;"
                  " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
-              (unsigned long)(uintptr_t)pins[i].data, pins[i].width,
+              bridged_in, pins[i].width,
               pins[i].elem, pins[i].width, pins[i].name);
       bridged_in++;
    }
@@ -1870,8 +2088,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // edge. gen_statemachine folds a SYNC reset into the model's logic (it reads
    // the reset as a normal input), so sm_clock handles that itself.
    if (rst != NULL) {
-      fprintf(f, "  if(((uint8_t*)%#lxUL)[0]&1) sm_reset(&S);\n",
-              (unsigned long)(uintptr_t)rst->data);
+      fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
       fprintf(f, "  else if(posedge) sm_clock(&S,&in);\n");
    }
    else
@@ -1903,18 +2120,48 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "); }\n");
    // outputs: driven-certain logic3d (L3D_0=2 / L3D_1=3) in the low byte of each
    // `elem`-byte sub-element; upper bytes stay 0 (value fits in 0..7).
+   // NVC_ACCEL_NO_FORCE: compute outputs but skip the deposit (measurement only;
+   // produces wrong results — used to isolate the boundary-deposit per-cycle cost).
+   const bool no_force = getenv("NVC_ACCEL_NO_FORCE") != NULL;
+   // Build the deferred-output table in emit order so the bridge's per-output
+   // ordinal matches m->aj_defer_outs[ord]. Each output is classified now (the
+   // fast-clk table already exists — aj_build_fastclk runs before emit); a
+   // qualifying output is bank-switched, the rest fall back to deposit_signal.
+   chunk->defer_outs = xcalloc_array(npins > 0 ? npins : 1, sizeof(aj_defer_out_t));
+   int ord = 0, deferred = 0;
    for (int i = 0; i < npins; i++) {
       if (!pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       const int bufsz = pins[i].width * pins[i].elem > 0
-                        ? pins[i].width * pins[i].elem : 1;   // FORCE reads width*elem bytes
-      fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
-                 " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|((v>>b)&1);"
-                 " FORCE(MDL,(void*)%#lxUL,buf,0,%d); }\n",
-              bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-              (unsigned long)(uintptr_t)pins[i].sig, pins[i].width);
+                        ? pins[i].width * pins[i].elem : 1;   // width*elem bytes
+      aj_defer_out_t *d = &chunk->defer_outs[ord];
+      rt_nexus_t *tgt = aj_classify_output(m, pins[i].sig);
+      if (tgt != NULL && (size_t)tgt->size * tgt->width != (size_t)bufsz)
+         tgt = NULL;   // layout mismatch across the port hop — fall back
+      d->valuesz = (size_t)bufsz;
+      d->defer   = (tgt != NULL);
+      if (d->defer) {
+         d->nexus       = tgt;
+         d->eff         = (unsigned char *)tgt->signal->shared.data + tgt->offset;
+         d->last        = d->eff + tgt->signal->shared.size;
+         d->cache_event = (tgt->flags & NET_F_CACHE_EVENT) != 0;
+         d->shadow      = xmalloc(bufsz);
+         deferred++;
+      }
+      chunk->bindtab[6 + ni + ord] = pins[i].sig;
+      if (!no_force)
+         fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+                    " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|((v>>b)&1);"
+                    " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
+                 bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
+                 ord, ord, pins[i].width);
+      ord++;
       bridged_out++;
    }
+   chunk->defer_count = ord;
+   if (deferred > 0)
+      notef("accel-jit: NVC_ACCEL_BANK — %d/%d output(s) bank-switched (deferred)",
+            deferred, ord);
    fprintf(f, "}\n");
    fclose(f);
    free(dut_text);
@@ -2044,34 +2291,59 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    snprintf(top_mod, sizeof top_mod, "%s",
             vhdl2vlog_variant_name(tree_ident(ent), scope->where));
 
-   char dutc[600], bridge[600], so[600];
-   snprintf(dutc,   sizeof dutc,   "%s/aj_%s.c", accel_dir, top);
-   snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, top);
-   snprintf(so,     sizeof so,     "%s/aj_%s.so", accel_dir, top);
-
-   // 2. synthesize the flattened model (gen_statemachine, cwd = source dir for includes)
-   char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
-   char *slash = strrchr(dir, '/');
-   if (slash) *slash = '\0';
-   else snprintf(dir, sizeof dir, ".");   // bare filename: sources relative to cwd
-   char cmd[8192];
-   int off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
-   for (int i = 0; i < nsrc; i++)
-      off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
-   // Re-synthesize with the elaboration's actual generics (width/depth/...).
-   // The vhdl2vlog path emits already-elaborated modules (generics baked in),
-   // so passing them would chparam a non-existent defparam and error.
-   char params[256];
-   if (!getenv("NVC_ACCEL_FROM_VHDL")
-       && accel_verilog_params(ref, params, sizeof params) && params[0]) {
-      off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
-      notef("accel-jit: params %s", params);
+   // Content-hash the synthesis inputs (the emitted/collected Verilog + the top
+   // module name) so the synth output is keyed by the LOGIC: a cached synth is
+   // reused when the logic is unchanged (in-place update) and gen_statemachine
+   // only re-runs when it actually changes. Override with NVC_ACCEL_NO_CACHE.
+   uint64_t vhash = 1469598103934665603ULL;   // FNV-1a
+   for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+   for (int i = 0; i < nsrc; i++) {
+      char *vtext = aj_read_file(srcs[i]);
+      if (vtext != NULL) {
+         for (const char *p = vtext; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+         free(vtext);
+      }
    }
-   off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top_mod, dutc);
-   notef("accel-jit: synth '%s' (top module '%s') from %d source(s)", top, top_mod, nsrc);
-   if (system(cmd) != 0 || access(dutc, F_OK) != 0) {
-      notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
-      return false;
+
+   char dutc[600], bridge[600], so[600];
+   snprintf(dutc,   sizeof dutc,   "%s/aj_%s_%016llx.c", accel_dir, top,
+            (unsigned long long)vhash);
+   snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, top);
+   snprintf(so,     sizeof so,     "%s/aj_%s_%016llx.so", accel_dir, top,
+            (unsigned long long)vhash);
+
+   // 2. synthesize the flattened model (gen_statemachine) — but only if this
+   //    exact logic has not been synthesized before. The cached synth (keyed by
+   //    the content hash above) is reused as-is for an in-place update; a logic
+   //    change yields a new hash -> a fresh synth, recompiling ONLY this chunk.
+   char cmd[8192];
+   if (getenv("NVC_ACCEL_NO_CACHE") == NULL && access(dutc, F_OK) == 0) {
+      notef("accel-jit: reusing cached synth for '%s' (logic unchanged)", top);
+   }
+   else {
+      char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
+      char *slash = strrchr(dir, '/');
+      if (slash) *slash = '\0';
+      else snprintf(dir, sizeof dir, ".");   // bare filename: sources rel to cwd
+      int off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
+      for (int i = 0; i < nsrc; i++)
+         off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
+      // Re-synthesize with the elaboration's actual generics (width/depth/...).
+      // The vhdl2vlog path emits already-elaborated modules (generics baked in),
+      // so passing them would chparam a non-existent defparam and error.
+      char params[256];
+      if (!getenv("NVC_ACCEL_FROM_VHDL")
+          && accel_verilog_params(ref, params, sizeof params) && params[0]) {
+         off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
+         notef("accel-jit: params %s", params);
+      }
+      off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top_mod, dutc);
+      notef("accel-jit: synth '%s' (top module '%s') from %d source(s)",
+            top, top_mod, nsrc);
+      if (system(cmd) != 0 || access(dutc, F_OK) != 0) {
+         notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
+         return false;
+      }
    }
 
    // 3. capture the port boundary (post-elab addresses). A big datapath chunk
@@ -2129,32 +2401,57 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       return false;
    }
 
-   // 4. emit the address-baked bridge and compile
+   // 4. register the chunk, build the fast-clk posedge table FIRST (the bank-
+   //    switch classifier in aj_emit_bridge consults it), then emit the address-
+   //    baked bridge (builds the chunk's deferred-output table) and compile.
+   aj_chunk_t *chunk = aj_chunk_new(m);
+   chunk->scope   = scope;
+   chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 2, sizeof(void *));
+   aj_build_fastclk(m, clk.sig, clk.data);
+   // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
+   // address table in chunk->bindtab — both cheap; the gcc below is what we cache.
    if (!aj_emit_bridge(bridge, dutc, pins, npins, &clk,
-                       have_rst ? &rst : NULL, m))
+                       have_rst ? &rst : NULL, m, chunk)) {
+      aj_accel_teardown(m);
       return false;
-   const char *cc = getenv("NVC_ACCEL_CC");
-   if (!cc) cc = "gcc -g -O3";
-   snprintf(cmd, sizeof cmd, "%s -shared -fPIC -o '%s' '%s'", cc, so, bridge);
-   if (system(cmd) != 0 || access(so, F_OK) != 0) {
-      notef("accel-jit: compile failed for '%s'", top);
-      return false;
+   }
+   // Compile only if this exact (de-baked, content-only) .so is not already
+   // cached. A logic change re-hashes -> a fresh .so; unchanged logic skips BOTH
+   // synth and compile, leaving just the per-run table bind below.
+   if (getenv("NVC_ACCEL_NO_CACHE") == NULL && access(so, F_OK) == 0) {
+      notef("accel-jit: reusing cached .so for '%s' (logic unchanged)", top);
+   }
+   else {
+      const char *cc = getenv("NVC_ACCEL_CC");
+      if (!cc) cc = "gcc -g -O3";
+      snprintf(cmd, sizeof cmd, "%s -shared -fPIC -o '%s' '%s'", cc, so, bridge);
+      if (system(cmd) != 0 || access(so, F_OK) != 0) {
+         notef("accel-jit: compile failed for '%s'", top);
+         aj_accel_teardown(m);
+         return false;
+      }
    }
 
-   // 5. load, reroute the subtree, reset the model
+   // 5. load, point the .so's AJB table at our per-run addresses, reroute
    void *dl = dlopen(so, RTLD_NOW);
-   if (!dl) { warnf("accel-jit: dlopen %s: %s", so, dlerror()); return false; }
+   if (!dl) { warnf("accel-jit: dlopen %s: %s", so, dlerror());
+              aj_accel_teardown(m); return false; }
    void (*eval)(void)  = dlsym(dl, "accel_eval");
    void (*reset)(void) = dlsym(dl, "accel_reset");
-   if (!eval || !reset) {
-      warnf("accel-jit: missing accel_eval/accel_reset in %s", so);
+   void ***ajb         = (void ***)dlsym(dl, "AJB");
+   if (!eval || !reset || !ajb) {
+      warnf("accel-jit: missing accel_eval/accel_reset/AJB in %s", so);
       dlclose(dl);
+      aj_accel_teardown(m);
       return false;
    }
-   g_aj_eval = eval;
+   *ajb = chunk->bindtab;   // de-baked binding: .so AJB -> per-run address table
+   chunk->eval  = eval;
+   chunk->reset = reset;
+   chunk->dl    = dl;
+   g_aj_model   = m;
    reset();
-   aj_reroute(scope);
-   aj_build_fastclk(m, clk.sig, clk.data);
+   aj_reroute(scope, chunk);
    notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
    return true;
 }
@@ -5540,6 +5837,30 @@ static void model_cycle(rt_model_t *m)
          rt_proc_t **pr = m->fastclk_table;
          for (unsigned i = 0; i < m->fastclk_count; i++, pr++)
             run_process(m, *pr);
+
+         // NVC_ACCEL_BANK swap: the chunk STAGEd its registered outputs into
+         // shadows; every clk-reader above has now read the OLD effective value
+         // (the delta-delay / NBA semantics). Publish shadow->effective so the
+         // new value is visible at the NEXT clock edge. No wakeup / no extra
+         // delta — the gate proved all readers are in the table just dispatched.
+         for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+            aj_chunk_t *c = m->aj_chunks[ci];
+            if (!c->defer_pending) continue;
+            for (unsigned i = 0; i < c->defer_count; i++) {
+               aj_defer_out_t *d = &c->defer_outs[i];
+               if (!d->dirty) continue;
+               d->dirty = false;
+               if (!cmp_bytes(d->eff, d->shadow, d->valuesz)) {
+                  copy2(d->last, d->eff, d->shadow, d->valuesz);
+                  d->nexus->event_delta = m->iteration + 1;
+                  d->nexus->last_event  = m->now;
+                  if (d->cache_event)
+                     d->nexus->signal->shared.flags |= SIG_F_EVENT_FLAG;
+                  m->trigger_epoch++;
+               }
+            }
+            c->defer_pending = false;
+         }
       }
    }
 
