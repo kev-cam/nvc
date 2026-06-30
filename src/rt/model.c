@@ -2443,7 +2443,10 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       pin.width    = pin.elem ? (int)(sig->shared.size / pin.elem) : 1;
       pin.data     = (uint8_t *)sig->shared.data;
       pin.sig      = sig;
-      pin.is_output = (tree_subkind(p) == PORT_OUT);
+      // PORT_BUFFER is an output (a readable-back registered output); classify it
+      // with PORT_OUT so the bridge DEPOSITS it rather than trying to drive it in,
+      // matching vhdl2vlog emitting `buffer` ports as Verilog `output`.
+      pin.is_output = (tree_subkind(p) == PORT_OUT || tree_subkind(p) == PORT_BUFFER);
       notef("accel-jit:   port %-10s %-3s width=%d elem=%d", lname,
             pin.is_output ? "out" : "in", pin.width, pin.elem);
       // Soundness gate: the bit0-per-element value-bit bridge handles logic3d

@@ -1196,7 +1196,14 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    for (int i = 0; i < nports; i++) {
       tree_t p = tree_port(block, i);
       const port_mode_t mode = tree_subkind(p);
-      fprintf(f, "  %s ", mode == PORT_OUT || mode == PORT_INOUT ? "output" : "input");
+      // A VHDL `buffer` port is an OUTPUT that is also readable internally (VeeR
+      // uses it for registered outputs that feed back). Emit it as `output` (a
+      // Verilog output is internally readable too) — NOT `input`. Mislabeling it
+      // `input` makes the net both a port-input and a flop Q in the accel
+      // codegen, colliding into one C identifier (redefinition compile failure).
+      fprintf(f, "  %s ",
+              mode == PORT_OUT || mode == PORT_INOUT || mode == PORT_BUFFER
+              ? "output" : "input");
       emit_range(f, tree_type(p));
       fprintf(f, "%s%s\n", vid(tree_ident(p)), i + 1 < nports ? "," : "");
    }
