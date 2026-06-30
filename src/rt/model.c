@@ -1988,15 +1988,19 @@ static char *aj_read_file(const char *path)
    return buf;
 }
 
-// gen_statemachine declares each scalar/vector port as "uint64_t _<name>;" (or
-// "unsigned __int128 _<name>;" for a >64-bit port). Match either spelling — a
-// wide port that fails this check would pass the gate but never get bridged.
+// gen_statemachine declares each scalar/vector port as "uint64_t _<name>;" for
+// <=64 bits, or as a limb array "uint32_t _<name>[N];" for a >64-bit port (the
+// scalable wide path). Match either spelling — a wide port that fails this check
+// would pass the gate but never get bridged. (The older "unsigned __int128"
+// spelling is matched too for forward/backward compatibility.)
 static bool aj_model_has_field(const char *dutc_text, const char *name)
 {
-   char n1[80], n2[96];
+   char n1[80], n2[96], n3[96];
    snprintf(n1, sizeof n1, "uint64_t _%s;", name);
    snprintf(n2, sizeof n2, "unsigned __int128 _%s;", name);
-   return strstr(dutc_text, n1) != NULL || strstr(dutc_text, n2) != NULL;
+   snprintf(n3, sizeof n3, "uint32_t _%s[", name);   // wide limb array
+   return strstr(dutc_text, n1) != NULL || strstr(dutc_text, n2) != NULL
+       || strstr(dutc_text, n3) != NULL;
 }
 
 // Emit the address-baked bridge .c around the generated model.
@@ -2091,11 +2095,22 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       chunk->bindtab[6 + bridged_in] = pins[i].data;
-      const char *invt = pins[i].width > 64 ? "unsigned __int128" : "uint64_t";
-      fprintf(f, "  { uint8_t*p=IN_ADDR(%d); %s v=0;"
-                 " for(int b=0;b<%d;b++) v|=(%s)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
-              bridged_in, invt, pins[i].width,
-              invt, pins[i].elem, pins[i].width, pins[i].name);
+      if (pins[i].width > 64) {
+         // Wide port: gen_statemachine declares in._<name> as a uint32_t[N] limb
+         // array. nexus element b (MSB-first) maps to value bit (width-1-b);
+         // place each bit in its limb. (32-bit limbs scale to any width.)
+         const int nl = (pins[i].width + 31) / 32;
+         fprintf(f, "  { uint8_t*p=IN_ADDR(%d); for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
+                    " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
+                    " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } }\n",
+                 bridged_in, nl, pins[i].name, pins[i].width, pins[i].width,
+                 pins[i].name, pins[i].elem);
+      } else {
+         fprintf(f, "  { uint8_t*p=IN_ADDR(%d); uint64_t v=0;"
+                    " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
+                 bridged_in, pins[i].width,
+                 pins[i].elem, pins[i].width, pins[i].name);
+      }
       bridged_in++;
    }
    // Advance the registers to the next state ONLY on the clock posedge
@@ -2165,13 +2180,23 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          deferred++;
       }
       chunk->bindtab[6 + ni + ord] = pins[i].sig;
-      const char *outvt = pins[i].width > 64 ? "unsigned __int128" : "uint64_t";
-      if (!no_force)
-         fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); %s v=o._%s;"
-                    " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
-                    " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
-                 bufsz, outvt, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-                 ord, ord, pins[i].width);
+      if (!no_force) {
+         if (pins[i].width > 64)
+            // Wide output: o._<name> is a uint32_t[N] limb array; read bit b from
+            // its limb and drive nexus element (width-1-b) MSB-first.
+            fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf);"
+                       " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
+                       "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
+                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
+                    bufsz, pins[i].width, pins[i].width, pins[i].elem,
+                    pins[i].name, ord, ord, pins[i].width);
+         else
+            fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+                       " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
+                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,posedge); }\n",
+                    bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
+                    ord, ord, pins[i].width);
+      }
       ord++;
       bridged_out++;
    }
@@ -2421,11 +2446,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       pin.is_output = (tree_subkind(p) == PORT_OUT);
       notef("accel-jit:   port %-10s %-3s width=%d elem=%d", lname,
             pin.is_output ? "out" : "in", pin.width, pin.elem);
-      // Soundness gate: the bit0-per-element value-bit bridge only handles
-      // logic3d (elem=4) / std_logic (elem=1) vectors of <=64 value-bits. A
-      // record / integer / wide port would silently corrupt — decline the whole
-      // chunk (stays interpreted) rather than produce wrong results.
-      if (pin.width < 1 || pin.width > 128 || (pin.elem != 1 && pin.elem != 4)
+      // Soundness gate: the bit0-per-element value-bit bridge handles logic3d
+      // (elem=4) / std_logic (elem=1) vectors. Width is now marshalled in 32-bit
+      // limbs both here and in gen_statemachine, so any width is sound; the 4096
+      // cap is just the wide-int runtime's wmul scratch (uint32_t t[128]). A
+      // record / integer port still declines (stays interpreted).
+      if (pin.width < 1 || pin.width > 4096 || (pin.elem != 1 && pin.elem != 4)
           || !aj_marshallable_type(tree_type(p))) {
          notef("accel-jit: subtree '%s' port '%s' not value-bit marshallable "
                "(width=%d elem=%d) — leaving in nvc", top, lname, pin.width, pin.elem);
