@@ -2380,6 +2380,32 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          return false;
    }
 
+   // Bisection knobs (localize a miscompiling subtree by name):
+   //   NVC_ACCEL_ONLY=n1,n2  install ONLY subtrees whose lowered name contains a token
+   //   NVC_ACCEL_SKIP=n1,n2  leave matching subtrees in the interpreter
+   // Both are comma lists matched as substrings of the lowered subtree name.
+   {
+      const char *only = getenv("NVC_ACCEL_ONLY");
+      if (only != NULL && only[0] != '\0') {
+         char buf[512];
+         snprintf(buf, sizeof buf, "%s", only);
+         bool match = false;
+         for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+            if (t[0] != '\0' && strstr(top0, t) != NULL) { match = true; break; }
+         if (!match) return false;
+      }
+      const char *skip = getenv("NVC_ACCEL_SKIP");
+      if (skip != NULL && skip[0] != '\0') {
+         char buf[512];
+         snprintf(buf, sizeof buf, "%s", skip);
+         for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+            if (t[0] != '\0' && strstr(top0, t) != NULL) {
+               notef("accel-jit: subtree '%s' skipped (NVC_ACCEL_SKIP)", top0);
+               return false;
+            }
+      }
+   }
+
    // 1. gather the subtree's Verilog sources
    static char srcs[64][512];
    int nsrc = 0;
