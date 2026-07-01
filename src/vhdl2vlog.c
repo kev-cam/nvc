@@ -1227,6 +1227,88 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
 // per-(entity,generics) name emit_subtree_v gives the child's definition, so
 // width-variants stay distinct and the flatten resolves. (vid() = instance LABEL
 // only, not the module reference.)
+// Extract (signal, low-bit, high-bit) from a signal-assign target that is a
+// static bit or slice of a plain signal. Returns false for anything else (whole
+// signal, non-static index, record field, ...), which the caller treats as
+// "cannot prove overridden" — i.e. it is emitted normally.
+static bool target_slice(tree_t tgt, ident_t *sig, int *lo, int *hi)
+{
+   tree_t base = tgt;
+   if (tree_kind(tgt) == T_ARRAY_SLICE) {
+      tree_t r = tree_range(tgt, 0);
+      int64_t a, b;
+      if (!folded_int(tree_left(r), &a) || !folded_int(tree_right(r), &b))
+         return false;
+      if (tree_subkind(r) == RANGE_DOWNTO) { *hi = (int)a; *lo = (int)b; }
+      else                                 { *lo = (int)a; *hi = (int)b; }
+      base = tree_value(tgt);
+   }
+   else if (tree_kind(tgt) == T_ARRAY_REF) {
+      if (tree_params(tgt) != 1) return false;
+      int64_t idx;
+      if (!folded_int(tree_value(tree_param(tgt, 0)), &idx)) return false;
+      *lo = *hi = (int)idx;
+      base = tree_value(tgt);
+   }
+   else
+      return false;   // whole-signal / other target
+
+   if (tree_kind(base) != T_REF) return false;
+   *sig = tree_ident(tree_ref(base));
+   return *hi >= *lo;
+}
+
+// A block statement that becomes a single continuous `assign` in Verilog: either
+// a concurrent T_SIGNAL_ASSIGN, or a process whose only non-wait statement is a
+// signal-assign (the line-787 continuous-assign case). Returns that assign.
+static tree_t continuous_assign_of(tree_t s)
+{
+   if (tree_kind(s) == T_SIGNAL_ASSIGN) return s;
+   if (tree_kind(s) == T_PROCESS) {
+      tree_t only = NULL; int cnt = 0;
+      const int nst = tree_stmts(s);
+      for (int i = 0; i < nst; i++) {
+         tree_t st = tree_stmt(s, i);
+         if (tree_kind(st) == T_WAIT) continue;
+         only = st; cnt++;
+      }
+      if (cnt == 1 && tree_kind(only) == T_SIGNAL_ASSIGN) return only;
+   }
+   return NULL;
+}
+
+// VHDL processes assign a signal's slices with LAST-wins priority, but vhdl2vlog
+// emits each as a concurrent Verilog `assign`. Yosys resolves overlapping
+// continuous assigns by keeping the NARROWER/earlier driver, not the last one —
+// so a slice fully overridden by a LATER assign to the same signal is a dead
+// driver that yosys would wrongly honour (e.g. VeeR i0_predict_p_d[59:58] under
+// the later [67:56]). Detect and drop those; partial overlaps where the later
+// assign is narrower already match (yosys narrower-wins == VHDL last-wins).
+static bool stmt_fully_overridden(tree_t block, int idx)
+{
+   tree_t ca = continuous_assign_of(tree_stmt(block, idx));
+   if (ca == NULL) return false;
+   ident_t sig; int lo, hi;
+   if (!target_slice(tree_target(ca), &sig, &lo, &hi)) return false;
+   const int w = hi - lo + 1;
+   if (w <= 0 || w > 2048) return false;
+
+   bool covered[2048] = { false };
+   int ncov = 0;
+   const int n = tree_stmts(block);
+   for (int j = idx + 1; j < n && ncov < w; j++) {
+      tree_t caj = continuous_assign_of(tree_stmt(block, j));
+      if (caj == NULL) continue;
+      ident_t sj_sig; int lj, hj;
+      if (!target_slice(tree_target(caj), &sj_sig, &lj, &hj)) continue;
+      if (sj_sig != sig) continue;
+      const int b0 = lj > lo ? lj : lo, b1 = hj < hi ? hj : hi;
+      for (int b = b0; b <= b1; b++)
+         if (!covered[b - lo]) { covered[b - lo] = true; ncov++; }
+   }
+   return ncov == w;
+}
+
 bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
 {
    g_unhandled = 0;
@@ -1273,8 +1355,11 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    for (int i = 0; i < nstmts; i++)
       emit_proc_locals(f, tree_stmt(block, i), seen, &nseen);
 
-   for (int i = 0; i < nstmts; i++)
+   for (int i = 0; i < nstmts; i++) {
+      if (stmt_fully_overridden(block, i))
+         continue;   // dead driver: a later assign overrides all of these bits
       emit_stmt(f, tree_stmt(block, i));
+   }
 
    fputs("endmodule\n", f);
    return g_unhandled == 0;   // faithful translation only
