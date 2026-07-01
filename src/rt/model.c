@@ -2341,6 +2341,25 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       }
       bridged_in++;
    }
+   // NVC_ACCEL_INDUMP: dump this cycle's SETTLED input vector (named, in pin
+   // order) at each posedge, so a fork-checkpoint child can capture the exact
+   // real stimulus around a divergence for offline replay (net_diff / xcheck).
+   fprintf(f, "  static int _indump=-1; if(_indump<0) _indump=getenv(\"NVC_ACCEL_INDUMP\")?1:0;\n");
+   fprintf(f, "  if(_indump && posedge){ fprintf(stderr,\"#AJIN t=%%lld\", t);\n");
+   for (int i = 0; i < npins; i++) {
+      if (pins[i].is_output) continue;
+      if (!aj_model_has_field(dut_text, pins[i].name)) continue;
+      if (pins[i].width > 64) {
+         const int nl = (pins[i].width + 31) / 32;
+         fprintf(f, "    fprintf(stderr,\" %s=\"); for(int _l=%d;_l>=0;_l--)"
+                    " fprintf(stderr,\"%%08x\", in._%s[_l]);\n",
+                 pins[i].name, nl - 1, pins[i].name);
+      }
+      else
+         fprintf(f, "    fprintf(stderr,\" %s=%%llx\", (unsigned long long)in._%s);\n",
+                 pins[i].name, pins[i].name);
+   }
+   fprintf(f, "    fprintf(stderr,\"\\n\"); }\n");
    // Advance the registers to the next state ONLY on the clock posedge
    // (sm_clock). An async reset port (rst) resets immediately whenever asserted
    // (any delta), matching real async-reset hardware; otherwise advance on the
