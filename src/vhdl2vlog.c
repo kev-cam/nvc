@@ -282,7 +282,10 @@ static void emit_lit(FILE *f, tree_t e)
          fprintf(f, "%"PRIi64, i);
       return;
    }
-   // std_logic enum literal '0'/'1' etc.
+   // std_logic enum literal '0'/'1' etc. A literal with no ident (real, string,
+   // physical, ...) is not a bit-enum lit -- mark unhandled (the leaf declines)
+   // rather than fatal in tree_ident.
+   if (!tree_has_ident(e)) { g_unhandled++; fputs("/*lit?*/0", f); return; }
    const char *s = istr(tree_ident(e));
    if (strcmp(s, "'0'") == 0) fputs("1'b0", f);
    else if (strcmp(s, "'1'") == 0) fputs("1'b1", f);
@@ -657,10 +660,11 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          // scheduled (non-blocking '<='). A reduction-loop accumulator is a
          // variable and MUST be blocking or each iteration reads the stale value.
          fputs(tree_kind(s) == T_VAR_ASSIGN ? " = " : " <= ", f);
-         if (tree_kind(s) == T_SIGNAL_ASSIGN && tree_waveforms(s) > 0)
-            emit_expr(f, tree_value(tree_waveform(s, 0)));
-         else
+         if (tree_kind(s) == T_VAR_ASSIGN)
             emit_expr(f, tree_value(s));
+         else if (tree_waveforms(s) > 0 && tree_has_value(tree_waveform(s, 0)))
+            emit_expr(f, tree_value(tree_waveform(s, 0)));
+         else { g_unhandled++; fputs("0/*null-wave*/", f); }  // disconnect/null waveform — decline
          fputs(";\n", f);
       }
       break;
@@ -1086,6 +1090,11 @@ static bool enum_is_bitlike(type_t t)
 static bool type_synth_ok(type_t t)
 {
    if (type_is_array(t)) {
+      // type_width (below) flattens every dimension, which needs a constraint and
+      // fatal-errors on an unconstrained array (range_of has no range) — e.g. an
+      // unconstrained bit_vector function result / deferred constant. Such a type
+      // can't be sized or emit_range'd here, so decline and leave the leaf in nvc.
+      if (type_is_unconstrained(t)) return false;
       // Decline large memory arrays: gen_statemachine would flatten them into
       // hundreds of thousands of flip-flops (hang/OOM). A RAM belongs in nvc's
       // native memory model, not an accelerated chunk -- leave it interpreted.
