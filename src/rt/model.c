@@ -1600,6 +1600,33 @@ struct _aj_chunk {
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
 static aj_chunk_t *g_aj_cur_chunk = NULL;  // chunk whose eval is running
 
+// NVC_ACCEL_VERIFY: run the accel .so as a PASSIVE companion of the interpreter
+// (do NOT reroute — the interpreter drives the real sim), and at end of each
+// time step compare every bridge output against the settled interpreted value.
+// Turns the accel path into a per-net differential oracle: it reports the exact
+// net + time where the compiled model first diverges from the reference.
+static int         g_aj_verify   = 0;       // int (not bool): the bridge reads it via AJB
+static bool        g_aj_vcompare = false;   // this pass compares (else just advances state)
+static aj_chunk_t *g_aj_vchunks[64];
+static int         g_aj_nvchunks = 0;
+static int         g_aj_vreports = 0;
+
+// Any element where the interpreter value is DEFINED (logic3d 2/3 = '0'/'1')
+// disagrees with the accel value (which is always 2/3). Interpreter metavalues
+// (U/X/Z/W/...) are don't-care — the .so only models 2-state, so skip them.
+static bool aj_verify_diff(const unsigned char *ip, const unsigned char *ap,
+                           size_t valuesz, int width)
+{
+   const int es = (width > 0) ? (int)(valuesz / width) : 1, e = es > 0 ? es : 1;
+   const int n  = (width > 0) ? width : (int)valuesz;
+   for (int i = 0; i < n; i++) {
+      const unsigned char iv = ip[(size_t)i * e];
+      if (iv != 2 && iv != 3) continue;          // metavalue -> don't-care
+      if ((iv & 1) != (ap[(size_t)i * e] & 1)) return true;
+   }
+   return false;
+}
+
 static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
 {
    // Recover this proc's chunk from its vtable (first field), establish the
@@ -1640,7 +1667,33 @@ struct _aj_defer_out {
    bool           cache_event;
    bool           defer;      // bank-switch this output (vs deposit_signal)
    bool           dirty;      // shadow staged this cycle, awaiting swap
+   bool           verify_flagged;  // NVC_ACCEL_VERIFY: already reported diverged
 };
+
+// NVC_ACCEL_VERIFY report: compact logic3d-bytes -> value hex (bit0 of each
+// element) + the net name and sim time, once per diverging output.
+static void aj_verify_report(void *sigp, const unsigned char *interp,
+                             const unsigned char *accel, size_t valuesz, int width)
+{
+   if (g_aj_vreports++ >= 100) {
+      if (g_aj_vreports == 101)
+         notef("accel-verify: further divergences suppressed (cap 100)");
+      return;
+   }
+   const int es = (width > 0) ? (int)(valuesz / width) : 1, e = es > 0 ? es : 1;
+   uint64_t iv = 0, av = 0;
+   const int nb = width <= 64 ? width : 64;
+   // logic3d bytes are stored MSB-first: byte (width-1-b) carries bit b.
+   for (int b = 0; b < nb; b++) {
+      if (interp[(size_t)(width - 1 - b) * e] & 1) iv |= (uint64_t)1 << b;
+      if (accel [(size_t)(width - 1 - b) * e] & 1) av |= (uint64_t)1 << b;
+   }
+   char tm[32]; fmt_time_r(tm, sizeof tm, g_aj_model->now, "");
+   notef("accel-verify: %s+%d  %s  interp=0x%"PRIx64" accel=0x%"PRIx64
+         "%s  (accel diverges from interp)", tm, g_aj_model->iteration,
+         istr(tree_ident(((rt_signal_t *)sigp)->where)), iv, av,
+         width > 64 ? " [low 64b]" : "");
+}
 
 // Baked into the bridge as AJ_OUT: called once per output with the logic3d
 // bytes the chunk computed. Routed to the CURRENTLY-running chunk's deferred-
@@ -1651,6 +1704,26 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
 {
    rt_model_t *m = g_aj_model;
    aj_chunk_t *c = g_aj_cur_chunk;
+
+   // NVC_ACCEL_VERIFY: passive check — the interpreter drives the net; compare the
+   // accel bytes against its settled value and report the first divergence per
+   // output. Never deposit (the reference sim must stay golden). Advance passes
+   // (g_aj_vcompare == false) just step the .so state per delta so its multi-clock
+   // register order matches the rerouted model; only the settle pass compares.
+   if (g_aj_verify) {
+      if (g_aj_vcompare && c != NULL && ord >= 0
+          && (unsigned)ord < c->defer_count) {
+         aj_defer_out_t *d = &c->defer_outs[ord];
+         // d->eff is BANK-only; read the signal's live value directly (offset 0,
+         // matching deposit_signal(sigp, buf, 0, width)).
+         const unsigned char *interp = ((rt_signal_t *)sigp)->shared.data;
+         if (!d->verify_flagged && aj_verify_diff(interp, buf, d->valuesz, width)) {
+            d->verify_flagged = true;
+            aj_verify_report(sigp, interp, buf, d->valuesz, width);
+         }
+      }
+      return;
+   }
    if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
        && c->defer_outs[ord].defer) {
       aj_defer_out_t *d = &c->defer_outs[ord];
@@ -1671,6 +1744,28 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
    }
    else
       deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+}
+
+// NVC_ACCEL_VERIFY: run every passive companion chunk against the interpreted
+// inputs/state. Called per delta with compare=false (advance the .so state so its
+// multi-clock register order tracks the rerouted model) and once per settled time
+// step with compare=true (aj_out then diffs each output vs the interpreter and
+// flags divergences). Mirrors aj_proc_eval's context; nothing is ever deposited.
+static void aj_verify_step(rt_model_t *m, bool compare)
+{
+   model_thread_t *thread = model_thread(m);
+   rt_scope_t *save_scope = thread->active_scope;
+   aj_chunk_t *save_chunk = g_aj_cur_chunk;
+   g_aj_vcompare = compare;
+   for (int i = 0; i < g_aj_nvchunks; i++) {
+      aj_chunk_t *c = g_aj_vchunks[i];
+      thread->active_scope = c->scope;
+      g_aj_cur_chunk = c;
+      if (c->eval) c->eval(c->state, c->bindtab);
+   }
+   g_aj_vcompare = false;
+   g_aj_cur_chunk = save_chunk;
+   thread->active_scope = save_scope;
 }
 
 static tree_t aj_scope_ref(rt_scope_t *scope)
@@ -2082,20 +2177,24 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // can be shared by many instances (one synth, N chunks) each with its OWN
    // state. accel_eval/accel_reset take the chunk's state pointer; S and last_t
    // are macros over it so the generated body below is unchanged.
+   // clk_last0: last main-clk value, for VERIFY-mode value-edge detection (the
+   // verify harness runs the bridge every delta so it sees clk-low; the rerouted
+   // path is NOT guaranteed to, hence keeps the time-edge below).
    if (nck == 0)
-      fprintf(f, "typedef struct { state_t S; long long last_t; } aj_cs_t;\n");
+      fprintf(f, "typedef struct { state_t S; long long last_t;"
+                 " unsigned char clk_last0; } aj_cs_t;\n");
    else
       // per-extra-clock last value, for value-edge detection across deltas.
       fprintf(f, "typedef struct { state_t S; long long last_t;"
-                 " unsigned char ck_last[%d]; } aj_cs_t;\n", nck);
+                 " unsigned char clk_last0; unsigned char ck_last[%d]; } aj_cs_t;\n", nck);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
-                 " sm_reset(&S); last_t = -1; }\n\n");
+                 " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0; }\n\n");
    else
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
-                 " sm_reset(&S); last_t = -1;"
+                 " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
                  " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
@@ -2105,6 +2204,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    chunk->bindtab[3] = (void *)&aj_out;
    chunk->bindtab[4] = clk->data;
    chunk->bindtab[5] = rst ? rst->data : NULL;
+   // Spare slot after the per-pin table (array is sized 6+npins+2): a live pointer
+   // to g_aj_verify so the bridge can switch to value-edge clocking under VERIFY.
+   chunk->bindtab[6 + npins] = &g_aj_verify;
+   fprintf(f, "#define VERIFY (*(int*)AJB[%d])\n", 6 + npins);
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
@@ -2121,8 +2224,14 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // level edge-detect would need the bridge to also run during clk-low, which a
    // posedge-optimized clocked process does NOT). COMB outputs re-settle on every
    // call regardless (below).
-   fprintf(f, "  int posedge = (_clk && t != last_t);\n");
-   fprintf(f, "  if(posedge) last_t = t;\n");
+   // Reroute path: time-edge (bridge only runs when a rerouted process wakes it —
+   // reliably at the posedge, not during clk-low). VERIFY path: the harness runs
+   // the bridge EVERY delta (it sees clk-low too), so use a robust value-edge that
+   // never double-fires on a stray clk-high sample (e.g. a clock being stopped).
+   fprintf(f, "  int posedge;\n");
+   fprintf(f, "  if(VERIFY) posedge = (_clk && !aj_cs->clk_last0);\n");
+   fprintf(f, "  else { posedge = (_clk && t != last_t); if(posedge) last_t = t; }\n");
+   fprintf(f, "  aj_cs->clk_last0 = _clk;\n");
    // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
    // behaviour (no combinational re-settle on input-change deltas) — wrong for a
    // Mealy boundary, used to demonstrate the settling fix.
@@ -2628,8 +2737,17 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
    g_aj_model   = m;
    chunk->reset(chunk->state);
-   aj_reroute(scope, chunk);
-   notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
+   if (g_aj_verify) {
+      // Passive companion: DON'T reroute — the interpreter keeps driving the real
+      // sim; aj_verify_step runs this chunk at end of each time step and compares.
+      if (g_aj_nvchunks < 64) g_aj_vchunks[g_aj_nvchunks++] = chunk;
+      notef("accel-jit: VERIFY — '%s' companion installed (interp drives; accel "
+            "checked per-net each step)", top);
+   }
+   else {
+      aj_reroute(scope, chunk);
+      notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
+   }
    return true;
 }
 
@@ -2786,6 +2904,8 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
 // Naming: ~/.cache/nvc/accel/accel-mod_<entity>-arch_<arch>.so
 void accel_auto(rt_model_t *m)
 {
+   g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
+
    const char *home = getenv("HOME");
    if (!home) home = "/tmp";
 
@@ -6077,6 +6197,12 @@ static void model_cycle(rt_model_t *m)
 
    run_callbacks(m, END_OF_PROCESSES);
 
+   // NVC_ACCEL_VERIFY: advance each companion .so's state this delta (no compare)
+   // so its multi-clock register ordering tracks the rerouted model delta-for-delta
+   // (extra clocks like free_clk lag clk by a delta and must read post-clk state).
+   if (g_aj_verify && g_aj_nvchunks > 0)
+      aj_verify_step(m, false);
+
    // Verilog scheduling regions
 
    if (m->next_is_delta)
@@ -6107,6 +6233,12 @@ static void model_cycle(rt_model_t *m)
       deferq_run(m, &m->postponedq);
 
       run_callbacks(m, END_TIME_STEP);
+
+      // NVC_ACCEL_VERIFY: everything for this time step has settled — re-settle
+      // each companion's combinational outputs (state already advanced above) and
+      // compare per-net against the interpreted values (see aj_out).
+      if (g_aj_verify && g_aj_nvchunks > 0)
+         aj_verify_step(m, true);
 
       m->can_create_delta = true;
    }
