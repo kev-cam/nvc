@@ -40,6 +40,13 @@ ana "$HERE/whl_tb.vhd"    || { echo "analyze whl_tb FAILED";   exit 2; }
 # combinational outputs on input-change deltas (NVC_ACCEL_NO_SETTLE=1 -> wrong).
 ana "$HERE/meal_top.vhd"  || { echo "analyze meal_top FAILED"; exit 2; }
 ana "$HERE/meal_tb.vhd"   || { echo "analyze meal_tb FAILED";  exit 2; }
+# signed comparison: vhdl2vlog wraps signed operands in $signed(...) so yosys
+# sets A_SIGNED and gen_statemachine picks the signed compare (signed_expr / wslt).
+# scmin = narrow (8b); wscmp = wide (96b, limb path). An unsigned compare miscounts.
+ana "$HERE/scmin.vhd"     || { echo "analyze scmin FAILED";    exit 2; }
+ana "$HERE/scmin_tb.vhd"  || { echo "analyze scmin_tb FAILED"; exit 2; }
+ana "$HERE/wscmp.vhd"     || { echo "analyze wscmp FAILED";    exit 2; }
+ana "$HERE/wscmp_tb.vhd"  || { echo "analyze wscmp_tb FAILED"; exit 2; }
 
 fails=0
 run_case() {
@@ -69,5 +76,7 @@ run_case gred_tb
 run_case agg_tb
 run_case whl_tb
 run_case meal_tb
+run_case scmin_tb
+run_case wscmp_tb
 echo "=== $fails failure(s) ==="
 exit $fails

@@ -232,6 +232,21 @@ static bool type_is_logic3d(type_t t)
    return false;
 }
 
+// True for an ieee.numeric_std `signed` (sub)type. Verilog erases VHDL
+// signedness, so a signed relational/arithmetic op would otherwise emit as a
+// bare unsigned operator and yosys builds the cell with A_SIGNED=0 (negatives
+// compare/extend as raw bit patterns). Detecting it lets emit_expr wrap the
+// operands in $signed so yosys sets A_SIGNED and the synth model sign-extends.
+static bool type_is_signed(type_t t)
+{
+   for (int i = 0; i < 8 && t != NULL; i++) {
+      if (!strcasecmp(id_base(istr(type_ident(t))), "SIGNED")) return true;
+      if (type_kind(t) != T_SUBTYPE) break;
+      t = type_base(t);
+   }
+   return false;
+}
+
 // Map an sv2vhdl logic3d package function to a Verilog operator on value bits.
 // *kind: 0=binary "(a op b)", 1=unary-prefix "(op a)", 2=identity "a",
 // 3=reduction "(op a)". Returns NULL if not a known logic3d op.
@@ -438,15 +453,30 @@ static void emit_expr(FILE *f, tree_t e)
          int l3dk = -1;
          const char *l3dop = (op == NULL) ? vlog_l3d_op(fn, &l3dk) : NULL;
          if (op != NULL && nparams == 2) {
+            // If either operand is numeric_std `signed`, wrap both in $signed so
+            // yosys builds a signed cell (arithmetic/compare sign-extends). Bitwise
+            // ops are unaffected by $signed, so blanket-wrapping is safe.
+            tree_t a0 = tree_value(tree_param(e, 0)), a1 = tree_value(tree_param(e, 1));
+            const bool sgn =
+               (tree_has_type(a0) && type_is_signed(tree_type(a0)))
+               || (tree_has_type(a1) && type_is_signed(tree_type(a1)));
             fputc('(', f);
-            emit_expr(f, tree_value(tree_param(e, 0)));
+            if (sgn) fputs("$signed(", f);
+            emit_expr(f, a0);
+            if (sgn) fputc(')', f);
             fprintf(f, " %s ", op);
-            emit_expr(f, tree_value(tree_param(e, 1)));
+            if (sgn) fputs("$signed(", f);
+            emit_expr(f, a1);
+            if (sgn) fputc(')', f);
             fputc(')', f);
          }
          else if (op != NULL && nparams == 1) {
+            const bool sgn = (tree_has_type(tree_value(tree_param(e, 0)))
+                              && type_is_signed(tree_type(tree_value(tree_param(e, 0)))));
             fprintf(f, "%s(", op);
+            if (sgn) fputs("$signed(", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
+            if (sgn) fputc(')', f);
             fputc(')', f);
          }
          else if (l3dop != NULL && l3dk == 0 && nparams == 2) {
