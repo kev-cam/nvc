@@ -45,6 +45,9 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 typedef struct _rt_callback rt_callback_t;
 typedef struct _memblock memblock_t;
@@ -1611,6 +1614,33 @@ static aj_chunk_t *g_aj_vchunks[64];
 static int         g_aj_nvchunks = 0;
 static int         g_aj_vreports = 0;
 
+// NVC_FORK_AT: fork-and-test checkpointing. On reaching the target simulation
+// time (at a settled END_TIME_STEP), fork() snapshots the ENTIRE simulation —
+// heap, signals, the dlopen'd accel .so's and JIT code all come along copy-on-
+// write. Each of NVC_FORK_TESTS children runs FORWARD from that state (to
+// --stop-time); the parent WAITS between them, so it never advances and can
+// spawn every test from the same good state. Reach an expensive state once, then
+// probe forward from it cheaply and repeatably. Needs a single-threaded sim
+// (NVC_PARALLEL_PROCS unset — the default) so fork() at the barrier is clean.
+static int64_t     g_fork_at     = -2;      // fs; -2 = not parsed, -1 = disabled
+static int         g_fork_tests  = 1;       // children spawned per checkpoint
+static int         g_fork_child  = 0;       // 0 = root/parent; else 1+iter in a child
+static bool        g_forked      = false;   // checkpoint already taken
+
+static int64_t parse_fork_time(const char *s)
+{
+   unsigned base; char unit[4];
+   if (s == NULL || sscanf(s, "%u%3s", &base, unit) != 2) return -1;
+   uint64_t mult;
+   if      (!strcmp(unit, "fs")) mult = 1;
+   else if (!strcmp(unit, "ps")) mult = 1000;
+   else if (!strcmp(unit, "ns")) mult = 1000000;
+   else if (!strcmp(unit, "us")) mult = 1000000000;
+   else if (!strcmp(unit, "ms")) mult = 1000000000000ULL;
+   else return -1;
+   return (int64_t)(base * mult);
+}
+
 // Any element where the interpreter value is DEFINED (logic3d 2/3 = '0'/'1')
 // disagrees with the accel value (which is always 2/3). Interpreter metavalues
 // (U/X/Z/W/...) are don't-care — the .so only models 2-state, so skip them.
@@ -1766,6 +1796,48 @@ static void aj_verify_step(rt_model_t *m, bool compare)
    g_aj_vcompare = false;
    g_aj_cur_chunk = save_chunk;
    thread->active_scope = save_scope;
+}
+
+// NVC_FORK_AT: at a settled time step, fork NVC_FORK_TESTS children that each run
+// forward from this exact state; the parent waits between them (holding the
+// checkpoint) and never advances. See the g_fork_* comment above.
+static void fork_checkpoint(rt_model_t *m)
+{
+   g_forked = true;
+   char tb[32];
+   fmt_time_r(tb, sizeof tb, m->now, "");
+   // Return to a single thread first: nvc keeps parked pool workers (from
+   // elaboration/JIT) that fork() would orphan — a child inheriting the ghosts
+   // spins forever. They are lazily recreated in whichever process needs them.
+   thread_quiesce_workers();
+   notef("fork-checkpoint: reached %s — spawning %d test(s); parent holds this state",
+         tb, g_fork_tests);
+   for (int i = 0; i < g_fork_tests; i++) {
+      fflush(NULL);                          // drain stdio so COW doesn't duplicate it
+      const pid_t pid = fork();
+      if (pid < 0) {
+         warnf("fork-checkpoint: fork failed: %s", strerror(errno));
+         return;                             // give up; parent resumes normally
+      }
+      else if (pid == 0) {
+         g_fork_child = i + 1;               // child never re-forks; runs forward
+         char ib[16];
+         snprintf(ib, sizeof ib, "%d", i);
+         setenv("NVC_FORK_ITER", ib, 1);     // per-test probes can key off the iteration
+         notef("fork-checkpoint: [test %d/%d pid=%d] advancing from %s",
+               i + 1, g_fork_tests, (int)getpid(), tb);
+         return;                             // -> run loop advances this child to stop-time
+      }
+      int status = 0;
+      waitpid(pid, &status, 0);              // parent blocks here — does NOT advance
+      notef("fork-checkpoint: [test %d/%d] exited (%d); checkpoint at %s intact",
+            i + 1, g_fork_tests,
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1, tb);
+   }
+   notef("fork-checkpoint: %d test(s) complete; parent held at %s, not advancing",
+         g_fork_tests, tb);
+   fflush(NULL);
+   _exit(0);                                 // parent never advances past the checkpoint
 }
 
 static tree_t aj_scope_ref(rt_scope_t *scope)
@@ -6240,6 +6312,11 @@ static void model_cycle(rt_model_t *m)
       if (g_aj_verify && g_aj_nvchunks > 0)
          aj_verify_step(m, true);
 
+      // NVC_FORK_AT: the state is settled — take the fork-and-test checkpoint.
+      if (g_fork_at >= 0 && !g_fork_child && !g_forked
+          && m->now >= (uint64_t)g_fork_at)
+         fork_checkpoint(m);
+
       m->can_create_delta = true;
    }
    else if (m->stop_delta > 0 && m->iteration == m->stop_delta)
@@ -6292,6 +6369,12 @@ void model_run(rt_model_t *m, uint64_t stop_time)
 
    if (m->force_stop)
       return;   // Was error during intialisation
+
+   if (g_fork_at == -2) {   // parse NVC_FORK_AT / NVC_FORK_TESTS once
+      g_fork_at = parse_fork_time(getenv("NVC_FORK_AT"));
+      const char *nt = getenv("NVC_FORK_TESTS");
+      if (nt != NULL) { const int v = atoi(nt); if (v > 0) g_fork_tests = v; }
+   }
 
    run_callbacks(m, START_OF_SIMULATION);
 

@@ -410,6 +410,38 @@ static void join_worker_threads(void)
 #endif
 }
 
+// Stop and join all pool worker threads, returning the process to a single
+// (main) thread, then re-arm the pool. Used before fork() so a checkpointed
+// child does not inherit ghost workers it can neither wake nor join. Safe to
+// call at a quiescent point on the main thread; workers are lazily recreated on
+// the next parallel operation (should_stop is left clear).
+void thread_quiesce_workers(void)
+{
+   assert(my_thread->kind == MAIN_THREAD);
+
+   SCOPED_A(nvc_thread_t *) join_list = AINIT;
+   for (int i = 1; i < MAX_THREADS; i++) {
+      nvc_thread_t *t = atomic_load(&threads[i]);
+      if (t != NULL && relaxed_load(&t->kind) == WORKER_THREAD)
+         APUSH(join_list, t);
+   }
+   if (join_list.count == 0)
+      return;   // already single-threaded
+
+   platform_mutex_lock(&wakelock);
+   {
+      atomic_store(&should_stop, true);
+      platform_cond_broadcast(&wake_workers);
+   }
+   platform_mutex_unlock(&wakelock);
+
+   for (int i = 0; i < join_list.count; i++)
+      thread_join(join_list.items[i]);   // frees struct, decrements running_threads
+
+   assert(atomic_load(&running_threads) == 1);
+   atomic_store(&should_stop, false);    // re-arm for lazy recreation (in children)
+}
+
 static nvc_thread_t *thread_new(thread_fn_t fn, void *arg,
                                 thread_kind_t kind, char *name)
 {
