@@ -557,7 +557,11 @@ static void emit_expr(FILE *f, tree_t e)
             // constant bit OR a signal/expression bit -- replicates across the
             // whole vector. (Was const-bit-only, which declined `(others => sig)`
             // -- the dominant aggregate in VeeR datapath modules.)
-            if (n == 1 && tree_subkind(tree_assoc(e, 0)) == A_OTHERS) {
+            // type_width fatals on a variable-bounded aggregate type (e.g. the
+            // slice target of `s(k downto 1) <= (others => 1)` where k is a
+            // variable) — guard so those fall through to the g_unhandled decline.
+            if (n == 1 && tree_subkind(tree_assoc(e, 0)) == A_OTHERS
+                && type_const_bounds(tree_type(e))) {
                const int w = type_width(tree_type(e));
                if (w > 0) {
                   fprintf(f, "{%d{", w);
@@ -1090,11 +1094,14 @@ static bool enum_is_bitlike(type_t t)
 static bool type_synth_ok(type_t t)
 {
    if (type_is_array(t)) {
-      // type_width (below) flattens every dimension, which needs a constraint and
-      // fatal-errors on an unconstrained array (range_of has no range) — e.g. an
-      // unconstrained bit_vector function result / deferred constant. Such a type
-      // can't be sized or emit_range'd here, so decline and leave the leaf in nvc.
-      if (type_is_unconstrained(t)) return false;
+      // type_width (below) flattens every dimension via range_bounds/assume_int,
+      // which FATALs on any non-static bound: an unconstrained array (range_of has
+      // no range — e.g. an unconstrained bit_vector function result / deferred
+      // constant), or a generic-/variable-bounded dimension or element (e.g. a
+      // generic-package subtype `natural range G to 100`). type_const_bounds checks
+      // every dimension AND element recursively with folded_bounds (no fatal); if
+      // the flattened width isn't a compile-time constant, decline and stay in nvc.
+      if (!type_const_bounds(t)) return false;
       // Decline large memory arrays: gen_statemachine would flatten them into
       // hundreds of thousands of flip-flops (hang/OOM). A RAM belongs in nvc's
       // native memory model, not an accelerated chunk -- leave it interpreted.
