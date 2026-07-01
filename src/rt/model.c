@@ -1257,9 +1257,13 @@ static void *accel_bg_thread(void *arg)
 
    const char *accel_cc = getenv("NVC_ACCEL_CC");
    if (!accel_cc) accel_cc = "gcc -g -O3";
+   // NVC_ACCEL_SMDUMP: compile in gen_statemachine's sm_dump_comb (all internal
+   // nets) so the bridge can dump the accel model's internal state in the REAL
+   // sim (see aj_emit_bridge). Clear ~/.cache/nvc/accel when toggling it.
+   const char *smdump = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
    snprintf(cmd, sizeof(cmd),
-            "%s -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
-            accel_cc, bg->so_path, nvc_path, log_path);
+            "%s %s -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
+            accel_cc, smdump, bg->so_path, nvc_path, log_path);
 
    rc = system(cmd);
    if (rc != 0) {
@@ -2403,6 +2407,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // fixpoint nvc's interpreted delta loop reaches. No lookahead needed: outputs
    // are deposited THIS delta (below) and propagate immediately via wakeup.
    fprintf(f, "  sm_comb(&S,&in,&o);\n");
+   // NVC_ACCEL_SMDUMP: dump the accel model's ALL internal nets (registers +
+   // combinational) once per cycle at the posedge, in the REAL sim — accurate
+   // multi-clock + real stimulus. Trace where a divergence enters a cone that
+   // random xcheck / offline replay can't reach. Needs -DSM_DUMP (compile).
+   fprintf(f, "#ifdef SM_DUMP\n");
+   fprintf(f, "  { static int _smd=-1; if(_smd<0) _smd=getenv(\"NVC_ACCEL_SMDUMP\")?1:0;\n");
+   fprintf(f, "    if(_smd && posedge){ fprintf(stderr,\"#AJSM t=%%lld\\n\",t);"
+              " sm_dump_comb(&S,&in,stderr); } }\n");
+   fprintf(f, "#endif\n");
    // Generic per-pin trace (only fields the synth model actually declares, so it
    // compiles for any DUT — not just the a_plus_b ports it was first written for).
    fprintf(f, "  if(g_dbg>0){ fprintf(stderr,\"AJ   in:");
@@ -2801,7 +2814,10 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    else {
       const char *cc = getenv("NVC_ACCEL_CC");
       if (!cc) cc = "gcc -g -O3";
-      snprintf(cmd, sizeof cmd, "%s -shared -fPIC -o '%s' '%s'", cc, so, bridge);
+      // NVC_ACCEL_SMDUMP: compile in sm_dump_comb (all internal nets) for the
+      // real-sim internal-net probe (see aj_emit_bridge). Clear the cache to toggle.
+      const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
+      snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'", cc, smd, so, bridge);
       if (system(cmd) != 0 || access(so, F_OK) != 0) {
          notef("accel-jit: compile failed for '%s'", top);
          aj_accel_teardown(m);
