@@ -1613,6 +1613,7 @@ static aj_chunk_t *g_aj_cur_chunk = NULL;  // chunk whose eval is running
 // Turns the accel path into a per-net differential oracle: it reports the exact
 // net + time where the compiled model first diverges from the reference.
 static int         g_aj_verify   = 0;       // int (not bool): the bridge reads it via AJB
+static bool        g_aj_verify_skipx = false;  // NVC_ACCEL_VERIFY_X: skip interp-X elems
 static bool        g_aj_vcompare = false;   // this pass compares (else just advances state)
 static aj_chunk_t *g_aj_vchunks[64];
 static int         g_aj_nvchunks = 0;
@@ -1653,9 +1654,16 @@ static bool aj_verify_diff(const unsigned char *ip, const unsigned char *ap,
 {
    const int es = (width > 0) ? (int)(valuesz / width) : 1, e = es > 0 ? es : 1;
    const int n  = (width > 0) ? width : (int)valuesz;
+   // Compare the VALUE bit (bit0) of every element. logic3d carries the 2-state
+   // value in bit0 regardless of the unknown/strength bits, and that value bit is
+   // exactly what a 2-state sim (Verilator) computes — so this is a Verilator-
+   // equivalent comparison. (An earlier version skipped interp metavalues, which
+   // HID real divergences on nets that read X in the 4-state interpreter but whose
+   // value bit is still the true 2-state result.) NVC_ACCEL_VERIFY_X restores the
+   // old metavalue-skipping behaviour for designs that genuinely traffic in X.
    for (int i = 0; i < n; i++) {
       const unsigned char iv = ip[(size_t)i * e];
-      if (iv != 2 && iv != 3) continue;          // metavalue -> don't-care
+      if (g_aj_verify_skipx && iv != 2 && iv != 3) continue;   // opt-out: skip X
       if ((iv & 1) != (ap[(size_t)i * e] & 1)) return true;
    }
    return false;
@@ -2386,12 +2394,22 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // clock actually rises. Each advance reads the LIVE state S at its own delta
       // (an extra clock lagging clk sees the post-clk-advance state, as nvc's
       // interpreted delta loop does); the top-of-sm_clock snapshot gives NBA.
+      //
+      // NVC_ACCEL_CK_COINCIDENT: VeeR's active_clk/free_clk are the SAME edge as
+      // clk merely gated by an enable (rvclkhdr ICG = clk & en). Their flops must
+      // sample the PRE-edge snapshot coincident with clk, not the post-clk-advance
+      // state. In coincident mode we fold every extra group's advance into the main
+      // posedge (one sm_clock_masked call reads ONE pre-edge S), giving correct NBA
+      // for coincident gated clocks. (A genuinely-lagging derived clock would need
+      // the value-edge path; VeeR has none.)
+      fprintf(f, "  static int _coinc=-1; if(_coinc<0) _coinc=getenv(\"NVC_ACCEL_CK_COINCIDENT\")?1:0;\n");
       fprintf(f, "  unsigned posedge_mask = 0;\n");
       fprintf(f, "  if(posedge) posedge_mask |= 1u;\n");
       for (int k = 0; k < nck; k++)
          fprintf(f, "  { int _n=(in._%s&1);"
-                    " if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
-                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k);
+                    " if(_coinc){ if(posedge) posedge_mask|=(1u<<(1+%d)); }"
+                    " else if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
+                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k, k);
       fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
       if (rst != NULL) {
          fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
@@ -3012,6 +3030,7 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
 void accel_auto(rt_model_t *m)
 {
    g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
+   g_aj_verify_skipx = getenv("NVC_ACCEL_VERIFY_X") != NULL;
 
    const char *home = getenv("HOME");
    if (!home) home = "/tmp";
