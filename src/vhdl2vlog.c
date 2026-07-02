@@ -524,11 +524,28 @@ static void emit_expr(FILE *f, tree_t e)
             emit_expr(f, tree_value(tree_param(e, 0))); fputs(")) & 1'b1)", f);
          }
          else {
+            // Element width: a 2-D array `array(..) of vector(W-1 downto 0)` is
+            // flattened to a 1-D wire [N*W-1:0], so a scalar index selects a W-bit
+            // WORD, not a bit. Emit a part-select scaled by W (`[(idx)*W +: W]`)
+            // for multi-bit elements; a plain `[idx]` bit-select only for 1-bit
+            // elements (logic3d_vector). Without the scaling a RAM `mem(adr)` read
+            // /write touches ONE bit (the VeeR icache 256x34 SRAM corruption).
+            int ew = 1;
+            type_t et = tree_type(e);
+            if (type_is_array(et) && type_const_bounds(et))
+               ew = type_width(et);
             emit_expr(f, base);
             if (tree_params(e) > 0) {
-               fputc('[', f);
-               emit_expr(f, tree_value(tree_param(e, 0)));
-               fputc(']', f);
+               if (ew > 1) {
+                  fputs("[(", f);
+                  emit_expr(f, tree_value(tree_param(e, 0)));
+                  fprintf(f, ")*%d +: %d]", ew, ew);
+               }
+               else {
+                  fputc('[', f);
+                  emit_expr(f, tree_value(tree_param(e, 0)));
+                  fputc(']', f);
+               }
             }
          }
       }
