@@ -2172,6 +2172,10 @@ static char *aj_read_file(const char *path)
 // scalable wide path). Match either spelling — a wide port that fails this check
 // would pass the gate but never get bridged. (The older "unsigned __int128"
 // spelling is matched too for forward/backward compatibility.)
+// multi-clock unchanged-inputs skip block, built where the pin info is in
+// scope and emitted after posedge_mask is computed (see below)
+static char g_aj_skip_buf[4096];
+
 static bool aj_model_has_field(const char *dutc_text, const char *name)
 {
    char n1[80], n2[96], n3[96];
@@ -2264,21 +2268,30 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // clk_last0: last main-clk value, for VERIFY-mode value-edge detection (the
    // verify harness runs the bridge every delta so it sees clk-low; the rerouted
    // path is NOT guaranteed to, hence keeps the time-edge below).
+   // in_prev/in_prev_valid/rst_prev: previous eval's scanned inputs, for the
+   // unchanged-inputs skip (an off-edge wake whose comb-relevant inputs are
+   // byte-identical to the last eval cannot change any output — skip sm_comb
+   // and the deposits). Lives in per-chunk state, NOT a .so static, because
+   // one .so can serve many instances.
    if (nck == 0)
       fprintf(f, "typedef struct { state_t S; long long last_t;"
-                 " unsigned char clk_last0; } aj_cs_t;\n");
+                 " unsigned char clk_last0;"
+                 " inputs_t in_prev; unsigned char in_prev_valid, rst_prev; } aj_cs_t;\n");
    else
       // per-extra-clock last value, for value-edge detection across deltas.
       fprintf(f, "typedef struct { state_t S; long long last_t;"
-                 " unsigned char clk_last0; unsigned char ck_last[%d]; } aj_cs_t;\n", nck);
+                 " unsigned char clk_last0; unsigned char ck_last[%d];"
+                 " inputs_t in_prev; unsigned char in_prev_valid, rst_prev; } aj_cs_t;\n", nck);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
-                 " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0; }\n\n");
+                 " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
+                 " aj_cs->in_prev_valid = 0; }\n\n");
    else
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
+                 " aj_cs->in_prev_valid = 0;"
                  " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
@@ -2293,7 +2306,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    chunk->bindtab[6 + npins] = &g_aj_verify;
    fprintf(f, "#define VERIFY (*(int*)AJB[%d])\n", 6 + npins);
 
-   fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n");
+   fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
    fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
    fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
@@ -2372,6 +2385,49 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  pins[i].name, pins[i].name);
    }
    fprintf(f, "    fprintf(stderr,\"\\n\"); }\n");
+   // Unchanged-inputs skip: an off-edge wake (e.g. the clk falling-edge delta,
+   // which wakes every rerouted subtree) whose comb-relevant inputs are byte-
+   // identical to the previous eval cannot change any output — skip sm_comb
+   // (dec's is ~57K lines) and the whole deposit pass. Clock fields are
+   // neutralised in the compare (their EDGES are what matter and those are
+   // captured above / in posedge_mask); a reset-level change defeats the skip
+   // via rst_prev. Disabled under VERIFY (per-delta advance is the point
+   // there) and by NVC_ACCEL_NO_SKIP for A/B measurement.
+   {
+      char neutral[1024] = "";
+      size_t np = 0;
+      if (aj_model_has_field(dut_text, "clk"))
+         np += snprintf(neutral + np, sizeof(neutral) - np,
+                        " _pa._clk=0;_pb._clk=0;");
+      for (int k = 0; k < nck; k++)
+         np += snprintf(neutral + np, sizeof(neutral) - np,
+                        " _pa._%s=0;_pb._%s=0;", extra_clk[k], extra_clk[k]);
+      const char *edge = (nck == 0) ? "posedge" : "(posedge_mask!=0)";
+      const char *rstv = (rst != NULL) ? "(RST[0]&1)" : "0";
+      // multi-clock: emitted after posedge_mask is computed (below); single-
+      // clock: emitted here, before the dispatch
+      if (nck == 0) {
+         fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
+         fprintf(f, "    int _rn = %s;\n", rstv);
+         fprintf(f, "    if(!_noskip && !VERIFY && !%s && aj_cs->in_prev_valid && _rn==aj_cs->rst_prev){\n", edge);
+         fprintf(f, "      inputs_t _pa = in, _pb = aj_cs->in_prev;%s\n", neutral);
+         fprintf(f, "      if(memcmp(&_pa,&_pb,sizeof _pa)==0) return;\n");
+         fprintf(f, "    }\n");
+         fprintf(f, "    aj_cs->in_prev = in; aj_cs->in_prev_valid = 1; aj_cs->rst_prev = _rn; }\n");
+      }
+      else {
+         // stash for emission after the mask computation below
+         snprintf(g_aj_skip_buf, sizeof(g_aj_skip_buf),
+            "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n"
+            "    int _rn = %s;\n"
+            "    if(!_noskip && !VERIFY && !%s && aj_cs->in_prev_valid && _rn==aj_cs->rst_prev){\n"
+            "      inputs_t _pa = in, _pb = aj_cs->in_prev;%s\n"
+            "      if(memcmp(&_pa,&_pb,sizeof _pa)==0) return;\n"
+            "    }\n"
+            "    aj_cs->in_prev = in; aj_cs->in_prev_valid = 1; aj_cs->rst_prev = _rn; }\n",
+            rstv, edge, neutral);
+      }
+   }
    // Advance the registers to the next state ONLY on the clock posedge
    // (sm_clock). An async reset port (rst) resets immediately whenever asserted
    // (any delta), matching real async-reset hardware; otherwise advance on the
@@ -2411,6 +2467,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                     " else if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
                     " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k, k);
       fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
+      fputs(g_aj_skip_buf, f);   // unchanged-inputs skip (built above)
+      g_aj_skip_buf[0] = '\0';
       if (rst != NULL) {
          fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
          fprintf(f, "  else if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
