@@ -13,6 +13,7 @@
 #include "tree.h"
 #include "type.h"
 #include "common.h"
+#include "hash.h"
 #include "ident.h"
 #include "vhdl2vlog.h"
 
@@ -191,6 +192,61 @@ static void emit_range(FILE *f, type_t type)
    else if (type_is_integer(type))
       fprintf(f, "[31:0] ");
    // std_logic / boolean / enum -> single bit, no range
+}
+
+// ---- memory-shaped signals -------------------------------------------------
+// A signal of type array(N) of vector(W-1:0) whose EVERY module reference is a
+// plain single-index T_ARRAY_REF is emitted as a true Verilog memory
+// (`reg [W-1:0] name [0:N-1]`) instead of a flattened N*W-bit vector. yosys
+// then lowers the accesses to word-based $memrd/$memwr, which the accel
+// codegen turns into O(1) word reads/writes. Flattening instead yields
+// whole-vector dynamic $shiftx barrel shifts — O(N*W) PER ACCESS (the VeeR
+// icache 256x34 SRAM cost ~70% of total --accel sim time that way). Any other
+// use (slice, whole-array read, port map) disqualifies the signal and it falls
+// back to the flattened emission.
+
+#define MAX_MEM_SIGS 64
+static tree_t g_mem_sigs[MAX_MEM_SIGS];
+static int    g_n_mem_sigs = 0;
+
+static bool sig_is_mem(tree_t decl)
+{
+   for (int i = 0; i < g_n_mem_sigs; i++)
+      if (g_mem_sigs[i] == decl) return true;
+   return false;
+}
+
+// array(N>=2) of vector(2..64 bits), const bounds both levels
+static bool mem_shape(type_t t, unsigned *nwords, unsigned *elemw)
+{
+   if (!type_is_array(t) || !type_const_bounds(t) || dimension_of(t) != 1)
+      return false;
+   type_t et = type_elem(t);
+   if (!type_is_array(et) || !type_const_bounds(et)) return false;
+   const unsigned ew = type_width(et);
+   if (ew < 2 || ew > 64) return false;   // >64: accel memory codegen declines
+   const unsigned total = type_width(t);
+   if (total < 2 * ew) return false;
+   *nwords = total / ew;
+   *elemw  = ew;
+   return true;
+}
+
+typedef struct { tree_t decl; int refs; int indexed; } mem_scan_t;
+
+static void mem_scan_cb(tree_t t, void *ctx)
+{
+   mem_scan_t *sc = (mem_scan_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k == T_REF) {
+      if (tree_has_ref(t) && tree_ref(t) == sc->decl) sc->refs++;
+   }
+   else if (k == T_ARRAY_REF && tree_params(t) == 1) {
+      tree_t base = tree_value(t);
+      if (tree_kind(base) == T_REF && tree_has_ref(base)
+          && tree_ref(base) == sc->decl)
+         sc->indexed++;
+   }
 }
 
 // map a VHDL operator/function call to a Verilog operator
@@ -530,9 +586,13 @@ static void emit_expr(FILE *f, tree_t e)
             // for multi-bit elements; a plain `[idx]` bit-select only for 1-bit
             // elements (logic3d_vector). Without the scaling a RAM `mem(adr)` read
             // /write touches ONE bit (the VeeR icache 256x34 SRAM corruption).
+            // Memory-qualified signals are declared as true Verilog memories
+            // (word-indexed), so their index is emitted UNscaled.
+            const bool memsig = tree_kind(base) == T_REF && tree_has_ref(base)
+               && sig_is_mem(tree_ref(base));
             int ew = 1;
             type_t et = tree_type(e);
-            if (type_is_array(et) && type_const_bounds(et))
+            if (!memsig && type_is_array(et) && type_const_bounds(et))
                ew = type_width(et);
             emit_expr(f, base);
             if (tree_params(e) > 0) {
@@ -897,8 +957,21 @@ static bool stmt_assigns(tree_t s, ident_t name)
    switch (tree_kind(s)) {
    case T_SIGNAL_ASSIGN:
    case T_VAR_ASSIGN:
-      return tree_kind(tree_target(s)) == T_REF
-         && tree_ident(tree_ref(tree_target(s))) == name;
+      {
+         // Peel indexed/slice/record prefixes: `ram(adr) <= d` assigns `ram`
+         // just as much as `ram <= ...` does. Matching only bare T_REF left
+         // such signals classified `wire` while being driven from an always
+         // block (invalid Verilog yosys happened to tolerate) and blocked the
+         // memory-shaped emission.
+         tree_t tgt = tree_target(s);
+         tree_kind_t tk = tree_kind(tgt);
+         while (tk == T_ARRAY_REF || tk == T_ARRAY_SLICE || tk == T_RECORD_REF) {
+            tgt = tree_value(tgt);
+            tk = tree_kind(tgt);
+         }
+         return tk == T_REF && tree_has_ref(tgt)
+            && tree_ident(tree_ref(tgt)) == name;
+      }
    case T_IF:
       for (int i = 0; i < tree_conds(s); i++) {
          tree_t c = tree_cond(s, i);
@@ -1072,17 +1145,43 @@ static void emit_stmt_list(FILE *f, tree_t container, int ind)
 }
 
 // A signal assigned inside any process must be declared `reg`; one driven only
-// by a concurrent assignment stays a `wire`.
-static bool is_reg(tree_t block, tree_t decl)
+// by a concurrent assignment stays a `wire`. The per-decl stmt_assigns() walk
+// was O(decls x stmts) — 13K signals x 9K statements in VeeR's dec made module
+// emission the accel-install bottleneck (~50s/run in stmt_assigns). Instead
+// collect every process-assigned base ident in ONE walk and look up in a set.
+static hset_t *g_reg_set = NULL;   // idents assigned inside a process
+
+static void reg_scan_cb(tree_t t, void *ctx)
 {
-   ident_t name = tree_ident(decl);
+   const tree_kind_t k = tree_kind(t);
+   if (k != T_SIGNAL_ASSIGN && k != T_VAR_ASSIGN)
+      return;
+   tree_t tgt = tree_target(t);
+   tree_kind_t tk = tree_kind(tgt);
+   while (tk == T_ARRAY_REF || tk == T_ARRAY_SLICE || tk == T_RECORD_REF) {
+      tgt = tree_value(tgt);
+      tk = tree_kind(tgt);
+   }
+   if (tk == T_REF && tree_has_ref(tgt))
+      hset_insert((hset_t *)ctx, tree_ident(tree_ref(tgt)));
+}
+
+static void build_reg_set(tree_t block)
+{
+   if (g_reg_set != NULL) hset_free(g_reg_set);
+   g_reg_set = hset_new(256);
    const int nstmts = tree_stmts(block);
    for (int i = 0; i < nstmts; i++) {
       tree_t s = tree_stmt(block, i);
-      if (tree_kind(s) == T_PROCESS && stmt_assigns(s, name))
-         return true;
+      if (tree_kind(s) == T_PROCESS)
+         tree_visit(s, reg_scan_cb, g_reg_set);
    }
-   return false;
+}
+
+static bool is_reg(tree_t block, tree_t decl)
+{
+   (void)block;   // set precomputed by build_reg_set()
+   return g_reg_set != NULL && hset_contains(g_reg_set, tree_ident(decl));
 }
 
 // A standard 1-bit-like enumeration (std_logic family, bit, boolean): the only
@@ -1253,6 +1352,8 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    if (!block_types_synth(block))
       return false;
 
+   build_reg_set(block);   // one walk; is_reg() is then a set lookup
+
    fprintf(f, "// auto-generated from nvc elaborated VHDL by vhdl2vlog\n");
    fprintf(f, "module %s (\n", modname);
    const int nports = tree_ports(block);
@@ -1272,11 +1373,34 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    }
    fputs(");\n", f);
 
-   // signal declarations (skip ports and hier markers)
+   // qualify memory-shaped signals: array-of-vector, process-driven, and every
+   // reference a plain single-index (each such use contributes one T_REF and
+   // one matching T_ARRAY_REF, so refs==indexed; a slice/whole-array/port-map
+   // use adds an unmatched T_REF and disqualifies)
    const int ndecls = tree_decls(block);
+   g_n_mem_sigs = 0;
+   for (int i = 0; i < ndecls && g_n_mem_sigs < MAX_MEM_SIGS; i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) != T_SIGNAL_DECL) continue;
+      unsigned nw, ew;
+      if (!mem_shape(tree_type(d), &nw, &ew)) continue;
+      if (!is_reg(block, d)) continue;   // memory must be process-driven (reg)
+      mem_scan_t sc = { .decl = d, .refs = 0, .indexed = 0 };
+      tree_visit(block, mem_scan_cb, &sc);
+      if (sc.refs > 0 && sc.refs == sc.indexed)
+         g_mem_sigs[g_n_mem_sigs++] = d;
+   }
+
+   // signal declarations (skip ports and hier markers)
    for (int i = 0; i < ndecls; i++) {
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) != T_SIGNAL_DECL) continue;
+      unsigned nw, ew;
+      if (sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)) {
+         fprintf(f, "  reg [%u:0] %s [0:%u];\n", ew - 1,
+                 vid(tree_ident(d)), nw - 1);
+         continue;
+      }
       fprintf(f, "  %s ", is_reg(block, d) ? "reg" : "wire");
       emit_range(f, tree_type(d));
       fprintf(f, "%s;\n", vid(tree_ident(d)));
