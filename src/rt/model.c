@@ -2268,30 +2268,44 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // clk_last0: last main-clk value, for VERIFY-mode value-edge detection (the
    // verify harness runs the bridge every delta so it sees clk-low; the rerouted
    // path is NOT guaranteed to, hence keeps the time-edge below).
-   // in_prev/in_prev_valid/rst_prev: previous eval's scanned inputs, for the
-   // unchanged-inputs skip (an off-edge wake whose comb-relevant inputs are
-   // byte-identical to the last eval cannot change any output — skip sm_comb
-   // and the deposits). Lives in per-chunk state, NOT a .so static, because
-   // one .so can serve many instances.
+   // DIRECT IN-PLACE INPUTS (no per-eval marshalling). in_live is the packed
+   // input state the model reads — it PERSISTS in per-chunk state (NOT a .so
+   // static: one .so can serve many instances) and is the data's home in the
+   // model's preferred format. raw_shadow keeps the last-seen nvc logic3d
+   // bytes per pin; on eval each pin does a raw memcmp and is re-translated
+   // ONLY if its bytes changed. Per-eval data movement is therefore
+   // proportional to actual signal events, not to total boundary width —
+   // an unchanged pin costs one SIMD memcmp, a quiet subtree costs nothing.
+   size_t raw_total = 0;
+   for (int i = 0; i < npins; i++) {
+      if (pins[i].is_output) continue;
+      if (!aj_model_has_field(dut_text, pins[i].name)) continue;
+      raw_total += (size_t)pins[i].width * pins[i].elem;
+   }
+   if (raw_total == 0) raw_total = 1;
    if (nck == 0)
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0;"
-                 " inputs_t in_prev; unsigned char in_prev_valid, rst_prev; } aj_cs_t;\n");
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev;"
+                 " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", raw_total);
    else
       // per-extra-clock last value, for value-edge detection across deltas.
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0; unsigned char ck_last[%d];"
-                 " inputs_t in_prev; unsigned char in_prev_valid, rst_prev; } aj_cs_t;\n", nck);
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev;"
+                 " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck, raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
-                 " aj_cs->in_prev_valid = 0; }\n\n");
+                 " aj_cs->shadow_valid = 0;"
+                 " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live); }\n\n");
    else
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
-                 " aj_cs->in_prev_valid = 0;"
+                 " aj_cs->shadow_valid = 0;"
+                 " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live);"
                  " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
@@ -2308,6 +2322,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
+   // `in` resolves to the PERSISTENT packed inputs in chunk state. Emitted
+   // after the model #include so the model's own `in` parameters are untouched.
+   fprintf(f, "#define in (aj_cs->in_live)\n");
    fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
    fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
    fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
@@ -2334,38 +2351,54 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // Mealy boundary, used to demonstrate the settling fix.
    if (getenv("NVC_ACCEL_NO_SETTLE"))
       fprintf(f, "  if(!posedge) return;\n");
-   fprintf(f, "  inputs_t in; outputs_t o;\n");
-   fprintf(f, "  memset(&in,0,sizeof in); memset(&o,0,sizeof o);\n");
+   fprintf(f, "  outputs_t o;\n");
+   fprintf(f, "  memset(&o,0,sizeof o);\n");
+   // _chg: any NON-CLOCK input pin's raw bytes changed since the last eval
+   // (clock-family pins still re-translate for sm_clock/mask use, but their
+   // effect is an EDGE, captured by posedge/posedge_mask — so they don't force
+   // a re-settle by themselves). First eval (shadow_valid==0) runs everything.
+   fprintf(f, "  int _chg = !aj_cs->shadow_valid;\n");
 
    int bridged_in = 0, bridged_out = 0;
-   // inputs: each sub-element is `elem` bytes (logic3d = natural); the value bit
-   // is bit 0 of the element's low byte (little-endian), so step by `elem`.
-   // nvc stores a `(width-1 downto 0)` vector MSB-first: element offset 0 is the
-   // leftmost bit (width-1), offset width-1 is the LSB. The synth model packs bit
-   // b at position b, so element offset e maps to bit (width-1-e) — without this
-   // reversal every multi-bit input arrives bit-reversed (din=1 read as 0x80).
+   size_t raw_off = 0;
+   // inputs: DIRECT IN-PLACE — the packed `in` (chunk-state in_live) persists;
+   // each pin memcmp's its nvc logic3d bytes against raw_shadow and is only
+   // re-translated on change. Translation detail: each sub-element is `elem`
+   // bytes (logic3d = natural); the value bit is bit 0 of the element's low
+   // byte (little-endian). nvc stores a `(width-1 downto 0)` vector MSB-first:
+   // element offset e maps to bit (width-1-e) — without this reversal every
+   // multi-bit input arrives bit-reversed (din=1 read as 0x80).
    for (int i = 0; i < npins; i++) {
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       chunk->bindtab[6 + bridged_in] = pins[i].data;
+      const size_t nb = (size_t)pins[i].width * pins[i].elem;
+      bool is_ck = strcmp(pins[i].name, "clk") == 0;
+      for (int k = 0; k < nck && !is_ck; k++)
+         if (strcmp(pins[i].name, extra_clk[k]) == 0) is_ck = true;
+      fprintf(f, "  { uint8_t*p=IN_ADDR(%d);"
+                 " if(!aj_cs->shadow_valid || memcmp(aj_cs->raw_shadow+%zu,p,%zu)){"
+                 " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
+              bridged_in, raw_off, nb, raw_off, nb, is_ck ? "" : " _chg=1;");
       if (pins[i].width > 64) {
          // Wide port: gen_statemachine declares in._<name> as a uint32_t[N] limb
-         // array. nexus element b (MSB-first) maps to value bit (width-1-b);
-         // place each bit in its limb. (32-bit limbs scale to any width.)
+         // array; place each bit in its limb. (32-bit limbs scale to any width.)
          const int nl = (pins[i].width + 31) / 32;
-         fprintf(f, "  { uint8_t*p=IN_ADDR(%d); for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
+         fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
                     " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
-                    " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } }\n",
-                 bridged_in, nl, pins[i].name, pins[i].width, pins[i].width,
+                    " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } } }\n",
+                 nl, pins[i].name, pins[i].width, pins[i].width,
                  pins[i].name, pins[i].elem);
       } else {
-         fprintf(f, "  { uint8_t*p=IN_ADDR(%d); uint64_t v=0;"
-                    " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b); in._%s=v; }\n",
-                 bridged_in, pins[i].width,
-                 pins[i].elem, pins[i].width, pins[i].name);
+         fprintf(f, "    uint64_t v=0;"
+                    " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b);"
+                    " in._%s=v; } }\n",
+                 pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
       }
+      raw_off += nb;
       bridged_in++;
    }
+   fprintf(f, "  aj_cs->shadow_valid = 1;\n");
    // NVC_ACCEL_INDUMP: dump this cycle's SETTLED input vector (named, in pin
    // order) at each posedge, so a fork-checkpoint child can capture the exact
    // real stimulus around a divergence for offline replay (net_diff / xcheck).
@@ -2385,47 +2418,28 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  pins[i].name, pins[i].name);
    }
    fprintf(f, "    fprintf(stderr,\"\\n\"); }\n");
-   // Unchanged-inputs skip: an off-edge wake (e.g. the clk falling-edge delta,
-   // which wakes every rerouted subtree) whose comb-relevant inputs are byte-
-   // identical to the previous eval cannot change any output — skip sm_comb
-   // (dec's is ~57K lines) and the whole deposit pass. Clock fields are
-   // neutralised in the compare (their EDGES are what matter and those are
-   // captured above / in posedge_mask); a reset-level change defeats the skip
-   // via rst_prev. Disabled under VERIFY (per-delta advance is the point
-   // there) and by NVC_ACCEL_NO_SKIP for A/B measurement.
+   // Early-out: no clock edge, no reset-level change, and no non-clock input
+   // changed (per the raw-shadow memcmp above) — no output can change, so skip
+   // sm_clock/sm_comb and the whole deposit pass. Supersedes the struct-copy
+   // skip: detection now rides on the same per-pin change tracking that keeps
+   // in_live fresh, with zero extra copies. Disabled under VERIFY (per-delta
+   // evaluation is the point there); NVC_ACCEL_NO_SKIP for A/B measurement.
    {
-      char neutral[1024] = "";
-      size_t np = 0;
-      if (aj_model_has_field(dut_text, "clk"))
-         np += snprintf(neutral + np, sizeof(neutral) - np,
-                        " _pa._clk=0;_pb._clk=0;");
-      for (int k = 0; k < nck; k++)
-         np += snprintf(neutral + np, sizeof(neutral) - np,
-                        " _pa._%s=0;_pb._%s=0;", extra_clk[k], extra_clk[k]);
-      const char *edge = (nck == 0) ? "posedge" : "(posedge_mask!=0)";
       const char *rstv = (rst != NULL) ? "(RST[0]&1)" : "0";
-      // multi-clock: emitted after posedge_mask is computed (below); single-
-      // clock: emitted here, before the dispatch
       if (nck == 0) {
          fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
          fprintf(f, "    int _rn = %s;\n", rstv);
-         fprintf(f, "    if(!_noskip && !VERIFY && !%s && aj_cs->in_prev_valid && _rn==aj_cs->rst_prev){\n", edge);
-         fprintf(f, "      inputs_t _pa = in, _pb = aj_cs->in_prev;%s\n", neutral);
-         fprintf(f, "      if(memcmp(&_pa,&_pb,sizeof _pa)==0) return;\n");
-         fprintf(f, "    }\n");
-         fprintf(f, "    aj_cs->in_prev = in; aj_cs->in_prev_valid = 1; aj_cs->rst_prev = _rn; }\n");
+         fprintf(f, "    if(!_noskip && !VERIFY && !posedge && !_chg && _rn==aj_cs->rst_prev) return;\n");
+         fprintf(f, "    aj_cs->rst_prev = _rn; }\n");
       }
       else {
-         // stash for emission after the mask computation below
+         // stash for emission after posedge_mask is computed (below)
          snprintf(g_aj_skip_buf, sizeof(g_aj_skip_buf),
             "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n"
             "    int _rn = %s;\n"
-            "    if(!_noskip && !VERIFY && !%s && aj_cs->in_prev_valid && _rn==aj_cs->rst_prev){\n"
-            "      inputs_t _pa = in, _pb = aj_cs->in_prev;%s\n"
-            "      if(memcmp(&_pa,&_pb,sizeof _pa)==0) return;\n"
-            "    }\n"
-            "    aj_cs->in_prev = in; aj_cs->in_prev_valid = 1; aj_cs->rst_prev = _rn; }\n",
-            rstv, edge, neutral);
+            "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && _rn==aj_cs->rst_prev) return;\n"
+            "    aj_cs->rst_prev = _rn; }\n",
+            rstv);
       }
    }
    // Advance the registers to the next state ONLY on the clock posedge
