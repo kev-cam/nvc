@@ -1589,6 +1589,31 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
 // recovers its chunk via (aj_chunk_t *)proc->vtable (the accel_binding_t
 // pattern). Each chunk has its own compiled eval/state/reset and its own
 // deferred-output table, so multiple chunks can be live at once.
+// NVC_ACCEL_HANDOFF: one packed chunk-to-chunk edge. When a chunk output's
+// only readers are other chunks' rerouted procs, the producer writes its
+// PACKED value straight into each consumer's packed in_live field (same bit-
+// at-position-b layout on both sides — no logic3d translation in either
+// direction, no deposit_signal), flags the consumer's ext_chg and schedules
+// one of its procs for the next delta (deposit-equivalent wake semantics).
+typedef struct {
+   int            ord;       // producer output ordinal
+   void          *dst;       // consumer packed input field (in_live._x)
+   unsigned char *ext_chg;   // consumer external-change flag (in chunk state)
+   rt_proc_t     *wake;      // a rerouted proc of the consumer to schedule
+   unsigned       nbytes;    // packed bytes (8 scalar / 4*limbs wide)
+   void          *stage;     // staged value — applied to dst BETWEEN deltas
+   bool           dirty;     // stage holds a value awaiting application
+} aj_hoff_edge_t;
+
+// bridged pin summary kept for the post-install handoff link pass (only pins
+// the bridge actually bound, in bridge ordinal order)
+typedef struct {
+   void        *data;        // input: signal shared.data the pin reads
+   rt_signal_t *sig;         // output: driven signal
+   int          width;
+   int          elem;
+} aj_bpin_t;
+
 struct _aj_chunk {
    rt_proc_vtable_t vtable;          // FIRST — recover chunk from proc->vtable
    void           (*eval)(void *, void **);  // .so's accel_eval(state, bindtab)
@@ -1602,6 +1627,17 @@ struct _aj_chunk {
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
    int              order;           // topological eval order (later)
+   // NVC_ACCEL_HANDOFF (filled by aj_link_handoff after all chunks install)
+   aj_bpin_t       *b_in;            // bridged inputs, bridge ordinal order
+   aj_bpin_t       *b_out;           // bridged outputs, output ordinal order
+   int              n_bin, n_bout;
+   uint8_t         *hoff_flags;      // per-output ord: 1 = handoff (skip deposit)
+   uint8_t         *hin_flags;       // per-input ord: 1 = handoff-fed (never
+                                     // translate from logic3d — the deposit is
+                                     // bypassed so those bytes are stale; the
+                                     // producer's poke is the only writer)
+   aj_hoff_edge_t  *hoff_edges;
+   int              hoff_nedges;
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -1786,6 +1822,52 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
    }
    else
       deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+}
+
+// NVC_ACCEL_HANDOFF: producer-side poke. Called from the generated bridge for
+// an output whose hoff flag is set, ONLY when the packed value changed (the
+// bridge gates on o_prev — required for fixpoint termination on cross-chunk
+// combinational cycles, mirroring deposit's wake-on-change). The value is
+// STAGED, not applied: writing the consumer's in_live immediately would make
+// it visible within the CURRENT delta — a consumer evaluating later in the
+// same posedge queue would capture the producer's post-edge Q one cycle early
+// (deposit_signal's update lands at the next delta boundary; ours must too).
+// aj_apply_pokes() publishes stage->dst after the delta's procq drains.
+static bool g_aj_hoff_pending = false;
+
+static void aj_poke(int ord, const void *packed, unsigned nbytes)
+{
+   aj_chunk_t *c = g_aj_cur_chunk;
+   if (c == NULL) return;
+   for (int i = 0; i < c->hoff_nedges; i++) {
+      aj_hoff_edge_t *e = &c->hoff_edges[i];
+      if (e->ord != ord) continue;
+      memcpy(e->stage, packed, nbytes < e->nbytes ? nbytes : e->nbytes);
+      e->dirty = true;
+      g_aj_hoff_pending = true;
+   }
+}
+
+// Between-deltas application point (called from model_cycle after the procq
+// drain): publish staged pokes into consumer in_live fields, flag ext_chg and
+// schedule one proc per consumer for the NEXT delta — exactly the visibility
+// and wake semantics the bypassed deposit_signal would have given.
+static void aj_apply_pokes(rt_model_t *m)
+{
+   if (!g_aj_hoff_pending) return;
+   g_aj_hoff_pending = false;
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      for (int i = 0; i < c->hoff_nedges; i++) {
+         aj_hoff_edge_t *e = &c->hoff_edges[i];
+         if (!e->dirty) continue;
+         e->dirty = false;
+         memcpy(e->dst, e->stage, e->nbytes);
+         *e->ext_chg = 1;
+         if (!e->wake->wakeable.pending)
+            deltaq_insert_proc(m, 0, e->wake);
+      }
+   }
 }
 
 // NVC_ACCEL_VERIFY: run every passive companion chunk against the interpreted
@@ -2131,6 +2213,147 @@ static rt_nexus_t *aj_classify_output(rt_model_t *m, rt_signal_t *sig)
    #undef BANK_DECLINE
 }
 
+// ---- NVC_ACCEL_HANDOFF link pass -------------------------------------------
+// After all chunks are installed, wire packed chunk-to-chunk edges: for each
+// producer output whose consumer-visible nexus is read ONLY by other chunks'
+// rerouted procs, resolve each consumer's packed input field (via the .so's
+// accel_in_addr) and record an edge; set the producer's per-output hoff flag
+// so the bridge pokes packed instead of translating + depositing. Any non-
+// chunk reader (interp glue, VCD watch, implicit signal) declines the output
+// and it keeps the deposit path. Never runs under VERIFY.
+
+typedef void *(*aj_in_addr_fn)(void *, int, unsigned long *);
+
+static aj_chunk_t *aj_chunk_of_proc(rt_model_t *m, rt_proc_t *p)
+{
+   for (unsigned i = 0; i < m->aj_chunk_count; i++)
+      if ((void *)p->vtable == (void *)m->aj_chunks[i])
+         return m->aj_chunks[i];
+   return NULL;
+}
+
+// Collect the distinct consumer chunks reading `pending` (with one proc each).
+// Returns false if ANY reader is not a rerouted chunk proc.
+#define AJ_HOFF_MAX_CONS 8
+static bool aj_hoff_readers(rt_model_t *m, void *pending,
+                            aj_chunk_t **cons, rt_proc_t **wake, int *ncons)
+{
+   *ncons = 0;
+   rt_wakeable_t *one = NULL;
+   rt_pending_t  *many = NULL;
+   int count = 0;
+   if (pointer_tag(pending) == 1) {
+      one = untag_pointer(pending, rt_wakeable_t);
+      count = 1;
+   }
+   else if (pending != NULL) {
+      many = untag_pointer(pending, rt_pending_t);
+      count = many->count;
+   }
+   for (int i = 0; i < count; i++) {
+      rt_wakeable_t *w = one != NULL ? one : many->wake[i];
+      if (w == NULL) continue;
+      if (w->kind != W_PROC) return false;
+      rt_proc_t *p = container_of(w, rt_proc_t, wakeable);
+      aj_chunk_t *c = aj_chunk_of_proc(m, p);
+      if (c == NULL) return false;
+      bool seen = false;
+      for (int j = 0; j < *ncons; j++)
+         if (cons[j] == c) { seen = true; break; }
+      if (!seen) {
+         if (*ncons == AJ_HOFF_MAX_CONS) return false;
+         cons[*ncons] = c;
+         wake[*ncons] = p;
+         (*ncons)++;
+      }
+   }
+   return *ncons > 0;
+}
+
+static void aj_link_handoff(rt_model_t *m)
+{
+   static bool done = false;
+   if (done || getenv("NVC_ACCEL_HANDOFF") == NULL || g_aj_verify)
+      return;
+   done = true;
+
+   int nlink = 0;
+   for (unsigned pi = 0; pi < m->aj_chunk_count; pi++) {
+      aj_chunk_t *P = m->aj_chunks[pi];
+      if (P->b_out == NULL || P->hoff_flags == NULL) continue;
+      for (int ord = 0; ord < P->n_bout; ord++) {
+         rt_signal_t *sig = P->b_out[ord].sig;
+         if (sig == NULL || sig->n_nexus != 1) continue;
+         rt_nexus_t *n = &sig->nexus;
+         if (n->outputs != NULL) {
+            // one direct output-port hop to the consumer-visible nexus
+            // (mirrors aj_classify_output)
+            rt_source_t *o = n->outputs;
+            if (o->chain_output != NULL || o->tag != SOURCE_PORT
+                || o->u.port.conv_func != NULL) continue;
+            if (!aj_pending_empty(n->pending)) continue;
+            n = o->u.port.output;
+            if (n->signal->n_nexus != 1 || n->outputs != NULL) continue;
+         }
+         const int width = P->b_out[ord].width;
+         if ((size_t)n->size * n->width
+             != (size_t)width * P->b_out[ord].elem) continue;
+
+         aj_chunk_t *cons[AJ_HOFF_MAX_CONS];
+         rt_proc_t  *wake[AJ_HOFF_MAX_CONS];
+         int ncons = 0;
+         if (!aj_hoff_readers(m, n->pending, cons, wake, &ncons)) continue;
+
+         const unsigned pbytes = width <= 64 ? 8 : 4u * ((width + 31) / 32);
+         void *sigdata = n->signal->shared.data;
+         aj_hoff_edge_t add[AJ_HOFF_MAX_CONS];
+         int nadd = 0;
+         bool ok = true;
+         for (int ci = 0; ci < ncons && ok; ci++) {
+            aj_chunk_t *C = cons[ci];
+            if (C == P || C->b_in == NULL) { ok = false; break; }
+            aj_in_addr_fn ia =
+               (aj_in_addr_fn)dlsym(C->dl, "accel_in_addr");
+            if (ia == NULL) { ok = false; break; }
+            int j = -1;
+            for (int k = 0; k < C->n_bin; k++)
+               if (C->b_in[k].data == sigdata && C->b_in[k].width == width) {
+                  j = k; break;
+               }
+            if (j < 0) { ok = false; break; }
+            unsigned long nb = 0;
+            void *dst = ia(C->state, j, &nb);
+            void *ext = ia(C->state, -1, NULL);
+            if (dst == NULL || ext == NULL || nb != pbytes) { ok = false; break; }
+            add[nadd++] = (aj_hoff_edge_t){
+               .ord = ord, .dst = dst, .ext_chg = (unsigned char *)ext,
+               .wake = wake[ci], .nbytes = pbytes,
+               .stage = xmalloc(pbytes), .dirty = false };
+         }
+         if (!ok || nadd == 0) continue;
+
+         P->hoff_edges = xrealloc_array(P->hoff_edges,
+                                        P->hoff_nedges + nadd,
+                                        sizeof(aj_hoff_edge_t));
+         for (int k = 0; k < nadd; k++)
+            P->hoff_edges[P->hoff_nedges++] = add[k];
+         P->hoff_flags[ord] = 1;
+         // consumers: stop translating these inputs from logic3d — the deposit
+         // is bypassed so those bytes are frozen; the poke is the only writer
+         for (int ci = 0; ci < ncons; ci++) {
+            aj_chunk_t *C = cons[ci];
+            for (int k = 0; k < C->n_bin; k++)
+               if (C->b_in[k].data == sigdata && C->b_in[k].width == width)
+                  C->hin_flags[k] = 1;
+         }
+         nlink++;
+      }
+   }
+   if (nlink > 0)
+      notef("accel-jit: NVC_ACCEL_HANDOFF — %d output(s) wired packed"
+            " chunk-to-chunk (deposit bypassed)", nlink);
+}
+
 // Undo aj_build_fastclk + the partially-built chunk when an install fails after
 // they were created, so a non-installed chunk leaves no active state.
 static void aj_accel_teardown(rt_model_t *m)
@@ -2172,6 +2395,8 @@ static char *aj_read_file(const char *path)
 // scalable wide path). Match either spelling — a wide port that fails this check
 // would pass the gate but never get bridged. (The older "unsigned __int128"
 // spelling is matched too for forward/backward compatibility.)
+#define AJ_MAX_PINS 4096   // per-subtree bridged-pin cap (dec has hundreds)
+
 // multi-clock unchanged-inputs skip block, built where the pin info is in
 // scope and emitted after posedge_mask is computed (see below)
 static char g_aj_skip_buf[4096];
@@ -2283,28 +2508,36 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       raw_total += (size_t)pins[i].width * pins[i].elem;
    }
    if (raw_total == 0) raw_total = 1;
+   // ext_chg: set by a PRODUCER chunk's packed poke (NVC_ACCEL_HANDOFF) when it
+   // writes this chunk's in_live directly — the logic3d bytes never change so
+   // the raw-shadow memcmp can't see it. o_prev: previous packed outputs, gates
+   // the poke (poke-on-change = fixpoint termination on cross-chunk comb loops).
    if (nck == 0)
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0;"
-                 " inputs_t in_live; unsigned char shadow_valid, rst_prev;"
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
+                 " outputs_t o_prev;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", raw_total);
    else
       // per-extra-clock last value, for value-edge detection across deltas.
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0; unsigned char ck_last[%d];"
-                 " inputs_t in_live; unsigned char shadow_valid, rst_prev;"
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
+                 " outputs_t o_prev;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck, raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
-                 " aj_cs->shadow_valid = 0;"
+                 " aj_cs->shadow_valid = 0; aj_cs->ext_chg = 0;"
+                 " memset(&aj_cs->o_prev, 0, sizeof aj_cs->o_prev);"
                  " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live); }\n\n");
    else
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
-                 " aj_cs->shadow_valid = 0;"
+                 " aj_cs->shadow_valid = 0; aj_cs->ext_chg = 0;"
+                 " memset(&aj_cs->o_prev, 0, sizeof aj_cs->o_prev);"
                  " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live);"
                  " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
 
@@ -2315,10 +2548,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    chunk->bindtab[3] = (void *)&aj_out;
    chunk->bindtab[4] = clk->data;
    chunk->bindtab[5] = rst ? rst->data : NULL;
-   // Spare slot after the per-pin table (array is sized 6+npins+2): a live pointer
-   // to g_aj_verify so the bridge can switch to value-edge clocking under VERIFY.
+   // Slots after the per-pin table (array is sized 6+npins+4):
+   //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
+   //   [6+npins+1] per-output handoff flags (set by aj_link_handoff post-install)
+   //   [6+npins+2] aj_poke — packed chunk-to-chunk handoff (NVC_ACCEL_HANDOFF)
    chunk->bindtab[6 + npins] = &g_aj_verify;
+   chunk->hoff_flags = xcalloc(npins > 0 ? npins : 1);
+   chunk->hin_flags  = xcalloc(npins > 0 ? npins : 1);
+   chunk->bindtab[6 + npins + 1] = chunk->hoff_flags;
+   chunk->bindtab[6 + npins + 2] = (void *)&aj_poke;
+   chunk->bindtab[6 + npins + 3] = chunk->hin_flags;
    fprintf(f, "#define VERIFY (*(int*)AJB[%d])\n", 6 + npins);
+   fprintf(f, "typedef void (*ajpoke_fn)(int,const void*,unsigned);\n");
+   fprintf(f, "#define AJ_HOFF ((unsigned char*)AJB[%d])\n", 6 + npins + 1);
+   fprintf(f, "#define AJ_POKE ((ajpoke_fn)AJB[%d])\n", 6 + npins + 2);
+   fprintf(f, "#define AJ_HIN ((unsigned char*)AJB[%d])\n", 6 + npins + 3);
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
@@ -2357,10 +2601,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // (clock-family pins still re-translate for sm_clock/mask use, but their
    // effect is an EDGE, captured by posedge/posedge_mask — so they don't force
    // a re-settle by themselves). First eval (shadow_valid==0) runs everything.
+   // ext_chg: a producer chunk poked our packed inputs directly (handoff) —
+   // the logic3d bytes didn't change, so only this flag knows.
    fprintf(f, "  int _chg = !aj_cs->shadow_valid;\n");
+   fprintf(f, "  if(aj_cs->ext_chg){ _chg = 1; aj_cs->ext_chg = 0; }\n");
 
    int bridged_in = 0, bridged_out = 0;
    size_t raw_off = 0;
+   static int bin_pin[AJ_MAX_PINS];    // pin index per bridged-input ordinal
+   static int bout_pin[AJ_MAX_PINS];   // pin index per output ordinal
    // inputs: DIRECT IN-PLACE — the packed `in` (chunk-state in_live) persists;
    // each pin memcmp's its nvc logic3d bytes against raw_shadow and is only
    // re-translated on change. Translation detail: each sub-element is `elem`
@@ -2377,9 +2626,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       for (int k = 0; k < nck && !is_ck; k++)
          if (strcmp(pins[i].name, extra_clk[k]) == 0) is_ck = true;
       fprintf(f, "  { uint8_t*p=IN_ADDR(%d);"
-                 " if(!aj_cs->shadow_valid || memcmp(aj_cs->raw_shadow+%zu,p,%zu)){"
+                 " if(!AJ_HIN[%d] && (!aj_cs->shadow_valid ||"
+                 " memcmp(aj_cs->raw_shadow+%zu,p,%zu))){"
                  " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
-              bridged_in, raw_off, nb, raw_off, nb, is_ck ? "" : " _chg=1;");
+              bridged_in, bridged_in, raw_off, nb, raw_off, nb,
+              is_ck ? "" : " _chg=1;");
       if (pins[i].width > 64) {
          // Wide port: gen_statemachine declares in._<name> as a uint32_t[N] limb
          // array; place each bit in its limb. (32-bit limbs scale to any width.)
@@ -2395,10 +2646,23 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                     " in._%s=v; } }\n",
                  pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
       }
+      bin_pin[bridged_in] = i;
       raw_off += nb;
       bridged_in++;
    }
+   // _first: force the full output pass on the first eval (deposit the initial
+   // values; o_prev starts zeroed and must not suppress them)
+   fprintf(f, "  int _first = !aj_cs->shadow_valid;\n");
    fprintf(f, "  aj_cs->shadow_valid = 1;\n");
+   // bridged-input summary for the handoff link pass (bridge ordinal order)
+   chunk->b_in = xcalloc_array(bridged_in > 0 ? bridged_in : 1,
+                               sizeof(aj_bpin_t));
+   chunk->n_bin = bridged_in;
+   for (int bi = 0; bi < bridged_in; bi++) {
+      aj_pin_t *pp = &pins[bin_pin[bi]];
+      chunk->b_in[bi] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
+                                     .width = pp->width, .elem = pp->elem };
+   }
    // NVC_ACCEL_INDUMP: dump this cycle's SETTLED input vector (named, in pin
    // order) at each posedge, so a fork-checkpoint child can capture the exact
    // real stimulus around a divergence for offline replay (net_diff / xcheck).
@@ -2562,30 +2826,89 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       }
       chunk->bindtab[6 + ni + ord] = pins[i].sig;
       if (!no_force) {
-         if (pins[i].width > 64)
+         // NVC_ACCEL_HANDOFF: an output the link pass wired chunk-to-chunk
+         // pokes its PACKED value straight into the consumers (change-gated on
+         // o_prev — poke-on-change is what terminates cross-chunk comb loops)
+         // and skips the logic3d translation + deposit entirely. Flags are all
+         // zero until aj_link_handoff runs, so the else branch is the default.
+         if (pins[i].width > 64) {
+            const int nl = (pins[i].width + 31) / 32;
+            fprintf(f, "  if(AJ_HOFF[%d]){"
+                       " if(memcmp(o._%s,aj_cs->o_prev._%s,%d)){"
+                       " memcpy(aj_cs->o_prev._%s,o._%s,%d);"
+                       " AJ_POKE(%d,aj_cs->o_prev._%s,%d); } }\n",
+                    ord, pins[i].name, pins[i].name, 4 * nl,
+                    pins[i].name, pins[i].name, 4 * nl,
+                    ord, pins[i].name, 4 * nl);
             // Wide output: o._<name> is a uint32_t[N] limb array; read bit b from
-            // its limb and drive nexus element (width-1-b) MSB-first.
-            fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf);"
+            // its limb and drive nexus element (width-1-b) MSB-first. Change-
+            // gated on o_prev: deposit_signal is a no-op for an unchanged value,
+            // so skip the whole translate+call (VERIFY compares every delta and
+            // bypasses the gate; _first forces the initial deposit).
+            fprintf(f, "  else if(VERIFY || _first ||"
+                       " memcmp(o._%s,aj_cs->o_prev._%s,%d)){"
+                       " memcpy(aj_cs->o_prev._%s,o._%s,%d);\n",
+                    pins[i].name, pins[i].name, 4 * nl,
+                    pins[i].name, pins[i].name, 4 * nl);
+            fprintf(f, "    uint8_t buf[%d]; memset(buf,0,sizeof buf);"
                        " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
                        "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
                        " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                     bufsz, pins[i].width, pins[i].width, pins[i].elem,
                     pins[i].name, ord, ord, pins[i].width, pe_arg);
-         else
-            fprintf(f, "  { uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+         }
+         else {
+            fprintf(f, "  if(AJ_HOFF[%d]){"
+                       " if(o._%s!=aj_cs->o_prev._%s){"
+                       " aj_cs->o_prev._%s=o._%s;"
+                       " AJ_POKE(%d,&aj_cs->o_prev._%s,8); } }\n",
+                    ord, pins[i].name, pins[i].name,
+                    pins[i].name, pins[i].name, ord, pins[i].name);
+            fprintf(f, "  else if(VERIFY || _first || o._%s!=aj_cs->o_prev._%s){"
+                       " aj_cs->o_prev._%s=o._%s;\n",
+                    pins[i].name, pins[i].name, pins[i].name, pins[i].name);
+            fprintf(f, "    uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
                        " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
                        " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                     bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
                     ord, ord, pins[i].width, pe_arg);
+         }
       }
+      bout_pin[ord] = i;
       ord++;
       bridged_out++;
    }
    chunk->defer_count = ord;
+   // bridged-output summary for the handoff link pass (output ordinal order)
+   chunk->b_out = xcalloc_array(ord > 0 ? ord : 1, sizeof(aj_bpin_t));
+   chunk->n_bout = ord;
+   for (int bo = 0; bo < ord; bo++) {
+      aj_pin_t *pp = &pins[bout_pin[bo]];
+      chunk->b_out[bo] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
+                                      .width = pp->width, .elem = pp->elem };
+   }
    if (deferred > 0)
       notef("accel-jit: NVC_ACCEL_BANK — %d/%d output(s) bank-switched (deferred)",
             deferred, ord);
    fprintf(f, "}\n");
+   // accel_in_addr: resolve a bridged-input ordinal to its packed in_live
+   // field (ord == -1 -> the ext_chg flag). The handoff link pass uses this to
+   // wire a producer's poke straight into this chunk's packed inputs.
+   fprintf(f, "void *accel_in_addr(void *p, int _iord, unsigned long *nb){\n");
+   fprintf(f, "  aj_cs_t *aj_cs = p;\n  switch(_iord){\n");
+   fprintf(f, "  case -1: return &aj_cs->ext_chg;\n");
+   for (int bi = 0; bi < bridged_in; bi++) {
+      aj_pin_t *pp = &pins[bin_pin[bi]];
+      if (pp->width > 64) {
+         const int nl = (pp->width + 31) / 32;
+         fprintf(f, "  case %d: if(nb)*nb=%d; return aj_cs->in_live._%s;\n",
+                 bi, 4 * nl, pp->name);
+      }
+      else
+         fprintf(f, "  case %d: if(nb)*nb=8; return &aj_cs->in_live._%s;\n",
+                 bi, pp->name);
+   }
+   fprintf(f, "  }\n  return 0;\n}\n");
    fclose(f);
    free(dut_text);
 
@@ -2826,7 +3149,6 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // (dec) has hundreds of ports; a 64-pin cap silently dropped most of them ->
    // the chunk ran on stale inputs / undriven outputs. Size by the real port
    // count and decline (don't silently truncate) if a module is absurdly wide.
-   #define AJ_MAX_PINS 4096
    static aj_pin_t pins[AJ_MAX_PINS];
    int npins = 0;
    aj_pin_t clk = {0}, rst = {0};
@@ -2886,7 +3208,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    //    baked bridge (builds the chunk's deferred-output table) and compile.
    aj_chunk_t *chunk = aj_chunk_new(m);
    chunk->scope   = scope;
-   chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 2, sizeof(void *));
+   chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 4, sizeof(void *));
    aj_build_fastclk(m, clk.sig, clk.data);
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
    // address table in chunk->bindtab — both cheap; the gcc below is what we cache.
@@ -6395,6 +6717,10 @@ static void model_cycle(rt_model_t *m)
 
    run_callbacks(m, END_OF_PROCESSES);
 
+   // NVC_ACCEL_HANDOFF: this delta's procs have all run — publish staged packed
+   // pokes (next-delta visibility, like deposit) and schedule the consumers.
+   aj_apply_pokes(m);
+
    // NVC_ACCEL_VERIFY: advance each companion .so's state this delta (no compare)
    // so its multi-clock register ordering tracks the rerouted model delta-for-delta
    // (extra clocks like free_clk lag clk by a delta and must read post-clk state).
@@ -6501,6 +6827,9 @@ void model_run(rt_model_t *m, uint64_t stop_time)
       const char *nt = getenv("NVC_FORK_TESTS");
       if (nt != NULL) { const int v = atoi(nt); if (v > 0) g_fork_tests = v; }
    }
+
+   if (m->aj_chunk_count > 0)
+      aj_link_handoff(m);   // wire packed chunk-to-chunk edges (NVC_ACCEL_HANDOFF)
 
    run_callbacks(m, START_OF_SIMULATION);
 
