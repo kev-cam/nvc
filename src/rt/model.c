@@ -1589,6 +1589,15 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
 // recovers its chunk via (aj_chunk_t *)proc->vtable (the accel_binding_t
 // pattern). Each chunk has its own compiled eval/state/reset and its own
 // deferred-output table, so multiple chunks can be live at once.
+typedef struct {
+   char          name[64];     // lowercased port name, e.g. "a_data"
+   bool          is_output;
+   int           width;        // bits (sub-elements)
+   int           elem;         // bytes per sub-element (logic3d = natural)
+   uint8_t      *data;         // shared.data (read inputs)
+   rt_signal_t  *sig;          // signal (force outputs via force_signal)
+} aj_pin_t;
+
 // NVC_ACCEL_HANDOFF: one packed chunk-to-chunk edge. When a chunk output's
 // only readers are other chunks' rerouted procs, the producer writes its
 // PACKED value straight into each consumer's packed in_live field (same bit-
@@ -1638,6 +1647,18 @@ struct _aj_chunk {
                                      // producer's poke is the only writer)
    aj_hoff_edge_t  *hoff_edges;
    int              hoff_nedges;
+   // post-link respecialization inputs: everything needed to RE-EMIT this
+   // chunk's bridge with the link results (hoff/hin flags, VERIFY, clocking
+   // mode) baked in as constants, compile it, and swap eval — the vtable
+   // regenerated to reflect the object's current state.
+   char            *rs_bridge;       // original bridge .c path
+   char            *rs_dutc;         // model .c the bridge #includes
+   char            *rs_top;          // subtree name
+   aj_pin_t        *rs_pins;         // full pin table copy
+   int              rs_npins;
+   aj_pin_t         rs_clk, rs_rst;
+   bool             rs_have_rst;
+   unsigned long    rs_state_size;   // sanity check across the swap
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -1724,14 +1745,6 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    thread->active_scope = save_scope;
 }
 
-typedef struct {
-   char          name[64];     // lowercased port name, e.g. "a_data"
-   bool          is_output;
-   int           width;        // bits (sub-elements)
-   int           elem;         // bytes per sub-element (logic3d = natural)
-   uint8_t      *data;         // shared.data (read inputs)
-   rt_signal_t  *sig;          // signal (force outputs via force_signal)
-} aj_pin_t;
 
 // NVC_ACCEL_BANK 2-bank deferred output. One per bridged output; `defer`
 // distinguishes the bank-switched outputs (staged into `shadow`, published by
@@ -2270,6 +2283,83 @@ static bool aj_hoff_readers(rt_model_t *m, void *pending,
    return *ncons > 0;
 }
 
+static bool aj_emit_bridge(const char *path, const char *dutc,
+                           aj_pin_t *pins, int npins, aj_pin_t *clk,
+                           aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk,
+                           bool spec);
+
+// Post-link respecialization: the vtable-hacking principle applied to the
+// bridge — the eval pointer is mutable state, so once the link pass fixes the
+// handoff wiring, RE-EMIT the bridge with those results (and VERIFY=0) baked
+// in as constants, compile it (cached by a hash of the flag vectors), and
+// swap chunk->eval. The steady-state code is then straight-line for the
+// linked topology: no AJ_HOFF/AJ_HIN tests, no VERIFY deref, handoff-fed
+// input pins gone entirely (not even a memcmp). The chunk STATE (aj_cs_t) is
+// emitted layout-identically, so the live state carries across the swap.
+static void aj_respecialize(rt_model_t *m)
+{
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      if (c->rs_bridge == NULL || c->rs_pins == NULL) continue;
+      bool any = false;
+      for (int i = 0; i < c->rs_npins && !any; i++)
+         if (c->hoff_flags[i] || c->hin_flags[i]) any = true;
+      if (!any) continue;   // link changed nothing for this chunk
+
+      uint64_t h = 1469598103934665603ull;   // FNV-1a over both flag vectors
+      for (int i = 0; i < c->rs_npins; i++) {
+         h = (h ^ c->hoff_flags[i]) * 1099511628211ull;
+         h = (h ^ (unsigned)(c->hin_flags[i] << 1)) * 1099511628211ull;
+      }
+
+      char dir[512];
+      snprintf(dir, sizeof dir, "%s", c->rs_bridge);
+      char *slash = strrchr(dir, '/');
+      if (slash != NULL) *slash = '\0';
+      else snprintf(dir, sizeof dir, ".");
+      char specc[600], specso[600];
+      snprintf(specc,  sizeof specc,  "%s/aj_%s_bridge_spec.c", dir, c->rs_top);
+      snprintf(specso, sizeof specso, "%s/aj_%s_spec_%016llx.so", dir, c->rs_top,
+               (unsigned long long)h);
+
+      if (!aj_emit_bridge(specc, c->rs_dutc, c->rs_pins, c->rs_npins,
+                          &c->rs_clk, c->rs_have_rst ? &c->rs_rst : NULL,
+                          m, c, true))
+         continue;
+
+      if (getenv("NVC_ACCEL_NO_CACHE") != NULL || access(specso, F_OK) != 0) {
+         const char *cc = getenv("NVC_ACCEL_CC");
+         if (cc == NULL) cc = "gcc -g -O3";
+         const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
+         char cmd[2048];
+         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
+                  cc, smd, specso, specc);
+         if (system(cmd) != 0 || access(specso, F_OK) != 0) {
+            warnf("accel-jit: respec compile failed for '%s' — keeping generic",
+                  c->rs_top);
+            continue;
+         }
+      }
+
+      void *dl = dlopen(specso, RTLD_NOW);
+      if (dl == NULL) {
+         warnf("accel-jit: respec dlopen: %s", dlerror());
+         continue;
+      }
+      void (*eval)(void *, void **) = dlsym(dl, "accel_eval");
+      unsigned long (*ssize)(void)  = dlsym(dl, "accel_state_size");
+      if (eval == NULL || ssize == NULL || ssize() != c->rs_state_size) {
+         warnf("accel-jit: respec '%s' state-layout mismatch — keeping generic",
+               c->rs_top);
+         dlclose(dl);
+         continue;
+      }
+      c->eval = eval;   // the swap: dispatch now points at specialized code
+      notef("accel-jit: respecialized '%s' (link results compiled in)",
+            c->rs_top);
+   }
+}
+
 static void aj_link_handoff(rt_model_t *m)
 {
    static bool done = false;
@@ -2352,6 +2442,9 @@ static void aj_link_handoff(rt_model_t *m)
    if (nlink > 0)
       notef("accel-jit: NVC_ACCEL_HANDOFF — %d output(s) wired packed"
             " chunk-to-chunk (deposit bypassed)", nlink);
+
+   if (nlink > 0 && getenv("NVC_ACCEL_NO_RESPEC") == NULL)
+      aj_respecialize(m);
 }
 
 // Undo aj_build_fastclk + the partially-built chunk when an install fails after
@@ -2412,9 +2505,16 @@ static bool aj_model_has_field(const char *dutc_text, const char *name)
 }
 
 // Emit the address-baked bridge .c around the generated model.
+// spec: post-link RE-emission — the link results (hoff/hin flags) and run mode
+// (VERIFY=0) are baked in as constants and every resolved branch is emitted
+// one-sided; all install side effects (bindtab, defer_outs, flag allocs,
+// b_in/b_out tables) are SKIPPED — they exist and must not be disturbed. The
+// state layout (aj_cs_t) is emitted identically so the live chunk state
+// carries across the eval-pointer swap.
 static bool aj_emit_bridge(const char *path, const char *dutc,
                            aj_pin_t *pins, int npins, aj_pin_t *clk,
-                           aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk)
+                           aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk,
+                           bool spec)
 {
    char *dut_text = aj_read_file(dutc);
    if (!dut_text) return false;
@@ -2552,13 +2652,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
    //   [6+npins+1] per-output handoff flags (set by aj_link_handoff post-install)
    //   [6+npins+2] aj_poke — packed chunk-to-chunk handoff (NVC_ACCEL_HANDOFF)
-   chunk->bindtab[6 + npins] = &g_aj_verify;
-   chunk->hoff_flags = xcalloc(npins > 0 ? npins : 1);
-   chunk->hin_flags  = xcalloc(npins > 0 ? npins : 1);
-   chunk->bindtab[6 + npins + 1] = chunk->hoff_flags;
-   chunk->bindtab[6 + npins + 2] = (void *)&aj_poke;
-   chunk->bindtab[6 + npins + 3] = chunk->hin_flags;
-   fprintf(f, "#define VERIFY (*(int*)AJB[%d])\n", 6 + npins);
+   if (!spec) {
+      chunk->bindtab[6 + npins] = &g_aj_verify;
+      chunk->hoff_flags = xcalloc(npins > 0 ? npins : 1);
+      chunk->hin_flags  = xcalloc(npins > 0 ? npins : 1);
+      chunk->bindtab[6 + npins + 1] = chunk->hoff_flags;
+      chunk->bindtab[6 + npins + 2] = (void *)&aj_poke;
+      chunk->bindtab[6 + npins + 3] = chunk->hin_flags;
+   }
+   // spec: the link pass only runs rerouted (never under VERIFY), so VERIFY is
+   // a compile-time 0 — the value-edge clocking, gate bypasses and per-delta
+   // compare branches all fold away.
+   if (spec)
+      fprintf(f, "#define VERIFY 0\n");
+   else
+      fprintf(f, "#define VERIFY (*(int*)AJB[%d])\n", 6 + npins);
    fprintf(f, "typedef void (*ajpoke_fn)(int,const void*,unsigned);\n");
    fprintf(f, "#define AJ_HOFF ((unsigned char*)AJB[%d])\n", 6 + npins + 1);
    fprintf(f, "#define AJ_POKE ((ajpoke_fn)AJB[%d])\n", 6 + npins + 2);
@@ -2620,48 +2728,63 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    for (int i = 0; i < npins; i++) {
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
-      chunk->bindtab[6 + bridged_in] = pins[i].data;
+      if (!spec)
+         chunk->bindtab[6 + bridged_in] = pins[i].data;
       const size_t nb = (size_t)pins[i].width * pins[i].elem;
       bool is_ck = strcmp(pins[i].name, "clk") == 0;
       for (int k = 0; k < nck && !is_ck; k++)
          if (strcmp(pins[i].name, extra_clk[k]) == 0) is_ck = true;
-      fprintf(f, "  { uint8_t*p=IN_ADDR(%d);"
-                 " if(!AJ_HIN[%d] && (!aj_cs->shadow_valid ||"
-                 " memcmp(aj_cs->raw_shadow+%zu,p,%zu))){"
-                 " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
-              bridged_in, bridged_in, raw_off, nb, raw_off, nb,
-              is_ck ? "" : " _chg=1;");
-      if (pins[i].width > 64) {
-         // Wide port: gen_statemachine declares in._<name> as a uint32_t[N] limb
-         // array; place each bit in its limb. (32-bit limbs scale to any width.)
-         const int nl = (pins[i].width + 31) / 32;
-         fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
-                    " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
-                    " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } } }\n",
-                 nl, pins[i].name, pins[i].width, pins[i].width,
-                 pins[i].name, pins[i].elem);
-      } else {
-         fprintf(f, "    uint64_t v=0;"
-                    " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b);"
-                    " in._%s=v; } }\n",
-                 pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
+      // spec + handoff-fed: the pin's logic3d bytes are frozen (deposit
+      // bypassed) and the poke is the only writer — emit NOTHING, not even
+      // the memcmp. raw_off still advances so aj_cs_t stays layout-identical.
+      const bool suppress = spec && chunk->hin_flags != NULL
+         && chunk->hin_flags[bridged_in];
+      if (!suppress) {
+         if (spec)
+            fprintf(f, "  { uint8_t*p=IN_ADDR(%d);"
+                       " if(!aj_cs->shadow_valid ||"
+                       " memcmp(aj_cs->raw_shadow+%zu,p,%zu)){"
+                       " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
+                    bridged_in, raw_off, nb, raw_off, nb,
+                    is_ck ? "" : " _chg=1;");
+         else
+            fprintf(f, "  { uint8_t*p=IN_ADDR(%d);"
+                       " if(!AJ_HIN[%d] && (!aj_cs->shadow_valid ||"
+                       " memcmp(aj_cs->raw_shadow+%zu,p,%zu))){"
+                       " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
+                    bridged_in, bridged_in, raw_off, nb, raw_off, nb,
+                    is_ck ? "" : " _chg=1;");
+         if (pins[i].width > 64) {
+            // Wide port: gen_statemachine declares in._<name> as a uint32_t[N]
+            // limb array; place each bit in its limb.
+            const int nl = (pins[i].width + 31) / 32;
+            fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
+                       " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
+                       " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } } }\n",
+                    nl, pins[i].name, pins[i].width, pins[i].width,
+                    pins[i].name, pins[i].elem);
+         } else {
+            fprintf(f, "    uint64_t v=0;"
+                       " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b);"
+                       " in._%s=v; } }\n",
+                    pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
+         }
       }
       bin_pin[bridged_in] = i;
       raw_off += nb;
       bridged_in++;
    }
-   // _first: force the full output pass on the first eval (deposit the initial
-   // values; o_prev starts zeroed and must not suppress them)
-   fprintf(f, "  int _first = !aj_cs->shadow_valid;\n");
    fprintf(f, "  aj_cs->shadow_valid = 1;\n");
-   // bridged-input summary for the handoff link pass (bridge ordinal order)
-   chunk->b_in = xcalloc_array(bridged_in > 0 ? bridged_in : 1,
-                               sizeof(aj_bpin_t));
-   chunk->n_bin = bridged_in;
-   for (int bi = 0; bi < bridged_in; bi++) {
-      aj_pin_t *pp = &pins[bin_pin[bi]];
-      chunk->b_in[bi] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
-                                     .width = pp->width, .elem = pp->elem };
+   if (!spec) {
+      // bridged-input summary for the handoff link pass (bridge ordinal order)
+      chunk->b_in = xcalloc_array(bridged_in > 0 ? bridged_in : 1,
+                                  sizeof(aj_bpin_t));
+      chunk->n_bin = bridged_in;
+      for (int bi = 0; bi < bridged_in; bi++) {
+         aj_pin_t *pp = &pins[bin_pin[bi]];
+         chunk->b_in[bi] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
+                                        .width = pp->width, .elem = pp->elem };
+      }
    }
    // NVC_ACCEL_INDUMP: dump this cycle's SETTLED input vector (named, in pin
    // order) at each posedge, so a fork-checkpoint child can capture the exact
@@ -2803,91 +2926,107 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // ordinal matches m->aj_defer_outs[ord]. Each output is classified now (the
    // fast-clk table already exists — aj_build_fastclk runs before emit); a
    // qualifying output is bank-switched, the rest fall back to deposit_signal.
-   chunk->defer_outs = xcalloc_array(npins > 0 ? npins : 1, sizeof(aj_defer_out_t));
+   if (!spec)
+      chunk->defer_outs = xcalloc_array(npins > 0 ? npins : 1,
+                                        sizeof(aj_defer_out_t));
    int ord = 0, deferred = 0;
    for (int i = 0; i < npins; i++) {
       if (!pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       const int bufsz = pins[i].width * pins[i].elem > 0
                         ? pins[i].width * pins[i].elem : 1;   // width*elem bytes
-      aj_defer_out_t *d = &chunk->defer_outs[ord];
-      rt_nexus_t *tgt = aj_classify_output(m, pins[i].sig);
-      if (tgt != NULL && (size_t)tgt->size * tgt->width != (size_t)bufsz)
-         tgt = NULL;   // layout mismatch across the port hop — fall back
-      d->valuesz = (size_t)bufsz;
-      d->defer   = (tgt != NULL);
-      if (d->defer) {
-         d->nexus       = tgt;
-         d->eff         = (unsigned char *)tgt->signal->shared.data + tgt->offset;
-         d->last        = d->eff + tgt->signal->shared.size;
-         d->cache_event = (tgt->flags & NET_F_CACHE_EVENT) != 0;
-         d->shadow      = xmalloc(bufsz);
-         deferred++;
+      if (!spec) {
+         aj_defer_out_t *d = &chunk->defer_outs[ord];
+         rt_nexus_t *tgt = aj_classify_output(m, pins[i].sig);
+         if (tgt != NULL && (size_t)tgt->size * tgt->width != (size_t)bufsz)
+            tgt = NULL;   // layout mismatch across the port hop — fall back
+         d->valuesz = (size_t)bufsz;
+         d->defer   = (tgt != NULL);
+         if (d->defer) {
+            d->nexus       = tgt;
+            d->eff         = (unsigned char *)tgt->signal->shared.data + tgt->offset;
+            d->last        = d->eff + tgt->signal->shared.size;
+            d->cache_event = (tgt->flags & NET_F_CACHE_EVENT) != 0;
+            d->shadow      = xmalloc(bufsz);
+            deferred++;
+         }
+         chunk->bindtab[6 + ni + ord] = pins[i].sig;
       }
-      chunk->bindtab[6 + ni + ord] = pins[i].sig;
       if (!no_force) {
          // NVC_ACCEL_HANDOFF: an output the link pass wired chunk-to-chunk
          // pokes its PACKED value straight into the consumers (change-gated on
          // o_prev — poke-on-change is what terminates cross-chunk comb loops)
          // and skips the logic3d translation + deposit entirely. Flags are all
          // zero until aj_link_handoff runs, so the else branch is the default.
+         // spec: the flag is a known constant — emit only the taken branch.
+         const int hoff = spec && chunk->hoff_flags != NULL
+            && chunk->hoff_flags[ord];
          if (pins[i].width > 64) {
             const int nl = (pins[i].width + 31) / 32;
-            fprintf(f, "  if(AJ_HOFF[%d]){"
-                       " if(memcmp(o._%s,aj_cs->o_prev._%s,%d)){"
-                       " memcpy(aj_cs->o_prev._%s,o._%s,%d);"
-                       " AJ_POKE(%d,aj_cs->o_prev._%s,%d); } }\n",
-                    ord, pins[i].name, pins[i].name, 4 * nl,
-                    pins[i].name, pins[i].name, 4 * nl,
-                    ord, pins[i].name, 4 * nl);
-            // Wide output: o._<name> is a uint32_t[N] limb array; read bit b from
-            // its limb and drive nexus element (width-1-b) MSB-first. Change-
-            // gated on o_prev: deposit_signal is a no-op for an unchanged value,
-            // so skip the whole translate+call (VERIFY compares every delta and
-            // bypasses the gate; _first forces the initial deposit).
-            fprintf(f, "  else if(VERIFY || _first ||"
-                       " memcmp(o._%s,aj_cs->o_prev._%s,%d)){"
-                       " memcpy(aj_cs->o_prev._%s,o._%s,%d);\n",
-                    pins[i].name, pins[i].name, 4 * nl,
-                    pins[i].name, pins[i].name, 4 * nl);
-            fprintf(f, "    uint8_t buf[%d]; memset(buf,0,sizeof buf);"
-                       " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
-                       "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
-                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
-                    bufsz, pins[i].width, pins[i].width, pins[i].elem,
-                    pins[i].name, ord, ord, pins[i].width, pe_arg);
+            if (!spec || hoff) {
+               if (!spec) fprintf(f, "  if(AJ_HOFF[%d])", ord);
+               else       fprintf(f, "  ");
+               fprintf(f, "{"
+                          " if(memcmp(o._%s,aj_cs->o_prev._%s,%d)){"
+                          " memcpy(aj_cs->o_prev._%s,o._%s,%d);"
+                          " AJ_POKE(%d,aj_cs->o_prev._%s,%d); } }\n",
+                       pins[i].name, pins[i].name, 4 * nl,
+                       pins[i].name, pins[i].name, 4 * nl,
+                       ord, pins[i].name, 4 * nl);
+            }
+            if (!spec || !hoff) {
+               // Wide output: o._<name> is a uint32_t[N] limb array; read bit b
+               // from its limb, drive nexus element (width-1-b) MSB-first.
+               // UNCONDITIONAL: deposits carry transaction semantics interp
+               // readers can wake on — change-gating them altered VeeR's
+               // cycle count (1033 -> 887). deposit_signal already handles
+               // value-change detection for events.
+               fprintf(f, "  %s{ uint8_t buf[%d]; memset(buf,0,sizeof buf);"
+                          " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
+                          "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
+                          " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
+                       spec ? "" : "else ",
+                       bufsz, pins[i].width, pins[i].width, pins[i].elem,
+                       pins[i].name, ord, ord, pins[i].width, pe_arg);
+            }
          }
          else {
-            fprintf(f, "  if(AJ_HOFF[%d]){"
-                       " if(o._%s!=aj_cs->o_prev._%s){"
-                       " aj_cs->o_prev._%s=o._%s;"
-                       " AJ_POKE(%d,&aj_cs->o_prev._%s,8); } }\n",
-                    ord, pins[i].name, pins[i].name,
-                    pins[i].name, pins[i].name, ord, pins[i].name);
-            fprintf(f, "  else if(VERIFY || _first || o._%s!=aj_cs->o_prev._%s){"
-                       " aj_cs->o_prev._%s=o._%s;\n",
-                    pins[i].name, pins[i].name, pins[i].name, pins[i].name);
-            fprintf(f, "    uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
-                       " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
-                       " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
-                    bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-                    ord, ord, pins[i].width, pe_arg);
+            if (!spec || hoff) {
+               if (!spec) fprintf(f, "  if(AJ_HOFF[%d])", ord);
+               else       fprintf(f, "  ");
+               fprintf(f, "{"
+                          " if(o._%s!=aj_cs->o_prev._%s){"
+                          " aj_cs->o_prev._%s=o._%s;"
+                          " AJ_POKE(%d,&aj_cs->o_prev._%s,8); } }\n",
+                       pins[i].name, pins[i].name,
+                       pins[i].name, pins[i].name, ord, pins[i].name);
+            }
+            if (!spec || !hoff) {
+               fprintf(f, "  %s{ uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
+                          " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
+                          " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
+                       spec ? "" : "else ",
+                       bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
+                       ord, ord, pins[i].width, pe_arg);
+            }
          }
       }
       bout_pin[ord] = i;
       ord++;
       bridged_out++;
    }
-   chunk->defer_count = ord;
-   // bridged-output summary for the handoff link pass (output ordinal order)
-   chunk->b_out = xcalloc_array(ord > 0 ? ord : 1, sizeof(aj_bpin_t));
-   chunk->n_bout = ord;
-   for (int bo = 0; bo < ord; bo++) {
-      aj_pin_t *pp = &pins[bout_pin[bo]];
-      chunk->b_out[bo] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
-                                      .width = pp->width, .elem = pp->elem };
+   if (!spec) {
+      chunk->defer_count = ord;
+      // bridged-output summary for the handoff link pass (output ordinal order)
+      chunk->b_out = xcalloc_array(ord > 0 ? ord : 1, sizeof(aj_bpin_t));
+      chunk->n_bout = ord;
+      for (int bo = 0; bo < ord; bo++) {
+         aj_pin_t *pp = &pins[bout_pin[bo]];
+         chunk->b_out[bo] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
+                                         .width = pp->width, .elem = pp->elem };
+      }
    }
-   if (deferred > 0)
+   if (deferred > 0 && !spec)
       notef("accel-jit: NVC_ACCEL_BANK — %d/%d output(s) bank-switched (deferred)",
             deferred, ord);
    fprintf(f, "}\n");
@@ -2912,7 +3051,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fclose(f);
    free(dut_text);
 
-   notef("accel-jit: bridge %d inputs, %d outputs", bridged_in, bridged_out);
+   if (!spec)
+      notef("accel-jit: bridge %d inputs, %d outputs", bridged_in, bridged_out);
    return bridged_in > 0 && bridged_out > 0;
 }
 
@@ -3213,7 +3353,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
    // address table in chunk->bindtab — both cheap; the gcc below is what we cache.
    if (!aj_emit_bridge(bridge, dutc, pins, npins, &clk,
-                       have_rst ? &rst : NULL, m, chunk)) {
+                       have_rst ? &rst : NULL, m, chunk, false)) {
       aj_accel_teardown(m);
       return false;
    }
@@ -3254,6 +3394,18 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    chunk->reset = reset;
    chunk->dl    = dl;
    chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
+   // keep the emission inputs for post-link respecialization (re-emit the
+   // bridge with the link results baked in, compile, swap eval)
+   chunk->rs_bridge = xstrdup(bridge);
+   chunk->rs_dutc   = xstrdup(dutc);
+   chunk->rs_top    = xstrdup(top);
+   chunk->rs_pins   = xmalloc_array(npins > 0 ? npins : 1, sizeof(aj_pin_t));
+   memcpy(chunk->rs_pins, pins, (npins > 0 ? npins : 1) * sizeof(aj_pin_t));
+   chunk->rs_npins  = npins;
+   chunk->rs_clk    = clk;
+   chunk->rs_rst    = rst;
+   chunk->rs_have_rst = have_rst;
+   chunk->rs_state_size = ssize();
    g_aj_model   = m;
    chunk->reset(chunk->state);
    if (g_aj_verify) {
