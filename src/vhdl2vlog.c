@@ -508,6 +508,66 @@ static void emit_expr(FILE *f, tree_t e)
             fputc('}', f);
             break;
          }
+         // sv2vhdl's Ternary_Unsigned(T, X, Y) is a plain mux: T ? X : Y
+         if (strcasecmp(vid(tree_ident(e)), "ternary_unsigned") == 0
+             && nparams == 3) {
+            fputs("((", f);
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            fputs(") ? (", f);
+            emit_expr(f, tree_value(tree_param(e, 1)));
+            fputs(") : (", f);
+            emit_expr(f, tree_value(tree_param(e, 2)));
+            fputs("))", f);
+            break;
+         }
+         // sv2vhdl one-hot decoders: bit i of the result is (x == i), i.e. a
+         // shifted 1. Works for any argument expression.
+         if ((strcasecmp(vid(tree_ident(e)), "decode2_4") == 0
+              || strcasecmp(vid(tree_ident(e)), "decode3_8") == 0)
+             && nparams == 1) {
+            const bool is38 = tolower((unsigned char)vid(tree_ident(e))[6]) == '3';
+            fprintf(f, "(%s'b1 << (", is38 ? "8" : "4");
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            fputs("))", f);
+            break;
+         }
+         // sv2vhdl one-hot -> binary encoders (assume one-hot input, OR trees):
+         //   f_Enc8to3(d):  {d4|d5|d6|d7, d2|d3|d6|d7, d1|d3|d5|d7}
+         //   encode8_3(x):  {|x[7:4],     x7|x6|x3|x2, x7|x5|x3|x1}   (identical)
+         // Need a simple ref for the bit-selects; else decline below.
+         if ((strcasecmp(vid(tree_ident(e)), "f_enc8to3") == 0
+              || strcasecmp(vid(tree_ident(e)), "encode8_3") == 0)
+             && nparams == 1) {
+            tree_t a0 = tree_value(tree_param(e, 0));
+            if (tree_kind(a0) == T_REF) {
+               const char *nm = vid(tree_ident(a0));
+               fprintf(f, "{(%s[4]|%s[5]|%s[6]|%s[7]),"
+                          "(%s[2]|%s[3]|%s[6]|%s[7]),"
+                          "(%s[1]|%s[3]|%s[5]|%s[7])}",
+                       nm, nm, nm, nm, nm, nm, nm, nm, nm, nm, nm, nm);
+               break;
+            }
+         }
+         // countones(x) -> explicit bit-sum (the subtree is read as plain .v,
+         // so SystemVerilog's $countones isn't available). Only for a simple
+         // signal ref of known width; anything else declines below.
+         if (strcasecmp(vid(tree_ident(e)), "countones") == 0 && nparams == 1) {
+            tree_t a0 = tree_value(tree_param(e, 0));
+            if (tree_kind(a0) == T_REF && tree_has_type(a0)
+                && type_is_array(tree_type(a0))
+                && type_const_bounds(tree_type(a0))) {
+               const int w = type_width(tree_type(a0));
+               const char *nm = vid(tree_ident(a0));
+               // Verilog self-determines the sum width from the operands — all
+               // 1-bit here, so without a wide anchor the count TRUNCATES to
+               // one bit (broke lsu_bus_buffer's num_valids -> bus-full logic).
+               fputs("(8'd0", f);
+               for (int b = 0; b < w; b++)
+                  fprintf(f, " + %s[%d]", nm, b);
+               fputc(')', f);
+               break;
+            }
+         }
          const char *op = vlog_op(fn);
          int l3dk = -1;
          const char *l3dop = (op == NULL) ? vlog_l3d_op(fn, &l3dk) : NULL;
@@ -746,6 +806,19 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          else if (tree_waveforms(s) > 0 && tree_has_value(tree_waveform(s, 0)))
             emit_expr(f, tree_value(tree_waveform(s, 0)));
          else { g_unhandled++; fputs("0/*null-wave*/", f); }  // disconnect/null waveform — decline
+         fputs(";\n", f);
+      }
+      break;
+   case T_DEPOSIT:
+      {
+         // nvc's deposit statement (`target := value` on a SIGNAL): an
+         // immediate in-place update — sv2vhdl uses it for Verilog BLOCKING
+         // assignments to signals (e.g. accumulators in reduction loops).
+         // Verilog equivalent: a blocking '='.
+         tab(f, ind);
+         emit_expr(f, tree_target(s));
+         fputs(" = ", f);
+         emit_expr(f, tree_value(s));
          fputs(";\n", f);
       }
       break;
@@ -1154,7 +1227,7 @@ static hset_t *g_reg_set = NULL;   // idents assigned inside a process
 static void reg_scan_cb(tree_t t, void *ctx)
 {
    const tree_kind_t k = tree_kind(t);
-   if (k != T_SIGNAL_ASSIGN && k != T_VAR_ASSIGN)
+   if (k != T_SIGNAL_ASSIGN && k != T_VAR_ASSIGN && k != T_DEPOSIT)
       return;
    tree_t tgt = tree_target(t);
    tree_kind_t tk = tree_kind(tgt);

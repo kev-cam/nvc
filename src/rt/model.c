@@ -2311,6 +2311,9 @@ static void aj_respecialize(rt_model_t *m)
          h = (h ^ c->hoff_flags[i]) * 1099511628211ull;
          h = (h ^ (unsigned)(c->hin_flags[i] << 1)) * 1099511628211ull;
       }
+      // spec bakes _coinc as a constant — a mode flip must miss the cache
+      h = (h ^ (getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 5u : 9u))
+         * 1099511628211ull;
 
       char dir[512];
       snprintf(dir, sizeof dir, "%s", c->rs_bridge);
@@ -2489,10 +2492,6 @@ static char *aj_read_file(const char *path)
 // would pass the gate but never get bridged. (The older "unsigned __int128"
 // spelling is matched too for forward/backward compatibility.)
 #define AJ_MAX_PINS 4096   // per-subtree bridged-pin cap (dec has hundreds)
-
-// multi-clock unchanged-inputs skip block, built where the pin info is in
-// scope and emitted after posedge_mask is computed (see below)
-static char g_aj_skip_buf[4096];
 
 static bool aj_model_has_field(const char *dutc_text, const char *name)
 {
@@ -2677,34 +2676,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // `in` resolves to the PERSISTENT packed inputs in chunk state. Emitted
    // after the model #include so the model's own `in` parameters are untouched.
    fprintf(f, "#define in (aj_cs->in_live)\n");
-   fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
-   fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
-   fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
-   // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
-   fprintf(f, "  int _clk = CLK[0]&1;\n");
-   fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
-   // The bridge now runs on EVERY boundary-input-change delta (the rerouted
-   // combinational processes wake it), not just the clock edge. ADVANCE the
-   // registers once per clock cycle — at the first call with clk high at a NEW
-   // simulation time (the posedge); last_t holds the time we last advanced (a
-   // level edge-detect would need the bridge to also run during clk-low, which a
-   // posedge-optimized clocked process does NOT). COMB outputs re-settle on every
-   // call regardless (below).
-   // Reroute path: time-edge (bridge only runs when a rerouted process wakes it —
-   // reliably at the posedge, not during clk-low). VERIFY path: the harness runs
-   // the bridge EVERY delta (it sees clk-low too), so use a robust value-edge that
-   // never double-fires on a stray clk-high sample (e.g. a clock being stopped).
-   fprintf(f, "  int posedge;\n");
-   fprintf(f, "  if(VERIFY) posedge = (_clk && !aj_cs->clk_last0);\n");
-   fprintf(f, "  else { posedge = (_clk && t != last_t); if(posedge) last_t = t; }\n");
-   fprintf(f, "  aj_cs->clk_last0 = _clk;\n");
-   // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
-   // behaviour (no combinational re-settle on input-change deltas) — wrong for a
-   // Mealy boundary, used to demonstrate the settling fix.
-   if (getenv("NVC_ACCEL_NO_SETTLE"))
-      fprintf(f, "  if(!posedge) return;\n");
-   fprintf(f, "  outputs_t o;\n");
-   fprintf(f, "  memset(&o,0,sizeof o);\n");
+   // aj_scan_inputs: apply the CURRENT delta's boundary values to the
+   // persistent packed inputs (translate-on-change against the raw shadow).
+   // A FUNCTION so the caller controls WHEN this delta's inputs become
+   // visible: non-coincident scans before the register advance (legacy);
+   // coincident advances FIRST — every flop's D then samples pre-edge state
+   // and PREVIOUS-delta-settled inputs (true NBA across the boundary; a
+   // mid-settle delta-0 glitch on an input can no longer poison a gated-clock
+   // register, which deadlocked ifu_mem_ctl's DMA arbitration FSM).
+   fprintf(f, "static int aj_scan_inputs(aj_cs_t *aj_cs, void **AJB){\n");
    // _chg: any NON-CLOCK input pin's raw bytes changed since the last eval
    // (clock-family pins still re-translate for sm_clock/mask use, but their
    // effect is an EDGE, captured by posedge/posedge_mask — so they don't force
@@ -2786,6 +2766,37 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                                         .width = pp->width, .elem = pp->elem };
       }
    }
+   fprintf(f, "  return _chg;\n}\n\n");
+   fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
+   fprintf(f, "  if(g_dbg<0) g_dbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?20000:0;\n");
+   fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
+   // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
+   fprintf(f, "  int _clk = CLK[0]&1;\n");
+   fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
+   // The bridge now runs on EVERY boundary-input-change delta (the rerouted
+   // combinational processes wake it), not just the clock edge. ADVANCE the
+   // registers once per clock cycle — at the first call with clk high at a NEW
+   // simulation time (the posedge); last_t holds the time we last advanced (a
+   // level edge-detect would need the bridge to also run during clk-low, which a
+   // posedge-optimized clocked process does NOT). COMB outputs re-settle on every
+   // call regardless (below).
+   // Reroute path: time-edge (bridge only runs when a rerouted process wakes it —
+   // reliably at the posedge, not during clk-low). VERIFY path: the harness runs
+   // the bridge EVERY delta (it sees clk-low too), so use a robust value-edge that
+   // never double-fires on a stray clk-high sample (e.g. a clock being stopped).
+   fprintf(f, "  int posedge;\n");
+   fprintf(f, "  if(VERIFY) posedge = (_clk && !aj_cs->clk_last0);\n");
+   fprintf(f, "  else { posedge = (_clk && t != last_t); if(posedge) last_t = t; }\n");
+   fprintf(f, "  aj_cs->clk_last0 = _clk;\n");
+   // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
+   // behaviour (no combinational re-settle on input-change deltas) — wrong for a
+   // Mealy boundary, used to demonstrate the settling fix.
+   if (getenv("NVC_ACCEL_NO_SETTLE"))
+      fprintf(f, "  if(!posedge) return;\n");
+   fprintf(f, "  outputs_t o;\n");
+   fprintf(f, "  memset(&o,0,sizeof o);\n");
+   if (nck == 0)
+      fprintf(f, "  int _chg = aj_scan_inputs(aj_cs, AJB);\n");
    // NVC_ACCEL_INDUMP: dump this cycle's SETTLED input vector (named, in pin
    // order) at each posedge, so a fork-checkpoint child can capture the exact
    // real stimulus around a divergence for offline replay (net_diff / xcheck).
@@ -2819,15 +2830,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          fprintf(f, "    if(!_noskip && !VERIFY && !posedge && !_chg && _rn==aj_cs->rst_prev) return;\n");
          fprintf(f, "    aj_cs->rst_prev = _rn; }\n");
       }
-      else {
-         // stash for emission after posedge_mask is computed (below)
-         snprintf(g_aj_skip_buf, sizeof(g_aj_skip_buf),
-            "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n"
-            "    int _rn = %s;\n"
-            "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && _rn==aj_cs->rst_prev) return;\n"
-            "    aj_cs->rst_prev = _rn; }\n",
-            rstv);
-      }
+      // multi-clock: the skip is emitted inline after the post-advance scan
+      // (see the nck>0 dispatch below); nothing stashed.
    }
    // Advance the registers to the next state ONLY on the clock posedge
    // (sm_clock). An async reset port (rst) resets immediately whenever asserted
@@ -2859,23 +2863,43 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // posedge (one sm_clock_masked call reads ONE pre-edge S), giving correct NBA
       // for coincident gated clocks. (A genuinely-lagging derived clock would need
       // the value-edge path; VeeR has none.)
-      fprintf(f, "  static int _coinc=-1; if(_coinc<0) _coinc=getenv(\"NVC_ACCEL_CK_COINCIDENT\")?1:0;\n");
+      if (spec)
+         fprintf(f, "  enum { _coinc = %d };\n",
+                 getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 1 : 0);
+      else
+         fprintf(f, "  static int _coinc=-1; if(_coinc<0) _coinc=getenv(\"NVC_ACCEL_CK_COINCIDENT\")?1:0;\n");
       fprintf(f, "  unsigned posedge_mask = 0;\n");
       fprintf(f, "  if(posedge) posedge_mask |= 1u;\n");
+      fprintf(f, "  int _chg = 0;\n");
+      // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
+      // clock from the freshly-scanned values — original behaviour, unchanged.
+      fprintf(f, "  if(!_coinc){\n");
+      fprintf(f, "    _chg = aj_scan_inputs(aj_cs, AJB);\n");
       for (int k = 0; k < nck; k++)
-         fprintf(f, "  { int _n=(in._%s&1);"
-                    " if(_coinc){ if(posedge) posedge_mask|=(1u<<(1+%d)); }"
-                    " else if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
-                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k, k);
+         fprintf(f, "    { int _n=(in._%s&1);"
+                    " if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
+                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k);
+      // coincident: every gated clock is the main edge; DEFER the scan until
+      // after the advance so flops sample previous-delta-settled inputs.
+      fprintf(f, "  } else {\n");
+      fprintf(f, "    if(posedge) posedge_mask |= %uu;\n",
+              ((1u << (nck + 1)) - 2u));
+      fprintf(f, "  }\n");
       fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
-      fputs(g_aj_skip_buf, f);   // unchanged-inputs skip (built above)
-      g_aj_skip_buf[0] = '\0';
       if (rst != NULL) {
          fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
          fprintf(f, "  else if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
       }
       else
          fprintf(f, "  if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
+      fprintf(f, "  if(_coinc) _chg = aj_scan_inputs(aj_cs, AJB);\n");
+      {
+         const char *rstv2 = (rst != NULL) ? "(RST[0]&1)" : "0";
+         fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
+         fprintf(f, "    int _rn = %s;\n", rstv2);
+         fprintf(f, "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && _rn==aj_cs->rst_prev) return;\n");
+         fprintf(f, "    aj_cs->rst_prev = _rn; }\n");
+      }
    }
    // ALWAYS re-settle the combinational outputs against the CURRENT state +
    // inputs. This runs on the posedge (after the register advance, so outputs
