@@ -209,6 +209,24 @@ static void emit_range(FILE *f, type_t type)
 static tree_t g_mem_sigs[MAX_MEM_SIGS];
 static int    g_n_mem_sigs = 0;
 
+// Hoisted process-locals / loop indices whose name collides with a module
+// signal or port get a __lp suffix; references follow by DECL IDENTITY (the
+// T_REF resolves to the loop/var decl, so no name ambiguity). VeeR's
+// ifu_compress_ctl has a 16-bit signal literally named `i` next to for-loops
+// indexed by `i` — the collision made yosys reject the whole module
+// ("Incompatible re-declaration of wire \i"), silently until now.
+#define MAX_REN_DECLS 128
+static tree_t g_ren_decls[MAX_REN_DECLS];
+static int    g_n_ren = 0;
+static hset_t *g_sig_names = NULL;   // module signal+port idents
+
+static bool ren_decl(tree_t d)
+{
+   for (int i = 0; i < g_n_ren; i++)
+      if (g_ren_decls[i] == d) return true;
+   return false;
+}
+
 static bool sig_is_mem(tree_t decl)
 {
    for (int i = 0; i < g_n_mem_sigs; i++)
@@ -447,6 +465,10 @@ static void emit_expr(FILE *f, tree_t e)
    switch (tree_kind(e)) {
    case T_REF:
       {
+         if (tree_has_ref(e) && ren_decl(tree_ref(e))) {
+            fprintf(f, "%s__lp", vid(tree_ident(e)));
+            break;
+         }
          const char *nm = vid(tree_ident(e));
          const char *bn = id_base(istr(tree_ident(e)));
          // logic3d constants L3D_0/L3D_1/L3D_0X/... -> value bit (2-state)
@@ -830,7 +852,16 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          // (tree_decl 0) is hoisted to a module-level `integer` by the caller.
          tree_t r = tree_range(s, 0);
          tree_t idecl = tree_decls(s) > 0 ? tree_decl(s, 0) : NULL;
-         const char *iv = idecl ? vid(tree_ident(idecl)) : "i";
+         static char ivbuf[96];
+         const char *iv = "i";
+         if (idecl != NULL) {
+            if (ren_decl(idecl)) {
+               snprintf(ivbuf, sizeof ivbuf, "%s__lp", vid(tree_ident(idecl)));
+               iv = ivbuf;
+            }
+            else
+               iv = vid(tree_ident(idecl));
+         }
          const bool to = (tree_subkind(r) == RANGE_TO);
          if (tree_subkind(r) != RANGE_TO && tree_subkind(r) != RANGE_DOWNTO) {
             g_unhandled++; tab(f, ind);
@@ -1361,7 +1392,7 @@ static bool local_seen(char seen[][64], int *nseen, const char *nm)
 {
    for (int i = 0; i < *nseen; i++)
       if (!strcmp(seen[i], nm)) return true;
-   if (*nseen < 256) { strncpy(seen[*nseen], nm, 63); seen[*nseen][63] = '\0'; (*nseen)++; }
+   if (*nseen < 8192) { strncpy(seen[*nseen], nm, 63); seen[*nseen][63] = '\0'; (*nseen)++; }
    return false;
 }
 
@@ -1376,7 +1407,19 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
          tree_t d = tree_decl(s, i);
          if (tree_kind(d) != T_VAR_DECL) continue;
          const char *nm = vid(tree_ident(d));
+         if (g_sig_names != NULL
+             && hset_contains(g_sig_names, ident_new(vid(tree_ident(d))))
+             && g_n_ren < MAX_REN_DECLS) {
+            g_ren_decls[g_n_ren++] = d;
+            char mn[96]; snprintf(mn, sizeof mn, "%s__lp", nm);
+            if (local_seen(seen, nseen, mn)) continue;
+            fputs("  reg ", f); emit_range(f, tree_type(d));
+            fprintf(f, "%s;\n", mn);
+            continue;
+         }
          if (local_seen(seen, nseen, nm)) continue;
+         if (g_sig_names != NULL)   // vars join the collision domain too
+            hset_insert(g_sig_names, ident_new(vid(tree_ident(d))));
          fputs("  reg ", f); emit_range(f, tree_type(d)); fprintf(f, "%s;\n", nm);
       }
       for (int i = 0; i < tree_stmts(s); i++)
@@ -1384,8 +1427,19 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
       break;
    case T_FOR:
       if (tree_decls(s) > 0) {
-         const char *nm = vid(tree_ident(tree_decl(s, 0)));
-         if (!local_seen(seen, nseen, nm)) fprintf(f, "  integer %s;\n", nm);
+         // Loop indices are purely local: mangle them UNCONDITIONALLY (__lp)
+         // so they can never collide with a module signal/port/var of the
+         // same name (VeeR's ifu_compress_ctl has a 16-bit signal `i` next
+         // to i-indexed loops — the collision made yosys reject the module,
+         // silently until the log_errfile fix). References follow by DECL
+         // IDENTITY (ren_decl), so no name ambiguity.
+         tree_t idc = tree_decl(s, 0);
+         if (!ren_decl(idc) && g_n_ren < MAX_REN_DECLS)
+            g_ren_decls[g_n_ren++] = idc;
+         char mn[96];
+         snprintf(mn, sizeof mn, "%s__lp", vid(tree_ident(idc)));
+         if (!local_seen(seen, nseen, mn))
+            fprintf(f, "  integer %s;\n", mn);
       }
       for (int i = 0; i < tree_stmts(s); i++)
          emit_proc_locals(f, tree_stmt(s, i), seen, nseen);
@@ -1426,6 +1480,19 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       return false;
 
    build_reg_set(block);   // one walk; is_reg() is then a set lookup
+
+   // module signal/port name set — hoisted locals colliding with these get
+   // renamed (__lp) to keep yosys from rejecting the module
+   if (g_sig_names != NULL) hset_free(g_sig_names);
+   g_sig_names = hset_new(256);
+   g_n_ren = 0;
+   for (int i = 0; i < tree_decls(block); i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) == T_SIGNAL_DECL)
+         hset_insert(g_sig_names, ident_new(vid(tree_ident(d))));
+   }
+   for (int i = 0; i < tree_ports(block); i++)
+      hset_insert(g_sig_names, ident_new(vid(tree_ident(tree_port(block, i)))));
 
    fprintf(f, "// auto-generated from nvc elaborated VHDL by vhdl2vlog\n");
    fprintf(f, "module %s (\n", modname);
@@ -1482,7 +1549,7 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    const int nstmts = tree_stmts(block);
 
    // hoist process-local variables (-> reg) and for-loop indices (-> integer)
-   char seen[256][64];
+   static char seen[8192][64];   // static: 512KB, too big for the stack
    int nseen = 0;
    for (int i = 0; i < nstmts; i++)
       emit_proc_locals(f, tree_stmt(block, i), seen, &nseen);
