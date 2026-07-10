@@ -215,16 +215,24 @@ static int    g_n_mem_sigs = 0;
 // ifu_compress_ctl has a 16-bit signal literally named `i` next to for-loops
 // indexed by `i` — the collision made yosys reject the whole module
 // ("Incompatible re-declaration of wire \i"), silently until now.
-#define MAX_REN_DECLS 128
-static tree_t g_ren_decls[MAX_REN_DECLS];
-static int    g_n_ren = 0;
+static hash_t *g_ren_map = NULL;   // var/index decl -> unique mangled suffix
+static int     g_ren_ctr = 0;      // per-module suffix counter
 static hset_t *g_sig_names = NULL;   // module signal+port idents
+
+static const char *ren_suffix(tree_t d)
+{
+   return (g_ren_map != NULL) ? (const char *)hash_get(g_ren_map, d) : NULL;
+}
 
 static bool ren_decl(tree_t d)
 {
-   for (int i = 0; i < g_n_ren; i++)
-      if (g_ren_decls[i] == d) return true;
-   return false;
+   return ren_suffix(d) != NULL;
+}
+
+static void ren_register(tree_t d, const char *sfx)
+{
+   if (g_ren_map == NULL) g_ren_map = hash_new(256);
+   hash_put(g_ren_map, d, (void *)xstrdup(sfx));
 }
 
 static bool sig_is_mem(tree_t decl)
@@ -466,7 +474,7 @@ static void emit_expr(FILE *f, tree_t e)
    case T_REF:
       {
          if (tree_has_ref(e) && ren_decl(tree_ref(e))) {
-            fprintf(f, "%s__lp", vid(tree_ident(e)));
+            fprintf(f, "%s%s", vid(tree_ident(e)), ren_suffix(tree_ref(e)));
             break;
          }
          const char *nm = vid(tree_ident(e));
@@ -856,7 +864,8 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          const char *iv = "i";
          if (idecl != NULL) {
             if (ren_decl(idecl)) {
-               snprintf(ivbuf, sizeof ivbuf, "%s__lp", vid(tree_ident(idecl)));
+               snprintf(ivbuf, sizeof ivbuf, "%s%s", vid(tree_ident(idecl)),
+                        ren_suffix(idecl));
                iv = ivbuf;
             }
             else
@@ -1216,7 +1225,9 @@ static bool is_counter_while(tree_t init_stmt, tree_t while_stmt, tree_t *Vout,
 static void emit_for_from_while(FILE *f, tree_t V, tree_t initv, tree_t cond,
                                 tree_t incv, tree_t while_stmt, int ind)
 {
-   const char *vn = vid(tree_ident(V));
+   char vn[120];
+   const char *sfx = ren_suffix(V);   // renamed hoisted vars: LHS must match refs
+   snprintf(vn, sizeof vn, "%s%s", vid(tree_ident(V)), sfx ? sfx : "");
    tab(f, ind);
    fprintf(f, "for (%s = ", vn); emit_expr(f, initv);
    fputs("; ", f);                emit_expr(f, cond);
@@ -1254,6 +1265,7 @@ static void emit_stmt_list(FILE *f, tree_t container, int ind)
 // emission the accel-install bottleneck (~50s/run in stmt_assigns). Instead
 // collect every process-assigned base ident in ONE walk and look up in a set.
 static hset_t *g_reg_set = NULL;   // idents assigned inside a process
+static hset_t *g_conc_set = NULL;  // idents driven by a CONCURRENT assign
 
 static void reg_scan_cb(tree_t t, void *ctx)
 {
@@ -1273,18 +1285,30 @@ static void reg_scan_cb(tree_t t, void *ctx)
 static void build_reg_set(tree_t block)
 {
    if (g_reg_set != NULL) hset_free(g_reg_set);
-   g_reg_set = hset_new(256);
+   if (g_conc_set != NULL) hset_free(g_conc_set);
+   g_reg_set  = hset_new(256);
+   g_conc_set = hset_new(256);
    const int nstmts = tree_stmts(block);
    for (int i = 0; i < nstmts; i++) {
       tree_t s = tree_stmt(block, i);
       if (tree_kind(s) == T_PROCESS)
          tree_visit(s, reg_scan_cb, g_reg_set);
+      else if (tree_kind(s) == T_SIGNAL_ASSIGN)   // concurrent assign
+         reg_scan_cb(s, g_conc_set);
    }
 }
 
+// A signal with a CONCURRENT driver must be `wire`: emitting it `reg` (because
+// some process ALSO touches a same-named signal, or a mis-scan) hands yosys the
+// tolerated-but-treacherous assign-to-reg form. In ifu_mem_ctl that mangled
+// `perr_state` (reg + assign from an instance-output slice) into cross-FSM
+// aliasing — the netlist's iccm_ready grew a spurious miss_state_idle term
+// that the RTL equation does not contain.
 static bool is_reg(tree_t block, tree_t decl)
 {
-   (void)block;   // set precomputed by build_reg_set()
+   (void)block;   // sets precomputed by build_reg_set()
+   if (g_conc_set != NULL && hset_contains(g_conc_set, tree_ident(decl)))
+      return false;
    return g_reg_set != NULL && hset_contains(g_reg_set, tree_ident(decl));
 }
 
@@ -1407,19 +1431,26 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
          tree_t d = tree_decl(s, i);
          if (tree_kind(d) != T_VAR_DECL) continue;
          const char *nm = vid(tree_ident(d));
-         if (g_sig_names != NULL
-             && hset_contains(g_sig_names, ident_new(vid(tree_ident(d))))
-             && g_n_ren < MAX_REN_DECLS) {
-            g_ren_decls[g_n_ren++] = d;
-            char mn[96]; snprintf(mn, sizeof mn, "%s__lp", nm);
-            if (local_seen(seen, nseen, mn)) continue;
+         // A variable whose name collides with a signal/port OR was already
+         // hoisted from ANOTHER process gets a unique per-module suffix.
+         // Sharing one module-scope reg between two always blocks is a
+         // synthesis multi-driver bug: yosys merged ifu_mem_ctl's perr/miss
+         // FSMs through the shared Verilog_Case_Ex temp, growing iccm_ready
+         // a spurious miss-idle term.
+         const bool sig_clash = g_sig_names != NULL
+            && hset_contains(g_sig_names, ident_new(nm));
+         if (sig_clash || local_seen(seen, nseen, nm)) {
+            char sfx[24], mn[120];
+            snprintf(sfx, sizeof sfx, "__pv%d", g_ren_ctr++);
+            ren_register(d, sfx);
+            snprintf(mn, sizeof mn, "%s%s", nm, sfx);
+            local_seen(seen, nseen, mn);
             fputs("  reg ", f); emit_range(f, tree_type(d));
             fprintf(f, "%s;\n", mn);
             continue;
          }
-         if (local_seen(seen, nseen, nm)) continue;
          if (g_sig_names != NULL)   // vars join the collision domain too
-            hset_insert(g_sig_names, ident_new(vid(tree_ident(d))));
+            hset_insert(g_sig_names, ident_new(nm));
          fputs("  reg ", f); emit_range(f, tree_type(d)); fprintf(f, "%s;\n", nm);
       }
       for (int i = 0; i < tree_stmts(s); i++)
@@ -1434,10 +1465,13 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
          // silently until the log_errfile fix). References follow by DECL
          // IDENTITY (ren_decl), so no name ambiguity.
          tree_t idc = tree_decl(s, 0);
-         if (!ren_decl(idc) && g_n_ren < MAX_REN_DECLS)
-            g_ren_decls[g_n_ren++] = idc;
-         char mn[96];
-         snprintf(mn, sizeof mn, "%s__lp", vid(tree_ident(idc)));
+         if (!ren_decl(idc)) {
+            char sfx[24];
+            snprintf(sfx, sizeof sfx, "__lp%d", g_ren_ctr++);
+            ren_register(idc, sfx);
+         }
+         char mn[120];
+         snprintf(mn, sizeof mn, "%s%s", vid(tree_ident(idc)), ren_suffix(idc));
          if (!local_seen(seen, nseen, mn))
             fprintf(f, "  integer %s;\n", mn);
       }
@@ -1485,7 +1519,8 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    // renamed (__lp) to keep yosys from rejecting the module
    if (g_sig_names != NULL) hset_free(g_sig_names);
    g_sig_names = hset_new(256);
-   g_n_ren = 0;
+   g_ren_map = NULL;   // dropped per module; translator process is short-lived
+   g_ren_ctr = 0;
    for (int i = 0; i < tree_decls(block); i++) {
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) == T_SIGNAL_DECL)

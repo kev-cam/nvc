@@ -1759,6 +1759,8 @@ struct _aj_defer_out {
    bool           defer;      // bank-switch this output (vs deposit_signal)
    bool           dirty;      // shadow staged this cycle, awaiting swap
    bool           verify_flagged;  // NVC_ACCEL_VERIFY: already reported diverged
+   bool           off_edge;   // seen changing on a non-posedge delta => Mealy/
+                              // combinational => never route through NBA region
 };
 
 // NVC_ACCEL_VERIFY report: compact logic3d-bytes -> value hex (bit0 of each
@@ -1833,8 +1835,34 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
       d->dirty = true;
       c->defer_pending = true;
    }
-   else
-      deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+   else {
+      // Route genuine flop-Q outputs through nvc's non-blocking (NBA) region —
+      // the SAME region native Verilog `<=` schedules into (--std=2040). Every
+      // flop in the design, interpreted or accel-chunk, then commits in one
+      // consistent region, so a consumer's flop reads this producer's PRE-edge
+      // value this delta and the new value only after the NBA region. That is
+      // exact flop-to-flop timing across a chunk boundary and fixes the
+      // cross-chunk gated-clock race (a consumer no longer captures a producer's
+      // post-edge Q one delta early when both sides are accel). The blocking
+      // deposit only approximated this via a next-delta wake, which drifted once
+      // the consumer sampled at its own later gated-clock delta.
+      //
+      // ONLY registered outputs may move to NBA: a Mealy/combinational output
+      // must stay visible in the active region. `posedge` alone is per-EVAL, not
+      // per-output (a comb output can change in a posedge delta), so classify at
+      // runtime — any output ever seen changing on a NON-posedge delta is Mealy
+      // and pinned to the immediate deposit (mirrors the deferred-bank fallback
+      // at the top of this function).
+      static int _nba = -1;
+      if (_nba < 0) _nba = getenv("NVC_ACCEL_NBA") ? 1 : 0;
+      aj_defer_out_t *d = (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count)
+                          ? &c->defer_outs[ord] : NULL;
+      if (!posedge && d != NULL) d->off_edge = true;
+      if (_nba && posedge && d != NULL && !d->off_edge)
+         sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, true /*nonblock*/);
+      else
+         deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+   }
 }
 
 // NVC_ACCEL_HANDOFF: producer-side poke. Called from the generated bridge for
@@ -2517,6 +2545,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 {
    char *dut_text = aj_read_file(dutc);
    if (!dut_text) return false;
+   // sm_clock_late present? (extra-group commits from a pre-edge snapshot +
+   // current inputs, at each gated clock's own value edge)
+   const bool has_late = strstr(dut_text, "void sm_clock_late") != NULL;
 
    // Multi-clock: gen_statemachine emits `const char *sm_extra_clocks[] = {...};`
    // listing the non-main clock INPUT field base-names. The bridge edge-detects
@@ -2619,11 +2650,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", raw_total);
    else
       // per-extra-clock last value, for value-edge detection across deltas.
+      // snapS/late_pend (late-capable models): pre-edge state snapshot taken
+      // at the main posedge + the extra-group bits still awaiting their
+      // clock's value edge (sm_clock_late commits them from snapS + current
+      // inputs — the interp-faithful gated-clock semantics).
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0; unsigned char ck_last[%d];"
+                 "%s"
                  " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
                  " outputs_t o_prev;"
-                 " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck, raw_total);
+                 " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck,
+              has_late ? " state_t snapS; unsigned char late_pend;" : "",
+              raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
@@ -2638,7 +2676,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  " aj_cs->shadow_valid = 0; aj_cs->ext_chg = 0;"
                  " memset(&aj_cs->o_prev, 0, sizeof aj_cs->o_prev);"
                  " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live);"
-                 " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n", nck);
+                 "%s"
+                 " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n",
+              has_late ? " aj_cs->late_pend = 0;" : "", nck);
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
    chunk->bindtab[0] = (void *)&deposit_signal;
@@ -2863,17 +2903,36 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // posedge (one sm_clock_masked call reads ONE pre-edge S), giving correct NBA
       // for coincident gated clocks. (A genuinely-lagging derived clock would need
       // the value-edge path; VeeR has none.)
-      if (spec)
-         fprintf(f, "  enum { _coinc = %d };\n",
-                 getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 1 : 0);
-      else
+      const int env_late = has_late
+         && getenv("NVC_ACCEL_CK_LATE") != NULL ? 1 : 0;
+      if (spec) {
+         fprintf(f, "  enum { _coinc = %d, _late = %d };\n",
+                 getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 1 : 0, env_late);
+      }
+      else {
          fprintf(f, "  static int _coinc=-1; if(_coinc<0) _coinc=getenv(\"NVC_ACCEL_CK_COINCIDENT\")?1:0;\n");
+         if (has_late)
+            fprintf(f, "  static int _late=-1; if(_late<0) _late=getenv(\"NVC_ACCEL_CK_LATE\")?1:0;\n");
+         else
+            fprintf(f, "  enum { _late = 0 };\n");
+      }
       fprintf(f, "  unsigned posedge_mask = 0;\n");
       fprintf(f, "  if(posedge) posedge_mask |= 1u;\n");
       fprintf(f, "  int _chg = 0;\n");
+      // LATE mode: snapshot the pre-edge state at the main posedge; the extra
+      // groups commit later, at each gated clock's own VALUE edge, from
+      // (snapshot registers + at-that-delta inputs) — the interp-faithful
+      // semantics for both internal-cone flops (dec ibvalff: pre-edge state)
+      // and input-fed flops (mem_ctl ok_prev, lsu bus enables: the input as
+      // of the gater's rise). Group 0 still advances at the posedge below.
+      if (has_late)
+         // NOTE: `S` is a macro for aj_cs->S — writing aj_cs->S here would
+         // expand into aj_cs->(aj_cs->S). Use the macro.
+         fprintf(f, "  if(_late && posedge){ aj_cs->snapS = S;"
+                    " aj_cs->late_pend = %uu; }\n", ((1u << (nck + 1)) - 2u));
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
-      fprintf(f, "  if(!_coinc){\n");
+      fprintf(f, "  if(!_late && !_coinc){\n");
       fprintf(f, "    _chg = aj_scan_inputs(aj_cs, AJB);\n");
       for (int k = 0; k < nck; k++)
          fprintf(f, "    { int _n=(in._%s&1);"
@@ -2881,7 +2940,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                     " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k);
       // coincident: every gated clock is the main edge; DEFER the scan until
       // after the advance so flops sample previous-delta-settled inputs.
-      fprintf(f, "  } else {\n");
+      fprintf(f, "  } else if(!_late) {\n");
       fprintf(f, "    if(posedge) posedge_mask |= %uu;\n",
               ((1u << (nck + 1)) - 2u));
       fprintf(f, "  }\n");
@@ -2892,7 +2951,20 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       }
       else
          fprintf(f, "  if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
-      fprintf(f, "  if(_coinc) _chg = aj_scan_inputs(aj_cs, AJB);\n");
+      fprintf(f, "  if(_late || _coinc) _chg = aj_scan_inputs(aj_cs, AJB);\n");
+      if (has_late) {
+         // gated-clock value edges, from the freshly-scanned inputs; each
+         // pending group commits ONCE per main-clock cycle
+         fprintf(f, "  if(_late){\n");
+         for (int k = 0; k < nck; k++)
+            fprintf(f, "    { int _n=(in._%s&1);"
+                       " if(_n && !aj_cs->ck_last[%d] && (aj_cs->late_pend & (1u<<(1+%d)))){"
+                       " sm_clock_late(&S, &aj_cs->snapS, &in, (1u<<(1+%d)));"
+                       " aj_cs->late_pend &= ~(1u<<(1+%d)); _chg = 1; }"
+                       " aj_cs->ck_last[%d]=_n; }\n",
+                    extra_clk[k], k, k, k, k, k);
+         fprintf(f, "  }\n");
+      }
       {
          const char *rstv2 = (rst != NULL) ? "(RST[0]&1)" : "0";
          fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
