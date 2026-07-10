@@ -1662,6 +1662,71 @@ struct _aj_chunk {
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
+
+// Comb-at-edge staging: an accel chunk computes the comb consequence of a
+// clock edge IN the edge delta, but the interpreter only exposes it two
+// deltas later (flop NBA at end-of-edge-delta -> comb process runs next
+// delta -> its assignment is visible the delta after). Deposit immediately
+// and a gated-clock late-commit in the gap samples it a cycle early (the
+// dec<->exu race, via exu's comb flush outputs). Stage such changes and
+// apply them at END_OF_PROCESSES of the FOLLOWING delta: bytes land at
+// end of delta N+1, readers wake and same-delta scanners see them from
+// delta N+2 -- interp-exact.
+typedef struct {
+   rt_signal_t   *sig;
+   unsigned char *buf;
+   size_t         bufsz;
+   int            width;
+   bool           armed;   // false = staged this delta; true = apply next
+} aj_stage2_t;
+static aj_stage2_t *g_aj_stage2 = NULL;
+static int g_aj_stage2_n = 0, g_aj_stage2_cap = 0;
+
+static void aj_stage2_put(rt_signal_t *sig, const void *buf, size_t bufsz,
+                          int width)
+{
+   for (int i = 0; i < g_aj_stage2_n; i++)
+      if (g_aj_stage2[i].sig == sig) {      // latest value wins, keep phase
+         assert(g_aj_stage2[i].bufsz == bufsz);
+         memcpy(g_aj_stage2[i].buf, buf, bufsz);
+         return;
+      }
+   if (g_aj_stage2_n == g_aj_stage2_cap) {
+      g_aj_stage2_cap = g_aj_stage2_cap ? g_aj_stage2_cap * 2 : 32;
+      g_aj_stage2 = xrealloc_array(g_aj_stage2, g_aj_stage2_cap,
+                                   sizeof(aj_stage2_t));
+   }
+   aj_stage2_t *e = &g_aj_stage2[g_aj_stage2_n++];
+   e->sig = sig; e->bufsz = bufsz; e->width = width; e->armed = false;
+   e->buf = xmalloc(bufsz);
+   memcpy(e->buf, buf, bufsz);
+}
+
+static void aj_stage2_cancel(rt_signal_t *sig)
+{
+   for (int i = 0; i < g_aj_stage2_n; i++)
+      if (g_aj_stage2[i].sig == sig) {
+         free(g_aj_stage2[i].buf);
+         g_aj_stage2[i] = g_aj_stage2[--g_aj_stage2_n];
+         return;
+      }
+}
+
+static void aj_apply_stage2(rt_model_t *m)
+{
+   for (int i = 0; i < g_aj_stage2_n; ) {
+      aj_stage2_t *e = &g_aj_stage2[i];
+      if (e->armed) {
+         deposit_signal(m, e->sig, e->buf, 0, e->width);
+         free(e->buf);
+         *e = g_aj_stage2[--g_aj_stage2_n];
+      }
+      else {
+         e->armed = true;
+         i++;
+      }
+   }
+}
 static aj_chunk_t *g_aj_cur_chunk = NULL;  // chunk whose eval is running
 
 // NVC_ACCEL_VERIFY: run the accel .so as a PASSIVE companion of the interpreter
@@ -1853,15 +1918,29 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
       // runtime — any output ever seen changing on a NON-posedge delta is Mealy
       // and pinned to the immediate deposit (mirrors the deferred-bank fallback
       // at the top of this function).
-      static int _nba = -1;
-      if (_nba < 0) _nba = getenv("NVC_ACCEL_NBA") ? 1 : 0;
-      aj_defer_out_t *d = (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count)
-                          ? &c->defer_outs[ord] : NULL;
-      if (!posedge && d != NULL) d->off_edge = true;
-      if (_nba && posedge && d != NULL && !d->off_edge)
+      // The bridge bakes the per-output cone class (gen_statemachine's
+      // sm_comb_outputs table) into bit2 of the posedge argument; bit0 is the
+      // eval's edge flag. Under NVC_ACCEL_NBA:
+      //   reg-only output @edge  -> NBA region (interp flop `<=`: visible d1)
+      //   comb output     @edge  -> 2-delta stage (interp comb-of-edge: d2)
+      //   anything off-edge      -> immediate (interp active-region comb)
+      static int _nba = -1, _st2 = -1;
+      if (_nba < 0) {
+         _nba = getenv("NVC_ACCEL_NBA") ? 1 : 0;
+         const char *s2 = getenv("NVC_ACCEL_STAGE2");
+         _st2 = s2 ? atoi(s2) : _nba;   // default: follow NBA; 0 forces off
+      }
+      const int pe = posedge & 1, combcls = posedge & 4;
+      if (_nba && pe && !combcls)
          sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, true /*nonblock*/);
-      else
+      else if (_st2 && pe && combcls && c != NULL && ord >= 0
+               && (unsigned)ord < c->defer_count)
+         aj_stage2_put((rt_signal_t *)sigp, buf,
+                       c->defer_outs[ord].valuesz, width);
+      else {
+         if (_st2) aj_stage2_cancel((rt_signal_t *)sigp);  // newer value wins
          deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+      }
    }
 }
 
@@ -2660,7 +2739,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
                  " outputs_t o_prev;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck,
-              has_late ? " state_t snapS; unsigned char late_pend;" : "",
+              has_late ? " state_t snapS; inputs_t snapIn;"
+                         " unsigned char late_pend;" : "",
               raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
@@ -2906,13 +2986,16 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       const int env_late = has_late
          && getenv("NVC_ACCEL_CK_LATE") != NULL ? 1 : 0;
       if (spec) {
-         fprintf(f, "  enum { _coinc = %d, _late = %d };\n",
-                 getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 1 : 0, env_late);
+         fprintf(f, "  enum { _coinc = %d, _late = %d, _lsnap = %d };\n",
+                 getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 1 : 0, env_late,
+                 getenv("NVC_ACCEL_LATE_SNAPIN") != NULL ? 1 : 0);
       }
       else {
          fprintf(f, "  static int _coinc=-1; if(_coinc<0) _coinc=getenv(\"NVC_ACCEL_CK_COINCIDENT\")?1:0;\n");
-         if (has_late)
+         if (has_late) {
             fprintf(f, "  static int _late=-1; if(_late<0) _late=getenv(\"NVC_ACCEL_CK_LATE\")?1:0;\n");
+            fprintf(f, "  static int _lsnap=-1; if(_lsnap<0) _lsnap=getenv(\"NVC_ACCEL_LATE_SNAPIN\")?1:0;\n");
+         }
          else
             fprintf(f, "  enum { _late = 0 };\n");
       }
@@ -2929,6 +3012,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          // NOTE: `S` is a macro for aj_cs->S — writing aj_cs->S here would
          // expand into aj_cs->(aj_cs->S). Use the macro.
          fprintf(f, "  if(_late && posedge){ aj_cs->snapS = S;"
+                    " aj_cs->snapIn = in;"
                     " aj_cs->late_pend = %uu; }\n", ((1u << (nck + 1)) - 2u));
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
@@ -2954,13 +3038,22 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       fprintf(f, "  if(_late || _coinc) _chg = aj_scan_inputs(aj_cs, AJB);\n");
       if (has_late) {
          // gated-clock value edges, from the freshly-scanned inputs; each
-         // pending group commits ONCE per main-clock cycle
+         // pending group commits ONCE per main-clock cycle.
+         // A fired late commit IS a clock edge: set aj_pe so the outputs it
+         // changes reach AJ_OUT edge-classified. Without this they arrived
+         // with posedge=0, were permanently pinned off_edge (Mealy) and thus
+         // excluded from the NBA-region deposit — leaving cross-chunk capture
+         // at a shared gated-clock delta dependent on procq eval order (the
+         // immediate deposit is same-delta-visible to a later-evaluated
+         // chunk's input scan; interp is immune because native `<=` commits
+         // in the NBA region).
          fprintf(f, "  if(_late){\n");
          for (int k = 0; k < nck; k++)
             fprintf(f, "    { int _n=(in._%s&1);"
                        " if(_n && !aj_cs->ck_last[%d] && (aj_cs->late_pend & (1u<<(1+%d)))){"
-                       " sm_clock_late(&S, &aj_cs->snapS, &in, (1u<<(1+%d)));"
-                       " aj_cs->late_pend &= ~(1u<<(1+%d)); _chg = 1; }"
+                       " sm_clock_late(&S, &aj_cs->snapS,"
+                       " _lsnap ? &aj_cs->snapIn : &in, (1u<<(1+%d)));"
+                       " aj_cs->late_pend &= ~(1u<<(1+%d)); _chg = 1; aj_pe = 1; }"
                        " aj_cs->ck_last[%d]=_n; }\n",
                     extra_clk[k], k, k, k, k, k);
          fprintf(f, "  }\n");
@@ -3018,6 +3111,37 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // (main posedge) is 0; pass `aj_pe = (posedge_mask!=0)` so any-group advance
    // still counts as an edge. Single-clock keeps the literal `posedge`.
    const char *pe_arg = (nck > 0) ? "aj_pe" : "posedge";
+   // Per-output cone class from gen_statemachine: `sm_comb_outputs[] = {...}`
+   // lists outputs whose combinational cone reaches a boundary input (Mealy).
+   // Those must stay in the ACTIVE region (posedge literal 0 -> immediate
+   // deposit); register-only outputs keep the real edge flag and may commit
+   // in the NBA region under NVC_ACCEL_NBA. Absent table (older model .c)
+   // -> every output is treated Mealy (today's behaviour).
+   char comb_out[256][64];
+   int n_comb_out = 0;
+   {
+      const char *start = strstr(dut_text, "const char *sm_comb_outputs[] = {");
+      if (start != NULL) {
+         start += strlen("const char *sm_comb_outputs[] = {");
+         const char *end = strchr(start, '}');
+         const char *p = start;
+         while (end != NULL && n_comb_out < 256) {
+            const char *q = strchr(p, '"');
+            if (q == NULL || q >= end) break;
+            const char *e = strchr(q + 1, '"');
+            if (e == NULL || e >= end) break;
+            int len = (int)(e - q - 1);
+            if (len > 0 && len < 64) {
+               memcpy(comb_out[n_comb_out], q + 1, len);
+               comb_out[n_comb_out][len] = '\0';
+               n_comb_out++;
+            }
+            p = e + 1;
+         }
+      }
+      else
+         n_comb_out = -1;   // no table: treat ALL outputs as Mealy
+   }
    // Build the deferred-output table in emit order so the bridge's per-output
    // ordinal matches m->aj_defer_outs[ord]. Each output is classified now (the
    // fast-clk table already exists — aj_build_fastclk runs before emit); a
@@ -3029,6 +3153,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    for (int i = 0; i < npins; i++) {
       if (!pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
+      bool is_comb = (n_comb_out < 0);   // no table -> conservative Mealy
+      for (int ci = 0; ci < n_comb_out && !is_comb; ci++)
+         if (strcmp(comb_out[ci], pins[i].name) == 0) is_comb = true;
+      char pe_buf[32];
+      snprintf(pe_buf, sizeof pe_buf, "(4|%s)", pe_arg);
+      const char *pe_i = is_comb ? pe_buf : pe_arg;
       const int bufsz = pins[i].width * pins[i].elem > 0
                         ? pins[i].width * pins[i].elem : 1;   // width*elem bytes
       if (!spec) {
@@ -3083,7 +3213,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                           " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                        spec ? "" : "else ",
                        bufsz, pins[i].width, pins[i].width, pins[i].elem,
-                       pins[i].name, ord, ord, pins[i].width, pe_arg);
+                       pins[i].name, ord, ord, pins[i].width, pe_i);
             }
          }
          else {
@@ -3103,7 +3233,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                           " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                        spec ? "" : "else ",
                        bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-                       ord, ord, pins[i].width, pe_arg);
+                       ord, ord, pins[i].width, pe_i);
             }
          }
       }
@@ -6968,6 +7098,7 @@ static void model_cycle(rt_model_t *m)
    // NVC_ACCEL_HANDOFF: this delta's procs have all run — publish staged packed
    // pokes (next-delta visibility, like deposit) and schedule the consumers.
    aj_apply_pokes(m);
+   aj_apply_stage2(m);
 
    // NVC_ACCEL_VERIFY: advance each companion .so's state this delta (no compare)
    // so its multi-clock register ordering tracks the rerouted model delta-for-delta
