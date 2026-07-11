@@ -1662,6 +1662,7 @@ struct _aj_chunk {
    // per-delta eval dedup (see aj_proc_eval)
    uint64_t         last_eval_now;
    int              last_eval_iter;
+   uint64_t         live_out_mask[4]; // dead-output pruning (re-applied on respec)
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -2486,6 +2487,9 @@ static void aj_respecialize(rt_model_t *m)
          continue;
       }
       c->eval = eval;   // the swap: dispatch now points at specialized code
+      // the specialized .so has its own sm_live_outputs — re-apply the mask
+      uint64_t *lom = dlsym(dl, "sm_live_outputs");
+      if (lom != NULL) memcpy(lom, c->live_out_mask, sizeof c->live_out_mask);
       notef("accel-jit: respecialized '%s' (link results compiled in)",
             c->rs_top);
    }
@@ -3722,6 +3726,92 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    else {
       aj_reroute(scope, chunk);
       notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
+      // Dead-output pruning: an output whose consumer-visible nexus has NO
+      // readers (empty pending list — wave watchers and processes both live
+      // there — and no downstream port) is never observed; clear its bit in
+      // the model's exported sm_live_outputs so the cone cells exclusive to
+      // it are skipped at run time (e.g. the retire-trace buses when the tb
+      // variant doesn't sample them). VERIFY never prunes (compares all).
+      for (int mi = 0; mi < 4; mi++) chunk->live_out_mask[mi] = ~0ull;
+      // Opt-in only: automatic liveness detection via pending-lists is
+      // UNSOUND for time-waiting readers (`wait for`/`wait until` processes
+      // are not in any signal's pending list while blocked on time — the toy
+      // checkers read Y that way and auto-pruning zeroed them). The tb author
+      // declares dead outputs explicitly: NVC_ACCEL_PRUNE=name1,name2 — or
+      // NVC_ACCEL_PRUNE=auto accepts the heuristic (sensitivity-list readers
+      // and wave watchers are visible; time-waiting readers are NOT).
+      const char *prune_env = getenv("NVC_ACCEL_PRUNE");
+      if (prune_env != NULL && prune_env[0] != '\0') {
+         const bool prune_auto = strcmp(prune_env, "auto") == 0;
+         uint64_t *lom = dlsym(dl, "sm_live_outputs");
+         char *dtx = aj_read_file(dutc);
+         const char *ord_tab = (dtx != NULL)
+            ? strstr(dtx, "const char *sm_output_order[] = {") : NULL;
+         if (lom != NULL && ord_tab != NULL) {
+            int pruned = 0;
+            for (int i = 0; i < npins; i++) {
+               if (!pins[i].is_output || pins[i].sig == NULL) continue;
+               bool dead = false;
+               if (prune_auto) {
+                  // heuristic: live iff ANY nexus (following single-port
+                  // hops) has pending readers/watchers
+                  bool live = false;
+                  rt_signal_t *sg = pins[i].sig;
+                  rt_nexus_t *n = &sg->nexus;
+                  for (unsigned nx = 0; nx < sg->n_nexus && !live;
+                       nx++, n = n->chain) {
+                     rt_nexus_t *t = n;
+                     for (int hop = 0; hop < 4 && t != NULL; hop++) {
+                        if (!aj_pending_empty(t->pending)) { live = true; break; }
+                        rt_source_t *o = t->outputs;
+                        if (o == NULL) break;
+                        if (o->chain_output != NULL || o->tag != SOURCE_PORT
+                            || o->u.port.conv_func != NULL) { live = true; break; }
+                        t = o->u.port.output;
+                     }
+                  }
+                  dead = !live;
+               }
+               else {
+                  // explicit comma list of output names to prune
+                  const char *p = prune_env;
+                  size_t nl = strlen(pins[i].name);
+                  while (*p != '\0') {
+                     const char *e = strchr(p, ',');
+                     size_t len = (e != NULL) ? (size_t)(e - p) : strlen(p);
+                     if (len == nl && strncmp(p, pins[i].name, nl) == 0) {
+                        dead = true; break;
+                     }
+                     if (e == NULL) break;
+                     p = e + 1;
+                  }
+               }
+               if (!dead) continue;
+               // find this output's bit in sm_output_order
+               const char *p = ord_tab;
+               int idx = 0; bool found = false;
+               while ((p = strchr(p, '"')) != NULL) {
+                  const char *e = strchr(p + 1, '"');
+                  if (e == NULL) break;
+                  if ((size_t)(e - p - 1) == strlen(pins[i].name)
+                      && strncmp(p + 1, pins[i].name, e - p - 1) == 0) {
+                     found = true; break;
+                  }
+                  idx++;
+                  p = e + 1;
+                  if (*p == '}' || idx >= 256) break;
+               }
+               if (found && idx < 256) {
+                  chunk->live_out_mask[idx >> 6] &= ~(1ull << (idx & 63));
+                  pruned++;
+               }
+            }
+            memcpy(lom, chunk->live_out_mask, sizeof chunk->live_out_mask);
+            if (pruned > 0)
+               notef("accel-jit: pruned %d unread output cone(s)", pruned);
+         }
+         free(dtx);
+      }
    }
    return true;
 }
