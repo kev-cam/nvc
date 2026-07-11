@@ -218,6 +218,14 @@ static int    g_n_mem_sigs = 0;
 static hash_t *g_ren_map = NULL;   // var/index decl -> unique mangled suffix
 static int     g_ren_ctr = 0;      // per-module suffix counter
 static hset_t *g_sig_names = NULL;   // module signal+port idents
+// True while emitting a COMBINATIONAL process body (always @(*)). SystemVerilog
+// always_comb uses blocking '='; sv2ghdl represents it as VHDL signal '<=', and
+// a naive '<=' in always @(*) is a non-blocking-in-comb anti-pattern — for a
+// self-accumulating target (x |= t  ->  x <= x | t) yosys reads the external
+// wire and drives it back => a combinational LOOP (which the ATPG levelizer and
+// clean tooling reject). Emit '=' for signal assigns inside a comb process to
+// recover the blocking semantics and break the loop.
+static bool g_comb_proc = false;
 
 static const char *ren_suffix(tree_t d)
 {
@@ -830,7 +838,8 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          // VHDL variables update immediately (Verilog blocking '='); signals are
          // scheduled (non-blocking '<='). A reduction-loop accumulator is a
          // variable and MUST be blocking or each iteration reads the stale value.
-         fputs(tree_kind(s) == T_VAR_ASSIGN ? " = " : " <= ", f);
+         const bool blocking = tree_kind(s) == T_VAR_ASSIGN || g_comb_proc;
+         fputs(blocking ? " = " : " <= ", f);
          if (tree_kind(s) == T_VAR_ASSIGN)
             emit_expr(f, tree_value(s));
          else if (tree_waveforms(s) > 0 && tree_has_value(tree_waveform(s, 0)))
@@ -984,7 +993,10 @@ static void emit_process(FILE *f, tree_t p)
       }
       else {
          fputs("  always @(*) begin\n", f);
+         const bool save = g_comb_proc;
+         g_comb_proc = true;          // signal assigns here are blocking '='
          emit_stmt_list(f, p, 4);
+         g_comb_proc = save;
          fputs("  end\n", f);
       }
    }
