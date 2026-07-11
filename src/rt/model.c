@@ -2648,6 +2648,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // sm_clock_late present? (extra-group commits from a pre-edge snapshot +
    // current inputs, at each gated clock's own value edge)
    const bool has_late = strstr(dut_text, "void sm_clock_late") != NULL;
+   // Fused commit+outputs (one full pass + output-cone recompute instead of
+   // sm_clock's pass followed by a full sm_comb pass) — models emitted by
+   // newer gen_statemachine provide it; older cached models fall back.
+   const bool has_clock_out = strstr(dut_text, "void sm_clock_out") != NULL;
+   const bool has_late_out  = strstr(dut_text, "void sm_clock_late_out") != NULL;
 
    // Multi-clock: gen_statemachine emits `const char *sm_extra_clocks[] = {...};`
    // listing the non-main clock INPUT field base-names. The bridge edge-detects
@@ -2979,13 +2984,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // (any delta), matching real async-reset hardware; otherwise advance on the
    // edge. gen_statemachine folds a SYNC reset into the model's logic (it reads
    // the reset as a normal input), so sm_clock handles that itself.
+   fprintf(f, "  int _fused = 0;\n");
    if (nck == 0) {
+      const char *adv = has_clock_out
+         ? "{ if(!VERIFY){ sm_clock_out(&S,&in,&o,1u); _fused=1; }"
+           " else sm_clock(&S,&in); }"
+         : "sm_clock(&S,&in);";
       if (rst != NULL) {
          fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
-         fprintf(f, "  else if(posedge) sm_clock(&S,&in);\n");
+         fprintf(f, "  else if(posedge) %s\n", adv);
       }
       else
-         fprintf(f, "  if(posedge) sm_clock(&S,&in);\n");
+         fprintf(f, "  if(posedge) %s\n", adv);
    }
    else {
       // Multi-clock: build a per-group posedge mask. Bit0 = main clk (time-edge,
@@ -3050,12 +3060,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
               ((1u << (nck + 1)) - 2u));
       fprintf(f, "  }\n");
       fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
-      if (rst != NULL) {
-         fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
-         fprintf(f, "  else if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
+      {
+         const char *adv = has_clock_out
+            ? "{ if(!VERIFY){ sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
+              " else sm_clock_masked(&S,&in,posedge_mask); }"
+            : "sm_clock_masked(&S,&in,posedge_mask);";
+         if (rst != NULL) {
+            fprintf(f, "  if(RST[0]&1) sm_reset(&S);\n");
+            fprintf(f, "  else if(posedge_mask) %s\n", adv);
+         }
+         else
+            fprintf(f, "  if(posedge_mask) %s\n", adv);
       }
-      else
-         fprintf(f, "  if(posedge_mask) sm_clock_masked(&S,&in,posedge_mask);\n");
       fprintf(f, "  if(_late || _coinc) _chg = aj_scan_inputs(aj_cs, AJB);\n");
       if (has_late) {
          // gated-clock value edges, from the freshly-scanned inputs; each
@@ -3096,8 +3112,17 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          fprintf(f, "      static int _evalsnap=-1; if(_evalsnap<0)"
                     " _evalsnap=getenv(\"NVC_ACCEL_LATE_EVALSNAP\")?1:0;\n");
          fprintf(f, "      if(_evalsnap) aj_cs->snapS = S;\n");
-         fprintf(f, "      sm_clock_late(&S, &aj_cs->snapS,"
-                    " _lsnap ? &aj_cs->snapIn : &in, _fired);\n");
+         if (has_late_out)
+            // fused: late-D-cone commit + output-cone recompute in one call;
+            // the tail full sm_comb is skipped for this eval
+            fprintf(f, "      if(!VERIFY){"
+                       " sm_clock_late_out(&S, &aj_cs->snapS,"
+                       " _lsnap ? &aj_cs->snapIn : &in, &o, _fired); _fused=1; }"
+                       " else sm_clock_late(&S, &aj_cs->snapS,"
+                       " _lsnap ? &aj_cs->snapIn : &in, _fired);\n");
+         else
+            fprintf(f, "      sm_clock_late(&S, &aj_cs->snapS,"
+                       " _lsnap ? &aj_cs->snapIn : &in, _fired);\n");
          fprintf(f, "      aj_cs->late_pend &= ~_fired; _chg = 1; aj_pe = 1;\n");
          fprintf(f, "    }\n");
          fprintf(f, "  }\n");
@@ -3116,7 +3141,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // cycle — intra-cycle combinational settling that converges to the same
    // fixpoint nvc's interpreted delta loop reaches. No lookahead needed: outputs
    // are deposited THIS delta (below) and propagate immediately via wakeup.
-   fprintf(f, "  sm_comb(&S,&in,&o);\n");
+   fprintf(f, "  if(!_fused) sm_comb(&S,&in,&o);\n");
    // NVC_ACCEL_SMDUMP: dump the accel model's ALL internal nets (registers +
    // combinational) once per cycle at the posedge, in the REAL sim — accurate
    // multi-clock + real stimulus. Trace where a divergence enters a cone that
