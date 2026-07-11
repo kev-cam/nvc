@@ -1659,6 +1659,9 @@ struct _aj_chunk {
    aj_pin_t         rs_clk, rs_rst;
    bool             rs_have_rst;
    unsigned long    rs_state_size;   // sanity check across the swap
+   // per-delta eval dedup (see aj_proc_eval)
+   uint64_t         last_eval_now;
+   int              last_eval_iter;
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -1797,6 +1800,19 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    // active-process context (run_process does not — only the default JIT eval
    // does, and the bridge needs it for deposit_signal()/AJ_OUT), run the chunk.
    aj_chunk_t *chunk = (aj_chunk_t *)proc->vtable;
+   // Per-delta dedup: EVERY rerouted proc of the chunk wakes on a boundary
+   // event and would re-eval the whole chunk — hundreds of identical evals
+   // per delta for a whole-core chunk, each paying the full input scan
+   // (aj_scan_inputs was 43% of dhrystone sim time). A repeat eval in the
+   // SAME (time, iteration) can never observe different inputs: interpreter
+   // driver updates are never same-delta-visible, and accel deposits/pokes/
+   // stage2 wake their consumers in a LATER delta. VERIFY doesn't reroute,
+   // so this path only runs in active mode.
+   if (chunk->last_eval_now == (uint64_t)m->now
+       && chunk->last_eval_iter == m->iteration)
+      return;
+   chunk->last_eval_now  = (uint64_t)m->now;
+   chunk->last_eval_iter = m->iteration;
    model_thread_t *thread = model_thread(m);
    rt_wakeable_t *save_obj   = thread->active_obj;
    rt_scope_t    *save_scope = thread->active_scope;
