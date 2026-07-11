@@ -1878,6 +1878,11 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          if (!d->verify_flagged && aj_verify_diff(interp, buf, d->valuesz, width)) {
             d->verify_flagged = true;
             aj_verify_report(sigp, interp, buf, d->valuesz, width);
+            if (g_aj_vreports == 1 && getenv("NVC_ACCEL_SMDUMP") != NULL) {
+               // settled-state dump at the FIRST divergence (needs -DSM_DUMP)
+               void (*dumpfn)(void *) = dlsym(c->dl, "accel_dump");
+               if (dumpfn != NULL) dumpfn(c->state);
+            }
          }
       }
       return;
@@ -3047,15 +3052,38 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          // immediate deposit is same-delta-visible to a later-evaluated
          // chunk's input scan; interp is immune because native `<=` commits
          // in the NBA region).
+         //
+         // Snapshot discipline: collect ALL groups whose clock rises in THIS
+         // delta, snapshot the LIVE state once, and commit them together from
+         // that snapshot. The per-eval snapshot is the interp-exact register
+         // view at this delta: group 0 (committed at the posedge delta) and
+         // any gated group that fired in an EARLIER delta read POST-edge
+         // (already in S); groups firing in THIS delta read each other
+         // PRE-edge (classic simultaneous <=). The previous design
+         // snapshotted once at the POSEDGE, so a late cone reading a group-0
+         // register saw a stale PRE-edge value — unified lsu's AXI arvalid
+         // cone (bus_clk_en sync on free_clk gating handshake flops on clk)
+         // issued every bus command one cycle late (cycles 1033 -> 955).
+         // NVC_ACCEL_LATE_CYCSNAP restores the per-cycle snapshot for A/B.
          fprintf(f, "  if(_late){\n");
+         fprintf(f, "    unsigned _fired = 0;\n");
          for (int k = 0; k < nck; k++)
             fprintf(f, "    { int _n=(in._%s&1);"
-                       " if(_n && !aj_cs->ck_last[%d] && (aj_cs->late_pend & (1u<<(1+%d)))){"
-                       " sm_clock_late(&S, &aj_cs->snapS,"
-                       " _lsnap ? &aj_cs->snapIn : &in, (1u<<(1+%d)));"
-                       " aj_cs->late_pend &= ~(1u<<(1+%d)); _chg = 1; aj_pe = 1; }"
+                       " if(_n && !aj_cs->ck_last[%d] && (aj_cs->late_pend & (1u<<(1+%d))))"
+                       " _fired |= (1u<<(1+%d));"
                        " aj_cs->ck_last[%d]=_n; }\n",
-                    extra_clk[k], k, k, k, k, k);
+                    extra_clk[k], k, k, k, k);
+         fprintf(f, "    if(_fired){\n");
+         // Default = per-CYCLE snapshot (dec/ifu/mem_ctl-validated); the
+         // per-EVAL (live-S) variant is opt-in for A/B — it regressed dec and
+         // mem_ctl and did not change lsu, so the posedge snapshot stands.
+         fprintf(f, "      static int _evalsnap=-1; if(_evalsnap<0)"
+                    " _evalsnap=getenv(\"NVC_ACCEL_LATE_EVALSNAP\")?1:0;\n");
+         fprintf(f, "      if(_evalsnap) aj_cs->snapS = S;\n");
+         fprintf(f, "      sm_clock_late(&S, &aj_cs->snapS,"
+                    " _lsnap ? &aj_cs->snapIn : &in, _fired);\n");
+         fprintf(f, "      aj_cs->late_pend &= ~_fired; _chg = 1; aj_pe = 1;\n");
+         fprintf(f, "    }\n");
          fprintf(f, "  }\n");
       }
       {
@@ -3259,6 +3287,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // accel_in_addr: resolve a bridged-input ordinal to its packed in_live
    // field (ord == -1 -> the ext_chg flag). The handoff link pass uses this to
    // wire a producer's poke straight into this chunk's packed inputs.
+   // Settle-time dump: the VERIFY harness calls this at the exact report of
+   // the first diverging output — full internal nets from the CURRENT state
+   // + in_live, i.e. the companion's settled view (the posedge SMDUMP can't
+   // see divergence born in later deltas).
+   fprintf(f, "#ifdef SM_DUMP\n");
+   fprintf(f, "void accel_dump(void *p){ aj_cs_t *aj_cs = p;\n");
+   fprintf(f, "  fprintf(stderr, \"#AJVD\\n\");\n");
+   fprintf(f, "  sm_dump_comb(&S, &(aj_cs->in_live), stderr); }\n");
+   fprintf(f, "#endif\n");
    fprintf(f, "void *accel_in_addr(void *p, int _iord, unsigned long *nb){\n");
    fprintf(f, "  aj_cs_t *aj_cs = p;\n  switch(_iord){\n");
    fprintf(f, "  case -1: return &aj_cs->ext_chg;\n");
