@@ -1663,6 +1663,11 @@ struct _aj_chunk {
    uint64_t         last_eval_now;
    int              last_eval_iter;
    uint64_t         live_out_mask[4]; // dead-output pruning (re-applied on respec)
+   // Serializes eval of THIS chunk under NVC_PARALLEL_PROCS: the chunk's .so
+   // state is mutable, so two workers must never run the same chunk's eval at
+   // once. Held across the dedup check + eval; different chunks have distinct
+   // locks so they still run concurrently. (No-op cost in the serial path.)
+   nvc_lock_t       eval_lock;
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -1685,14 +1690,21 @@ typedef struct {
 } aj_stage2_t;
 static aj_stage2_t *g_aj_stage2 = NULL;
 static int g_aj_stage2_n = 0, g_aj_stage2_cap = 0;
+// The stage2 list persists across deltas (the two-phase armed logic), so it
+// can't be per-thread. Under NVC_PARALLEL_PROCS the bridge calls put/cancel
+// from concurrent worker evals; serialize them. aj_apply_stage2() runs only at
+// the post-eval barrier (thread 0, workers idle), so it needs no lock.
+static nvc_lock_t g_aj_stage2_lock = 0;
 
 static void aj_stage2_put(rt_signal_t *sig, const void *buf, size_t bufsz,
                           int width)
 {
+   nvc_lock(&g_aj_stage2_lock);
    for (int i = 0; i < g_aj_stage2_n; i++)
       if (g_aj_stage2[i].sig == sig) {      // latest value wins, keep phase
          assert(g_aj_stage2[i].bufsz == bufsz);
          memcpy(g_aj_stage2[i].buf, buf, bufsz);
+         nvc_unlock(&g_aj_stage2_lock);
          return;
       }
    if (g_aj_stage2_n == g_aj_stage2_cap) {
@@ -1704,16 +1716,20 @@ static void aj_stage2_put(rt_signal_t *sig, const void *buf, size_t bufsz,
    e->sig = sig; e->bufsz = bufsz; e->width = width; e->armed = false;
    e->buf = xmalloc(bufsz);
    memcpy(e->buf, buf, bufsz);
+   nvc_unlock(&g_aj_stage2_lock);
 }
 
 static void aj_stage2_cancel(rt_signal_t *sig)
 {
+   nvc_lock(&g_aj_stage2_lock);
    for (int i = 0; i < g_aj_stage2_n; i++)
       if (g_aj_stage2[i].sig == sig) {
          free(g_aj_stage2[i].buf);
          g_aj_stage2[i] = g_aj_stage2[--g_aj_stage2_n];
+         nvc_unlock(&g_aj_stage2_lock);
          return;
       }
+   nvc_unlock(&g_aj_stage2_lock);
 }
 
 static void aj_apply_stage2(rt_model_t *m)
@@ -1731,7 +1747,11 @@ static void aj_apply_stage2(rt_model_t *m)
       }
    }
 }
-static aj_chunk_t *g_aj_cur_chunk = NULL;  // chunk whose eval is running
+// Per-thread: the chunk whose eval is running on THIS worker. Under
+// NVC_PARALLEL_PROCS each worker runs a different chunk, and the .so's bridge
+// callbacks (aj_out/aj_poke/aj_stage2) recover their chunk from here with no
+// model pointer, so it must be indexed by thread_id(), not a single global.
+static aj_chunk_t *g_aj_cur_chunk[MAX_THREADS];  // chunk running per worker
 
 // NVC_ACCEL_VERIFY: run the accel .so as a PASSIVE companion of the interpreter
 // (do NOT reroute — the interpreter drives the real sim), and at end of each
@@ -1809,20 +1829,34 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    // driver updates are never same-delta-visible, and accel deposits/pokes/
    // stage2 wake their consumers in a LATER delta. VERIFY doesn't reroute,
    // so this path only runs in active mode.
-   if (chunk->last_eval_now == (uint64_t)m->now
-       && chunk->last_eval_iter == m->iteration)
-      return;
-   chunk->last_eval_now  = (uint64_t)m->now;
-   chunk->last_eval_iter = m->iteration;
+   const int tid = thread_id();
+   // Atomic dedup CLAIM. A whole-core chunk is rerouted to hundreds of procs
+   // (one per boundary input) that all wake the same delta; the dedup collapses
+   // them to ONE eval. Under NVC_PARALLEL_PROCS those duplicates scatter across
+   // workers, so the claim must be atomic — but the lock is held ONLY for the
+   // tiny (now,iter) test-and-set, NOT the eval. The sole claim winner then
+   // evals lock-free (different chunks run concurrently); the hundreds of losers
+   // take the nanosecond critical section and return, so there is no spinning on
+   // the expensive eval. (Serial path: one uncontended lock, negligible.)
+   nvc_lock(&chunk->eval_lock);
+   const bool mine = !(chunk->last_eval_now == (uint64_t)m->now
+                       && chunk->last_eval_iter == m->iteration);
+   if (mine) {
+      chunk->last_eval_now  = (uint64_t)m->now;
+      chunk->last_eval_iter = m->iteration;
+   }
+   nvc_unlock(&chunk->eval_lock);
+   if (!mine)
+      return;   // another worker owns this chunk's eval this delta
    model_thread_t *thread = model_thread(m);
    rt_wakeable_t *save_obj   = thread->active_obj;
    rt_scope_t    *save_scope = thread->active_scope;
-   aj_chunk_t    *save_chunk = g_aj_cur_chunk;
+   aj_chunk_t    *save_chunk = g_aj_cur_chunk[tid];
    thread->active_obj   = &proc->wakeable;
    thread->active_scope = proc->scope;
-   g_aj_cur_chunk       = chunk;
+   g_aj_cur_chunk[tid]  = chunk;
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
-   g_aj_cur_chunk       = save_chunk;
+   g_aj_cur_chunk[tid]  = save_chunk;
    thread->active_obj   = save_obj;
    thread->active_scope = save_scope;
 }
@@ -1878,7 +1912,7 @@ static void aj_verify_report(void *sigp, const unsigned char *interp,
 static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
 {
    rt_model_t *m = g_aj_model;
-   aj_chunk_t *c = g_aj_cur_chunk;
+   aj_chunk_t *c = g_aj_cur_chunk[thread_id()];
 
    // NVC_ACCEL_VERIFY: passive check — the interpreter drives the net; compare the
    // accel bytes against its settled value and report the first divergence per
@@ -1979,14 +2013,17 @@ static bool g_aj_hoff_pending = false;
 
 static void aj_poke(int ord, const void *packed, unsigned nbytes)
 {
-   aj_chunk_t *c = g_aj_cur_chunk;
+   aj_chunk_t *c = g_aj_cur_chunk[thread_id()];
    if (c == NULL) return;
+   // c's eval is serialized by eval_lock, so this chunk's e->stage/e->dirty
+   // writes are single-threaded; only the shared pending flag needs atomicity
+   // (workers running OTHER chunks may set it concurrently).
    for (int i = 0; i < c->hoff_nedges; i++) {
       aj_hoff_edge_t *e = &c->hoff_edges[i];
       if (e->ord != ord) continue;
       memcpy(e->stage, packed, nbytes < e->nbytes ? nbytes : e->nbytes);
       e->dirty = true;
-      g_aj_hoff_pending = true;
+      atomic_store(&g_aj_hoff_pending, true);
    }
 }
 
@@ -1996,8 +2033,8 @@ static void aj_poke(int ord, const void *packed, unsigned nbytes)
 // and wake semantics the bypassed deposit_signal would have given.
 static void aj_apply_pokes(rt_model_t *m)
 {
-   if (!g_aj_hoff_pending) return;
-   g_aj_hoff_pending = false;
+   if (!atomic_load(&g_aj_hoff_pending)) return;
+   atomic_store(&g_aj_hoff_pending, false);
    for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
       aj_chunk_t *c = m->aj_chunks[ci];
       for (int i = 0; i < c->hoff_nedges; i++) {
@@ -2020,17 +2057,18 @@ static void aj_apply_pokes(rt_model_t *m)
 static void aj_verify_step(rt_model_t *m, bool compare)
 {
    model_thread_t *thread = model_thread(m);
+   const int tid = thread_id();   // VERIFY runs on thread 0, but stay per-thread
    rt_scope_t *save_scope = thread->active_scope;
-   aj_chunk_t *save_chunk = g_aj_cur_chunk;
+   aj_chunk_t *save_chunk = g_aj_cur_chunk[tid];
    g_aj_vcompare = compare;
    for (int i = 0; i < g_aj_nvchunks; i++) {
       aj_chunk_t *c = g_aj_vchunks[i];
       thread->active_scope = c->scope;
-      g_aj_cur_chunk = c;
+      g_aj_cur_chunk[tid] = c;
       if (c->eval) c->eval(c->state, c->bindtab);
    }
    g_aj_vcompare = false;
-   g_aj_cur_chunk = save_chunk;
+   g_aj_cur_chunk[tid] = save_chunk;
    thread->active_scope = save_scope;
 }
 
@@ -6925,6 +6963,9 @@ static struct {
    evproc_mb_t   mb[MAX_THREADS];
 } g_evproc;
 
+// Runtime parallel-delta gate (EVPROC_MIN default; raised via NVC_PARALLEL_MIN).
+static unsigned g_evproc_min = EVPROC_MIN;
+
 // Worker push (single producer): append, growing on demand. Never blocks.
 static inline prop_rec_t *prop_reserve(int tid)
 {
@@ -7027,6 +7068,18 @@ static void evproc_ensure_started(rt_model_t *m)
    if (nt < 2) { g_evproc.nthreads = 1; return; }   // disabled
    if (nt > MAX_THREADS) nt = MAX_THREADS;
 
+   // Per-delta parallelism only pays off when a delta has enough INDEPENDENT
+   // work to amortize the dispatch barrier. dq->count over-counts on rerouted
+   // accel chunks (hundreds of duplicate procs collapse to one eval), so tiny
+   // or duplicate-heavy deltas lose. NVC_PARALLEL_MIN raises the gate above the
+   // EVPROC_MIN default for such workloads (set very high to keep it serial).
+   const char *minenv = getenv("NVC_PARALLEL_MIN");
+   if (minenv) {
+      int mv = atoi(minenv);
+      if (mv > 0) g_evproc_min = (unsigned)mv;
+   }
+   notef("NVC_PARALLEL_PROCS=%d, parallel-delta gate=%u procs", nt, g_evproc_min);
+
    g_evproc.nthreads = nt;
    g_evproc.model    = m;
    for (int t = 1; t < nt; t++) {
@@ -7095,7 +7148,7 @@ static void evproc_shutdown(void)
 
 static inline void run_procq(rt_model_t *m, deferq_t *dq)
 {
-   if (g_evproc.nthreads > 1 && dq->count >= EVPROC_MIN)
+   if (g_evproc.nthreads > 1 && dq->count >= g_evproc_min)
       evproc_dispatch(m, dq);
    else
       deferq_run(m, dq);
