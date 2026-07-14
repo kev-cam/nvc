@@ -302,6 +302,12 @@ package logic3d_types_pkg is
     function to_integer(a : logic3d_vector) return natural;
 
     -- Shift operators
+    -- Shift-count value of a logic3d_vector: like to_integer but SATURATES at a
+    -- huge sentinel when the value is too large to hold, instead of dropping the
+    -- high bits (to_integer keeps only the low 31, so e.g. 2**64 wrongly reads 0
+    -- -> a shift by 2**64 would leave the operand unchanged instead of clearing
+    -- it). Any count past a vector's width clears/sign-fills it anyway.
+    function l3d_shcount(a : logic3d_vector) return natural;
     function "sll"(a : logic3d_vector; n : natural) return logic3d_vector;
     function "srl"(a : logic3d_vector; n : natural) return logic3d_vector;
     function shift_left (a : logic3d_vector; n : natural) return logic3d_vector;
@@ -817,6 +823,22 @@ package body logic3d_types_pkg is
                 -- always a time-0 / pre-reset artifact before index regs settle.
                 if is_uncertain(a(i)) then return 0; end if;
                 if is_one(a(i)) then result := result + 2**p; end if;
+            end if;
+            p := p + 1;
+        end loop;
+        return result;
+    end function;
+
+    function l3d_shcount(a : logic3d_vector) return natural is
+        constant HUGE : natural := 2**20;   -- bigger than any real vector width
+        variable result : natural := 0;
+        variable p      : natural := 0;
+    begin
+        for i in a'reverse_range loop
+            if is_uncertain(a(i)) then return 0; end if;  -- X count: as to_integer
+            if is_one(a(i)) then
+                if p >= 20 then return HUGE; end if;      -- overflow: saturate
+                result := result + 2**p;
             end if;
             p := p + 1;
         end loop;
