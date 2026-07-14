@@ -29,6 +29,9 @@ package sv_display_pkg is
     -- Verilog %s: the vector as packed 8-bit ASCII (MSB byte first, leading
     -- null bytes suppressed).
     function sv_sstr(v : std_logic_vector) return string;
+    -- Strip leading '0' characters (Verilog %0b/%0h/%0o minimum-width), keeping
+    -- at least one character.
+    function sv_strip0(s : string) return string;
 end package;
 
 package body sv_display_pkg is
@@ -224,6 +227,17 @@ package body sv_display_pkg is
             return "";
         end if;
         return res(1 to cnt);
+    end function;
+
+    -- Suppress leading '0' chars (Verilog %0b/%0h/%0o); keep >= 1 char so a
+    -- zero value still prints "0".
+    function sv_strip0(s : string) return string is
+        variable first : natural := s'left;
+    begin
+        while first < s'right and s(first) = '0' loop
+            first := first + 1;
+        end loop;
+        return s(first to s'right);
     end function;
 
 end package body;
