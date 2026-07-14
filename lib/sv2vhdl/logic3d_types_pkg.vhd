@@ -82,6 +82,8 @@ package logic3d_types_pkg is
     -- Resolved subtype: use for signals with multiple drivers
     ---------------------------------------------------------------------------
     subtype resolved_logic3d is l3d_resolve logic3d;
+    -- Element-resolved vector, for multi-bit nets/ports with several drivers.
+    subtype resolved_logic3d_vector is (l3d_resolve) logic3d_vector;
 
     ---------------------------------------------------------------------------
     -- Lookup tables (8x8 for 2-input, 8 for 1-input)
