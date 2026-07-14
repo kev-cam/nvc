@@ -308,6 +308,19 @@ package logic3d_types_pkg is
     function shift_right(a : logic3d_vector; n : natural) return logic3d_vector;
     -- Arithmetic right shift (Verilog >>> on a signed operand): sign-extends.
     function l3d_sra    (a : logic3d_vector; n : natural) return logic3d_vector;
+    -- Sequential UDP evaluation. `rows` is every table row concatenated, each
+    -- row (nin+2) chars: [current-state][in1..inN][next-state] (iverilog's
+    -- ivl_udp_row order). Returns the next output given the current output and
+    -- the current/previous inputs (previous = each input's 'last_value, so the
+    -- one input that changed carries the edge). Mirrors vvp/udp.cc semantics:
+    -- level rows first, then edge rows; '-' output holds; no match holds.
+    function sv_udp_seq(rows : string; nin : natural; cur_out : std_logic;
+                        prev_in : std_logic_vector;
+                        cur_in : std_logic_vector) return std_logic;
+    -- One-element std_logic_vector(0 to 0); lets the UDP input concatenation
+    -- stay a vector even for a single-input primitive.
+    function sl1(v : std_logic) return std_logic_vector;
+
     -- Signed relational + signed div/mod (Verilog signed context: both
     -- operands signed). Reinterpret the value bits as two's-complement.
     function l3d_lt_s(a, b : logic3d_vector) return boolean;
@@ -1086,6 +1099,173 @@ package body logic3d_types_pkg is
     function unsigned_to_l3d_bit(a : unsigned) return logic3d is
     begin
         if a(a'right) = '1' then return L3D_1; else return L3D_0; end if;
+    end function;
+
+    -- ---- Sequential UDP evaluation (mirrors vvp/udp.cc) --------------------
+    function sl1(v : std_logic) return std_logic_vector is
+        variable r : std_logic_vector(0 to 0);
+    begin
+        r(0) := v;
+        return r;
+    end function;
+
+    -- Class of a std_logic value for UDP matching: '0', '1', or 'x'.
+    function udp_cls(v : std_logic) return character is
+    begin
+        case v is
+            when '0' | 'L' => return '0';
+            when '1' | 'H' => return '1';
+            when others    => return 'x';
+        end case;
+    end function;
+
+    -- Does a UDP level char c cover value-class vc ('0'/'1'/'x')?
+    function udp_level_covers(c : character; vc : character) return boolean is
+    begin
+        case c is
+            when '0' => return vc = '0';
+            when '1' => return vc = '1';
+            when 'x' => return vc = 'x';
+            when 'b' => return vc = '0' or vc = '1';
+            when 'l' => return vc = '0' or vc = 'x';
+            when 'h' => return vc = '1' or vc = 'x';
+            when '?' => return true;
+            when others => return false;   -- not a level char
+        end case;
+    end function;
+
+    function udp_is_edge(c : character) return boolean is
+    begin
+        case c is
+            when '0'|'1'|'x'|'b'|'l'|'h'|'?' => return false;
+            when others => return true;
+        end case;
+    end function;
+
+    -- Edge char: which classes the CURRENT value may be (vvp mask0/1/x).
+    function udp_edge_cur(c : character; vc : character) return boolean is
+    begin
+        case c is
+            when 'B' => return vc='0' or vc='1';   -- (x?)
+            when 'f' => return vc='0';             -- (10)
+            when 'F' => return vc='0';             -- (x0)
+            when 'M' => return vc='x';             -- (1x)
+            when 'N' => return vc='0' or vc='x';
+            when 'P' => return vc='1' or vc='x';
+            when 'q' => return vc='x';             -- (bx)
+            when 'Q' => return vc='x';             -- (0x)
+            when 'r' => return vc='1';             -- (01)
+            when 'R' => return vc='1';             -- (x1)
+            when '%' => return vc='x';             -- (?x)
+            when '+' => return vc='1';             -- (?1)
+            when '_' => return vc='0';             -- (?0)
+            when others => return false;
+        end case;
+    end function;
+
+    -- Edge char: which classes the PREVIOUS value may be (vvp edge_mask*).
+    function udp_edge_prev(c : character; vc : character) return boolean is
+    begin
+        case c is
+            when 'B' => return vc='x';
+            when 'f' => return vc='1';
+            when 'F' => return vc='x';
+            when 'M' => return vc='1';
+            when 'N' => return vc='1';
+            when 'P' => return vc='0';
+            when 'q' => return vc='0' or vc='1';
+            when 'Q' => return vc='0';
+            when 'r' => return vc='0';
+            when 'R' => return vc='x';
+            when '%' => return vc='0' or vc='1';
+            when '+' => return vc='0' or vc='x';
+            when '_' => return vc='1' or vc='x';
+            when others => return false;
+        end case;
+    end function;
+
+    -- Does edge char c match the transition prev->cur (both std_logic)?
+    -- '*' is "any edge" (any value change); the rest use the per-char masks.
+    function udp_edge_matches(c : character; cur : std_logic;
+                              prev : std_logic) return boolean is
+        constant cc : character := udp_cls(cur);
+        constant pc : character := udp_cls(prev);
+    begin
+        if c = '*' then
+            return cc /= pc;   -- any transition
+        end if;
+        return udp_edge_cur(c, cc) and udp_edge_prev(c, pc);
+    end function;
+
+    -- Map a UDP output char to std_logic ('-' = hold current output).
+    function udp_out(c : character; cur_out : std_logic) return std_logic is
+    begin
+        case c is
+            when '0' => return '0';
+            when '1' => return '1';
+            when 'x' => return 'X';
+            when '-' => return cur_out;
+            when others => return 'X';
+        end case;
+    end function;
+
+    function sv_udp_seq(rows : string; nin : natural; cur_out : std_logic;
+                        prev_in : std_logic_vector;
+                        cur_in : std_logic_vector) return std_logic is
+        constant rowlen : natural := nin + 2;
+        constant nrows  : natural := rows'length / rowlen;
+        constant coc    : character := udp_cls(cur_out);
+        variable base   : natural;
+        variable ok     : boolean;
+        variable ecol   : integer;
+    begin
+        -- Pass 1: pure-level rows (no edge column), in table order.
+        for r in 0 to nrows - 1 loop
+            base := rows'left + r * rowlen;
+            ok := true;
+            for k in 0 to nin - 1 loop
+                if udp_is_edge(rows(base + 1 + k)) then ok := false; end if;
+            end loop;
+            if ok and udp_level_covers(rows(base), coc) then
+                ok := true;
+                for k in 0 to nin - 1 loop
+                    if not udp_level_covers(rows(base + 1 + k),
+                                            udp_cls(cur_in(cur_in'low + k))) then
+                        ok := false;
+                    end if;
+                end loop;
+                if ok then
+                    return udp_out(rows(base + nin + 1), cur_out);
+                end if;
+            end if;
+        end loop;
+        -- Pass 2: edge rows (single edge column) — needs a real transition.
+        for r in 0 to nrows - 1 loop
+            base := rows'left + r * rowlen;
+            ecol := -1;
+            for k in 0 to nin - 1 loop
+                if udp_is_edge(rows(base + 1 + k)) then ecol := k; end if;
+            end loop;
+            if ecol >= 0 and udp_level_covers(rows(base), coc) then
+                ok := udp_edge_matches(rows(base + 1 + ecol),
+                                       cur_in(cur_in'low + ecol),
+                                       prev_in(prev_in'low + ecol));
+                if ok then
+                    for k in 0 to nin - 1 loop
+                        if k /= ecol and
+                           not udp_level_covers(rows(base + 1 + k),
+                                                udp_cls(cur_in(cur_in'low + k))) then
+                            ok := false;
+                        end if;
+                    end loop;
+                end if;
+                if ok then
+                    return udp_out(rows(base + nin + 1), cur_out);
+                end if;
+            end if;
+        end loop;
+        -- No match: hold current output.
+        return cur_out;
     end function;
 
 end package body;
