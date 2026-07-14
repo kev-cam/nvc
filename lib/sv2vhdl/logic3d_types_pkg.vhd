@@ -239,6 +239,13 @@ package logic3d_types_pkg is
     function to_std_logic(a : logic3d) return std_logic;  -- lossless
     function to_logic3d(s : std_logic) return logic3d;    -- lossless
 
+    -- Certainty-preserving conversion to std_logic_vector: maps each logic3d
+    -- bit via to_std_logic (0/1/L/H/Z/W/X/U), so x/z survive for $display
+    -- radix formatting (unlike l3d_to_unsigned, which drops to value bits).
+    -- Element order is preserved (a'range), keeping the MSB leftmost.
+    function to_std_logic_vector(a : logic3d_vector) return std_logic_vector;
+    function to_std_logic_vector(a : logic3d) return std_logic_vector;  -- 1-elem
+
     ---------------------------------------------------------------------------
     -- Utilities - check individual bits, independent of other attributes
     ---------------------------------------------------------------------------
@@ -476,6 +483,24 @@ package body logic3d_types_pkg is
         constant SL_LUT : sl_lut_t := ('L', 'H', '0', '1', 'Z', 'W', 'X', 'U');
     begin
         return SL_LUT(a);
+    end function;
+
+    -- logic3d_vector -> std_logic_vector (per-bit, certainty preserving)
+    function to_std_logic_vector(a : logic3d_vector) return std_logic_vector is
+        variable result : std_logic_vector(a'range);
+    begin
+        for i in a'range loop
+            result(i) := to_std_logic(a(i));
+        end loop;
+        return result;
+    end function;
+
+    -- single logic3d -> 1-element std_logic_vector
+    function to_std_logic_vector(a : logic3d) return std_logic_vector is
+        variable result : std_logic_vector(0 downto 0);
+    begin
+        result(0) := to_std_logic(a);
+        return result;
     end function;
 
     ---------------------------------------------------------------------------
