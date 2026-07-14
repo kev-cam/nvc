@@ -308,6 +308,16 @@ package logic3d_types_pkg is
     function shift_right(a : logic3d_vector; n : natural) return logic3d_vector;
     -- Arithmetic right shift (Verilog >>> on a signed operand): sign-extends.
     function l3d_sra    (a : logic3d_vector; n : natural) return logic3d_vector;
+    -- Signed relational + signed div/mod (Verilog signed context: both
+    -- operands signed). Reinterpret the value bits as two's-complement.
+    function l3d_lt_s(a, b : logic3d_vector) return boolean;
+    function l3d_gt_s(a, b : logic3d_vector) return boolean;
+    function l3d_le_s(a, b : logic3d_vector) return boolean;
+    function l3d_ge_s(a, b : logic3d_vector) return boolean;
+    function l3d_div_s(a, b : logic3d_vector) return logic3d_vector;
+    function l3d_mod_s(a, b : logic3d_vector) return logic3d_vector;
+    -- Sign-extending resize (Verilog signed widening): fill high bits w/ sign.
+    function l3d_resize_s(a : logic3d_vector; new_size : natural) return logic3d_vector;
 
     -- Multiplication, division, modulus
     function "*"  (a, b : logic3d_vector) return logic3d_vector;
@@ -826,6 +836,55 @@ package body logic3d_types_pkg is
         return unsigned_to_l3d(unsigned(std_logic_vector(
             ieee.numeric_std.shift_right(
                 signed(std_logic_vector(l3d_to_unsigned(a))), n))));
+    end function;
+
+    -- Signed relational operators (numeric_std signed compare sign-extends the
+    -- shorter operand internally, so no pre-resize is needed).
+    function l3d_lt_s(a, b : logic3d_vector) return boolean is
+    begin
+        return signed(std_logic_vector(l3d_to_unsigned(a)))
+             < signed(std_logic_vector(l3d_to_unsigned(b)));
+    end function;
+    function l3d_gt_s(a, b : logic3d_vector) return boolean is
+    begin
+        return signed(std_logic_vector(l3d_to_unsigned(a)))
+             > signed(std_logic_vector(l3d_to_unsigned(b)));
+    end function;
+    function l3d_le_s(a, b : logic3d_vector) return boolean is
+    begin
+        return signed(std_logic_vector(l3d_to_unsigned(a)))
+             <= signed(std_logic_vector(l3d_to_unsigned(b)));
+    end function;
+    function l3d_ge_s(a, b : logic3d_vector) return boolean is
+    begin
+        return signed(std_logic_vector(l3d_to_unsigned(a)))
+             >= signed(std_logic_vector(l3d_to_unsigned(b)));
+    end function;
+
+    -- Signed division / modulus. Verilog defines a/0, a%0 as all-x.
+    function l3d_div_s(a, b : logic3d_vector) return logic3d_vector is
+        variable allx : logic3d_vector(a'range) := (others => L3D_X);
+    begin
+        if l3d_to_unsigned(b) = 0 then return allx; end if;
+        return unsigned_to_l3d(unsigned(std_logic_vector(ieee.numeric_std.resize(
+            signed(std_logic_vector(l3d_to_unsigned(a)))
+          / signed(std_logic_vector(l3d_to_unsigned(b))), a'length))));
+    end function;
+    function l3d_mod_s(a, b : logic3d_vector) return logic3d_vector is
+        variable allx : logic3d_vector(a'range) := (others => L3D_X);
+    begin
+        if l3d_to_unsigned(b) = 0 then return allx; end if;
+        return unsigned_to_l3d(unsigned(std_logic_vector(ieee.numeric_std.resize(
+            signed(std_logic_vector(l3d_to_unsigned(a)))
+            mod signed(std_logic_vector(l3d_to_unsigned(b))), a'length))));
+    end function;
+
+    -- Sign-extending resize: reinterpret as signed so numeric_std.resize fills
+    -- the new high bits with the sign bit (truncation keeps the low bits).
+    function l3d_resize_s(a : logic3d_vector; new_size : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(unsigned(std_logic_vector(ieee.numeric_std.resize(
+            signed(std_logic_vector(l3d_to_unsigned(a))), new_size))));
     end function;
 
     function "*"(a, b : logic3d_vector) return logic3d_vector is
