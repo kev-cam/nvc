@@ -23,6 +23,9 @@ package sv_display_pkg is
     -- Verilog %d with a field width: right-justify in `width` blanks.
     -- width <= string length => no padding (also covers %0d when width=0).
     function sv_dstr(v : std_logic_vector; width : integer) return string;
+    -- Signed decimal (Verilog %d of a signed operand): two's-complement value.
+    function sv_dstr_signed(v : std_logic_vector) return string;
+    function sv_dstr_signed(v : std_logic_vector; width : integer) return string;
 end package;
 
 package body sv_display_pkg is
@@ -155,6 +158,32 @@ package body sv_display_pkg is
     -- explicit narrow widths pass width <= length here and are returned as-is.
     function sv_dstr(v : std_logic_vector; width : integer) return string is
         constant s : string := sv_dstr(v);
+    begin
+        if width <= s'length then
+            return s;
+        end if;
+        return (1 to width - s'length => ' ') & s;
+    end function;
+
+    -- Signed %d: interpret the 4-state vector as two's-complement. "x" if any
+    -- bit is unknown, else the signed decimal (with '-' for negatives).
+    function sv_dstr_signed(v : std_logic_vector) return string is
+        constant n  : natural := v'length;
+        variable vv : std_logic_vector(n - 1 downto 0) := v;
+        variable s  : signed(n - 1 downto 0);
+    begin
+        for i in 0 to n - 1 loop
+            case vv(i) is
+                when '0' | 'L' => s(i) := '0';
+                when '1' | 'H' => s(i) := '1';
+                when others    => return "x";
+            end case;
+        end loop;
+        return integer'image(to_integer(s));
+    end function;
+
+    function sv_dstr_signed(v : std_logic_vector; width : integer) return string is
+        constant s : string := sv_dstr_signed(v);
     begin
         if width <= s'length then
             return s;

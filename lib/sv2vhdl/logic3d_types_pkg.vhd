@@ -306,6 +306,8 @@ package logic3d_types_pkg is
     function "srl"(a : logic3d_vector; n : natural) return logic3d_vector;
     function shift_left (a : logic3d_vector; n : natural) return logic3d_vector;
     function shift_right(a : logic3d_vector; n : natural) return logic3d_vector;
+    -- Arithmetic right shift (Verilog >>> on a signed operand): sign-extends.
+    function l3d_sra    (a : logic3d_vector; n : natural) return logic3d_vector;
 
     -- Multiplication, division, modulus
     function "*"  (a, b : logic3d_vector) return logic3d_vector;
@@ -816,6 +818,14 @@ package body logic3d_types_pkg is
     function shift_right(a : logic3d_vector; n : natural) return logic3d_vector is
     begin
         return unsigned_to_l3d(ieee.numeric_std.shift_right(l3d_to_unsigned(a), n));
+    end function;
+
+    -- Arithmetic right shift: reinterpret as signed so the sign bit fills in.
+    function l3d_sra(a : logic3d_vector; n : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(unsigned(std_logic_vector(
+            ieee.numeric_std.shift_right(
+                signed(std_logic_vector(l3d_to_unsigned(a))), n))));
     end function;
 
     function "*"(a, b : logic3d_vector) return logic3d_vector is
