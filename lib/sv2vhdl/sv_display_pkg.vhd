@@ -143,18 +143,35 @@ package body sv_display_pkg is
         return result;
     end function;
 
+    -- Verilog %d unknown-bit convention: all-x -> "x", all-z -> "z", any x
+    -- (mixed) -> "X", any z but no x -> "Z", else the decimal value.
+    function sv_unknown_char(v : std_logic_vector) return string is
+        variable any_x, any_z, all_x, all_z : boolean;
+    begin
+        any_x := false; any_z := false; all_x := true; all_z := true;
+        for i in v'range loop
+            case v(i) is
+                when 'Z'                   => any_z := true; all_x := false;
+                when '0' | '1' | 'L' | 'H' => all_x := false; all_z := false;
+                when others                => any_x := true; all_z := false;
+            end case;
+        end loop;
+        if all_x then return "x"; end if;
+        if all_z then return "z"; end if;
+        if any_x then return "X"; end if;
+        if any_z then return "Z"; end if;
+        return "";   -- all known: caller renders the decimal value
+    end function;
+
     function sv_dstr(v : std_logic_vector) return string is
         constant n  : natural := v'length;
         variable vv : std_logic_vector(n - 1 downto 0) := v;
         variable u  : unsigned(n - 1 downto 0);
+        constant uc : string := sv_unknown_char(vv);
     begin
-        -- Verilog %d prints "x" if any bit is unknown (x or z), else decimal.
+        if uc'length > 0 then return uc; end if;
         for i in 0 to n - 1 loop
-            case vv(i) is
-                when '0' | 'L' => u(i) := '0';
-                when '1' | 'H' => u(i) := '1';
-                when others    => return "x";
-            end case;
+            if vv(i) = '1' or vv(i) = 'H' then u(i) := '1'; else u(i) := '0'; end if;
         end loop;
         return integer'image(to_integer(u));
     end function;
@@ -177,13 +194,11 @@ package body sv_display_pkg is
         constant n  : natural := v'length;
         variable vv : std_logic_vector(n - 1 downto 0) := v;
         variable s  : signed(n - 1 downto 0);
+        constant uc : string := sv_unknown_char(vv);
     begin
+        if uc'length > 0 then return uc; end if;
         for i in 0 to n - 1 loop
-            case vv(i) is
-                when '0' | 'L' => s(i) := '0';
-                when '1' | 'H' => s(i) := '1';
-                when others    => return "x";
-            end case;
+            if vv(i) = '1' or vv(i) = 'H' then s(i) := '1'; else s(i) := '0'; end if;
         end loop;
         return integer'image(to_integer(s));
     end function;
