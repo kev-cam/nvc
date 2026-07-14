@@ -32,6 +32,14 @@ package sv_display_pkg is
     -- Strip leading '0' characters (Verilog %0b/%0h/%0o minimum-width), keeping
     -- at least one character.
     function sv_strip0(s : string) return string;
+    -- $timeformat(units, precision, suffix, min_width): set the global %t format.
+    procedure sv_set_timeformat(u : integer; pr : integer; suf : string;
+                                w : integer);
+    -- Verilog %t: format a time `value` (in the calling scope's time units,
+    -- signed power of 10) per the current $timeformat (or the default derived
+    -- from `scope_prec` if $timeformat was never called).
+    impure function sv_tstr(value : integer; scope_units : integer;
+                            scope_prec : integer) return string;
 end package;
 
 package body sv_display_pkg is
@@ -253,6 +261,111 @@ package body sv_display_pkg is
             first := first + 1;
         end loop;
         return s(first to s'right);
+    end function;
+
+    -- ---- $timeformat / %t ------------------------------------------------
+    -- Global (runtime, mutable) $timeformat state. VHDL requires a shared
+    -- variable to have a protected type.
+    type t_timeformat is protected
+        procedure set(u : integer; pr : integer; suf : string; w : integer);
+        impure function is_set   return boolean;
+        impure function get_u    return integer;
+        impure function get_prec return integer;
+        impure function get_w    return integer;
+        impure function get_suf  return string;
+    end protected;
+
+    type t_timeformat is protected body
+        variable f_set   : boolean := false;
+        variable f_units : integer := 0;
+        variable f_prec  : integer := 0;
+        variable f_width : integer := 0;
+        variable f_suf   : string(1 to 64) := (others => ' ');
+        variable f_len   : integer := 0;
+        procedure set(u : integer; pr : integer; suf : string; w : integer) is
+        begin
+            f_set := true; f_units := u; f_prec := pr; f_width := w;
+            f_len := suf'length;
+            if f_len > 64 then f_len := 64; end if;
+            f_suf := (others => ' ');
+            if f_len > 0 then
+                f_suf(1 to f_len) := suf(suf'left to suf'left + f_len - 1);
+            end if;
+        end procedure;
+        impure function is_set   return boolean is begin return f_set;   end;
+        impure function get_u    return integer is begin return f_units; end;
+        impure function get_prec return integer is begin return f_prec;  end;
+        impure function get_w    return integer is begin return f_width; end;
+        impure function get_suf  return string  is begin return f_suf(1 to f_len); end;
+    end protected body;
+
+    shared variable g_timeformat : t_timeformat;
+
+    procedure sv_set_timeformat(u : integer; pr : integer; suf : string;
+                                w : integer) is
+    begin
+        g_timeformat.set(u, pr, suf, w);
+    end procedure;
+
+    -- Right-justify `s` in a field of `w` blanks (no truncation if longer).
+    function rjust(s : string; w : integer) return string is
+    begin
+        if s'length >= w then
+            return s;
+        end if;
+        return (1 to w - s'length => ' ') & s;
+    end function;
+
+    -- Non-negative integer as a decimal with `p` fractional digits, e.g.
+    -- (3000, 6) -> "0.003000", (12345, 2) -> "123.45", (0, 0) -> "0".
+    function dec_with_point(n : natural; p : natural) return string is
+        constant s : string := integer'image(n);
+        variable pad : integer;
+    begin
+        if p = 0 then
+            return s;
+        end if;
+        if s'length <= p then
+            pad := p - s'length;
+            return "0." & (1 to pad => '0') & s;
+        end if;
+        return s(s'left to s'left + (s'length - p) - 1) & "."
+             & s(s'left + (s'length - p) to s'right);
+    end function;
+
+    impure function sv_tstr(value : integer; scope_units : integer;
+                            scope_prec : integer) return string is
+        variable u, p, w, e : integer;
+        variable av, scaled, pw10 : integer;
+        variable neg : boolean;
+    begin
+        if g_timeformat.is_set then
+            u := g_timeformat.get_u; p := g_timeformat.get_prec;
+            w := g_timeformat.get_w;
+        else
+            -- default %t: units = simulation precision, 0 decimals, width 20.
+            u := scope_prec; p := 0; w := 20;
+        end if;
+        neg := value < 0;
+        av  := abs(value);
+        -- scale so the result carries `p` fractional digits:
+        -- scaled = round(value * 10^(scope_units - u + p))
+        e := scope_units - u + p;
+        if e >= 0 then
+            scaled := av;
+            for i in 1 to e loop scaled := scaled * 10; end loop;
+        else
+            pw10 := 1;
+            for i in 1 to -e loop pw10 := pw10 * 10; end loop;
+            scaled := (av + pw10 / 2) / pw10;   -- round to nearest
+        end if;
+        -- Assemble: [-]<digits>.<frac><suffix>, right-justified in width w.
+        -- get_suf is the empty string when $timeformat was never called.
+        if neg then
+            return rjust("-" & dec_with_point(scaled, p) & g_timeformat.get_suf, w);
+        else
+            return rjust(dec_with_point(scaled, p) & g_timeformat.get_suf, w);
+        end if;
     end function;
 
 end package body;
