@@ -20,6 +20,9 @@ package sv_display_pkg is
     function sv_bstr(v : std_logic_vector) return string;
     -- Unsigned decimal string (Verilog %d)
     function sv_dstr(v : std_logic_vector) return string;
+    -- Verilog %d with a field width: right-justify in `width` blanks.
+    -- width <= string length => no padding (also covers %0d when width=0).
+    function sv_dstr(v : std_logic_vector; width : integer) return string;
 end package;
 
 package body sv_display_pkg is
@@ -145,6 +148,18 @@ package body sv_display_pkg is
             end case;
         end loop;
         return integer'image(to_integer(u));
+    end function;
+
+    -- Right-justify the %d decimal (or "x") in a field of `width` blanks.
+    -- Verilog default %d pads to the operand's max-magnitude width; %0d and
+    -- explicit narrow widths pass width <= length here and are returned as-is.
+    function sv_dstr(v : std_logic_vector; width : integer) return string is
+        constant s : string := sv_dstr(v);
+    begin
+        if width <= s'length then
+            return s;
+        end if;
+        return (1 to width - s'length => ' ') & s;
     end function;
 
 end package body;
