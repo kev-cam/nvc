@@ -26,6 +26,9 @@ package sv_display_pkg is
     -- Signed decimal (Verilog %d of a signed operand): two's-complement value.
     function sv_dstr_signed(v : std_logic_vector) return string;
     function sv_dstr_signed(v : std_logic_vector; width : integer) return string;
+    -- Verilog %s: the vector as packed 8-bit ASCII (MSB byte first, leading
+    -- null bytes suppressed).
+    function sv_sstr(v : std_logic_vector) return string;
 end package;
 
 package body sv_display_pkg is
@@ -189,6 +192,38 @@ package body sv_display_pkg is
             return s;
         end if;
         return (1 to width - s'length => ' ') & s;
+    end function;
+
+    -- Verilog %s: interpret the vector as packed 8-bit ASCII bytes, most
+    -- significant byte first. Leading all-zero (null) bytes are suppressed.
+    function sv_sstr(v : std_logic_vector) return string is
+        constant n      : natural := v'length;
+        variable vv     : std_logic_vector(n - 1 downto 0) := v;
+        constant nbytes : natural := (n + 7) / 8;
+        variable res    : string(1 to nbytes);
+        variable cnt    : natural := 0;
+        variable code   : natural;
+        variable started : boolean := false;
+    begin
+        for b in nbytes - 1 downto 0 loop
+            code := 0;
+            for bit in 0 to 7 loop
+                if (b * 8 + bit) < n then
+                    if vv(b * 8 + bit) = '1' or vv(b * 8 + bit) = 'H' then
+                        code := code + 2 ** bit;
+                    end if;
+                end if;
+            end loop;
+            if code /= 0 or started then
+                started := true;
+                cnt := cnt + 1;
+                res(cnt) := character'val(code);
+            end if;
+        end loop;
+        if cnt = 0 then
+            return "";
+        end if;
+        return res(1 to cnt);
     end function;
 
 end package body;
