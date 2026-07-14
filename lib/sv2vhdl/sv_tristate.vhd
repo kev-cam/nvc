@@ -10,9 +10,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_bufif0 is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        ctrl : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        ctrl : in  logic3d
     );
 end entity sv_bufif0;
 
@@ -22,8 +22,8 @@ begin
         variable d, c : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        c := to_logic3d(ctrl);
+        d := data;
+        c := ctrl;
         if not is_uncertain(c) and is_zero(c) then
             if is_uncertain(d) then result := L3D_X;
             elsif is_one(d) then    result := L3D_1;
@@ -37,7 +37,7 @@ begin
             else                    result := L3D_L;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -50,9 +50,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_bufif1 is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        ctrl : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        ctrl : in  logic3d
     );
 end entity sv_bufif1;
 
@@ -62,8 +62,8 @@ begin
         variable d, c : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        c := to_logic3d(ctrl);
+        d := data;
+        c := ctrl;
         if not is_uncertain(c) and is_one(c) then
             if is_uncertain(d) then result := L3D_X;
             elsif is_one(d) then    result := L3D_1;
@@ -77,7 +77,7 @@ begin
             else                    result := L3D_L;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -90,9 +90,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_notif0 is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        ctrl : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        ctrl : in  logic3d
     );
 end entity sv_notif0;
 
@@ -102,8 +102,8 @@ begin
         variable d, c : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        c := to_logic3d(ctrl);
+        d := data;
+        c := ctrl;
         if not is_uncertain(c) and is_zero(c) then
             if is_uncertain(d) then result := L3D_X;
             elsif is_one(d) then    result := L3D_0;
@@ -117,7 +117,7 @@ begin
             else                    result := L3D_H;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -130,9 +130,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_notif1 is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        ctrl : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        ctrl : in  logic3d
     );
 end entity sv_notif1;
 
@@ -142,8 +142,8 @@ begin
         variable d, c : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        c := to_logic3d(ctrl);
+        d := data;
+        c := ctrl;
         if not is_uncertain(c) and is_one(c) then
             if is_uncertain(d) then result := L3D_X;
             elsif is_one(d) then    result := L3D_0;
@@ -157,6 +157,6 @@ begin
             else                    result := L3D_H;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
