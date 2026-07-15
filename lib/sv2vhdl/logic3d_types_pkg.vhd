@@ -287,6 +287,8 @@ package logic3d_types_pkg is
     -- Arithmetic: convert to/from unsigned for +, -, comparisons
     function l3d_to_unsigned(a : logic3d_vector) return unsigned;
     function l3d_to_unsigned(a : logic3d) return unsigned;        -- 1-bit
+    -- Two's-complement reinterpretation (Verilog signed context).
+    function l3d_to_signed(a : logic3d_vector) return signed;
     function to_integer(a : logic3d) return natural;              -- 0 or 1
     function unsigned_to_l3d(a : unsigned) return logic3d_vector;
     function "+"(a, b : logic3d_vector) return logic3d_vector;
@@ -743,6 +745,11 @@ package body logic3d_types_pkg is
     end function;
 
     -- Convert single logic3d to 1-bit unsigned
+    function l3d_to_signed(a : logic3d_vector) return signed is
+    begin
+        return signed(std_logic_vector(l3d_to_unsigned(a)));
+    end function;
+
     function l3d_to_unsigned(a : logic3d) return unsigned is
         variable result : unsigned(0 downto 0);
     begin
