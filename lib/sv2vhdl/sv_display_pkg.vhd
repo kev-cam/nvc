@@ -242,8 +242,13 @@ package body sv_display_pkg is
             end loop;
             if code /= 0 or started then
                 started := true;
-                cnt := cnt + 1;
-                res(cnt) := character'val(code);
+                -- IEEE 1364: NUL characters in %s output are not printed
+                -- (embedded as well as leading; nvc's report would otherwise
+                -- escape them as a literal \000).
+                if code /= 0 then
+                    cnt := cnt + 1;
+                    res(cnt) := character'val(code);
+                end if;
             end if;
         end loop;
         if cnt = 0 then
