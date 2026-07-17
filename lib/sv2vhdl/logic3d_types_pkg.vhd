@@ -418,6 +418,18 @@ package logic3d_types_pkg is
     -- makes the result X, per Verilog arithmetic).
     function l3d_neg(a : logic3d_vector) return logic3d_vector;
 
+    -- Verilog index semantics: an index with any X/Z bit selects NOTHING
+    -- (reads x, writes lost). Convert an index vector to integer with a
+    -- far-out-of-range sentinel for uncertain values so every bounds guard
+    -- fails without arithmetic overflow.
+    function l3d_index(a : logic3d_vector; s : boolean) return integer;
+
+    -- Bounds-safe part/bit reads: Verilog reads x for out-of-range bits
+    -- (VHDL raises a bounds error). base may be any integer.
+    function l3d_part_read(a : logic3d_vector; base : integer; w : natural)
+        return logic3d_vector;
+    function l3d_bit_read(a : logic3d_vector; idx : integer) return logic3d;
+
     -- Bring a value of whatever numeric kind into logic3d at width w. The
     -- backend's C++ type annotations can lie for logic3d expressions that
     -- passed through numeric-typed paths, so the SAME function name is
@@ -1434,6 +1446,44 @@ package body logic3d_types_pkg is
     begin
         if a'length = w then return a; end if;
         return resize(a, w);      -- pkg resize (x-preserving)
+    end function;
+
+    function l3d_index(a : logic3d_vector; s : boolean) return integer is
+    begin
+        for i in a'range loop
+            if is_uncertain(a(i)) then
+                return integer'low;   -- fails every bounds guard
+            end if;
+        end loop;
+        if s then
+            return to_integer(l3d_to_signed(a));
+        end if;
+        return to_integer(l3d_to_unsigned(a));
+    end function;
+
+    function l3d_part_read(a : logic3d_vector; base : integer; w : natural)
+        return logic3d_vector is
+        variable r : logic3d_vector(w - 1 downto 0) := (others => L3D_X);
+    begin
+        -- Early bail keeps base + i from overflowing when base is the
+        -- uncertain-index sentinel (integer'low) or similar extremes.
+        if base > a'high or base < a'low - integer(w) then
+            return r;
+        end if;
+        for i in 0 to w - 1 loop
+            if base + i >= a'low and base + i <= a'high then
+                r(i) := a(base + i);
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    function l3d_bit_read(a : logic3d_vector; idx : integer) return logic3d is
+    begin
+        if idx >= a'low and idx <= a'high then
+            return a(idx);
+        end if;
+        return L3D_X;
     end function;
 
     function l3d_neg(a : logic3d_vector) return logic3d_vector is
