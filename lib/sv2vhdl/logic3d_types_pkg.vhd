@@ -414,6 +414,29 @@ package logic3d_types_pkg is
     function l3d_to_2state(a : logic3d_vector) return logic3d_vector;
     function l3d_to_2state(a : logic3d) return logic3d;
 
+    -- Two's-complement negation in the logic3d family (any uncertain bit
+    -- makes the result X, per Verilog arithmetic).
+    function l3d_neg(a : logic3d_vector) return logic3d_vector;
+
+    -- Bring a value of whatever numeric kind into logic3d at width w. The
+    -- backend's C++ type annotations can lie for logic3d expressions that
+    -- passed through numeric-typed paths, so the SAME function name is
+    -- overloaded for every kind and VHDL overload resolution picks the one
+    -- matching the expression's REAL type (the l3d overload is a resize).
+    function to_l3d(a : unsigned;       w : natural) return logic3d_vector;
+    function to_l3d(a : signed;         w : natural) return logic3d_vector;
+    function to_l3d(a : integer;        w : natural) return logic3d_vector;
+    function to_l3d(a : logic3d_vector; w : natural) return logic3d_vector;
+    -- NOTE: no logic3d-scalar overload -- logic3d is a subtype of natural, so
+    -- it would be a homograph of the integer one (scalar widening is handled
+    -- by the backend's cast path instead).
+
+    -- Verilog ** on vectors: modular exponentiation at the base's width
+    -- (square-and-multiply over the exponent's bits, truncating each step,
+    -- so wide exponents neither overflow nor need integer conversion).
+    function l3d_pow(b, e : logic3d_vector;
+                     bs, es : boolean) return logic3d_vector;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -1390,6 +1413,84 @@ package body logic3d_types_pkg is
             res(i) := l3d_to_2state(a(i));
         end loop;
         return res;
+    end function;
+
+    function to_l3d(a : unsigned; w : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(resize(a, w));
+    end function;
+
+    function to_l3d(a : signed; w : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(unsigned(resize(a, w)));   -- sign-extends first
+    end function;
+
+    function to_l3d(a : integer; w : natural) return logic3d_vector is
+    begin
+        return unsigned_to_l3d(unsigned(to_signed(a, w)));
+    end function;
+
+    function to_l3d(a : logic3d_vector; w : natural) return logic3d_vector is
+    begin
+        if a'length = w then return a; end if;
+        return resize(a, w);      -- pkg resize (x-preserving)
+    end function;
+
+    function l3d_neg(a : logic3d_vector) return logic3d_vector is
+    begin
+        for i in a'range loop
+            if is_uncertain(a(i)) then return (a'range => L3D_X); end if;
+        end loop;
+        return unsigned_to_l3d(unsigned(-signed(std_logic_vector(
+                   l3d_to_unsigned(a)))));
+    end function;
+
+    function l3d_pow(b, e : logic3d_vector;
+                     bs, es : boolean) return logic3d_vector is
+        constant w   : natural := b'length;
+        variable bu  : unsigned(w - 1 downto 0);
+        variable acc : unsigned(w - 1 downto 0) := (others => '0');
+        variable all_ones : boolean := true;
+    begin
+        -- Any uncertain bit makes the whole result X (Verilog **).
+        for i in b'range loop
+            if is_uncertain(b(i)) then return (b'range => L3D_X); end if;
+        end loop;
+        for i in e'range loop
+            if is_uncertain(e(i)) then return (b'range => L3D_X); end if;
+        end loop;
+
+        bu := l3d_to_unsigned(b);
+
+        if es and e'length > 0 and is_one(e(e'left)) then
+            -- Negative exponent: 1**n=1; (-1)**n = +/-1 by parity (signed
+            -- all-ones base); 0**-n = X (division by zero); else 0.
+            for i in b'range loop
+                if not is_one(b(i)) then all_ones := false; end if;
+            end loop;
+            if to_integer(bu) = 1 then
+                acc := to_unsigned(1, w);
+            elsif bs and all_ones then          -- base = -1
+                if is_one(e(e'right)) then      -- odd exponent
+                    return b;                    -- -1 (all ones)
+                else
+                    acc := to_unsigned(1, w);
+                end if;
+            elsif to_integer(bu) = 0 then
+                return (b'range => L3D_X);
+            end if;                              -- else acc stays 0
+        else
+            -- Square-and-multiply over exponent bits, MSB first, truncating
+            -- to w bits each step (Verilog wraps at the result width).
+            acc := to_unsigned(1, w);
+            for i in e'range loop
+                acc := resize(acc * acc, w);
+                if is_one(e(i)) then
+                    acc := resize(acc * bu, w);
+                end if;
+            end loop;
+        end if;
+        return unsigned_to_l3d(acc);
     end function;
 
 end package body;
