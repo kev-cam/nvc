@@ -7529,6 +7529,27 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
       copy_value_ptr(n, &(src->u.pseudo.value), vptr);
       src->disconnected = 0;
 
+      // Verilog force takes effect IMMEDIATELY: the next read in the forcing
+      // process must already see the forced value (VHDL-2008 force lands in
+      // the next delta). In Verilog mode write the effective value in place,
+      // deposit-style; the queued pseudo-source update then recomputes the
+      // same value and wakes receivers through the normal machinery.
+      if (standard() == STD_MX) {
+         const size_t valuesz = n->size * n->width;
+         unsigned char *eff = nexus_effective(n);
+         unsigned char *last = nexus_last_value(n);
+         if (!cmp_bytes(eff, vptr, valuesz)) {
+            copy2(last, eff, vptr, valuesz);
+            m->trigger_epoch++;
+            n->last_event = m->now;
+            n->event_delta = m->iteration + 1;
+            if (n->flags & NET_F_CACHE_EVENT)
+               n->signal->shared.flags |= SIG_F_EVENT_FLAG;
+            m->next_is_delta = true;
+            wakeup_all(m, &(n->pending));
+         }
+      }
+
       // A previous release may have left the nexus on a fast-path vtable
       // that ignores SOURCE_FORCING (e.g. nexus_single_driver_vtable when
       // there is a regular driver underneath).  Revert to the full driving-
@@ -7560,10 +7581,26 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
       n->flags &= ~NET_F_FORCED;
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
+
+      // Verilog reg release semantics: a variable with no real drivers
+      // RETAINS the forced value after release (until the next procedural
+      // assignment), where a net returns to its resolved driving value.
+      // The effective value already IS the forced value, so for a driverless
+      // (deposit-only) nexus just disconnect without queueing the recompute
+      // that would revert it; with NET_F_FORCED now clear, later deposits
+      // proceed normally.
+      bool has_driver = false;
+      for (rt_source_t *s0 = &(n->sources); s0; s0 = s0->chain_input) {
+         if (!is_pseudo_source(s0->tag)) {
+            has_driver = true;
+            break;
+         }
+      }
+
       src->disconnected = 1;
       n->vtable = &nexus_default_vtable;
 
-      if (!src->pseudoqueued) {
+      if (has_driver && !src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);
          src->pseudoqueued = 1;
       }
@@ -7591,6 +7628,16 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
       unsigned char *last = nexus_last_value(n);
 
       const size_t valuesz = n->size * n->width;
+
+      // Verilog force semantics: a procedural assignment to a forced
+      // variable is LOST (not queued) -- the forced value stays visible and
+      // the write does not reappear at release. (IEEE 1364: the variable
+      // retains the forced value until released, then keeps it until the
+      // next procedural assignment.)
+      if (n->flags & NET_F_FORCED) {
+         vptr += valuesz;
+         continue;
+      }
 
       if (!cmp_bytes(eff, vptr, valuesz)) {
          copy2(last, eff, vptr, valuesz);
