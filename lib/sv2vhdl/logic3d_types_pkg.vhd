@@ -218,6 +218,14 @@ package logic3d_types_pkg is
     function l3d_set_uncertain(a : logic3d) return logic3d;
 
     -- Multi-input (chained lookups, no delta cycles)
+    -- Logical &&/|| truthiness: a vector's truth value is its value-plane
+    -- OR-reduction; the scalar overload is the identity so the backend can
+    -- wrap either operand kind and let overload resolution pick. (No
+    -- return-type-overloaded l3d_and/l3d_or here: dual scalar/vector
+    -- consumers like l3d_to_unsigned make such calls ambiguous.)
+    function l3d_truthy(a : logic3d_vector) return logic3d;
+    function l3d_truthy(a : logic3d) return logic3d;
+
     function l3d_and3(a, b, c : logic3d) return logic3d;
     function l3d_and4(a, b, c, d : logic3d) return logic3d;
     function l3d_or3(a, b, c : logic3d) return logic3d;
@@ -418,10 +426,9 @@ package logic3d_types_pkg is
     -- makes the result X, per Verilog arithmetic).
     function l3d_neg(a : logic3d_vector) return logic3d_vector;
 
-    -- Verilog index semantics: an index with any X/Z bit selects NOTHING
-    -- (reads x, writes lost). Convert an index vector to integer with a
-    -- far-out-of-range sentinel for uncertain values so every bounds guard
-    -- fails without arithmetic overflow.
+    -- Index-vector to integer. 3D-logic doctrine: certainty never gates a
+    -- read, so uncertain bits index by their value plane (all-X address is
+    -- address 0), unlike Verilog's x-index-selects-nothing pessimism.
     function l3d_index(a : logic3d_vector; s : boolean) return integer;
 
     -- Bounds-safe part/bit reads: Verilog reads x for out-of-range bits
@@ -1450,11 +1457,9 @@ package body logic3d_types_pkg is
 
     function l3d_index(a : logic3d_vector; s : boolean) return integer is
     begin
-        for i in a'range loop
-            if is_uncertain(a(i)) then
-                return integer'low;   -- fails every bounds guard
-            end if;
-        end loop;
+        -- Uncertain bits index by their value plane (3D-logic doctrine: reads
+        -- use the 1/0 value, never the certainty, so an all-X address is
+        -- address 0 rather than an X-propagating bounds failure).
         if s then
             return to_integer(l3d_to_signed(a));
         end if;
@@ -1541,6 +1546,19 @@ package body logic3d_types_pkg is
             end loop;
         end if;
         return unsigned_to_l3d(acc);
+    end function;
+
+    function l3d_truthy(a : logic3d_vector) return logic3d is
+    begin
+        for i in a'range loop
+            if is_one(a(i)) then return L3D_1; end if;
+        end loop;
+        return L3D_0;
+    end function;
+
+    function l3d_truthy(a : logic3d) return logic3d is
+    begin
+        return a;
     end function;
 
 end package body;
