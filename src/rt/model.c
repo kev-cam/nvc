@@ -8204,7 +8204,21 @@ void x_sched_process(int64_t delay)
    TRACE("schedule process %s delay=%s", istr(proc->name), trace_time(delay));
 
    check_delay(delay);
-   deltaq_insert_proc(get_model(), delay, proc);
+
+   // Verilog mode: a zero-delay wait is #0 -- resume in the INACTIVE region,
+   // after every active-region delta at this time has settled, not merely one
+   // delta later. The translated `wait for 0 ns` exists precisely to emulate
+   // #0 and blocking-read settling, and one delta races comb reactions whose
+   // driver updates land a delta after the wakeup.
+   rt_model_t *m = get_model();
+   if (delay == 0 && standard() == STD_MX) {
+      set_pending(&proc->wakeable);
+      deferq_do(&m->inactiveq, async_run_process, proc);
+      m->next_is_delta = true;
+      return;
+   }
+
+   deltaq_insert_proc(m, delay, proc);
 }
 
 void x_sched_inactive(void)
