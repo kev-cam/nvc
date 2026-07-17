@@ -397,6 +397,23 @@ package logic3d_types_pkg is
     -- logic3d family so comparisons against logic3d operands type-check.
     function unsigned_to_l3d_bit(a : unsigned) return logic3d;
 
+    ---------------------------------------------------------------------------
+    -- Verilog real <-> logic3d conversions. Accumulate through real (not
+    -- integer) so vectors wider than 31 bits convert without overflow.
+    ---------------------------------------------------------------------------
+    function l3d_to_real(a : logic3d_vector) return real;   -- unsigned value
+    function l3d_to_real(a : logic3d) return real;          -- single bit
+    function l3d_to_real_s(a : logic3d_vector) return real; -- two's complement
+    -- Verilog implicit real->vector: round to nearest (half away from zero),
+    -- wrap into w bits, two's complement for negatives.
+    function real_to_l3d(r : real; w : natural) return logic3d_vector;
+    function real_to_l3d1(r : real) return logic3d;
+
+    -- Verilog 4-state -> 2-state cast (bit/int/shortint targets): certain 1
+    -- (strong or weak) stays 1, everything uncertain (X/Z/W/U) coerces to 0.
+    function l3d_to_2state(a : logic3d_vector) return logic3d_vector;
+    function l3d_to_2state(a : logic3d) return logic3d;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -1297,6 +1314,82 @@ package body logic3d_types_pkg is
         end loop;
         -- No match: hold current output.
         return cur_out;
+    end function;
+
+    ---------------------------------------------------------------------------
+    -- Verilog real <-> logic3d conversions
+    ---------------------------------------------------------------------------
+    function l3d_to_real(a : logic3d_vector) return real is
+        variable r : real := 0.0;
+    begin
+        for i in a'range loop      -- (msb downto lsb): MSB first
+            r := r * 2.0;
+            if is_one(a(i)) then
+                r := r + 1.0;
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    function l3d_to_real(a : logic3d) return real is
+    begin
+        if is_one(a) then return 1.0; else return 0.0; end if;
+    end function;
+
+    function l3d_to_real_s(a : logic3d_vector) return real is
+        variable r : real := l3d_to_real(a);
+    begin
+        if a'length > 0 and is_one(a(a'left)) then
+            r := r - 2.0 ** a'length;
+        end if;
+        return r;
+    end function;
+
+    function real_to_l3d(r : real; w : natural) return logic3d_vector is
+        constant m   : real := 2.0 ** w;
+        variable x   : real;
+        variable res : logic3d_vector(w - 1 downto 0) := (others => L3D_0);
+    begin
+        -- Round to nearest, half away from zero (Verilog conversion rule;
+        -- math_real round() has exactly these semantics), then wrap the
+        -- magnitude into w bits and two's-complement a negative value.
+        x := ieee.math_real.round(abs(r));
+        x := x - ieee.math_real.trunc(x / m) * m;   -- |value| mod 2**w
+        if r < 0.0 and x /= 0.0 then
+            x := m - x;
+        end if;
+        for i in 0 to w - 1 loop
+            if x - ieee.math_real.trunc(x / 2.0) * 2.0 >= 1.0 then
+                res(i) := L3D_1;
+            end if;
+            x := ieee.math_real.trunc(x / 2.0);
+        end loop;
+        return res;
+    end function;
+
+    function real_to_l3d1(r : real) return logic3d is
+        variable v : logic3d_vector(0 downto 0);
+    begin
+        v := real_to_l3d(r, 1);
+        return v(0);
+    end function;
+
+    function l3d_to_2state(a : logic3d) return logic3d is
+    begin
+        if is_one(a) and not is_uncertain(a) then
+            return L3D_1;
+        else
+            return L3D_0;
+        end if;
+    end function;
+
+    function l3d_to_2state(a : logic3d_vector) return logic3d_vector is
+        variable res : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            res(i) := l3d_to_2state(a(i));
+        end loop;
+        return res;
     end function;
 
 end package body;

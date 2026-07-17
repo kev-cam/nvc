@@ -84,10 +84,18 @@ static void to_string_real_format(jit_scalar_t *args, tlab_t *tlab,
       }
    }
 
+   // %f of a large double can need over 300 characters (DBL_MAX has 308
+   // integer digits), and the user format may demand an arbitrary width, so
+   // fall back to the heap when the stack buffer is too small.
    char buf[64];
-   checked_sprintf(buf, sizeof(buf), fmt_cstr, value);
-
-   ffi_return_string(buf, args, tlab);
+   const int nbytes = snprintf(buf, sizeof(buf), fmt_cstr, value);
+   if (nbytes < (int)sizeof(buf))
+      ffi_return_string(buf, args, tlab);
+   else {
+      char *big LOCAL = xmalloc(nbytes + 1);
+      snprintf(big, nbytes + 1, fmt_cstr, value);
+      ffi_return_string(big, args, tlab);
+   }
 }
 
 DLLEXPORT
