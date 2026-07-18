@@ -226,6 +226,11 @@ package logic3d_types_pkg is
     function l3d_truthy(a : logic3d_vector) return logic3d;
     function l3d_truthy(a : logic3d) return logic3d;
 
+    -- $isunknown: the explicit certainty observer -- L3D_1 when any bit has
+    -- certainty 0. Reads never consult certainty; tests probe it via this.
+    function l3d_isunknown(a : logic3d_vector) return logic3d;
+    function l3d_isunknown(a : logic3d) return logic3d;
+
     function l3d_and3(a, b, c : logic3d) return logic3d;
     function l3d_and4(a, b, c, d : logic3d) return logic3d;
     function l3d_or3(a, b, c : logic3d) return logic3d;
@@ -1559,6 +1564,20 @@ package body logic3d_types_pkg is
     function l3d_truthy(a : logic3d) return logic3d is
     begin
         return a;
+    end function;
+
+    function l3d_isunknown(a : logic3d_vector) return logic3d is
+    begin
+        for i in a'range loop
+            if is_uncertain(a(i)) then return L3D_1; end if;
+        end loop;
+        return L3D_0;
+    end function;
+
+    function l3d_isunknown(a : logic3d) return logic3d is
+    begin
+        if is_uncertain(a) then return L3D_1; end if;
+        return L3D_0;
     end function;
 
 end package body;
