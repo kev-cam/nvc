@@ -721,12 +721,23 @@ package body logic3d_types_pkg is
         variable aa : logic3d_vector(a'length-1 downto 0) := a;
         variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n  : natural := minimum(a'length, b'length);
-        variable r  : logic3d := L3D_1;
+        variable eq  : boolean := true;
+        variable unc : boolean := false;
     begin
+        -- Value-plane equality; certainty is metadata. The old AND/XNOR LUT
+        -- chain was x-pessimistic: one uncertain bit forced the RESULT's
+        -- value to 0 ("not equal"), zeroing every address/tag/pointer match
+        -- once boot-time uncertainty touched an operand (doctrine: certainty
+        -- never gates a computation's value).
         for i in 0 to n-1 loop
-            r := AND_LUT(r, XNOR_LUT(aa(i), bb(i)));
+            if is_one(aa(i)) /= is_one(bb(i)) then eq := false; end if;
+            if is_uncertain(aa(i)) or is_uncertain(bb(i)) then unc := true; end if;
         end loop;
-        return r;
+        if eq then
+            if unc then return L3D_U; else return L3D_1; end if;
+        else
+            if unc then return L3D_X; else return L3D_0; end if;
+        end if;
     end function;
 
     function l3d_or(a, b : logic3d_vector) return logic3d_vector is
