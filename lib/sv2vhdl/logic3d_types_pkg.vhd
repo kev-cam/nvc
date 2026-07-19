@@ -231,6 +231,15 @@ package logic3d_types_pkg is
     function l3d_isunknown(a : logic3d_vector) return logic3d;
     function l3d_isunknown(a : logic3d) return logic3d;
 
+    -- Value-plane equality for == in boolean contexts, overloaded across
+    -- the family so the operand's REAL type resolves (annotations lie for
+    -- indexed elements: a 1-bit slice keeps the VECTOR type, and a memory
+    -- word-select IS a vector despite the same annotation shape).
+    function l3d_eq1(a, b : logic3d) return boolean;
+    function l3d_eq1(a, b : logic3d_vector) return boolean;
+    function l3d_eq1(a : logic3d_vector; b : logic3d) return boolean;
+    function l3d_eq1(a : logic3d; b : logic3d_vector) return boolean;
+
     function l3d_and3(a, b, c : logic3d) return logic3d;
     function l3d_and4(a, b, c, d : logic3d) return logic3d;
     function l3d_or3(a, b, c : logic3d) return logic3d;
@@ -1589,6 +1598,28 @@ package body logic3d_types_pkg is
     begin
         if is_uncertain(a) then return L3D_1; end if;
         return L3D_0;
+    end function;
+
+    function l3d_eq1(a, b : logic3d) return boolean is
+    begin
+        return is_one(a) = is_one(b);
+    end function;
+
+    function l3d_eq1(a, b : logic3d_vector) return boolean is
+    begin
+        return a = b;   -- the value-plane boolean "=" above
+    end function;
+
+    function l3d_eq1(a : logic3d_vector; b : logic3d) return boolean is
+        variable ua : unsigned(a'length - 1 downto 0);
+    begin
+        to_u(a, ua);
+        return to_integer(ua) = to_integer(l3d_to_unsigned(b));
+    end function;
+
+    function l3d_eq1(a : logic3d; b : logic3d_vector) return boolean is
+    begin
+        return l3d_eq1(b, a);
     end function;
 
 end package body;
