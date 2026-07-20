@@ -27,7 +27,7 @@
 // per-thread model state (model_thread lazy-alloc) the runtime carries
 // throughout, so the simulation kernel is thread-safe for the parallel
 // (SMP) process scheduler. See docs/parallel-simulation.md.
-#define RT_MULTITHREADED 1
+#define RT_MULTITHREADED 0
 
 #define TIME_HIGH INT64_MAX  // Value of TIME'HIGH
 
