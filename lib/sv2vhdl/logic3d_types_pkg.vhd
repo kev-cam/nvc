@@ -696,15 +696,27 @@ package body logic3d_types_pkg is
     -- sometimes emits ops with mismatched index ranges (e.g. a is [19:16]
     -- and b is [3:0]) — both are 4 bits, just rebased differently.
     function l3d_and(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := AND_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := AND_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := AND_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
@@ -713,9 +725,8 @@ package body logic3d_types_pkg is
     -- Rebase to (length-1 downto 0) so index 0 is the LSB regardless of the
     -- literal's declared range, matching the vector-vector bodies above.
     function l3d_and(a : logic3d_vector; b : logic3d) return logic3d is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
     begin
-        return AND_LUT(aa(0), b);
+        return AND_LUT(a(a'right), b);   -- bit 0 is the rightmost element
     end function;
 
     function l3d_and(a : logic3d; b : std_logic) return logic3d is
@@ -727,20 +738,24 @@ package body logic3d_types_pkg is
     -- (X/Z propagate through the LUTs, matching x-pessimistic equality). Length
     -- mismatch compares the common low bits (operands are same-width in practice).
     function "="(a, b : logic3d_vector) return logic3d is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n  : natural := minimum(a'length, b'length);
         variable eq  : boolean := true;
         variable unc : boolean := false;
+        variable av, bv : logic3d;
     begin
         -- Value-plane equality; certainty is metadata. The old AND/XNOR LUT
         -- chain was x-pessimistic: one uncertain bit forced the RESULT's
         -- value to 0 ("not equal"), zeroing every address/tag/pointer match
         -- once boot-time uncertainty touched an operand (doctrine: certainty
         -- never gates a computation's value).
+        -- Copy-free: index from the right (bit 0) directly; once ineq and
+        -- uncertainty are both latched the outcome cannot change.
         for i in 0 to n-1 loop
-            if is_one(aa(i)) /= is_one(bb(i)) then eq := false; end if;
-            if is_uncertain(aa(i)) or is_uncertain(bb(i)) then unc := true; end if;
+            if a'ascending then av := a(a'high - i); else av := a(a'low + i); end if;
+            if b'ascending then bv := b(b'high - i); else bv := b(b'low + i); end if;
+            if is_one(av) /= is_one(bv) then eq := false; end if;
+            if is_uncertain(av) or is_uncertain(bv) then unc := true; end if;
+            if (not eq) and unc then exit; end if;
         end loop;
         if eq then
             if unc then return L3D_U; else return L3D_1; end if;
@@ -750,67 +765,127 @@ package body logic3d_types_pkg is
     end function;
 
     function l3d_or(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := OR_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := OR_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := OR_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
     function l3d_xor(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := XOR_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := XOR_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := XOR_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := NAND_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := NAND_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := NAND_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := NOR_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := NOR_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := NOR_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
     function l3d_xnor(a, b : logic3d_vector) return logic3d_vector is
-        variable aa : logic3d_vector(a'length-1 downto 0) := a;
-        variable bb : logic3d_vector(b'length-1 downto 0) := b;
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
+        variable ai, bi : integer;
     begin
-        result := (others => L3D_0);
-        for i in 0 to n-1 loop
-            result(result'low + i) := XNOR_LUT(aa(i), bb(i));
-        end loop;
+        -- Copy-free hot path: translated signals are always `downto`, so
+        -- rebasing needs only index offsets, not the two defensive vector
+        -- copies this used to make (they dominated the op's cost).
+        if n < a'length then
+            result := (others => L3D_0);
+        end if;
+        if (not a'ascending) and (not b'ascending) then
+            for i in 0 to n-1 loop
+                result(result'low + i) := XNOR_LUT(a(a'low + i), b(b'low + i));
+            end loop;
+        else
+            for i in 0 to n-1 loop
+               if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
+               if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
+               result(result'low + i) := XNOR_LUT(a(ai), b(bi));
+            end loop;
+        end if;
         return result;
     end function;
 
