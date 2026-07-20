@@ -910,11 +910,13 @@ package body logic3d_types_pkg is
     begin
         for i in a'reverse_range loop
             if p < 31 then
-                -- An uncertain (X/Z) bit in the low 31 makes the index value
-                -- undefined; return a safe in-range 0 instead of trapping on an
-                -- out-of-range slice (Verilog yields X for an X index). Almost
-                -- always a time-0 / pre-reset artifact before index regs settle.
-                if is_uncertain(a(i)) then return 0; end if;
+                -- Value-plane only: an uncertain bit still contributes its
+                -- VALUE (doctrine: certainty is metadata and never gates a
+                -- computation). The old return-0-on-uncertain guard silently
+                -- redirected dynamic indexes to element 0 whenever init-X
+                -- certainty rode along on a correct value (EH2 icache
+                -- miss-buffer sibling lookup dropped wrap-fill beat pairs).
+                -- is_one is value-plane, so the result stays in range.
                 if is_one(a(i)) then result := result + 2**p; end if;
             end if;
             p := p + 1;
