@@ -52,6 +52,7 @@ typedef struct {
    unsigned        delayed : 1;
    unsigned        zombie : 1;
    unsigned        fastclk : 1;   // NVC_FAST_CLK: clk-only, dispatched by table
+   unsigned        fused_cone : 1; // comb_fused_* block: force/release re-runs it
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
 
