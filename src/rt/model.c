@@ -4284,6 +4284,11 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
 
    proc->vtable->eval(m, proc);
 
+   // A fused cone's body is straight-line: one complete activation deposits
+   // its full nexus set, so the depositors map is complete — stop recording.
+   if (obj->fused_cone)
+      obj->dep_recorded = 1;
+
    // Static-wait bookkeeping. Finalize only at suspends that ARMED an
    // event wait (cur_count > 0): a mid-cycle timed suspend (the NBA
    // transform's `wait for 0 ns`) schedules nothing and must not be
@@ -5063,6 +5068,15 @@ static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset)
       build_index(signal);
    else if (signal->index != NULL)
       update_index(signal, new);
+
+   // A split must not orphan the depositor mapping: force/release on the
+   // child range looks up the CHILD nexus (partial-signal force previously
+   // missed the pre-split key and the cone never woke).
+   {
+      void *dep = hash_get(m->depositors, old);
+      if (dep != NULL)
+         hash_put(m->depositors, new, dep);
+   }
 
    return new;
 }
@@ -6046,7 +6060,7 @@ void model_reset(rt_model_t *m)
    // reset-per-eval arena instead of the collected heap, so GC never fires
    // during the run. Installed only AFTER init so the persistent live set
    // (allocated above) stays on the heap. RTL-only; gated.
-   if (getenv("NVC_EVAL_ARENA") != NULL)
+   if (getenv("NVC_NO_EVAL_ARENA") == NULL)   // default ON; opt-out
       jit_eval_arena_enable(true);
 
    // Install fast path for thread context access now that the thread local
@@ -7181,7 +7195,7 @@ static void *evproc_worker(void *arg)
 
    // Each worker gets its own eval arena so escaping results never touch the
    // shared collected heap (no GC stop-the-world to race the eval).
-   if (getenv("NVC_EVAL_ARENA") != NULL)
+   if (getenv("NVC_NO_EVAL_ARENA") == NULL)   // default ON; opt-out
       jit_eval_arena_enable(true);
 
    atomic_store(&mb->ready, 1);
@@ -7815,7 +7829,7 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
       // re-assert the computed value at release). Cones only: waking an
       // arbitrary (e.g. completed initial) process would re-run its body.
       rt_proc_t *ap = get_active_proc();
-      if (ap->wakeable.fused_cone)
+      if (ap->wakeable.fused_cone && !ap->wakeable.dep_recorded)
          hash_put(m->depositors, n, ap);
 
       unsigned char *eff = nexus_effective(n);

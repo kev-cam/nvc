@@ -53,6 +53,7 @@ typedef struct {
    unsigned        zombie : 1;
    unsigned        fastclk : 1;   // NVC_FAST_CLK: clk-only, dispatched by table
    unsigned        fused_cone : 1; // comb_fused_* block: force/release re-runs it
+   unsigned        dep_recorded : 1; // cone's depositor map entries complete
    unsigned        wait_state : 2; // 0=first activation, 1=static (entries
                                    // persist, sched/clear no-op), 2=dynamic
    rt_trigger_t   *trigger;
