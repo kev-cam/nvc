@@ -1902,6 +1902,250 @@ static void std_textio_shrink(jit_func_t *func, jit_anchor_t *anchor,
    args[0].pointer = NULL;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// sv2vhdl logic3d operations
+//
+// logic3d is a 3-bit code (bit0=value, bit1=strength, bit2=uncertainty)
+// declared as a subtype of NATURAL, so vector elements arrive here with
+// INTEGER representation: int32 lanes holding codes 0..7.  These intrinsics
+// replace the package's per-element LUT loops with branch-free bitwise
+// formulas over whole lanes (verified against the LUTs by the l3dplane
+// selftest and the intrinsics-on/off differential test).
+//
+// Semantics must match the VHDL bodies in lib/sv2vhdl/logic3d_types_pkg.vhd
+// EXACTLY, including the length-mismatch and ascending-range cases: an
+// intrinsic binding is permanent, so there is no falling back per call.
+//
+// Memory mapping used throughout: for the bodies' loops the operand element
+// of iteration i is at mem[len-1-i] regardless of range direction, so with
+// a descending result the whole loop is the unit-stride tail
+//    result[j] = f(a[j], b[j + lb - la])
+// and only the ascending-result case (never emitted by tgt-vhdl) needs the
+// reversed write result[i] = f(a[la-1-i], b[lb-1-i]).
+
+#define L3D_C0 2   // L3D_0: driven, certain 0
+#define L3D_C1 3   // L3D_1: driven, certain 1
+#define L3D_CX 6   // L3D_X: driven, uncertain 0
+#define L3D_CU 7   // L3D_U: driven, uncertain 1
+
+// AND_LUT: value ANDs; result always strong; uncertainty survives unless
+// some operand is certainly 0
+__attribute__((always_inline))
+static inline int32_t __l3d_and_code(int32_t a, int32_t b)
+{
+   const int32_t va = a & 1, vb = b & 1;
+   const int32_t ua = (a >> 2) & 1, ub = (b >> 2) & 1;
+   const int32_t cert0 = ((va | ua) ^ 1) | ((vb | ub) ^ 1);
+   return (va & vb) | 2 | (((ua | ub) & (cert0 ^ 1)) << 2);
+}
+
+// OR_LUT: value ORs; always strong; uncertainty dies against a certain 1
+__attribute__((always_inline))
+static inline int32_t __l3d_or_code(int32_t a, int32_t b)
+{
+   const int32_t va = a & 1, vb = b & 1;
+   const int32_t ua = (a >> 2) & 1, ub = (b >> 2) & 1;
+   const int32_t cert1 = (va & (ua ^ 1)) | (vb & (ub ^ 1));
+   return (va | vb) | 2 | (((ua | ub) & (cert1 ^ 1)) << 2);
+}
+
+// XOR_LUT: value XORs; always strong; uncertainty is the union
+__attribute__((always_inline))
+static inline int32_t __l3d_xor_code(int32_t a, int32_t b)
+{
+   return ((a ^ b) & 1) | 2 | (((a | b) & 4));
+}
+
+#define L3D_BINOP_BODY(CODE_FN)                                         \
+   const int la = ffi_array_length(args[3].integer);                    \
+   const int lb = ffi_array_length(args[6].integer);                    \
+   const bool adesc = args[3].integer < 0;                              \
+   const int32_t *adata = args[1].pointer;                              \
+   const int32_t *bdata = args[4].pointer;                              \
+   const int64_t aleft = args[2].integer, acode = args[3].integer;      \
+                                                                        \
+   if (la == 0) {                                                       \
+      args[0].pointer = (void *)adata;                                  \
+      args[1].integer = aleft;                                          \
+      args[2].integer = acode;                                          \
+      return;                                                           \
+   }                                                                    \
+                                                                        \
+   const int n = MIN(la, lb);                                           \
+   int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);       \
+                                                                        \
+   if (n < la) {                                                        \
+      for (int j = 0; j < la; j++)                                      \
+         result[j] = L3D_C0;                                            \
+   }                                                                    \
+                                                                        \
+   if (adesc) {                                                         \
+      const int d = lb - la;                                            \
+      for (int j = la - n; j < la; j++)                                 \
+         result[j] = CODE_FN(adata[j], bdata[j + d]);                   \
+   }                                                                    \
+   else {                                                               \
+      for (int i = 0; i < n; i++)                                       \
+         result[i] = CODE_FN(adata[la - 1 - i], bdata[lb - 1 - i]);     \
+   }                                                                    \
+                                                                        \
+   args[0].pointer = result;                                            \
+   args[1].integer = aleft;                                             \
+   args[2].integer = acode;
+
+static void l3d_and_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   L3D_BINOP_BODY(__l3d_and_code);
+}
+
+static void l3d_or_vector(jit_func_t *func, jit_anchor_t *anchor,
+                          jit_scalar_t *args, tlab_t *tlab)
+{
+   L3D_BINOP_BODY(__l3d_or_code);
+}
+
+static void l3d_xor_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   L3D_BINOP_BODY(__l3d_xor_code);
+}
+
+// NOT_LUT = (1,0,3,2,5,4,7,6): flip the value bit, keep strength and
+// uncertainty.  Index-aligned, so memory-aligned 1:1.
+static void l3d_not_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int32_t *adata = args[1].pointer;
+   const int64_t aleft = args[2].integer, acode = args[3].integer;
+
+   if (la == 0)
+      args[0].pointer = (void *)adata;
+   else {
+      int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);
+      for (int j = 0; j < la; j++)
+         result[j] = adata[j] ^ 1;
+      args[0].pointer = result;
+   }
+
+   args[1].integer = aleft;
+   args[2].integer = acode;
+}
+
+// Verilog '==' returning a 1-bit logic3d: value-plane equality over the
+// common low bits, uncertainty flag if any scanned bit is uncertain
+// (certainty is metadata and never gates the value)
+static void l3d_eq_vector(jit_func_t *func, jit_anchor_t *anchor,
+                          jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int lb = ffi_array_length(args[6].integer);
+   const int32_t *adata = args[1].pointer;
+   const int32_t *bdata = args[4].pointer;
+
+   const int n = MIN(la, lb);
+   int32_t neq = 0, unc = 0;
+   for (int i = 0; i < n; i++) {
+      const int32_t a = adata[la - 1 - i], b = bdata[lb - 1 - i];
+      neq |= (a ^ b) & 1;
+      unc |= (a | b) & 4;
+   }
+
+   args[0].integer = neq ? (unc ? L3D_CX : L3D_C0)
+                         : (unc ? L3D_CU : L3D_C1);
+}
+
+// Boolean "=" via to_u on both sides then NUMERIC_STD."=": numeric equality
+// of the value planes (leading zeros of the longer operand must be 0-valued)
+static void l3d_eq_bool(jit_func_t *func, jit_anchor_t *anchor,
+                        jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int lb = ffi_array_length(args[6].integer);
+   const int32_t *adata = args[1].pointer;
+   const int32_t *bdata = args[4].pointer;
+
+   const int n = MIN(la, lb);
+   int32_t neq = 0;
+   for (int i = 0; i < n; i++)
+      neq |= (adata[la - 1 - i] ^ bdata[lb - 1 - i]) & 1;
+   for (int j = 0; j < la - n; j++)
+      neq |= adata[j] & 1;
+   for (int j = 0; j < lb - n; j++)
+      neq |= bdata[j] & 1;
+
+   args[0].integer = !neq;
+}
+
+// result(i) := '1' when is_one(a(i)) else '0' -- index-aligned; result
+// bounds are a's; unsigned elements are STD_ULOGIC bytes ('0'=2, '1'=3)
+static void l3d_to_unsigned_vec(jit_func_t *func, jit_anchor_t *anchor,
+                                jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int32_t *adata = args[1].pointer;
+   const int64_t aleft = args[2].integer, acode = args[3].integer;
+
+   if (la == 0)
+      args[0].pointer = (void *)adata;
+   else {
+      uint8_t *result = __tlab_alloc(tlab, la, 8);
+      for (int j = 0; j < la; j++)
+         result[j] = 2 + (adata[j] & 1);
+      args[0].pointer = result;
+   }
+
+   args[1].integer = aleft;
+   args[2].integer = acode;
+}
+
+// result(i) := L3D_1 when a(i) = '1' else L3D_0 -- only enum '1' (=3) maps
+// to L3D_1; 'H' etc. map to L3D_0, matching the body's a(i)='1' test
+static void l3d_from_unsigned(jit_func_t *func, jit_anchor_t *anchor,
+                              jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const uint8_t *adata = args[1].pointer;
+   const int64_t aleft = args[2].integer, acode = args[3].integer;
+
+   if (la == 0)
+      args[0].pointer = (void *)adata;
+   else {
+      int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);
+      for (int j = 0; j < la; j++)
+         result[j] = 2 + (adata[j] == 3);
+      args[0].pointer = result;
+   }
+
+   args[1].integer = aleft;
+   args[2].integer = acode;
+}
+
+// procedure to_u(a : logic3d_vector; u : out unsigned): fill u from a with
+// a'left as MSB; the write index k starts at u'high and pins at u'low, so a
+// longer `a` overwrites u's last position with each later element.
+// Procedure convention: args[0]=suspend state, args[1]=context, params
+// from args[2].
+static void l3d_to_u_proc(jit_func_t *func, jit_anchor_t *anchor,
+                          jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[4].integer);
+   const int lu = ffi_array_length(args[7].integer);
+   const int32_t *adata = args[2].pointer;
+   uint8_t *udata = args[5].pointer;
+   const bool udesc = args[7].integer < 0;
+
+   if (lu > 0) {
+      for (int j = 0; j < la; j++) {
+         const int k = (j < lu) ? j : lu - 1;
+         udata[udesc ? k : lu - 1 - k] = 2 + (adata[j] & 1);
+      }
+   }
+
+   args[0].pointer = NULL;
+}
+
 #define UU "36IEEE.NUMERIC_STD.UNRESOLVED_UNSIGNED"
 #define U "25IEEE.NUMERIC_STD.UNSIGNED"
 #define US "34IEEE.NUMERIC_STD.UNRESOLVED_SIGNED"
@@ -1917,6 +2161,9 @@ static void std_textio_shrink(jit_func_t *func, jit_anchor_t *anchor,
 #define SS "IEEE.STD_LOGIC_SIGNED."
 #define AU "29IEEE.STD_LOGIC_ARITH.UNSIGNED"
 #define AS "27IEEE.STD_LOGIC_ARITH.SIGNED"
+#define L3P "SV2VHDL.LOGIC3D_TYPES_PKG."
+#define L3 "33SV2VHDL.LOGIC3D_TYPES_PKG.LOGIC3D"
+#define L3V "40SV2VHDL.LOGIC3D_TYPES_PKG.LOGIC3D_VECTOR"
 
 static jit_intrinsic_t intrinsic_list[] = {
    { NS "\"+\"(" U U ")" U, ieee_plus_unsigned },
@@ -2062,6 +2309,15 @@ static jit_intrinsic_t intrinsic_list[] = {
    { SA "\"=\"(" AS AS ")B", synopsys_eql_signed },
    { SS "\"=\"(VV)B", synopsys_eql_signed },
    { SS "\"=\"(YY)B", synopsys_eql_signed },
+   { L3P "L3D_AND(" L3V L3V ")" L3V, l3d_and_vector },
+   { L3P "L3D_OR(" L3V L3V ")" L3V, l3d_or_vector },
+   { L3P "L3D_XOR(" L3V L3V ")" L3V, l3d_xor_vector },
+   { L3P "L3D_NOT(" L3V ")" L3V, l3d_not_vector },
+   { L3P "\"=\"(" L3V L3V ")" L3, l3d_eq_vector },
+   { L3P "\"=\"(" L3V L3V ")B", l3d_eq_bool },
+   { L3P "L3D_TO_UNSIGNED(" L3V ")" U, l3d_to_unsigned_vec },
+   { L3P "UNSIGNED_TO_L3D(" U ")" L3V, l3d_from_unsigned },
+   { L3P "TO_U(" L3V U ")", l3d_to_u_proc },
    { NULL, NULL }
 };
 
