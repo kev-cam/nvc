@@ -261,6 +261,8 @@ static const rt_nexus_vtable_t nexus_memo1_vtable;
 static void update_implicit_signal(rt_model_t *m, rt_implicit_t *imp);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
+static void clear_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
+static void sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void reset_scope(rt_model_t *m, rt_scope_t *s);
 static void async_run_process(rt_model_t *m, void *arg);
 static void evproc_shutdown(void);
@@ -4281,6 +4283,37 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
       return;   // Filtered
 
    proc->vtable->eval(m, proc);
+
+   // Static-wait bookkeeping. Finalize only at suspends that ARMED an
+   // event wait (cur_count > 0): a mid-cycle timed suspend (the NBA
+   // transform's `wait for 0 ns`) schedules nothing and must not be
+   // mistaken for a changed wait set.
+   if (obj->trigger == NULL && obj->wait_state != 2 && proc->cur_count > 0) {
+      if (obj->wait_state == 0) {
+         if (proc->wait_count > 0) {
+            proc->wait_sig = proc->cur_sig;
+            proc->wait_fpcount = proc->cur_count;
+            obj->wait_state = 1;   // promote: entries now persist
+         }
+      }
+      else if (proc->cur_sig != proc->wait_sig
+               || proc->cur_count != proc->wait_fpcount) {
+         // The wait set changed: demote to the dynamic path. Remove the
+         // persistent registrations and install THIS activation's set
+         // (recorded in cur_set) so no wakeup is lost — never re-run the
+         // process (body side effects must execute exactly once).
+         for (unsigned i = 0; i < proc->wait_count; i++)
+            clear_event(m, &(proc->wait_set[i]->pending), obj);
+         free(proc->wait_set);
+         proc->wait_set = NULL;
+         proc->wait_count = proc->wait_cap = 0;
+         obj->wait_state = 2;
+         for (unsigned i = 0; i < proc->cur_count; i++)
+            sched_event(m, &(proc->cur_set[i]->pending), obj);
+      }
+      proc->cur_sig = 0;
+      proc->cur_count = 0;
+   }
 }
 
 static void reset_scope(rt_model_t *m, rt_scope_t *s)
@@ -8611,6 +8644,37 @@ void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count)
 
    rt_model_t *m = get_model();
    rt_nexus_t *n = split_nexus(m, s, offset, count);
+
+   // Static-wait fast path: after the first activation the pending-list
+   // entries persist forever (enable/disable model — the list is never
+   // touched again). Later activations only fingerprint their re-arm
+   // calls so run_process can detect a process whose wait set actually
+   // changes and demote it to the classic dynamic path.
+   if (obj->kind == W_PROC && obj->trigger == NULL && obj->wait_state != 2) {
+      rt_proc_t *p = container_of(obj, rt_proc_t, wakeable);
+      for (; count > 0; n = n->chain) {
+         p->cur_sig ^= (uint64_t)(uintptr_t)n;
+         if (p->cur_count == p->cur_cap) {
+            p->cur_cap = p->cur_cap ? p->cur_cap * 2 : 16;
+            p->cur_set = xrealloc_array(p->cur_set, p->cur_cap,
+                                        sizeof(rt_nexus_t *));
+         }
+         p->cur_set[p->cur_count++] = n;
+         if (obj->wait_state == 0) {
+            sched_event(m, &(n->pending), obj);
+            if (p->wait_count == p->wait_cap) {
+               p->wait_cap = p->wait_cap ? p->wait_cap * 2 : 16;
+               p->wait_set = xrealloc_array(p->wait_set, p->wait_cap,
+                                            sizeof(rt_nexus_t *));
+            }
+            p->wait_set[p->wait_count++] = n;
+         }
+         count -= n->width;
+         assert(count >= 0);
+      }
+      return;
+   }
+
    for (; count > 0; n = n->chain) {
       sched_event(m, &(n->pending), obj);
 
@@ -8629,6 +8693,13 @@ void x_clear_event(sig_shared_t *ss, uint32_t offset, int32_t count)
 
    rt_model_t *m = get_model();
    rt_proc_t *proc = get_active_proc();
+
+   // Static-wait: entries persist; the re-arm clear is a no-op. (State 0
+   // has no prior registrations, state 1 keeps them by design.)
+   if (proc->wakeable.kind == W_PROC && proc->wakeable.trigger == NULL
+       && proc->wakeable.wait_state != 2)
+      return;
+
    rt_nexus_t *n = split_nexus(m, s, offset, count);
    for (; count > 0; n = n->chain) {
       clear_event(m, &(n->pending), &(proc->wakeable));

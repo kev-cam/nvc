@@ -53,6 +53,8 @@ typedef struct {
    unsigned        zombie : 1;
    unsigned        fastclk : 1;   // NVC_FAST_CLK: clk-only, dispatched by table
    unsigned        fused_cone : 1; // comb_fused_* block: force/release re-runs it
+   unsigned        wait_state : 2; // 0=first activation, 1=static (entries
+                                   // persist, sched/clear no-op), 2=dynamic
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
 
@@ -87,9 +89,20 @@ struct _rt_proc {
    tlab_t        *tlab;
    rt_scope_t    *scope;
    mptr_t         privdata;
+   // Static-wait tracking: registered sensitivity set (built on the first
+   // activation, entries then persist on the pending lists forever) and
+   // the fingerprint used to verify later activations re-arm the same set.
+   rt_nexus_t   **wait_set;
+   unsigned       wait_count, wait_cap;   // wait_set[] registrations
+   unsigned       wait_fpcount;            // fingerprint sched-call count
+   uint64_t       wait_sig;
+   unsigned       cur_count;
+   uint64_t       cur_sig;
+   rt_nexus_t   **cur_set;      // this activation's re-arm set (for demote)
+   unsigned       cur_cap;
 };
 
-STATIC_ASSERT(sizeof(rt_proc_t) <= 136);
+STATIC_ASSERT(sizeof(rt_proc_t) <= 184);   // +static-wait tracking
 
 typedef struct _rt_prop {
    rt_wakeable_t  wakeable;
