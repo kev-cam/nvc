@@ -1854,14 +1854,31 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    // evals lock-free (different chunks run concurrently); the hundreds of losers
    // take the nanosecond critical section and return, so there is no spinning on
    // the expensive eval. (Serial path: one uncontended lock, negligible.)
-   nvc_lock(&chunk->eval_lock);
-   const bool mine = !(chunk->last_eval_now == (uint64_t)m->now
-                       && chunk->last_eval_iter == m->iteration);
-   if (mine) {
-      chunk->last_eval_now  = (uint64_t)m->now;
-      chunk->last_eval_iter = m->iteration;
+   // A whole-core chunk reroutes to hundreds of procs that all wake this
+   // delta, so this claim runs millions of times -- the atomic test-and-set
+   // showed up as ~10% of accel sim time. Only NVC_PARALLEL_PROCS scatters
+   // the duplicates across workers and needs the lock; the serial default has
+   // one thread and can claim with a plain read-modify-write. Same g_par_active
+   // gate the scheduler locks use.
+   bool mine;
+   if (unlikely(relaxed_load(&g_par_active))) {
+      nvc_lock(&chunk->eval_lock);
+      mine = !(chunk->last_eval_now == (uint64_t)m->now
+               && chunk->last_eval_iter == m->iteration);
+      if (mine) {
+         chunk->last_eval_now  = (uint64_t)m->now;
+         chunk->last_eval_iter = m->iteration;
+      }
+      nvc_unlock(&chunk->eval_lock);
    }
-   nvc_unlock(&chunk->eval_lock);
+   else {
+      mine = !(chunk->last_eval_now == (uint64_t)m->now
+               && chunk->last_eval_iter == m->iteration);
+      if (mine) {
+         chunk->last_eval_now  = (uint64_t)m->now;
+         chunk->last_eval_iter = m->iteration;
+      }
+   }
    if (!mine)
       return;   // another worker owns this chunk's eval this delta
    model_thread_t *thread = model_thread(m);
