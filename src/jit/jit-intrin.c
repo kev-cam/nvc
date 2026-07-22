@@ -2288,6 +2288,109 @@ static void l3d_sub_vector(jit_func_t *func, jit_anchor_t *anchor,
    l3d_addsub(args, tlab, 1);
 }
 
+// "*"(a, b): value-plane multiply. The l3d wrapper truncates the numeric_std
+// product back to a'length (result(a'length-1 downto 0)), so only the low la
+// columns are needed. Schoolbook column-sum then carry-propagate -- no unsigned
+// conversion.
+static void l3d_mul_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int lb = ffi_array_length(args[6].integer);
+   const int32_t *a = args[1].pointer;
+   const int32_t *b = args[4].pointer;
+
+   if (la == 0) {
+      args[0].pointer = NULL;
+      args[1].integer = 0;
+      args[2].integer = -1;
+      return;
+   }
+
+   int32_t *r = __tlab_alloc(tlab, (size_t)la * sizeof(int32_t), 8);
+   int64_t *col = __tlab_alloc(tlab, (size_t)la * sizeof(int64_t), 8);
+   memset(col, 0, (size_t)la * sizeof(int64_t));
+
+   for (int s = 0; s < la; s++) {          // s,j = significance of a,b
+      if (!(a[la - 1 - s] & 1)) continue;
+      for (int j = 0; j < lb && s + j < la; j++)   // truncate at column la
+         if (b[lb - 1 - j] & 1) col[s + j]++;
+   }
+
+   int64_t carry = 0;
+   for (int c = 0; c < la; c++) {
+      const int64_t v = col[c] + carry;
+      r[la - 1 - c] = 2 + (int)(v & 1);
+      carry = v >> 1;
+   }
+
+   args[0].pointer = r;
+   args[1].integer = la - 1;
+   args[2].integer = ~la;
+}
+
+// Signed comparison of two value planes (a[0]=MSB=sign, two's complement).
+static int l3d_scmp(const int32_t *a, int la, const int32_t *b, int lb)
+{
+   const int asign = (la > 0) ? (a[0] & 1) : 0;
+   const int bsign = (lb > 0) ? (b[0] & 1) : 0;
+   if (asign != bsign)
+      return asign ? -1 : 1;   // negative < positive
+
+   const int W = la > lb ? la : lb;
+   for (int k = 0; k < W; k++) {   // sign-extend both to W, compare MSB-first
+      const int abit = (k < W - la) ? asign : (a[la - W + k] & 1);
+      const int bbit = (k < W - lb) ? bsign : (b[lb - W + k] & 1);
+      if (abit != bbit)
+         return abit < bbit ? -1 : 1;
+   }
+   return 0;
+}
+
+#define L3D_SCMP_INTRIN(name, op)                                          \
+   static void name(jit_func_t *func, jit_anchor_t *anchor,                \
+                    jit_scalar_t *args, tlab_t *tlab)                      \
+   {                                                                       \
+      args[0].integer =                                                    \
+         l3d_scmp(args[1].pointer, ffi_array_length(args[3].integer),      \
+                  args[4].pointer, ffi_array_length(args[6].integer)) op;  \
+   }
+
+L3D_SCMP_INTRIN(l3d_lt_s_vec, < 0)
+L3D_SCMP_INTRIN(l3d_gt_s_vec, > 0)
+L3D_SCMP_INTRIN(l3d_le_s_vec, <= 0)
+L3D_SCMP_INTRIN(l3d_ge_s_vec, >= 0)
+
+// l3d_resize_s(a, new_size): signed resize of the value plane (numeric_std
+// SIGNED resize semantics -- sign-fill, keep low bits + sign). a[0]=MSB=sign.
+static void l3d_resize_s_vec(jit_func_t *func, jit_anchor_t *anchor,
+                             jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int32_t *a = args[1].pointer;
+   const int nw = args[4].integer;
+
+   if (nw < 1) {
+      args[0].pointer = NULL;
+      args[1].integer = 0;
+      args[2].integer = -1;
+      return;
+   }
+
+   int32_t *r = __tlab_alloc(tlab, (size_t)nw * sizeof(int32_t), 8);
+   const int sign = (la > 0) ? (a[0] & 1) : 0;
+   for (int i = 0; i < nw; i++)   // sign-fill (covers MSB + any extension)
+      r[i] = 2 + sign;
+
+   const int lo = (la < nw ? la : nw) - 1;   // copy significance 0..lo-1
+   for (int i = 0; i < lo; i++)
+      r[nw - 1 - i] = 2 + (a[la - 1 - i] & 1);
+
+   args[0].pointer = r;
+   args[1].integer = nw - 1;
+   args[2].integer = ~nw;
+}
+
 #define UU "36IEEE.NUMERIC_STD.UNRESOLVED_UNSIGNED"
 #define U "25IEEE.NUMERIC_STD.UNSIGNED"
 #define US "34IEEE.NUMERIC_STD.UNRESOLVED_SIGNED"
@@ -2466,6 +2569,12 @@ static jit_intrinsic_t intrinsic_list[] = {
    { L3P "\">\"(" L3V L3V ")B", l3d_gt_vec },
    { L3P "\"+\"(" L3V L3V ")" L3V, l3d_add_vector },
    { L3P "\"-\"(" L3V L3V ")" L3V, l3d_sub_vector },
+   { L3P "\"*\"(" L3V L3V ")" L3V, l3d_mul_vector },
+   { L3P "L3D_LT_S(" L3V L3V ")B", l3d_lt_s_vec },
+   { L3P "L3D_GT_S(" L3V L3V ")B", l3d_gt_s_vec },
+   { L3P "L3D_LE_S(" L3V L3V ")B", l3d_le_s_vec },
+   { L3P "L3D_GE_S(" L3V L3V ")B", l3d_ge_s_vec },
+   { L3P "L3D_RESIZE_S(" L3V "N)" L3V, l3d_resize_s_vec },
    { NULL, NULL }
 };
 
