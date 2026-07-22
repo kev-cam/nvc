@@ -7815,7 +7815,7 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
    TRACE("deposit signal %s+%d value=%s count=%zd", istr(tree_ident(s->where)),
          offset, fmt_values(values, count * s->nexus.size), count);
 
-   assert(!get_active_proc()->wakeable.postponed);
+   assert(get_active_proc() == NULL || !get_active_proc()->wakeable.postponed);
 
    rt_nexus_t *n = split_nexus(m, s, offset, count);
    const char *vptr = values;
@@ -7828,8 +7828,12 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
       // sensitive to their own defs, and deposits leave no driver to
       // re-assert the computed value at release). Cones only: waking an
       // arbitrary (e.g. completed initial) process would re-run its body.
+      // A deposit applied between deltas (accel STAGE2 output staging via
+      // aj_apply_stage2, or any bridge/external deposit) has no active process
+      // -- there is no cone to record, and the depositor map only exists to
+      // re-run a fused cone on force/release of a net it deposits.
       rt_proc_t *ap = get_active_proc();
-      if (ap->wakeable.fused_cone && !ap->wakeable.dep_recorded)
+      if (ap != NULL && ap->wakeable.fused_cone && !ap->wakeable.dep_recorded)
          hash_put(m->depositors, n, ap);
 
       unsigned char *eff = nexus_effective(n);
