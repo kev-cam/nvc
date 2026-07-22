@@ -1146,13 +1146,17 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
    thread->active_obj = &(proc->wakeable);
    thread->active_scope = proc->scope;
 
-   // Per-instance scratch: run this process's body against its OWN scope's
-   // arena, so an instance's transients are isolated from every other
-   // instance's (no shared arena to serialise parallel eval, and each
-   // instance's allocations are local for debugging). Created lazily on first
-   // use; only when the eval arena is enabled at all.
+   // Per-instance scratch (opt-in via NVC_SCOPE_SCRATCH): run this process's
+   // body against its OWN scope's arena instead of the shared per-thread one,
+   // grouping each instance's transients in their own buffer for debugging.
+   // OFF by default because it costs ~3% (measured, VeeR-EH2 hello): many
+   // small per-scope arenas hurt cache locality versus one hot shared arena,
+   // and it buys no parallel-eval isolation -- parallel workers already have
+   // per-thread arenas (model_cycle), so per-scope granularity adds nothing.
+   static int per_inst = -1;
+   if (per_inst < 0) per_inst = (getenv("NVC_SCOPE_SCRATCH") != NULL);
    eval_arena_t *saved_arena = NULL;
-   if (jit_eval_arena_enabled()) {
+   if (per_inst && jit_eval_arena_enabled()) {
       if (unlikely(proc->scope->scratch == NULL))
          proc->scope->scratch = eval_arena_new();
       saved_arena = jit_eval_arena_swap(proc->scope->scratch);
