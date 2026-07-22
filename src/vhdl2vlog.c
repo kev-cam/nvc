@@ -1686,6 +1686,21 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       fprintf(f, "  %s ", is_reg(block, d) ? "reg" : "wire");
       emit_range(f, tree_type(d));
       fprintf(f, "%s;\n", vid(tree_ident(d)));
+
+      // A signal with an initial value that is assigned NOWHERE (no process,
+      // no concurrent statement) is effectively a constant. The bare `wire`
+      // above leaves it undriven (x/0 in synthesis), dropping the value. Drive
+      // it with a continuous assign of its initializer. Signals that DO have a
+      // driver (reg or concurrent) get their value from that driver -- a second
+      // assign here would be a multi-driver conflict.
+      const bool driven =
+         (g_reg_set  != NULL && hset_contains(g_reg_set,  tree_ident(d)))
+         || (g_conc_set != NULL && hset_contains(g_conc_set, tree_ident(d)));
+      if (!driven && tree_has_value(d)) {
+         fprintf(f, "  assign %s = ", vid(tree_ident(d)));
+         emit_expr(f, tree_value(d));
+         fputs(";\n", f);
+      }
    }
 
    const int nstmts = tree_stmts(block);
