@@ -329,8 +329,15 @@ static bool type_is_logic3d(type_t t)
 // operands in $signed so yosys sets A_SIGNED and the synth model sign-extends.
 static bool type_is_signed(type_t t)
 {
+   // numeric_std declares `subtype SIGNED is (resolved) UNRESOLVED_SIGNED`, and
+   // every operator/function (`+`, `-`, resize, ...) returns UNRESOLVED_SIGNED.
+   // So a declared `signed` signal reads as SIGNED but any expression RESULT
+   // reads as UNRESOLVED_SIGNED -- both must count, or a chained signed
+   // expression (acc + r8 - r12) loses sign-extension on the outer operator.
    for (int i = 0; i < 8 && t != NULL; i++) {
-      if (!strcasecmp(id_base(istr(type_ident(t))), "SIGNED")) return true;
+      const char *b = id_base(istr(type_ident(t)));
+      if (!strcasecmp(b, "SIGNED") || !strcasecmp(b, "UNRESOLVED_SIGNED"))
+         return true;
       if (type_kind(t) != T_SUBTYPE) break;
       t = type_base(t);
    }
