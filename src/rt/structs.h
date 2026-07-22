@@ -333,6 +333,7 @@ typedef struct _rt_scope {
    mptr_t           privdata;
    rt_scope_t      *parent;
    scope_list_t     children;
+   eval_arena_t    *scratch;   // per-instance transient arena (reset per eval)
 } rt_scope_t;
 
 typedef struct _rt_watch {

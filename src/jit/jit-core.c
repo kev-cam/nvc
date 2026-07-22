@@ -131,6 +131,24 @@ void jit_eval_arena_enable(bool on)
    }
 }
 
+// Point the current thread's eval-arena at `a` (an instance's own scratch),
+// returning the previous arena so the caller can restore it. Lets each
+// instance's process-body transients live in its OWN arena -- isolation for
+// parallel eval and locality for debugging -- while resolution/init between
+// evals keep using the default arena.
+eval_arena_t *jit_eval_arena_swap(eval_arena_t *a)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   eval_arena_t *old = thread->eval_arena;
+   thread->eval_arena = a;
+   return old;
+}
+
+bool jit_eval_arena_enabled(void)
+{
+   return jit_thread_get()->eval_arena != NULL;
+}
+
 void jit_eval_arena_reset(void)
 {
    jit_thread_local_t *thread = jit_thread_get();

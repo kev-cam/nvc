@@ -701,6 +701,11 @@ static void cleanup_signal(rt_model_t *m, rt_signal_t *s)
 
 static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
 {
+   if (scope->scratch != NULL) {
+      eval_arena_free(scope->scratch);
+      scope->scratch = NULL;
+   }
+
    for (int i = 0; i < scope->procs.count; i++) {
       rt_proc_t *p = scope->procs.items[i];
       mptr_free(m->mspace, &(p->privdata));
@@ -1134,11 +1139,25 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
    assert(thread->tlab->alloc == 0);
 
    // Reclaim the previous eval's escaping unconstrained results in O(1) (no-op
-   // unless the eval arena is enabled).
+   // unless the eval arena is enabled). This resets the DEFAULT arena, which
+   // also caught resolution/conversion transients since the last eval.
    jit_eval_arena_reset();
 
    thread->active_obj = &(proc->wakeable);
    thread->active_scope = proc->scope;
+
+   // Per-instance scratch: run this process's body against its OWN scope's
+   // arena, so an instance's transients are isolated from every other
+   // instance's (no shared arena to serialise parallel eval, and each
+   // instance's allocations are local for debugging). Created lazily on first
+   // use; only when the eval arena is enabled at all.
+   eval_arena_t *saved_arena = NULL;
+   if (jit_eval_arena_enabled()) {
+      if (unlikely(proc->scope->scratch == NULL))
+         proc->scope->scratch = eval_arena_new();
+      saved_arena = jit_eval_arena_swap(proc->scope->scratch);
+      jit_eval_arena_reset();   // reclaim this instance's previous transients
+   }
 
    jit_scalar_t state = {
       .pointer = *mptr_get(proc->privdata) ?: (void *)-1
@@ -1152,6 +1171,9 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
    if (!jit_fastcall(m->jit, proc->handle, &result, state, context,
                      proc->tlab ?: thread->tlab))
       m->force_stop = true;
+
+   if (saved_arena != NULL)
+      jit_eval_arena_swap(saved_arena);   // restore the default arena
 
    if (proc->tlab != NULL && result.pointer == NULL) {
       tlab_release(proc->tlab);

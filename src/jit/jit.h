@@ -81,6 +81,9 @@ bool jit_is_shutdown(jit_t *j);
 // initialisation, on the thread that will run process bodies.
 void jit_eval_arena_enable(bool on);
 void jit_eval_arena_reset(void);
+typedef struct _eval_arena eval_arena_t;
+eval_arena_t *jit_eval_arena_swap(eval_arena_t *a);
+bool jit_eval_arena_enabled(void);
 
 void *jit_mspace_alloc(size_t size) RETURNS_NONNULL;
 jit_stack_trace_t *jit_stack_trace(void);
