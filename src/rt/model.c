@@ -261,6 +261,7 @@ static const rt_nexus_vtable_t nexus_memo1_vtable;
 static void update_implicit_signal(rt_model_t *m, rt_implicit_t *imp);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
+static void wakeable_set_kind(rt_wakeable_t *w, wakeable_kind_t k);
 static void clear_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void reset_scope(rt_model_t *m, rt_scope_t *s);
@@ -5923,11 +5924,11 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
             case V_ASSIGN:
             case V_UDP_TABLE:
             case V_GATE_INST:
-               p->wakeable.kind = W_ASSIGN;
+               wakeable_set_kind(&p->wakeable, W_ASSIGN);
                break;
             case V_INITIAL:
             case V_ALWAYS:
-               p->wakeable.kind = W_PROC;
+               wakeable_set_kind(&p->wakeable, W_PROC);
                break;
             default:
                should_not_reach_here();
@@ -5956,7 +5957,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
             p->scope     = s;
             p->privdata  = mptr_new(m->mspace, "process privdata");
 
-            p->wakeable.kind      = W_PROC;
+            wakeable_set_kind(&p->wakeable, W_PROC);
             p->wakeable.pending   = false;
             p->wakeable.delayed   = false;
             p->wakeable.postponed = !!(tree_flags(t) & TREE_F_POSTPONED);
@@ -5983,7 +5984,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
             p->name     = sym;
             p->privdata = mptr_new(m->mspace, "property privdata");
 
-            p->wakeable.kind    = W_PROPERTY;
+            wakeable_set_kind(&p->wakeable, W_PROPERTY);
             p->wakeable.pending = false;
             p->wakeable.delayed = false;
 
@@ -6531,6 +6532,114 @@ static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
    set_pending(obj);
 }
 
+// Per-kind wake handlers -- the bodies of the old wakeup_one switch, now
+// reached through the schedulable's vtable (rt_wakeable_t.vtable, first field)
+// so the hot dispatch is a load-and-call with no case statement.
+
+static void wake_proc(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_proc_t *proc = container_of(obj, rt_proc_t, wakeable);
+   TRACE("wakeup %sprocess %s", obj->postponed ? "postponed " : "",
+         istr(proc->name));
+
+   if (proc->wakeable.delayed) {
+      // Already scheduled to run at a later time -- delete it from the queue
+      heap_delete(m->eventq_heap, heap_delete_proc_cb, proc);
+      proc->wakeable.delayed = false;
+   }
+
+   procq_do(m, obj, async_run_process, proc);
+}
+
+static void wake_property(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_prop_t *prop = container_of(obj, rt_prop_t, wakeable);
+   TRACE("wakeup property %s", istr(prop->name));
+   procq_do(m, obj, async_update_property, prop);
+}
+
+static void wake_implicit(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_implicit_t *imp = container_of(obj, rt_implicit_t, wakeable);
+   TRACE("wakeup implicit signal %s closure %s",
+         istr(tree_ident(imp->signal.where)),
+         istr(jit_get_name(m->jit, imp->closure.handle)));
+
+   deferq_do(&m->implicitq, async_update_implicit_signal, imp);
+   set_pending(obj);
+}
+
+static void wake_watch(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_watch_t *w = container_of(obj, rt_watch_t, wakeable);
+   TRACE("wakeup %svalue change callback %p %s",
+         obj->postponed ? "postponed " : "", w, debug_symbol_name(w->fn));
+
+   assert(!w->wakeable.zombie);
+   procq_do(m, obj, async_watch_callback, w);
+}
+
+static void wake_transfer(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_transfer_t *t = container_of(obj, rt_transfer_t, wakeable);
+   TRACE("wakeup signal transfer for %s",
+         istr(tree_ident(t->target->signal->where)));
+
+   procq_do(m, obj, async_transfer_signal, t);
+}
+
+static void wake_trigger(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_trigger_t *t = container_of(obj, rt_trigger_t, wakeable);
+   TRACE("wakeup trigger %p", t);
+
+   if (!m->blocking_update) {
+      deferq_do(&m->triggerq, async_run_trigger, t);
+      set_pending(obj);
+   }
+   else if (run_trigger(m, t))
+      wakeup_all(m, &(t->pending));
+}
+
+static void wake_assign(rt_model_t *m, rt_wakeable_t *obj)
+{
+   rt_proc_t *proc = container_of(obj, rt_proc_t, wakeable);
+   TRACE("wakeup continuous assignment %s", istr(proc->name));
+
+   assert(!proc->wakeable.delayed);
+
+   if (m->blocking_update)
+      update_assignment(m, proc);
+   else {
+      deferq_do(&m->implicitq, async_run_process, proc);
+      set_pending(obj);
+   }
+}
+
+static const wakeable_vtable_t wakeable_proc_vt     = { .wake = wake_proc };
+static const wakeable_vtable_t wakeable_property_vt = { .wake = wake_property };
+static const wakeable_vtable_t wakeable_implicit_vt = { .wake = wake_implicit };
+static const wakeable_vtable_t wakeable_watch_vt    = { .wake = wake_watch };
+static const wakeable_vtable_t wakeable_transfer_vt = { .wake = wake_transfer };
+static const wakeable_vtable_t wakeable_trigger_vt  = { .wake = wake_trigger };
+static const wakeable_vtable_t wakeable_assign_vt   = { .wake = wake_assign };
+
+// Set an object's kind and its matching default wake vtable. Creation-time
+// (cold) -- the dispatch itself is vtable, not a switch.
+static void wakeable_set_kind(rt_wakeable_t *w, wakeable_kind_t k)
+{
+   w->kind = k;
+   switch (k) {
+   case W_PROC:     w->vtable = &wakeable_proc_vt;     break;
+   case W_PROPERTY: w->vtable = &wakeable_property_vt; break;
+   case W_IMPLICIT: w->vtable = &wakeable_implicit_vt; break;
+   case W_WATCH:    w->vtable = &wakeable_watch_vt;    break;
+   case W_TRANSFER: w->vtable = &wakeable_transfer_vt; break;
+   case W_TRIGGER:  w->vtable = &wakeable_trigger_vt;  break;
+   case W_ASSIGN:   w->vtable = &wakeable_assign_vt;   break;
+   }
+}
+
 static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
 {
    if (obj->fastclk && m->fastclk_on) {
@@ -6543,95 +6652,7 @@ static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
    if (obj->pending)
       return;   // Already scheduled
 
-   switch (obj->kind) {
-   case W_PROC:
-      {
-         rt_proc_t *proc = container_of(obj, rt_proc_t, wakeable);
-         TRACE("wakeup %sprocess %s", obj->postponed ? "postponed " : "",
-               istr(proc->name));
-
-         if (proc->wakeable.delayed) {
-            // This process was already scheduled to run at a later
-            // time so we need to delete it from the simulation queue
-            heap_delete(m->eventq_heap, heap_delete_proc_cb, proc);
-            proc->wakeable.delayed = false;
-         }
-
-         procq_do(m, obj, async_run_process, proc);
-      }
-      break;
-
-   case W_PROPERTY:
-      {
-         rt_prop_t *prop = container_of(obj, rt_prop_t, wakeable);
-         TRACE("wakeup property %s", istr(prop->name));
-         procq_do(m, obj, async_update_property, prop);
-      }
-      break;
-
-   case W_IMPLICIT:
-      {
-         rt_implicit_t *imp = container_of(obj, rt_implicit_t, wakeable);
-         TRACE("wakeup implicit signal %s closure %s",
-               istr(tree_ident(imp->signal.where)),
-               istr(jit_get_name(m->jit, imp->closure.handle)));
-
-         deferq_do(&m->implicitq, async_update_implicit_signal, imp);
-         set_pending(obj);
-      }
-      break;
-
-   case W_WATCH:
-      {
-         rt_watch_t *w = container_of(obj, rt_watch_t, wakeable);
-         TRACE("wakeup %svalue change callback %p %s",
-               obj->postponed ? "postponed " : "", w, debug_symbol_name(w->fn));
-
-         assert(!w->wakeable.zombie);
-         procq_do(m, obj, async_watch_callback, w);
-      }
-      break;
-
-   case W_TRANSFER:
-      {
-         rt_transfer_t *t = container_of(obj, rt_transfer_t, wakeable);
-         TRACE("wakeup signal transfer for %s",
-               istr(tree_ident(t->target->signal->where)));
-
-         procq_do(m, obj, async_transfer_signal, t);
-      }
-      break;
-
-   case W_TRIGGER:
-      {
-         rt_trigger_t *t = container_of(obj, rt_trigger_t, wakeable);
-         TRACE("wakeup trigger %p", t);
-
-         if (!m->blocking_update) {
-            deferq_do(&m->triggerq, async_run_trigger, t);
-            set_pending(obj);
-         }
-         else if (run_trigger(m, t))
-            wakeup_all(m, &(t->pending));
-      }
-      break;
-
-   case W_ASSIGN:
-      {
-         rt_proc_t *proc = container_of(obj, rt_proc_t, wakeable);
-         TRACE("wakeup continuous assignment %s", istr(proc->name));
-
-         assert(!proc->wakeable.delayed);
-
-         if (m->blocking_update)
-            update_assignment(m, proc);
-         else {
-            deferq_do(&m->implicitq, async_run_process, proc);
-            set_pending(obj);
-         }
-      }
-      break;
-   }
+   obj->vtable->wake(m, obj);
 }
 
 static void wakeup_all(rt_model_t *m, void **pending)
@@ -8028,7 +8049,7 @@ rt_watch_t *watch_new(rt_model_t *m, sig_event_fn_t fn, void *user,
    w->user_data = user;
    w->num_slots = slots;
 
-   w->wakeable.kind      = W_WATCH;
+   wakeable_set_kind(&w->wakeable, W_WATCH);
    w->wakeable.postponed = (kind == WATCH_POSTPONED);
    w->wakeable.pending   = false;
    w->wakeable.delayed   = false;
@@ -8260,7 +8281,7 @@ static rt_trigger_t *new_trigger(rt_model_t *m, trigger_kind_t kind,
 
    rt_trigger_t *t = static_alloc(m, sizeof(rt_trigger_t) + argsz);
    memset(t, '\0', sizeof(rt_trigger_t));
-   t->wakeable.kind = W_TRIGGER;
+   wakeable_set_kind(&t->wakeable, W_TRIGGER);
    t->handle = handle;
    t->nargs  = nargs;
    t->epoch  = UINT64_MAX;
@@ -8574,7 +8595,7 @@ void x_transfer_signal(sig_shared_t *target_ss, uint32_t toffset,
    t->after  = after;
    t->reject = reject;
 
-   t->wakeable.kind      = W_TRANSFER;
+   wakeable_set_kind(&t->wakeable, W_TRANSFER);
    t->wakeable.postponed = false;
    t->wakeable.pending   = false;
    t->wakeable.delayed   = false;
@@ -9104,7 +9125,7 @@ sig_shared_t *x_implicit_signal(uint32_t count, uint32_t size, tree_t where,
 
    imp->closure = *closure;
    imp->delay = delay;
-   imp->wakeable.kind = W_IMPLICIT;
+   wakeable_set_kind(&imp->wakeable, W_IMPLICIT);
 
    deferq_do(&m->implicitq, async_update_implicit_signal, imp);
    set_pending(&(imp->wakeable));
@@ -9423,7 +9444,7 @@ void x_process_init(jit_handle_t handle, tree_t where)
    p->scope     = s;
    p->privdata  = mptr_new(m->mspace, "process privdata");
 
-   p->wakeable.kind      = W_PROC;
+   wakeable_set_kind(&p->wakeable, W_PROC);
    p->wakeable.pending   = false;
    p->wakeable.postponed = false;
    p->wakeable.delayed   = false;

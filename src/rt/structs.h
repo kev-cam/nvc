@@ -45,7 +45,15 @@ typedef enum {
    FUNC_TRIGGER, OR_TRIGGER, CMP_TRIGGER, LEVEL_TRIGGER
 } trigger_kind_t;
 
+// Virtual method table for a schedulable object. The scheduler dispatches
+// through this instead of switching on `kind`, so a new kind of schedulable
+// is a new vtable rather than another case in the hot loop -- and an
+// individual object can be given a specialized vtable (e.g. an accel chunk
+// that schedules itself once per delta) without changing its kind.
+typedef struct _wakeable_vtable wakeable_vtable_t;
+
 typedef struct {
+   const wakeable_vtable_t *vtable;  // FIRST: zero-offset recovery for dispatch
    wakeable_kind_t kind : 8;
    unsigned        pending : 1;
    unsigned        postponed : 1;
@@ -58,6 +66,13 @@ typedef struct {
                                    // persist, sched/clear no-op), 2=dynamic
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
+
+// wake: enqueue this object to run in the current delta (what the old
+// wakeup_one switch did per kind). Called with the fastclk/pending guards
+// already applied.
+struct _wakeable_vtable {
+   void (*wake)(rt_model_t *m, rt_wakeable_t *obj);
+};
 
 typedef struct _rt_trigger {
    rt_wakeable_t   wakeable;
