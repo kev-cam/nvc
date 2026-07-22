@@ -656,7 +656,44 @@ static void emit_expr(FILE *f, tree_t e)
             fputc(')', f);
          }
          else if (l3dop != NULL && l3dk == 2 && nparams >= 1) {
-            emit_expr(f, tree_value(tree_param(e, 0)));   // identity on value bit
+            // resize / to_signed / to_unsigned: the width arg is dropped and
+            // Verilog's surrounding (assignment or operator) context does the
+            // resize. Two cases need help beyond that:
+            //  (1) a SIGNED result must be $signed-wrapped so the context
+            //      sign-extends (Verilog zero-extends a bare unsigned value) --
+            //      e.g. `sel := resize(c20,32)` as an assignment RHS, where the
+            //      operator-level $signed wrapping never runs. Idempotent under
+            //      an operator that also wraps.
+            //  (2) a WIDENING UNSIGNED result must materialize its zero-extension
+            //      rather than drop it: dropping is unsound when the value is
+            //      later reinterpreted as signed (`signed(resize(bits,32))`) --
+            //      the value's own MSB would wrongly become the sign bit.
+            // l3d resize has a non-signed, non-array-numeric type so it stays
+            // the bare identity below.
+            tree_t a0 = tree_value(tree_param(e, 0));
+            const bool sgn = tree_has_type(e) && type_is_signed(tree_type(e));
+            // Target width: the resize/to_(un)signed size arg (param 1) folds to
+            // a constant; the FCALL's own type is the unconstrained numeric_std
+            // return type (no const bounds), so read the width from the arg.
+            int64_t nwi = -1;
+            int nw = -1, aw = -1;
+            if (nparams >= 2 && folded_int(tree_value(tree_param(e, 1)), &nwi))
+               nw = (int)nwi;
+            if (tree_has_type(a0) && type_is_array(tree_type(a0))
+                && type_const_bounds(tree_type(a0)))
+               aw = (int)type_width(tree_type(a0));
+            if (sgn) {
+               fputs("$signed(", f);
+               emit_expr(f, a0);
+               fputc(')', f);
+            }
+            else if (nw > 0 && aw > 0 && nw > aw) {
+               fprintf(f, "{%d'b0, ", nw - aw);
+               emit_expr(f, a0);
+               fputc('}', f);
+            }
+            else
+               emit_expr(f, a0);
          }
          else {
             // rising_edge / unhandled function: surface for inspection
