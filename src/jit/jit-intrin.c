@@ -196,6 +196,21 @@ static const uint8_t lane_iota[16] = {
 
 #endif
 
+// TLAB overflow: route transient results that don't fit the 64K TLAB to the
+// per-eval eval-arena (growable, reset each proc eval) -- the SAME arena the
+// JIT's own aggregate allocator (__nvc_mspace_alloc) already uses. Previously
+// this fell back to mspace_alloc (the collected heap), so the vector
+// intrinsics were the dominant GC feeder (~25M allocs/run on VeeR hello);
+// the arena keeps them off the collector entirely.
+__attribute__((noinline, cold))
+static void *__tlab_overflow(tlab_t *t, size_t size)
+{
+   jit_thread_local_t *thread = jit_thread_local();
+   if (likely(thread->eval_arena != NULL))
+      return eval_arena_alloc(thread->eval_arena, size);
+   return mspace_alloc(t->mspace, size);
+}
+
 __attribute__((always_inline))
 static inline void *__tlab_alloc(tlab_t *t, size_t size, size_t align)
 {
@@ -210,7 +225,7 @@ static inline void *__tlab_alloc(tlab_t *t, size_t size, size_t align)
       return t->data + base;
    }
    else
-      return mspace_alloc(t->mspace, size);
+      return __tlab_overflow(t, size);
 }
 
 __attribute__((always_inline))
