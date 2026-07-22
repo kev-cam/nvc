@@ -856,8 +856,10 @@ static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
 }
 
 // detect a clocked process: a wrapping `if rising_edge(clk) [or falling_edge(rst)]`.
-// Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list.
-static tree_t clock_of(tree_t proc, tree_t *body_if, tree_t *sig, bool *pe, int *ne)
+// Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list
+// and (if given) the enclosing T_IF so the caller can find an async-reset elsif.
+static tree_t clock_of(tree_t proc, tree_t *body_if, tree_t *sig, bool *pe,
+                       int *ne, tree_t *ifstmt)
 {
    const int n = tree_stmts(proc);
    for (int i = 0; i < n; i++) {
@@ -866,7 +868,38 @@ static tree_t clock_of(tree_t proc, tree_t *body_if, tree_t *sig, bool *pe, int 
       tree_t c = tree_cond(s, 0);
       tree_t test = tree_has_value(c) ? tree_value(c) : NULL;
       int k = edges_of(test, sig, pe, 8);
-      if (k > 0) { *body_if = c; *ne = k; return c; }
+      if (k > 0) {
+         *body_if = c; *ne = k;
+         if (ifstmt != NULL) *ifstmt = s;
+         return c;
+      }
+   }
+   return NULL;
+}
+
+// Detect an async-reset elsif on a clocked process: `elsif rst = '1'|'0'` -- a
+// LEVEL test on a signal (in the process sensitivity), the way VHDL expresses
+// `always @(posedge clk or posedge rst) if (rst) ...`. clock_of matches only the
+// FIRST (clock-edge) condition, so without this the reset branch is silently
+// dropped. Returns the reset T_COND and fills the reset signal + polarity
+// (pe = active-high '1' -> posedge). Only conditions AFTER the clock edge.
+static tree_t areset_of(tree_t ifstmt, tree_t *rsig, bool *rpe)
+{
+   const int nc = tree_conds(ifstmt);
+   for (int i = 1; i < nc; i++) {
+      tree_t c = tree_cond(ifstmt, i);
+      if (!tree_has_value(c)) continue;   // bare `else` is not a reset
+      tree_t test = tree_value(c);
+      if (tree_kind(test) != T_FCALL) continue;
+      // operator function names are quoted in the tree ("=", not =)
+      if (strcasecmp(id_base(istr(tree_ident(test))), "\"=\"")) continue;
+      if (tree_params(test) < 2) continue;
+      int64_t lv;
+      if (!folded_int(tree_value(tree_param(test, 1)), &lv)) continue;
+      if (lv != 2 && lv != 3) continue;   // std_logic '0'=2, '1'=3
+      *rsig = tree_value(tree_param(test, 0));
+      *rpe  = (lv == 3);
+      return c;
    }
    return NULL;
 }
@@ -1002,19 +1035,37 @@ static void emit_seq(FILE *f, tree_t s, int ind)
 
 static void emit_process(FILE *f, tree_t p)
 {
-   tree_t body_if = NULL, sig[8];
+   tree_t body_if = NULL, sig[8], ifstmt = NULL;
    bool pe[8];
    int ne = 0;
-   tree_t clk = clock_of(p, &body_if, sig, pe, &ne);
+   tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    if (clk != NULL) {
+      tree_t rsig = NULL; bool rpe = false;
+      tree_t rcond = (ifstmt != NULL) ? areset_of(ifstmt, &rsig, &rpe) : NULL;
       fputs("  always @(", f);
       for (int i = 0; i < ne; i++) {
          if (i) fputs(" or ", f);
          fputs(pe[i] ? "posedge " : "negedge ", f);
          emit_expr(f, sig[i]);
       }
+      if (rcond != NULL) {
+         fputs(" or ", f);
+         fputs(rpe ? "posedge " : "negedge ", f);
+         emit_expr(f, rsig);
+      }
       fputs(") begin\n", f);
-      emit_stmt_list(f, body_if, 4);
+      if (rcond != NULL) {
+         // async reset: `if (rst) <reset> else <clocked>`
+         fputs("    if (", f);
+         emit_expr(f, tree_value(rcond));
+         fputs(") begin\n", f);
+         emit_stmt_list(f, rcond, 6);
+         fputs("    end else begin\n", f);
+         emit_stmt_list(f, body_if, 6);
+         fputs("    end\n", f);
+      }
+      else
+         emit_stmt_list(f, body_if, 4);
       fputs("  end\n", f);
    }
    else {
