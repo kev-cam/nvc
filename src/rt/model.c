@@ -4170,6 +4170,46 @@ void accel_auto(rt_model_t *m)
    aj_mkdir_p(accel_dir);   // JIT writes aj_*.c/.so here; may not exist yet
 
    accel_scan_scope(m, root_scope(m), accel_dir);
+
+   // Establish initial combinational output values at t=0. model_reset ran the
+   // subtree's procs with their original vtables, but the reroute supersedes
+   // their driver transactions; without an initial accel deposit the output
+   // nets sit at 'U' until the first clock edge -- and a reader that samples an
+   // output on that same edge (before the chunk's own eval deposits it) captures
+   // the 'U', which is fatal for an xor/accumulate reader (one 'U' poisons it
+   // forever, e.g. c1c_tb's `chk <= chk xor result`). Run each installed chunk's
+   // comb eval once (clk is low at t=0 => the bridge takes the sm_comb path and
+   // deposits reset-state outputs), mirroring the interpreter's initial settle.
+   // VERIFY mode never reroutes, so it needs no seeding.
+   if (!g_aj_verify) {
+      const int tid = thread_id();
+      model_thread_t *thread = model_thread(m);
+      rt_wakeable_t *save_obj   = thread->active_obj;
+      rt_scope_t    *save_scope = thread->active_scope;
+      aj_chunk_t    *save_chunk = g_aj_cur_chunk[tid];
+      thread->active_obj   = NULL;   // no cone proc -- deposit_signal null-guards
+      thread->active_scope = NULL;
+      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+         aj_chunk_t *c = m->aj_chunks[ci];
+         if (c->eval == NULL) continue;
+         // Force a comb-only settle: the bridge clocks on (clk && t != last_t)
+         // and last_t is -1 after reset, so a design that initialises clk HIGH
+         // would spuriously clock at t=0. The interpreter only settles comb at
+         // init (rising_edge is false with no transition), so drive clk low for
+         // this one eval and restore it -- the first real edge is unaffected
+         // (its posedge still comes from t != last_t). bindtab[4] is clk->data.
+         uint8_t *clkp = c->bindtab ? (uint8_t *)c->bindtab[4] : NULL;
+         const bool force = (clkp != NULL && (clkp[0] & 1));
+         const uint8_t saved = force ? clkp[0] : 0;
+         if (force) clkp[0] = 2;   // driven-'0' (std_logic '0' / logic3d 0)
+         g_aj_cur_chunk[tid] = c;
+         c->eval(c->state, c->bindtab);
+         if (force) clkp[0] = saved;
+      }
+      g_aj_cur_chunk[tid] = save_chunk;
+      thread->active_obj   = save_obj;
+      thread->active_scope = save_scope;
+   }
 }
 
 void proc_reset_vtable(rt_proc_t *proc)
