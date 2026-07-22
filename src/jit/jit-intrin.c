@@ -2240,6 +2240,54 @@ static void l3d_gt_vec(jit_func_t *func, jit_anchor_t *anchor,
                      > 0;
 }
 
+// "+"/"-"(a, b): value-plane ripple add/subtract. numeric_std returns
+// UNSIGNED(max(la,lb)-1 downto 0), so the result is W = max(la,lb) codes,
+// descending, each a driven-certain L3D_0 (2) or L3D_1 (3). Subtraction is
+// a + ~b + 1 (two's complement, carry out dropped -- modular). No conversion
+// to unsigned, no TO_01.
+static void l3d_addsub(jit_scalar_t *args, tlab_t *tlab, int sub)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int lb = ffi_array_length(args[6].integer);
+   const int32_t *a = args[1].pointer;
+   const int32_t *b = args[4].pointer;
+
+   const int W = la > lb ? la : lb;
+   if (W == 0) {
+      args[0].pointer = NULL;
+      args[1].integer = 0;
+      args[2].integer = -1;
+      return;
+   }
+
+   int32_t *r = __tlab_alloc(tlab, (size_t)W * sizeof(int32_t), 8);
+   int carry = sub;   // subtract: start carry at 1 for a + ~b + 1
+   for (int s = 0; s < W; s++) {   // s = significance, 0 = LSB
+      const int abit = (s < la) ? (a[la - 1 - s] & 1) : 0;
+      int bbit = (s < lb) ? (b[lb - 1 - s] & 1) : 0;
+      if (sub) bbit ^= 1;
+      const int sum = abit + bbit + carry;
+      r[W - 1 - s] = 2 + (sum & 1);   // 2=L3D_0, 3=L3D_1 (driven, certain)
+      carry = sum >> 1;
+   }
+
+   args[0].pointer = r;
+   args[1].integer = W - 1;
+   args[2].integer = ~W;   // (W-1 downto 0)
+}
+
+static void l3d_add_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   l3d_addsub(args, tlab, 0);
+}
+
+static void l3d_sub_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   l3d_addsub(args, tlab, 1);
+}
+
 #define UU "36IEEE.NUMERIC_STD.UNRESOLVED_UNSIGNED"
 #define U "25IEEE.NUMERIC_STD.UNSIGNED"
 #define US "34IEEE.NUMERIC_STD.UNRESOLVED_SIGNED"
@@ -2416,6 +2464,8 @@ static jit_intrinsic_t intrinsic_list[] = {
    { L3P "L3D_INDEX(" L3V "B)I", l3d_index_vec },
    { L3P "\"<\"(" L3V L3V ")B", l3d_lt_vec },
    { L3P "\">\"(" L3V L3V ")B", l3d_gt_vec },
+   { L3P "\"+\"(" L3V L3V ")" L3V, l3d_add_vector },
+   { L3P "\"-\"(" L3V L3V ")" L3V, l3d_sub_vector },
    { NULL, NULL }
 };
 
