@@ -1059,17 +1059,11 @@ static void emit_process(FILE *f, tree_t p)
       tree_t rsig = NULL; bool rpe = false, rbefore = false;
       tree_t rcond = (ifstmt != NULL)
          ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
-      if (rcond != NULL) {
-         // Async-reset flop. gen_statemachine lowers it to an async-reset
-         // override, but the cycle-model runtime currently diverges (the reset
-         // is re-applied from sm_comb's per-eval state write, racing the
-         // clocked update), so DECLINE: keep the leaf in the interpreter
-         // (correct) rather than accelerate with altered reset timing. Applies
-         // to BOTH the standard `if rst then <reset> elsif clk` (arst-priority)
-         // and the swapped `if clk elsif rst` (clk-priority) forms.
-         // TODO: accelerate once the runtime async-reset path is verified.
-         (void)rsig; (void)rpe; (void)rbefore;
+      if (rcond != NULL && !rbefore) {
+         // Swapped `if clk elsif rst` form is clk-priority -- not a standard
+         // $adff -- so decline rather than emit the wrong arst-priority form.
          g_unhandled++;
+         rcond = NULL;
       }
       fputs("  always @(", f);
       for (int i = 0; i < ne; i++) {
@@ -1077,8 +1071,23 @@ static void emit_process(FILE *f, tree_t p)
          fputs(pe[i] ? "posedge " : "negedge ", f);
          emit_expr(f, sig[i]);
       }
+      if (rcond != NULL) {
+         fputs(" or ", f);
+         fputs(rpe ? "posedge " : "negedge ", f);
+         emit_expr(f, rsig);
+      }
       fputs(") begin\n", f);
-      emit_stmt_list(f, body_if, 4);
+      if (rcond != NULL) {
+         fputs("    if (", f);
+         emit_expr(f, tree_value(rcond));
+         fputs(") begin\n", f);
+         emit_stmt_list(f, rcond, 6);
+         fputs("    end else begin\n", f);
+         emit_stmt_list(f, body_if, 6);
+         fputs("    end\n", f);
+      }
+      else
+         emit_stmt_list(f, body_if, 4);
       fputs("  end\n", f);
    }
    else {
@@ -1696,20 +1705,31 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
                  vid(tree_ident(d)), nw - 1);
          continue;
       }
-      fprintf(f, "  %s ", is_reg(block, d) ? "reg" : "wire");
+      const bool is_r = is_reg(block, d);
+      fprintf(f, "  %s ", is_r ? "reg" : "wire");
       emit_range(f, tree_type(d));
-      fprintf(f, "%s;\n", vid(tree_ident(d)));
+      fprintf(f, "%s", vid(tree_ident(d)));
+      // A process-driven reg with a default value carries a POWER-ON init.
+      // Emit it as a Verilog reg initializer so yosys records the wire `init`
+      // attribute -- distinct from any async-reset value. Without it the accel
+      // powers on at the reg's reset value (or 0) instead of its declared
+      // default (e.g. `signal r := 0` with an async reset to X started at X).
+      if (is_r && tree_has_value(d)) {
+         fputs(" = ", f);
+         emit_expr(f, tree_value(d));
+      }
+      fputs(";\n", f);
 
       // A signal with an initial value that is assigned NOWHERE (no process,
       // no concurrent statement) is effectively a constant. The bare `wire`
       // above leaves it undriven (x/0 in synthesis), dropping the value. Drive
-      // it with a continuous assign of its initializer. Signals that DO have a
-      // driver (reg or concurrent) get their value from that driver -- a second
-      // assign here would be a multi-driver conflict.
+      // it with a continuous assign of its initializer. (A reg or concurrent-
+      // driven signal gets its value from that driver -- a second assign would
+      // be a multi-driver conflict.)
       const bool driven =
          (g_reg_set  != NULL && hset_contains(g_reg_set,  tree_ident(d)))
          || (g_conc_set != NULL && hset_contains(g_conc_set, tree_ident(d)));
-      if (!driven && tree_has_value(d)) {
+      if (!is_r && !driven && tree_has_value(d)) {
          fprintf(f, "  assign %s = ", vid(tree_ident(d)));
          emit_expr(f, tree_value(d));
          fputs(";\n", f);
