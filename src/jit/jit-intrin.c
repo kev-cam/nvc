@@ -2161,6 +2161,85 @@ static void l3d_to_u_proc(jit_func_t *func, jit_anchor_t *anchor,
    args[0].pointer = NULL;
 }
 
+// --- Native value-domain logic3d ops. logic3d's value plane IS the 2-state
+// --- value (already 0/1), so arithmetic, comparison and index-by-value work
+// --- directly on the value bit with NO conversion to numeric_std unsigned --
+// --- eliminating the to_u / TO_01 / unsigned_to_l3d round-trip the package
+// --- bodies do (the dominant interp cost). a[0] is the MSB, a[la-1] the LSB.
+
+// Unsigned value of a logic3d_vector's value plane, capped at 31 bits to match
+// to_integer's `p < 31` guard (result is a NATURAL / 32-bit integer).
+static int64_t l3d_uval31(const int32_t *a, int la)
+{
+   int64_t v = 0;
+   const int n = la < 31 ? la : 31;
+   for (int p = 0; p < n; p++)      // p=0 is the LSB (a[la-1])
+      v |= (int64_t)(a[la - 1 - p] & 1) << p;
+   return v;
+}
+
+// to_integer(logic3d_vector) -> natural
+static void l3d_to_integer_vec(jit_func_t *func, jit_anchor_t *anchor,
+                               jit_scalar_t *args, tlab_t *tlab)
+{
+   args[0].integer = l3d_uval31(args[1].pointer,
+                                ffi_array_length(args[3].integer));
+}
+
+// l3d_index(a, signed) -> integer: value-plane index (uncertain bits index by
+// their value). Unsigned = to_integer(l3d_to_unsigned); signed = two's
+// complement (to_integer(l3d_to_signed)).
+static void l3d_index_vec(jit_func_t *func, jit_anchor_t *anchor,
+                          jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int32_t *a = args[1].pointer;
+   const bool sgn = args[4].integer != 0;
+
+   if (!sgn) {
+      args[0].integer = l3d_uval31(a, la);
+      return;
+   }
+
+   // Signed: sign bit is a'left = a[0]. Build the two's-complement value.
+   int64_t v = 0;
+   const int n = la < 63 ? la : 63;
+   for (int p = 0; p < n; p++)
+      v |= (int64_t)(a[la - 1 - p] & 1) << p;
+   if (la >= 1 && la <= 63 && (a[0] & 1))
+      v |= ~(((int64_t)1 << (la - 1 == 63 ? 63 : la)) - 1);   // sign-extend
+   args[0].integer = v;
+}
+
+// Unsigned comparison of two value planes (a[0]=MSB). Returns <0, 0, >0.
+static int l3d_ucmp(const int32_t *a, int la, const int32_t *b, int lb)
+{
+   const int W = la > lb ? la : lb;
+   for (int k = 0; k < W; k++) {    // k=0 is the MSB of the W-wide compare
+      const int abit = (k < W - la) ? 0 : (a[la - W + k] & 1);
+      const int bbit = (k < W - lb) ? 0 : (b[lb - W + k] & 1);
+      if (abit != bbit)
+         return abit < bbit ? -1 : 1;
+   }
+   return 0;
+}
+
+static void l3d_lt_vec(jit_func_t *func, jit_anchor_t *anchor,
+                       jit_scalar_t *args, tlab_t *tlab)
+{
+   args[0].integer = l3d_ucmp(args[1].pointer, ffi_array_length(args[3].integer),
+                              args[4].pointer, ffi_array_length(args[6].integer))
+                     < 0;
+}
+
+static void l3d_gt_vec(jit_func_t *func, jit_anchor_t *anchor,
+                       jit_scalar_t *args, tlab_t *tlab)
+{
+   args[0].integer = l3d_ucmp(args[1].pointer, ffi_array_length(args[3].integer),
+                              args[4].pointer, ffi_array_length(args[6].integer))
+                     > 0;
+}
+
 #define UU "36IEEE.NUMERIC_STD.UNRESOLVED_UNSIGNED"
 #define U "25IEEE.NUMERIC_STD.UNSIGNED"
 #define US "34IEEE.NUMERIC_STD.UNRESOLVED_SIGNED"
@@ -2333,6 +2412,10 @@ static jit_intrinsic_t intrinsic_list[] = {
    { L3P "L3D_TO_UNSIGNED(" L3V ")" U, l3d_to_unsigned_vec },
    { L3P "UNSIGNED_TO_L3D(" U ")" L3V, l3d_from_unsigned },
    { L3P "TO_U(" L3V U ")", l3d_to_u_proc },
+   { L3P "TO_INTEGER(" L3V ")N", l3d_to_integer_vec },
+   { L3P "L3D_INDEX(" L3V "B)I", l3d_index_vec },
+   { L3P "\"<\"(" L3V L3V ")B", l3d_lt_vec },
+   { L3P "\">\"(" L3V L3V ")B", l3d_gt_vec },
    { NULL, NULL }
 };
 
