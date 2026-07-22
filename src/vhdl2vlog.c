@@ -865,30 +865,45 @@ static tree_t clock_of(tree_t proc, tree_t *body_if, tree_t *sig, bool *pe,
    for (int i = 0; i < n; i++) {
       tree_t s = tree_stmt(proc, i);
       if (tree_kind(s) != T_IF) continue;
-      tree_t c = tree_cond(s, 0);
-      tree_t test = tree_has_value(c) ? tree_value(c) : NULL;
-      int k = edges_of(test, sig, pe, 8);
-      if (k > 0) {
-         *body_if = c; *ne = k;
-         if (ifstmt != NULL) *ifstmt = s;
-         return c;
+      // Scan ALL branches for the clock edge, not just the first: the standard
+      // async-reset flop puts `if rst='1' then <reset> elsif rising_edge(clk)`,
+      // so the clock is the SECOND condition. body_if is the edge branch (the
+      // clocked body).
+      const int nconds = tree_conds(s);
+      for (int j = 0; j < nconds; j++) {
+         tree_t c = tree_cond(s, j);
+         tree_t test = tree_has_value(c) ? tree_value(c) : NULL;
+         int k = edges_of(test, sig, pe, 8);
+         if (k > 0) {
+            *body_if = c; *ne = k;
+            if (ifstmt != NULL) *ifstmt = s;
+            return c;
+         }
       }
    }
    return NULL;
 }
 
-// Detect an async-reset elsif on a clocked process: `elsif rst = '1'|'0'` -- a
-// LEVEL test on a signal (in the process sensitivity), the way VHDL expresses
-// `always @(posedge clk or posedge rst) if (rst) ...`. clock_of matches only the
-// FIRST (clock-edge) condition, so without this the reset branch is silently
-// dropped. Returns the reset T_COND and fills the reset signal + polarity
-// (pe = active-high '1' -> posedge). Only conditions AFTER the clock edge.
-static tree_t areset_of(tree_t ifstmt, tree_t *rsig, bool *rpe)
+// Detect an async-reset branch on a clocked process: a `rst = '1'|'0'` LEVEL
+// test on a signal (in the process sensitivity), the way VHDL expresses an
+// async-reset flop. Scans every branch EXCEPT the clock-edge one. Fills the
+// reset signal + polarity (pe = active-high '1' -> posedge) and *before =
+// whether the reset branch precedes the clock branch. In the STANDARD flop
+// `if rst then <reset> elsif rising_edge(clk) then <sync>` the reset is FIRST
+// (arst-priority) -> maps exactly to `always @(posedge clk or posedge rst)
+// if (rst) <reset> else <sync>`. If the reset comes AFTER the clock (rising_edge
+// first), the VHDL is clk-priority -- NOT a standard $adff -- and the caller
+// declines rather than emit the wrong (arst-priority) form.
+static tree_t areset_of(tree_t ifstmt, tree_t clockcond, tree_t *rsig,
+                        bool *rpe, bool *before)
 {
    const int nc = tree_conds(ifstmt);
-   for (int i = 1; i < nc; i++) {
+   int clk_idx = nc;
+   for (int i = 0; i < nc; i++)
+      if (tree_cond(ifstmt, i) == clockcond) { clk_idx = i; break; }
+   for (int i = 0; i < nc; i++) {
       tree_t c = tree_cond(ifstmt, i);
-      if (!tree_has_value(c)) continue;   // bare `else` is not a reset
+      if (c == clockcond || !tree_has_value(c)) continue;   // clock / bare else
       tree_t test = tree_value(c);
       if (tree_kind(test) != T_FCALL) continue;
       // operator function names are quoted in the tree ("=", not =)
@@ -897,8 +912,9 @@ static tree_t areset_of(tree_t ifstmt, tree_t *rsig, bool *rpe)
       int64_t lv;
       if (!folded_int(tree_value(tree_param(test, 1)), &lv)) continue;
       if (lv != 2 && lv != 3) continue;   // std_logic '0'=2, '1'=3
-      *rsig = tree_value(tree_param(test, 0));
-      *rpe  = (lv == 3);
+      *rsig   = tree_value(tree_param(test, 0));
+      *rpe    = (lv == 3);
+      *before = (i < clk_idx);
       return c;
    }
    return NULL;
@@ -1040,32 +1056,29 @@ static void emit_process(FILE *f, tree_t p)
    int ne = 0;
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    if (clk != NULL) {
-      tree_t rsig = NULL; bool rpe = false;
-      tree_t rcond = (ifstmt != NULL) ? areset_of(ifstmt, &rsig, &rpe) : NULL;
+      tree_t rsig = NULL; bool rpe = false, rbefore = false;
+      tree_t rcond = (ifstmt != NULL)
+         ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
+      if (rcond != NULL) {
+         // Async-reset flop. gen_statemachine lowers it to an async-reset
+         // override, but the cycle-model runtime currently diverges (the reset
+         // is re-applied from sm_comb's per-eval state write, racing the
+         // clocked update), so DECLINE: keep the leaf in the interpreter
+         // (correct) rather than accelerate with altered reset timing. Applies
+         // to BOTH the standard `if rst then <reset> elsif clk` (arst-priority)
+         // and the swapped `if clk elsif rst` (clk-priority) forms.
+         // TODO: accelerate once the runtime async-reset path is verified.
+         (void)rsig; (void)rpe; (void)rbefore;
+         g_unhandled++;
+      }
       fputs("  always @(", f);
       for (int i = 0; i < ne; i++) {
          if (i) fputs(" or ", f);
          fputs(pe[i] ? "posedge " : "negedge ", f);
          emit_expr(f, sig[i]);
       }
-      if (rcond != NULL) {
-         fputs(" or ", f);
-         fputs(rpe ? "posedge " : "negedge ", f);
-         emit_expr(f, rsig);
-      }
       fputs(") begin\n", f);
-      if (rcond != NULL) {
-         // async reset: `if (rst) <reset> else <clocked>`
-         fputs("    if (", f);
-         emit_expr(f, tree_value(rcond));
-         fputs(") begin\n", f);
-         emit_stmt_list(f, rcond, 6);
-         fputs("    end else begin\n", f);
-         emit_stmt_list(f, body_if, 6);
-         fputs("    end\n", f);
-      }
-      else
-         emit_stmt_list(f, body_if, 4);
+      emit_stmt_list(f, body_if, 4);
       fputs("  end\n", f);
    }
    else {
