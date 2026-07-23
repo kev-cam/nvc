@@ -1172,8 +1172,11 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
       .pointer = *mptr_get(proc->scope->privdata)
    };
 
-   if (!jit_fastcall(m->jit, proc->handle, &result, state, context,
-                     proc->tlab ?: thread->tlab))
+   // Explicit in-region call: this is the scheduler's process activation, which
+   // runs inside the landing pad armed by model_run, so it skips the per-call
+   // setjmp / state transitions / diag-hint churn.
+   if (!jit_fastcall_inregion(m->jit, proc->handle, &result, state, context,
+                              proc->tlab ?: thread->tlab))
       m->force_stop = true;
 
    if (saved_arena != NULL)
@@ -7724,8 +7727,28 @@ void model_run(rt_model_t *m, uint64_t stop_time)
 
    run_callbacks(m, START_OF_SIMULATION);
 
-   while (!should_stop_now(m, stop_time))
-      model_cycle(m);
+   // Arm ONE abort landing pad for the whole scheduler loop. Previously
+   // jit_try_vcall armed a setjmp (plus two state transitions and a
+   // diag-hint add/remove) on every process activation -- millions of times --
+   // purely to catch an abort that terminates the run anyway. With the pad
+   // hoisted here, that scaffolding leaves the per-eval path entirely and an
+   // abort inside any process unwinds straight to this frame.
+   {
+      volatile jit_state_t oldstate;
+      jit_thread_local_t *volatile thread =
+         jit_run_region_enter(m->jit, (jit_state_t *)&oldstate);
+
+      if (jit_setjmp(thread->abort_env) == 0) {
+         thread->jmp_buf_valid = 1;
+
+         while (!should_stop_now(m, stop_time))
+            model_cycle(m);
+      }
+      else
+         m->force_stop = true;   // abort unwound out of a process body
+
+      jit_run_region_leave(m->jit, thread, oldstate);
+   }
 
    run_callbacks(m, END_OF_SIMULATION);
 

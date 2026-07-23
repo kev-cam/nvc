@@ -426,6 +426,21 @@ void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f);
 void jit_tier_up(jit_func_t *f);
 jit_thread_local_t *jit_thread_local(void);
 void jit_thread_install_fast_path(void);
+
+// Run-region landing pad. The scheduler loop arms ONE abort landing pad around
+// the whole run (see model_run) instead of jit_try_vcall arming a setjmp on
+// every process activation. Entering puts the thread in JIT_RUNNING and
+// registers the JIT diagnostic hook once; jit_try_vcall then takes a fast path
+// that skips the per-call setjmp, both state transitions and the diag-hint
+// add/remove churn. An abort inside any process unwinds straight to the
+// scheduler's pad, which sets force_stop. Callers outside a region (elaboration
+// -time folding, foreign calls) still arm their own per-call pad as before.
+bool jit_fastcall_inregion(jit_t *j, jit_handle_t handle,
+                           jit_scalar_t *result, jit_scalar_t p1,
+                           jit_scalar_t p2, tlab_t *tlab);
+jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate);
+void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
+                          jit_state_t oldstate);
 void jit_fill_irbuf(jit_func_t *f);
 int32_t *jit_get_cover_ptr(jit_func_t *f, jit_value_t addr);
 jit_entry_fn_t jit_bind_intrinsic(ident_t name);

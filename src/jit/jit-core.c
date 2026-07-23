@@ -650,31 +650,86 @@ static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
    }
 }
 
+jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate)
+{
+   jit_thread_local_t *thread = jit_thread_local();
+   *oldstate = thread->state;
+   jit_transition(j, *oldstate, JIT_RUNNING);
+   return thread;
+}
+
+void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
+                          jit_state_t oldstate)
+{
+   thread->jmp_buf_valid = 0;
+   thread->anchor = NULL;
+   jit_transition(j, JIT_RUNNING, oldstate);
+}
+
 static bool jit_try_vcall(jit_t *j, jit_func_t *f, jit_scalar_t *args,
                           tlab_t *tlab)
 {
-   jit_thread_local_t *volatile thread = jit_thread_get();
-   volatile const jit_state_t oldstate = thread->state;
+   jit_thread_local_t *volatile vthread = jit_thread_get();
+   volatile const jit_state_t oldstate = vthread->state;
 
-   const int rc = jit_setjmp(thread->abort_env);
+   const int rc = jit_setjmp(vthread->abort_env);
    if (rc == 0) {
-      thread->jmp_buf_valid = 1;
+      vthread->jmp_buf_valid = 1;
       jit_transition(j, oldstate, JIT_RUNNING);
 
       jit_entry_fn_t entry = load_acquire(&f->entry);
       (*entry)(f, NULL, args, tlab);
 
       jit_transition(j, JIT_RUNNING, oldstate);
-      thread->jmp_buf_valid = 0;
-      thread->anchor = NULL;
+      vthread->jmp_buf_valid = 0;
+      vthread->anchor = NULL;
       return true;
    }
    else {
       jit_transition(j, JIT_RUNNING, oldstate);
-      thread->jmp_buf_valid = 0;
-      thread->anchor = NULL;
+      vthread->jmp_buf_valid = 0;
+      vthread->anchor = NULL;
       return false;
    }
+}
+
+// Explicit in-region call, used ONLY by the scheduler's process activation
+// (run_process), which we know executes inside the landing pad armed by
+// model_run. Because the caller states the context rather than this code
+// inferring it from shared mutable flags, elaboration/folding can never reach
+// here -- an earlier attempt keyed off (jmp_buf_valid && state == JIT_RUNNING)
+// and misfired on nested elaboration calls that already had an outer pad.
+// Skips the per-call setjmp, both state transitions and the diag-hint
+// add/remove; an abort unwinds to model_run's pad. Falls back to the normal
+// path when no region is armed (model_step / shell / VHPI stepping).
+static bool jit_vcall_inregion(jit_t *j, jit_func_t *f, jit_scalar_t *args,
+                               tlab_t *tlab)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+
+   if (unlikely(!thread->jmp_buf_valid || thread->state != JIT_RUNNING))
+      return jit_try_vcall(j, f, args, tlab);
+
+   jit_entry_fn_t entry = load_acquire(&f->entry);
+   (*entry)(f, NULL, args, tlab);
+   thread->anchor = NULL;
+   return true;
+}
+
+bool jit_fastcall_inregion(jit_t *j, jit_handle_t handle, jit_scalar_t *result,
+                           jit_scalar_t p1, jit_scalar_t p2, tlab_t *tlab)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+
+   jit_scalar_t args[JIT_MAX_ARGS];
+   args[0] = p1;
+   args[1] = p2;
+
+   if (!jit_vcall_inregion(j, f, args, tlab))
+      return false;
+
+   *result = args[0];
+   return true;
 }
 
 static void jit_unpack_args(jit_func_t *f, jit_scalar_t *args, va_list ap)
