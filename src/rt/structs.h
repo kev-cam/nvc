@@ -94,6 +94,11 @@ typedef void (*proc_eval_fn)(rt_model_t *m, rt_proc_t *proc);
 typedef struct _rt_proc_vtable {
    proc_eval_fn eval;     // execute one cycle
    void (*reset)(rt_proc_t *proc);  // revert to default vtable
+   // Per-instance abort policy. Invoked at the scheduler's landing pad after an
+   // abort unwound out of THIS process, so an instance decides what an abort
+   // means for it (stop the run, record and continue, demote severity) instead
+   // of one global rule baked into the unwind target. NULL => stop the run.
+   void (*on_abort)(rt_model_t *m, rt_proc_t *proc);
 } rt_proc_vtable_t;
 
 struct _rt_proc {

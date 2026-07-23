@@ -1201,9 +1201,16 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
 
 static void proc_reset_default(rt_proc_t *proc);
 
+// Default abort policy: an abort out of a process stops the run.
+static void proc_on_abort_default(rt_model_t *m, rt_proc_t *proc)
+{
+   m->force_stop = true;
+}
+
 static const rt_proc_vtable_t proc_default_vtable = {
-   .eval  = proc_eval_jit,
-   .reset = proc_reset_default,
+   .eval     = proc_eval_jit,
+   .reset    = proc_reset_default,
+   .on_abort = proc_on_abort_default,
 };
 
 static void proc_reset_default(rt_proc_t *proc)
@@ -1492,6 +1499,7 @@ bool accel_load(rt_model_t *m, const char *so_path)
       accel_binding_t *binding = xcalloc(sizeof(accel_binding_t));
       binding->vtable.eval  = proc_eval_accel;
       binding->vtable.reset = proc_reset_default;
+      binding->vtable.on_abort = proc_on_abort_default;
       binding->eval         = eval;
       binding->dl_handle    = dl;
 
@@ -2281,6 +2289,7 @@ static aj_chunk_t *aj_chunk_new(rt_model_t *m)
    }
    aj_chunk_t *c = xcalloc(sizeof(aj_chunk_t));
    c->vtable.eval = aj_proc_eval;
+   c->vtable.on_abort = proc_on_abort_default;
    m->aj_chunks[m->aj_chunk_count++] = c;
    return c;
 }
@@ -4312,6 +4321,7 @@ void lazy_eval_install(rt_model_t *m)
          lazy_proc_wrap_t *wrap = xcalloc(sizeof(lazy_proc_wrap_t));
          wrap->vtable.eval = proc_eval_lazy;
          wrap->vtable.reset = proc_reset_default;
+         wrap->vtable.on_abort = proc_on_abort_default;
          wrap->real_eval = proc->vtable->eval;
          wrap->dirty = ~(uint64_t)0;  // all bits set = armed initially
          proc->vtable = &wrap->vtable;
@@ -7744,8 +7754,16 @@ void model_run(rt_model_t *m, uint64_t stop_time)
          while (!should_stop_now(m, stop_time))
             model_cycle(m);
       }
-      else
-         m->force_stop = true;   // abort unwound out of a process body
+      else {
+         // An abort unwound out of a process body. Dispatch to THAT instance's
+         // policy rather than applying one global rule here -- get_active_proc()
+         // still names it, since the longjmp skipped the activation's clear.
+         rt_proc_t *ap = get_active_proc();
+         if (ap != NULL && ap->vtable->on_abort != NULL)
+            ap->vtable->on_abort(m, ap);
+         else
+            m->force_stop = true;
+      }
 
       jit_run_region_leave(m->jit, thread, oldstate);
    }
