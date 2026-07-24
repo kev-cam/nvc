@@ -2098,6 +2098,132 @@ static void l3d_not_vector(jit_func_t *func, jit_anchor_t *anchor,
    args[2].integer = acode;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Packed 3D-logic word (l3dw): one int32 lane holds a GROUP of 8 wires as byte
+// planes -- byte0 value, byte1 driven, byte2 uncertain, byte3 reserved. So a
+// logic3dw_vector of W words carries 8*W wires at 4 bytes / 8 wires (vs
+// logic3d's 4 bytes / wire and std_logic's 1 byte / wire).
+//
+// The gate LUTs use only the value and uncertain planes and always drive the
+// output, so each per-wire __l3d_*_code formula becomes a BYTE-PARALLEL formula
+// computing all 8 wires of a lane at once (no cross-wire carry): the scalar
+// `x ^ 1` (bit) becomes 8-bit `~x & 0xFF`. Verified against the per-wire path
+// and against std_logic on 2-state inputs by test/regress/logic3dw1.
+//
+// Same int32-lane ABI as logic3d, so the vector plumbing is shared; only the
+// per-lane word function and the length-mismatch pad (driven certain 0 =
+// 0x00FF00) differ.
+
+#define L3DW_PAD0 0x00FF00   // value 0, driven 0xFF, uncertain 0
+
+__attribute__((always_inline))
+static inline int32_t __l3dw_and_word(int32_t a, int32_t b)
+{
+   const int32_t Va = a & 0xFF, Ua = (a >> 16) & 0xFF;
+   const int32_t Vb = b & 0xFF, Ub = (b >> 16) & 0xFF;
+   const int32_t Vc = Va & Vb;
+   const int32_t c0 = (~(Va | Ua) | ~(Vb | Ub)) & 0xFF;   // some operand cert 0
+   const int32_t Uc = (Ua | Ub) & ~c0 & 0xFF;
+   return Vc | 0xFF00 | (Uc << 16);
+}
+
+__attribute__((always_inline))
+static inline int32_t __l3dw_or_word(int32_t a, int32_t b)
+{
+   const int32_t Va = a & 0xFF, Ua = (a >> 16) & 0xFF;
+   const int32_t Vb = b & 0xFF, Ub = (b >> 16) & 0xFF;
+   const int32_t Vc = Va | Vb;
+   const int32_t c1 = ((Va & ~Ua) | (Vb & ~Ub)) & 0xFF;   // some operand cert 1
+   const int32_t Uc = (Ua | Ub) & ~c1 & 0xFF;
+   return Vc | 0xFF00 | (Uc << 16);
+}
+
+__attribute__((always_inline))
+static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
+{
+   const int32_t Vc = (a ^ b) & 0xFF;
+   const int32_t Uc = ((a | b) >> 16) & 0xFF;             // uncertainty union
+   return Vc | 0xFF00 | (Uc << 16);
+}
+
+#define L3DW_BINOP_BODY(WORD_FN)                                        \
+   const int la = ffi_array_length(args[3].integer);                    \
+   const int lb = ffi_array_length(args[6].integer);                    \
+   const bool adesc = args[3].integer < 0;                              \
+   const int32_t *adata = args[1].pointer;                              \
+   const int32_t *bdata = args[4].pointer;                              \
+   const int64_t aleft = args[2].integer, acode = args[3].integer;      \
+                                                                        \
+   if (la == 0) {                                                       \
+      args[0].pointer = (void *)adata;                                  \
+      args[1].integer = aleft;                                          \
+      args[2].integer = acode;                                          \
+      return;                                                           \
+   }                                                                    \
+                                                                        \
+   const int n = MIN(la, lb);                                           \
+   int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);       \
+                                                                        \
+   if (n < la) {                                                        \
+      for (int j = 0; j < la; j++)                                      \
+         result[j] = L3DW_PAD0;                                         \
+   }                                                                    \
+                                                                        \
+   if (adesc) {                                                         \
+      const int d = lb - la;                                            \
+      for (int j = la - n; j < la; j++)                                 \
+         result[j] = WORD_FN(adata[j], bdata[j + d]);                   \
+   }                                                                    \
+   else {                                                               \
+      for (int i = 0; i < n; i++)                                       \
+         result[i] = WORD_FN(adata[la - 1 - i], bdata[lb - 1 - i]);     \
+   }                                                                    \
+                                                                        \
+   args[0].pointer = result;                                            \
+   args[1].integer = aleft;                                             \
+   args[2].integer = acode;
+
+static void l3dw_and_vector(jit_func_t *func, jit_anchor_t *anchor,
+                            jit_scalar_t *args, tlab_t *tlab)
+{
+   L3DW_BINOP_BODY(__l3dw_and_word);
+}
+
+static void l3dw_or_vector(jit_func_t *func, jit_anchor_t *anchor,
+                           jit_scalar_t *args, tlab_t *tlab)
+{
+   L3DW_BINOP_BODY(__l3dw_or_word);
+}
+
+static void l3dw_xor_vector(jit_func_t *func, jit_anchor_t *anchor,
+                            jit_scalar_t *args, tlab_t *tlab)
+{
+   L3DW_BINOP_BODY(__l3dw_xor_word);
+}
+
+// NOT: flip the value plane, keep driven and uncertain planes.
+static void l3dw_not_vector(jit_func_t *func, jit_anchor_t *anchor,
+                            jit_scalar_t *args, tlab_t *tlab)
+{
+   const int la = ffi_array_length(args[3].integer);
+   const int32_t *adata = args[1].pointer;
+   const int64_t aleft = args[2].integer, acode = args[3].integer;
+
+   if (la == 0)
+      args[0].pointer = (void *)adata;
+   else {
+      int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);
+      for (int j = 0; j < la; j++) {
+         const int32_t a = adata[j];
+         result[j] = ((~a) & 0xFF) | (a & 0xFFFF00);   // ~value, keep drv+unc
+      }
+      args[0].pointer = result;
+   }
+
+   args[1].integer = aleft;
+   args[2].integer = acode;
+}
+
 // Verilog '==' returning a 1-bit logic3d: value-plane equality over the
 // common low bits, uncertainty flag if any scanned bit is uncertain
 // (certainty is metadata and never gates the value)
@@ -2459,8 +2585,14 @@ static void l3d_resize_s_vec(jit_func_t *func, jit_anchor_t *anchor,
 #define L3P "SV2VHDL.LOGIC3D_TYPES_PKG."
 #define L3 "33SV2VHDL.LOGIC3D_TYPES_PKG.LOGIC3D"
 #define L3V "40SV2VHDL.LOGIC3D_TYPES_PKG.LOGIC3D_VECTOR"
+#define L3WP "SV2VHDL.LOGIC3DW_PKG."
+#define L3WV "32SV2VHDL.LOGIC3DW_PKG.L3DW_VECTOR"
 
 static jit_intrinsic_t intrinsic_list[] = {
+   { L3WP "L3DW_AND(" L3WV L3WV ")" L3WV, l3dw_and_vector },
+   { L3WP "L3DW_OR("  L3WV L3WV ")" L3WV, l3dw_or_vector },
+   { L3WP "L3DW_XOR(" L3WV L3WV ")" L3WV, l3dw_xor_vector },
+   { L3WP "L3DW_NOT(" L3WV ")" L3WV, l3dw_not_vector },
    { NS "\"+\"(" U U ")" U, ieee_plus_unsigned },
    { NS "\"+\"(" UU UU ")" UU, ieee_plus_unsigned },
    { NS "\"+\"(" U "N)" U, ieee_plus_unsigned_natural },

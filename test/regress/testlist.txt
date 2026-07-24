@@ -1255,3 +1255,4 @@ logic3d9        normal,deps=logic3d8
 logic3d10       normal
 mx_nested_port  shell
 numstd_mul1     normal,2008
+logic3dw1       normal,2040
