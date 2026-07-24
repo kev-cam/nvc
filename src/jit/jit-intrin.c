@@ -2344,7 +2344,14 @@ static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
    return Vc | 0xFF00 | (Uc << 16);
 }
 
-#define L3DW_BINOP_BODY(WORD_FN)                                        \
+// The 2-state fast path is the whole point of the packed word: once reset has
+// cleared the uncertain planes, a bus op is a pure value-plane bitwise op over
+// int32 lanes -- 8 wires per byte, 32 wires per SSE op, twice std_logic's 16.
+// AND/OR/XOR ignore the input driven plane and force driven on output, so only
+// the uncertain plane gates the fast path. `((a OP b) & 0xFF) | 0xFF00` takes
+// the value byte, forces driven=0xFF, leaves uncertain=0 -- exactly the full
+// formula's result when both operands are certain.
+#define L3DW_BINOP_BODY(WORD_FN, VAL_OP)                                \
    const int la = ffi_array_length(args[3].integer);                    \
    const int lb = ffi_array_length(args[6].integer);                    \
    const bool adesc = args[3].integer < 0;                              \
@@ -2369,8 +2376,20 @@ static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
                                                                         \
    if (adesc) {                                                         \
       const int d = lb - la;                                            \
-      for (int j = la - n; j < la; j++)                                 \
-         result[j] = WORD_FN(adata[j], bdata[j + d]);                   \
+      /* Single pass: write the 2-state value-plane result AND accumulate   \
+         the operands' uncertain planes. VAL_OP is correct whenever every   \
+         wire is certain; if any uncertain bit turned up, recompute the     \
+         whole vector with the full formula (rare after reset). */          \
+      int32_t unc = 0;                                                  \
+      for (int j = la - n; j < la; j++) {                              \
+         const int32_t a = adata[j], b = bdata[j + d];                 \
+         result[j] = (VAL_OP);                                         \
+         unc |= a | b;                                                 \
+      }                                                                 \
+      if (unlikely(unc & 0x00FF0000)) {                                \
+         for (int j = la - n; j < la; j++)                             \
+            result[j] = WORD_FN(adata[j], bdata[j + d]);               \
+      }                                                                 \
    }                                                                    \
    else {                                                               \
       for (int i = 0; i < n; i++)                                       \
@@ -2384,19 +2403,19 @@ static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
 static void l3dw_and_vector(jit_func_t *func, jit_anchor_t *anchor,
                             jit_scalar_t *args, tlab_t *tlab)
 {
-   L3DW_BINOP_BODY(__l3dw_and_word);
+   L3DW_BINOP_BODY(__l3dw_and_word, a & b);
 }
 
 static void l3dw_or_vector(jit_func_t *func, jit_anchor_t *anchor,
                            jit_scalar_t *args, tlab_t *tlab)
 {
-   L3DW_BINOP_BODY(__l3dw_or_word);
+   L3DW_BINOP_BODY(__l3dw_or_word, a | b);
 }
 
 static void l3dw_xor_vector(jit_func_t *func, jit_anchor_t *anchor,
                             jit_scalar_t *args, tlab_t *tlab)
 {
-   L3DW_BINOP_BODY(__l3dw_xor_word);
+   L3DW_BINOP_BODY(__l3dw_xor_word, (a ^ b) ^ 0xFF00);
 }
 
 // NOT: flip the value plane, keep driven and uncertain planes.
