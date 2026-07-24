@@ -1258,3 +1258,4 @@ numstd_mul1     normal,2008
 logic3dw1       normal,2040
 
 ieee20          fail,gold,2008
+logic3dw2       normal,2040

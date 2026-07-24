@@ -22,6 +22,12 @@ package logic3dw_pkg is
   type l3dw is range 0 to 2147483647;                     -- 4-byte word
   type l3dw_vector is array (natural range <>) of l3dw;
 
+  -- Whole-word constants (all 8 wires the same state), for vector defaults
+  -- `(others => L3DW_x)`. value byte | driven 0xFF | uncertain byte.
+  constant L3DW_0 : l3dw := 16#00FF00#;   -- all wires driven 0
+  constant L3DW_1 : l3dw := 16#00FFFF#;   -- all wires driven 1
+  constant L3DW_X : l3dw := 16#FFFF00#;   -- all wires driven, uncertain
+
   -- group count for N wires
   function nwords(nwires : natural) return natural;
 
