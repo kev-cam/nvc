@@ -243,10 +243,15 @@ typedef struct _rt_pipe_fifo {
 // Can be replaced at runtime with short-circuit fast paths
 // (e.g. single-driver direct store, federation bridge redirect).
 typedef struct _rt_nexus_vtable {
+   // Ordered hottest-first, so the hottest dispatch lands at vtable offset 0
+   // (zero-displacement indirect call, first in the vtable's cache line). The
+   // per-delta driving recompute and event notify are the hot pair; deposit
+   // (effective-value) is colder; read_source is never dispatched through the
+   // vtable (only stored) so it goes last.
    void  (*update_driving)(rt_model_t *m, rt_nexus_t *n);
+   void  (*notify)(rt_model_t *m, rt_nexus_t *n);
    void  (*deposit)(rt_model_t *m, rt_nexus_t *n, const void *value);
    void *(*read_source)(rt_nexus_t *nexus, rt_source_t *src);
-   void  (*notify)(rt_model_t *m, rt_nexus_t *n);
 } rt_nexus_vtable_t;
 
 typedef struct _rt_nexus {
