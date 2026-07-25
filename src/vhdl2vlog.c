@@ -1077,17 +1077,40 @@ static void emit_process(FILE *f, tree_t p)
          emit_expr(f, rsig);
       }
       fputs(") begin\n", f);
-      if (rcond != NULL) {
-         fputs("    if (", f);
-         emit_expr(f, tree_value(rcond));
-         fputs(") begin\n", f);
-         emit_stmt_list(f, rcond, 6);
-         fputs("    end else begin\n", f);
-         emit_stmt_list(f, body_if, 6);
-         fputs("    end\n", f);
+      // The tgt-vhdl NBA idiom surrounds the edge-guard if with statements
+      // that are part of the register semantics and MUST be kept:
+      //     v_nba_<r> := <r>;              -- shadow pre-load  (before the if)
+      //     if <edges> then ... end if;
+      //     wait for 0 ns;                 -- delta delay (subsumed by `<=`)
+      //     <r> <= v_nba_<r>;              -- THE COMMIT      (after the if)
+      //     wait on <sens>;
+      // Dropping the tail left every rvdff-family register never written --
+      // yosys folded the whole flop chain to constant 0 (VeeR accel
+      // divergence). Emit the pre-statements (variable assigns, blocking)
+      // at the top of the always block and the post-statements at the
+      // bottom (signal assigns emit as nonblocking `<=`, which reproduces
+      // the wait-for-0 delta semantics); T_WAITs emit nothing.
+      {
+         const int np = tree_stmts(p);
+         int ifidx = np;
+         for (int i = 0; i < np; i++)
+            if (tree_stmt(p, i) == ifstmt) { ifidx = i; break; }
+         if (ifidx < np)
+            emit_stmt_list_range(f, p, 0, ifidx, 4);
+         if (rcond != NULL) {
+            fputs("    if (", f);
+            emit_expr(f, tree_value(rcond));
+            fputs(") begin\n", f);
+            emit_stmt_list(f, rcond, 6);
+            fputs("    end else begin\n", f);
+            emit_stmt_list(f, body_if, 6);
+            fputs("    end\n", f);
+         }
+         else
+            emit_stmt_list(f, body_if, 4);
+         if (ifidx < np)
+            emit_stmt_list_range(f, p, ifidx + 1, np, 4);
       }
-      else
-         emit_stmt_list(f, body_if, 4);
       fputs("  end\n", f);
    }
    else {
