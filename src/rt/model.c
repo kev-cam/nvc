@@ -1814,6 +1814,10 @@ static aj_chunk_t *g_aj_cur_chunk[MAX_THREADS];  // chunk running per worker
 // net + time where the compiled model first diverges from the reference.
 static int         g_aj_verify   = 0;       // int (not bool): the bridge reads it via AJB
 static bool        g_aj_verify_skipx = false;  // NVC_ACCEL_VERIFY_X: skip interp-X elems
+static bool        g_aj_vtrack = false;  // NVC_ACCEL_VERIFY_TRACK: verify_flagged means
+                                         // "currently diverged"; also report RECONVERGED
+                                         // transitions so transient vs persistent
+                                         // divergence is decidable from the log
 static bool        g_aj_vcompare = false;   // this pass compares (else just advances state)
 static aj_chunk_t *g_aj_vchunks[64];
 static int         g_aj_nvchunks = 0;
@@ -1953,11 +1957,13 @@ struct _aj_defer_out {
 // NVC_ACCEL_VERIFY report: compact logic3d-bytes -> value hex (bit0 of each
 // element) + the net name and sim time, once per diverging output.
 static void aj_verify_report(void *sigp, const unsigned char *interp,
-                             const unsigned char *accel, size_t valuesz, int width)
+                             const unsigned char *accel, size_t valuesz, int width,
+                             const char *tag)
 {
-   if (g_aj_vreports++ >= 100) {
-      if (g_aj_vreports == 101)
-         notef("accel-verify: further divergences suppressed (cap 100)");
+   const int cap = g_aj_vtrack ? 200000 : 100;
+   if (g_aj_vreports++ >= cap) {
+      if (g_aj_vreports == cap + 1)
+         notef("accel-verify: further divergences suppressed (cap %d)", cap);
       return;
    }
    const int es = (width > 0) ? (int)(valuesz / width) : 1, e = es > 0 ? es : 1;
@@ -1970,9 +1976,9 @@ static void aj_verify_report(void *sigp, const unsigned char *interp,
    }
    char tm[32]; fmt_time_r(tm, sizeof tm, g_aj_model->now, "");
    notef("accel-verify: %s+%d  %s  interp=0x%"PRIx64" accel=0x%"PRIx64
-         "%s  (accel diverges from interp)", tm, g_aj_model->iteration,
+         "%s  (%s)", tm, g_aj_model->iteration,
          istr(tree_ident(((rt_signal_t *)sigp)->where)), iv, av,
-         width > 64 ? " [low 64b]" : "");
+         width > 64 ? " [low 64b]" : "", tag);
 }
 
 // Baked into the bridge as AJ_OUT: called once per output with the logic3d
@@ -1997,14 +2003,24 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          // d->eff is BANK-only; read the signal's live value directly (offset 0,
          // matching deposit_signal(sigp, buf, 0, width)).
          const unsigned char *interp = ((rt_signal_t *)sigp)->shared.data;
-         if (!d->verify_flagged && aj_verify_diff(interp, buf, d->valuesz, width)) {
+         const bool diff = aj_verify_diff(interp, buf, d->valuesz, width);
+         if (!d->verify_flagged && diff) {
             d->verify_flagged = true;
-            aj_verify_report(sigp, interp, buf, d->valuesz, width);
+            aj_verify_report(sigp, interp, buf, d->valuesz, width,
+                             "accel diverges from interp");
             if (g_aj_vreports == 1 && getenv("NVC_ACCEL_SMDUMP") != NULL) {
                // settled-state dump at the FIRST divergence (needs -DSM_DUMP)
                void (*dumpfn)(void *) = dlsym(c->dl, "accel_dump");
                if (dumpfn != NULL) dumpfn(c->state);
             }
+         }
+         else if (g_aj_vtrack && d->verify_flagged && !diff) {
+            // NVC_ACCEL_VERIFY_TRACK: net was diverged, now matches again — log
+            // the reconvergence and re-arm so a later re-divergence reports too.
+            // A net that RECONVERGES next timestep was a one-step transient
+            // (orchestration/timing); one that never reconverges is state drift.
+            d->verify_flagged = false;
+            aj_verify_report(sigp, interp, buf, d->valuesz, width, "RECONVERGED");
          }
       }
       return;
@@ -2886,16 +2902,34 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             p = e + 1;
          }
       }
-      // Each extra clock must be a marshalled input field, else the bridge cannot
-      // edge-detect it from the boundary — decline (leave the chunk interpreted).
-      for (int k = 0; k < nck; k++)
-         if (!aj_model_has_field(dut_text, extra_clk[k])) {
-            notef("accel-jit: extra clock '%s' not a marshalled input — declining",
-                  extra_clk[k]);
-            free(dut_text);
-            return false;
-         }
    }
+
+   // Per-BIT vector clocks: gen_statemachine names a group on bit N of a
+   // vector clock wire "<wire>__b<N>" (EH2's active_thread_l2clk[1:0] — one
+   // group per thread).  Split into the marshalled FIELD name and the bit to
+   // extract, so each group edge-detects its own bit instead of bit 0 (which
+   // advanced thread-1 flops on thread-0's clock).
+   char extra_clk_field[16][64];
+   int  extra_clk_bit[16];
+   for (int k = 0; k < nck; k++) {
+      snprintf(extra_clk_field[k], sizeof extra_clk_field[k], "%s", extra_clk[k]);
+      extra_clk_bit[k] = 0;
+      char *b = strstr(extra_clk_field[k], "__b");
+      if (b != NULL && b[3] != '\0' && strspn(b + 3, "0123456789") == strlen(b + 3)) {
+         extra_clk_bit[k] = atoi(b + 3);
+         *b = '\0';
+      }
+   }
+
+   // Each extra clock must be a marshalled input field, else the bridge cannot
+   // edge-detect it from the boundary — decline (leave the chunk interpreted).
+   for (int k = 0; k < nck; k++)
+      if (!aj_model_has_field(dut_text, extra_clk_field[k])) {
+         notef("accel-jit: extra clock '%s' not a marshalled input — declining",
+               extra_clk[k]);
+         free(dut_text);
+         return false;
+      }
 
    FILE *f = fopen(path, "w");
    if (!f) { free(dut_text); return false; }
@@ -3065,7 +3099,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       const size_t nb = (size_t)pins[i].width * pins[i].elem;
       bool is_ck = strcmp(pins[i].name, "clk") == 0;
       for (int k = 0; k < nck && !is_ck; k++)
-         if (strcmp(pins[i].name, extra_clk[k]) == 0) is_ck = true;
+         if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       // spec + handoff-fed: the pin's logic3d bytes are frozen (deposit
       // bypassed) and the poke is the only writer — emit NOTHING, not even
       // the memcmp. raw_off still advances so aj_cs_t stays layout-identical.
@@ -3275,9 +3309,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       fprintf(f, "  if(!_late && !_coinc){\n");
       fprintf(f, "    _chg = aj_scan_inputs(aj_cs, AJB);\n");
       for (int k = 0; k < nck; k++)
-         fprintf(f, "    { int _n=(in._%s&1);"
+         fprintf(f, "    { int _n=(int)(in._%s>>%d)&1;"
                     " if(_n && !aj_cs->ck_last[%d]) posedge_mask|=(1u<<(1+%d));"
-                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk[k], k, k, k);
+                    " aj_cs->ck_last[%d]=_n; }\n", extra_clk_field[k],
+                 extra_clk_bit[k], k, k, k);
       // coincident: every gated clock is the main edge; DEFER the scan until
       // after the advance so flops sample previous-delta-settled inputs.
       fprintf(f, "  } else if(!_late) {\n");
@@ -3299,7 +3334,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       if (has_late)
          fprintf(f, ", (unsigned)aj_cs->late_pend");
       for (int k = 0; k < nck; k++)
-         fprintf(f, ", (int)(in._%s&1), (int)aj_cs->ck_last[%d]", extra_clk[k], k);
+         fprintf(f, ", (int)(in._%s>>%d)&1, (int)aj_cs->ck_last[%d]",
+                 extra_clk_field[k], extra_clk_bit[k], k);
       fprintf(f, "); }\n");
       {
          const char *adv = has_clock_out
@@ -3341,11 +3377,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          fprintf(f, "  if(_late){\n");
          fprintf(f, "    unsigned _fired = 0;\n");
          for (int k = 0; k < nck; k++)
-            fprintf(f, "    { int _n=(in._%s&1);"
+            fprintf(f, "    { int _n=(int)(in._%s>>%d)&1;"
                        " if(_n && !aj_cs->ck_last[%d] && (aj_cs->late_pend & (1u<<(1+%d))))"
                        " _fired |= (1u<<(1+%d));"
                        " aj_cs->ck_last[%d]=_n; }\n",
-                    extra_clk[k], k, k, k, k);
+                    extra_clk_field[k], extra_clk_bit[k], k, k, k, k);
          fprintf(f, "    if(_fired){\n");
          // Default = per-CYCLE snapshot (dec/ifu/mem_ctl-validated); the
          // per-EVAL (live-S) variant is opt-in for A/B — it regressed dec and
@@ -3374,7 +3410,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             fprintf(f, " \" %s=%%d/l%%d\"", extra_clk[k]);
          fprintf(f, " \"\\n\", t, d, _fired, (unsigned)aj_cs->late_pend");
          for (int k = 0; k < nck; k++)
-            fprintf(f, ", (int)(in._%s&1), (int)aj_cs->ck_last[%d]", extra_clk[k], k);
+            fprintf(f, ", (int)(in._%s>>%d)&1, (int)aj_cs->ck_last[%d]",
+                 extra_clk_field[k], extra_clk_bit[k], k);
          fprintf(f, "); }\n");
          fprintf(f, "  }\n");
       }
@@ -4218,6 +4255,7 @@ void accel_auto(rt_model_t *m)
 {
    g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
    g_aj_verify_skipx = getenv("NVC_ACCEL_VERIFY_X") != NULL;
+   g_aj_vtrack = getenv("NVC_ACCEL_VERIFY_TRACK") != NULL;
 
    const char *home = getenv("HOME");
    if (!home) home = "/tmp";
