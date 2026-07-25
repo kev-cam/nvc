@@ -3248,9 +3248,28 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       if (has_late)
          // NOTE: `S` is a macro for aj_cs->S — writing aj_cs->S here would
          // expand into aj_cs->(aj_cs->S). Use the macro.
+         // ck_last RESET at arming: the chunk only re-scans when it is
+         // evaluated, and a quiet chunk sleeps through the negedge half-cycle
+         // entirely (VeeR dec_tlu: evals at 0, 5ns, 15ns, 30ns — nothing at
+         // 10ns).  The gated clocks' FALLS are then never observed, ck_last
+         // sticks at 1, and every rise after the first fails the !ck_last
+         // edge test → late_pend jams armed and no gated group ever commits
+         // again (first edge fine, all later cycles dead).  An ICG-of-clk
+         // gated clock is by construction LOW at the instant of the main
+         // posedge, so any remembered high is the previous cycle's scan —
+         // clear it when arming and the same-timestep rise detects freshly.
+         // A genuinely-divided clock that legitimately holds high across a
+         // main posedge would see a spurious edge — NVC_ACCEL_CK_KEEPLAST
+         // restores the old behaviour for such designs (none in VeeR; the
+         // per-group ICG-of-clk auto-detect is the general landing).
+         fprintf(f, "  static int _keeplast=-1; if(_keeplast<0)"
+                    " _keeplast=getenv(\"NVC_ACCEL_CK_KEEPLAST\")?1:0;\n");
          fprintf(f, "  if(_late && posedge){ aj_cs->snapS = S;"
                     " aj_cs->snapIn = in;"
-                    " aj_cs->late_pend = %uu; }\n", ((1u << (nck + 1)) - 2u));
+                    " aj_cs->late_pend = %uu;"
+                    " if(!_keeplast) for(int _k=0;_k<%d;_k++)"
+                    " aj_cs->ck_last[_k]=0; }\n",
+                 ((1u << (nck + 1)) - 2u), nck);
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
       fprintf(f, "  if(!_late && !_coinc){\n");
@@ -3266,6 +3285,22 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
               ((1u << (nck + 1)) - 2u));
       fprintf(f, "  }\n");
       fprintf(f, "  int aj_pe = (posedge_mask != 0);\n");
+      // NVC_ACCEL_CK_TRACE=<N>: dump the first N evals' clock bookkeeping to
+      // stderr -- one line per eval with the scanned value / last / late_pend
+      // of every extra clock BEFORE the advance.  Debug aid for gated-clock
+      // first-edge divergence (VeeR free_l2clk): shows exactly which delta a
+      // gated group's rise is observed in and whether its commit fires.
+      fprintf(f, "  static int _ckt=-2; if(_ckt==-2){ const char *e=getenv(\"NVC_ACCEL_CK_TRACE\"); _ckt=e?atoi(e):0; }\n");
+      fprintf(f, "  if(_ckt>0){ _ckt--; fprintf(stderr, \"[ckt %s] t=%%lld+%%u pe=%%d mask=0x%%x%s\"",
+              istr(chunk->scope->name), has_late ? " pend=0x%x" : "");
+      for (int k = 0; k < nck; k++)
+         fprintf(f, " \" %s=%%d/l%%d\"", extra_clk[k]);
+      fprintf(f, " \"\\n\", t, d, posedge, posedge_mask");
+      if (has_late)
+         fprintf(f, ", (unsigned)aj_cs->late_pend");
+      for (int k = 0; k < nck; k++)
+         fprintf(f, ", (int)(in._%s&1), (int)aj_cs->ck_last[%d]", extra_clk[k], k);
+      fprintf(f, "); }\n");
       {
          const char *adv = has_clock_out
             ? "{ if(!VERIFY){ sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
@@ -3331,6 +3366,16 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                        " _lsnap ? &aj_cs->snapIn : &in, _fired);\n");
          fprintf(f, "      aj_cs->late_pend &= ~_fired; _chg = 1; aj_pe = 1;\n");
          fprintf(f, "    }\n");
+         // CK_TRACE line B: post-scan/post-late state — fresh in._*, updated
+         // ck_last[], fired bits and what remains pending.
+         fprintf(f, "    if(_ckt>0){ fprintf(stderr, \"[ckT %s] t=%%lld+%%u fired=0x%%x pend=0x%%x\"",
+                 istr(chunk->scope->name));
+         for (int k = 0; k < nck; k++)
+            fprintf(f, " \" %s=%%d/l%%d\"", extra_clk[k]);
+         fprintf(f, " \"\\n\", t, d, _fired, (unsigned)aj_cs->late_pend");
+         for (int k = 0; k < nck; k++)
+            fprintf(f, ", (int)(in._%s&1), (int)aj_cs->ck_last[%d]", extra_clk[k], k);
+         fprintf(f, "); }\n");
          fprintf(f, "  }\n");
       }
       {
