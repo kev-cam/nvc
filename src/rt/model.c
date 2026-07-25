@@ -1063,9 +1063,16 @@ static void deltaq_insert_pseudo_source(rt_model_t *m, rt_source_t *src)
    m->next_is_delta = true;
 }
 
+static void direct_eval_uninstall(rt_proc_t *proc);
+
 static void reset_process(rt_model_t *m, rt_proc_t *proc)
 {
    TRACE("reset process %s", istr(proc->name));
+
+   // A direct-eval wrapper caches the state/context pointers this reset is
+   // about to (re)write -- restore the default vtable first (the stale-vtable
+   // trap: reset bypasses the vtable and never calls .reset).
+   direct_eval_uninstall(proc);
 
    assert(proc->tlab == NULL);
    assert(model_thread(m)->tlab == NULL);   // Not used during reset
@@ -1221,6 +1228,152 @@ static void proc_reset_default(rt_proc_t *proc)
 void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt)
 {
    proc->vtable = vt;
+}
+
+// --- Direct process eval (Phase A of the direct-entry design) ---------------
+//
+// For a process with a STATIC sensitivity list (wakeable.wait_state == 1)
+// every input to the default eval path is per-proc CONSTANT once
+// reset_process has run: the state pointer (*mptr_get(proc->privdata) is
+// written exactly once at reset, and the mspace GC is non-moving mark-sweep
+// so the value never changes), the context pointer (scope privdata, ditto)
+// and the jit_func_t (the handle->func binding is stable for the life of
+// the jit -- funcs are only freed in jit_free). The default path re-derives
+// all of them and then goes through two more call layers
+// (jit_fastcall_inregion -> jit_vcall_inregion) on every activation. This
+// wrapper caches them once at install time and calls the function's
+// published entry point directly.
+//
+// Preserved exactly from proc_eval_jit / jit_vcall_inregion:
+//  - jit_eval_arena_reset() and active_obj/active_scope bookkeeping
+//  - the landing-pad check (jmp_buf_valid && state == JIT_RUNNING): the
+//    in-region contract only holds under model_run's armed pad; model_step /
+//    shell / VHPI stepping arrive without one and must take the protected
+//    jit_fastcall fallback
+//  - thread->anchor = NULL after the call (stack-trace anchor discipline)
+//  - the TLAB claim/release protocol on the result pointer (a process that
+//    suspends holding TLAB allocations claims the buffer for private use)
+//  - tier-up: f->entry is re-read with load_acquire on every eval, so the
+//    store_release publication from the compile thread is observed exactly
+//    as before
+// Elided (with reasons):
+//  - per-eval jit_get_func + mptr_get dereferences (constant post-reset)
+//  - the jit_fastcall_inregion / jit_vcall_inregion call layers (inlined)
+//  - the NVC_SCOPE_SCRATCH block: opt-in debug feature; the wrapper is
+//    simply never installed when that env var is set
+//
+// The vtable must stay the FIRST field so the wrapper is recovered from
+// proc->vtable at zero cost (established accel/lazy/chunk pattern). The
+// wrapper is only ever installed OVER the default vtable, and is removed at
+// the 1 -> 2 wait-state demotion and in reset_process; anything else that
+// swaps vtables (accel_load, aj_reroute) replaces the pointer wholesale and
+// never chains through it, so a concurrent replacement merely orphans the
+// wrapper. Gated by NVC_DIRECT_EVAL (default ON; set 0 to disable for A/B).
+
+typedef struct {
+   rt_proc_vtable_t vtable;    // FIRST -- recovered from proc->vtable
+   jit_func_t      *func;      // stable handle->func binding
+   void            *state;     // cached *mptr_get(proc->privdata) ?: -1
+   void            *context;   // cached *mptr_get(proc->scope->privdata)
+} direct_eval_t;
+
+static void proc_eval_direct(rt_model_t *m, rt_proc_t *proc)
+{
+   direct_eval_t *de = (direct_eval_t *)proc->vtable;
+
+   model_thread_t *thread = model_thread(m);
+   assert(thread->tlab != NULL);
+   assert(thread->tlab->alloc == 0);
+
+   // Reclaim the previous eval's escaping unconstrained results in O(1)
+   jit_eval_arena_reset();
+
+   thread->active_obj = &(proc->wakeable);
+   thread->active_scope = proc->scope;
+
+   tlab_t *tlab = proc->tlab ?: thread->tlab;
+
+   jit_scalar_t args[JIT_MAX_ARGS];
+   args[0].pointer = de->state;
+   args[1].pointer = de->context;
+
+   void *result_ptr;
+
+   jit_thread_local_t *jthread = jit_thread_get();
+   if (likely(jthread->jmp_buf_valid && jthread->state == JIT_RUNNING)) {
+      // In-region: model_run's landing pad is armed; an abort longjmps
+      // straight to it (same contract as jit_vcall_inregion's fast path)
+      jit_entry_fn_t entry = load_acquire(&(de->func->entry));
+      (*entry)(de->func, NULL, args, tlab);
+      jthread->anchor = NULL;
+      result_ptr = args[0].pointer;
+   }
+   else {
+      // No pad armed (model_step / shell / VHPI stepping): protected call
+      jit_scalar_t result = { .pointer = NULL };
+      if (!jit_fastcall(m->jit, proc->handle, &result,
+                        args[0], args[1], tlab))
+         m->force_stop = true;
+      result_ptr = result.pointer;
+   }
+
+   if (proc->tlab != NULL && result_ptr == NULL) {
+      tlab_release(proc->tlab);
+      proc->tlab = NULL;
+   }
+   else if (proc->tlab == NULL && result_ptr != NULL) {
+      TRACE("claiming TLAB for private use (used %u/%u)",
+            thread->tlab->alloc, thread->tlab->limit);
+      proc->tlab = thread->tlab;
+      thread->tlab = tlab_acquire(m->mspace);
+   }
+   else if (proc->tlab == NULL)
+      tlab_reset(thread->tlab);
+
+   thread->active_obj = NULL;
+   thread->active_scope = NULL;
+}
+
+static bool direct_eval_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *e = getenv("NVC_DIRECT_EVAL");
+      enabled = !(e != NULL && *e == '0')
+         && getenv("NVC_SCOPE_SCRATCH") == NULL;
+   }
+   return enabled;
+}
+
+// Install at the wait_state 0 -> 1 promotion in run_process: reset_process
+// has run (privdata final) and the proc has a static wait set. Never
+// installed over a non-default vtable (accel/lazy/chunk own those).
+static void direct_eval_install(rt_model_t *m, rt_proc_t *proc)
+{
+   if (proc->vtable != &proc_default_vtable || !direct_eval_enabled())
+      return;
+
+   direct_eval_t *de = xcalloc(sizeof(direct_eval_t));
+   de->vtable.eval     = proc_eval_direct;
+   de->vtable.reset    = proc_reset_default;
+   de->vtable.on_abort = proc_on_abort_default;
+   de->func    = jit_get_func(m->jit, proc->handle);
+   de->state   = *mptr_get(proc->privdata) ?: (void *)-1;
+   de->context = *mptr_get(proc->scope->privdata);
+
+   proc->vtable = &(de->vtable);
+}
+
+// Restore the default vtable if (and only if) OUR wrapper is installed: at
+// the wait_state 1 -> 2 demotion and before reset_process re-runs the
+// process (both invalidate the cached constants).
+static void direct_eval_uninstall(rt_proc_t *proc)
+{
+   if (proc->vtable->eval == proc_eval_direct) {
+      direct_eval_t *de = (direct_eval_t *)proc->vtable;
+      proc->vtable = &proc_default_vtable;
+      free(de);
+   }
 }
 
 // Load a compiled state machine .so and swap a process vtable.
@@ -4479,6 +4632,7 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
             proc->wait_sig = proc->cur_sig;
             proc->wait_fpcount = proc->cur_count;
             obj->wait_state = 1;   // promote: entries now persist
+            direct_eval_install(m, proc);
          }
       }
       else if (proc->cur_sig != proc->wait_sig
@@ -4493,6 +4647,7 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
          proc->wait_set = NULL;
          proc->wait_count = proc->wait_cap = 0;
          obj->wait_state = 2;
+         direct_eval_uninstall(proc);   // demoted: back to the generic path
          for (unsigned i = 0; i < proc->cur_count; i++)
             sched_event(m, &(proc->cur_set[i]->pending), obj);
       }
