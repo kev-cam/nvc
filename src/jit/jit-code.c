@@ -561,6 +561,62 @@ code_blob_t *code_blob_new(code_cache_t *code, ident_t name, size_t hint)
    return blob;
 }
 
+// ---- Entry-publication watches ---------------------------------------------
+// Consumers (the fused-block emitter in rt/model.c) bake the current value
+// of a jit_func_t's entry pointer as an immediate call target.  A later
+// tier-up publish through code_blob_finalise must tell them so they can
+// re-patch.  The registry is a simple global array: watch/unwatch are
+// single-writer (model thread), notify may run on any thread (async cgen),
+// all three serialised by one lock.  Notify runs the callbacks under the
+// lock, so unwatch returning means no callback with that ctx can be running.
+
+typedef struct {
+   jit_entry_fn_t *slot;
+   code_watch_fn_t fn;
+   void           *ctx;
+} entry_watch_t;
+
+static entry_watch_t *entry_watches = NULL;
+static unsigned       n_entry_watches = 0;
+static unsigned       max_entry_watches = 0;
+static nvc_lock_t     entry_watch_lock = 0;
+
+void code_entry_watch(jit_entry_fn_t *slot, code_watch_fn_t fn, void *ctx)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   if (n_entry_watches == max_entry_watches) {
+      max_entry_watches = MAX(max_entry_watches * 2, 64);
+      entry_watches = xrealloc_array(entry_watches, max_entry_watches,
+                                     sizeof(entry_watch_t));
+   }
+
+   entry_watches[n_entry_watches++] =
+      (entry_watch_t){ .slot = slot, .fn = fn, .ctx = ctx };
+}
+
+void code_entry_unwatch(void *ctx)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   unsigned wptr = 0;
+   for (unsigned i = 0; i < n_entry_watches; i++) {
+      if (entry_watches[i].ctx != ctx)
+         entry_watches[wptr++] = entry_watches[i];
+   }
+   n_entry_watches = wptr;
+}
+
+static void code_entry_notify(jit_entry_fn_t *slot, jit_entry_fn_t fn)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   for (unsigned i = 0; i < n_entry_watches; i++) {
+      if (entry_watches[i].slot == slot)
+         (*entry_watches[i].fn)(slot, fn, entry_watches[i].ctx);
+   }
+}
+
 void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry)
 {
    code_span_t *span = blob->span;
@@ -599,6 +655,10 @@ void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry)
    thread_wx_mode(WX_EXECUTE);
 
    store_release(entry, (jit_entry_fn_t)span->entry);
+
+   // Tell anyone who baked the old entry as an immediate (fused blocks)
+   if (unlikely(relaxed_load(&n_entry_watches) > 0))
+      code_entry_notify(entry, (jit_entry_fn_t)span->entry);
 
    DEBUG_ONLY(relaxed_add(&span->owner->used, span->size));
    free(blob);

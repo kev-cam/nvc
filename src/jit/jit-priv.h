@@ -476,6 +476,20 @@ typedef void (*code_patch_fn_t)(code_blob_t *, jit_label_t, uint8_t *,
 
 code_blob_t *code_blob_new(code_cache_t *code, ident_t name, size_t hint);
 void code_blob_emit(code_blob_t *blob, const uint8_t *bytes, size_t len);
+
+// Entry-publication watch: notify a consumer that has BAKED a copy of
+// *slot (e.g. an immediate direct-call target in an emitted block) whenever
+// code_blob_finalise publishes a new entry through that slot, so the baked
+// copy can be re-patched.  Registration/removal is single-writer (the model
+// thread); the notify callback may run on ANY thread (async tier-up
+// compiles finalise on a worker thread), so callbacks must only record the
+// new target -- never patch executable code from the compile thread.  The
+// callback runs under the internal watch lock: code_entry_unwatch returning
+// guarantees no callback with that ctx is in flight or will fire again.
+typedef void (*code_watch_fn_t)(jit_entry_fn_t *slot, jit_entry_fn_t entry,
+                                void *ctx);
+void code_entry_watch(jit_entry_fn_t *slot, code_watch_fn_t fn, void *ctx);
+void code_entry_unwatch(void *ctx);
 void code_blob_align(code_blob_t *blob, unsigned align);
 void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry);
 void code_blob_mark(code_blob_t *blob, jit_label_t label);

@@ -183,6 +183,16 @@ typedef struct _rt_model {
    hash_t            *depositors;         // nexus -> last depositing rt_proc_t
                                           // (fused-cone force/release wakeups)
 
+   // NVC_FUSED_BLOCK (Phase B of the direct-entry design): the fast-clk
+   // member set fused into ONE emitted machine-code block -- straight-line
+   // per-member argument setup + direct calls to each member's native entry,
+   // targets baked at block-build time. Strictly STATELESS: the block owns
+   // sequencing only (member state stays in privdata), so it can be
+   // dissolved at any delta boundary with zero loss.
+   struct _fused_block *fused_block;
+   code_cache_t       *fused_code;   // blob allocator for fused blocks
+   jit_entry_fn_t      fused_stub;   // shared null-result stub (disable target)
+
    // NVC_ACCEL_BANK: per-output 2-bank deferred write (VHDL delta / Verilog
    // NBA). The chunk STAGEs its computed output into a private shadow on the
    // posedge (not the signal); after the fast-clk table has dispatched (every
@@ -1064,10 +1074,20 @@ static void deltaq_insert_pseudo_source(rt_model_t *m, rt_source_t *src)
 }
 
 static void direct_eval_uninstall(rt_proc_t *proc);
+static void fused_block_build(rt_model_t *m);
+static void fused_block_dissolve(rt_model_t *m);
+static bool fused_block_dispatch(rt_model_t *m);
 
 static void reset_process(rt_model_t *m, rt_proc_t *proc)
 {
    TRACE("reset process %s", istr(proc->name));
+
+   // A fused block bakes this process's state/context pointers as
+   // immediates; a reset invalidates them (privdata is rewritten, possibly
+   // to a new pointer). Rare event -> wholesale dissolve (the block is
+   // stateless, so dropping it at any delta boundary loses nothing).
+   if (unlikely(m->fused_block != NULL))
+      fused_block_dissolve(m);
 
    // A direct-eval wrapper caches the state/context pointers this reset is
    // about to (re)write -- restore the default vtable first (the stale-vtable
@@ -2598,12 +2618,18 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
    m->fastclk_on    = true;
    notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
          m->fastclk_count);
+
+   // NVC_FUSED_BLOCK: fuse the fresh table into one emitted block
+   fused_block_build(m);
 }
 
 // Tear the posedge table down (guard nexus fired, or install replaced it):
 // unflag members so wakeup_one queues them normally again, clear guards.
 static void aj_dissolve_fastclk(rt_model_t *m)
 {
+   // The fused block sequences table members; it never outlives the table
+   fused_block_dissolve(m);
+
    if (m->fastclk_table != NULL) {
       for (unsigned i = 0; i < m->fastclk_count; i++)
          m->fastclk_table[i]->wakeable.fastclk = 0;
@@ -4605,17 +4631,12 @@ void lazy_eval_install(rt_model_t *m)
    notef("lazy-eval: %d processes wrapped", n_wrapped);
 }
 
-static void run_process(rt_model_t *m, rt_proc_t *proc)
+// Post-eval bookkeeping shared by run_process and the fused-block member
+// epilogue (which replicates run_process's semantics per member and must
+// not drift from them).
+static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
 {
-   TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
-         istr(proc->name));
-
    rt_wakeable_t *obj = &(proc->wakeable);
-
-   if (obj->trigger != NULL && !run_trigger(m, obj->trigger))
-      return;   // Filtered
-
-   proc->vtable->eval(m, proc);
 
    // A fused cone's body is straight-line: one complete activation deposits
    // its full nexus set, so the depositors map is complete — stop recording.
@@ -4656,6 +4677,21 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
    }
 }
 
+static void run_process(rt_model_t *m, rt_proc_t *proc)
+{
+   TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
+         istr(proc->name));
+
+   rt_wakeable_t *obj = &(proc->wakeable);
+
+   if (obj->trigger != NULL && !run_trigger(m, obj->trigger))
+      return;   // Filtered
+
+   proc->vtable->eval(m, proc);
+
+   proc_static_wait_finalize(m, proc);
+}
+
 static void reset_scope(rt_model_t *m, rt_scope_t *s)
 {
    for (int i = 0; i < s->children.count; i++)
@@ -4667,6 +4703,564 @@ static void reset_scope(rt_model_t *m, rt_scope_t *s)
    for (int i = 0; i < s->properties.count; i++)
       reset_property(m, s->properties.items[i]);
 }
+
+// ---- NVC_FUSED_BLOCK one-block posedge dispatch (Phase B) -------------------
+//
+// Fuses the NVC_FAST_CLK member set into ONE emitted machine-code block: a
+// straight-line sequence of per-member argument setup + direct calls to each
+// member's native entry, with the call targets dereferenced at BLOCK BUILD
+// time (every structure is static by then) and baked as immediates. One
+// arena reset, one landing-pad check and one activation replace N of each.
+//
+// The block is strictly STATELESS -- it owns SEQUENCING only. Everything
+// baked into it (state/context pointers, jit_func_t pointers, wakeable and
+// scope addresses, the model-thread pointer) is a derived constant owned by
+// the model, and the shared args buffer is per-call scratch whose contents
+// are dead between activations. Dissolving the block at any delta boundary
+// (fused_block_dissolve) therefore loses nothing: dispatch falls back to
+// the fast-clk table loop, or to normal queued wakeup once
+// aj_dissolve_fastclk has also run, with identical semantics. This is a
+// hard design constraint: large simulations roll through live design edits
+// with no restart, so every optimization must be runtime-reversible.
+//
+// Per-member emitted sequence (SysV x86-64; rbx = model_thread(m) and
+// r12 = the shared args buffer, both loaded once in the block prologue):
+//
+//   movabs rax, <state_i>            ; args[0] = cached *privdata ?: -1
+//   mov    [r12], rax
+//   movabs rax, <context_i>          ; args[1] = cached scope privdata
+//   mov    [r12+8], rax
+//   movabs rax, <&proc_i.wakeable>   ; driver lookup (x_sched_event etc reads
+//   mov    [rbx+off(active_obj)], rax     ; the active wakeable) and abort
+//   movabs rax, <proc_i.scope>            ; attribution (get_active_proc at
+//   mov    [rbx+off(active_scope)], rax   ; model_run's pad) are per member
+//   mov    rcx, [rbx+off(tlab)]      ; thread->tlab: NOT baked, a claim
+//                                    ; swaps it (rare; handled in epilogue)
+//   movabs rdi, <func_i>             ; native entry ABI: f, anchor=NULL,
+//   xor    esi, esi                  ; args, tlab
+//   mov    rdx, r12
+//   SITE A: call <entry_i>           ; 13-byte patchable slot
+//   movabs rdi, <m>                  ; per-member C epilogue: TLAB claim
+//   movabs rsi, <proc_i>             ; protocol + static-wait finalize
+//   mov    rdx, r12                  ; (branchy-but-cold -> out of line)
+//   SITE B: call <fused_member_epilogue>   ; 13-byte patchable slot
+//
+// Call slots are a fixed 13 bytes holding either `call rel32` + 8-byte nop
+// (target within +/-2GB of the site -- the common case; statically
+// predicted, sequential I-cache streams) or `movabs r11, imm64; call r11`
+// for far targets. Patching a slot is a plain byte store: ALL patches are
+// applied by the MODEL thread, the same thread that executes the block, and
+// same-thread store-then-execute is architecturally handled on x86 (SMC
+// detection flushes stale prefetch), so no cross-modifying-code protocol is
+// needed. A tier-up publish from the async compile thread only RECORDS the
+// new target (code_entry_watch callback -> want_a + patch_pending); the
+// model thread applies pending patches at the next dispatch. A member whose
+// own epilogue demotes it patches its OWN sites, which the instruction
+// pointer has already passed this activation.
+//
+// Member states:
+//   SITE_PLAIN    -- hot path above; requires a Phase A direct_eval_t
+//                    wrapper (wait_state 1, default-vtable), no trigger, no
+//                    private TLAB. Tier-up retargets SITE A in place.
+//   SITE_FALLBACK -- SITE A = shared null-result stub, SITE B =
+//                    fused_member_fallback -> run_process: the full generic
+//                    activation, bit-exact with the unfused table loop.
+//                    Used at build for unfusable members and at runtime
+//                    when a member demotes (wait-set change), arms a
+//                    trigger, or claims a private TLAB.
+//   SITE_DISABLED -- SITE A = shared null-result stub, SITE B =
+//                    fused_member_skip: member contributes nothing (future
+//                    live-edit demotion hook; nothing uses it yet).
+
+#ifdef ARCH_X86_64
+
+typedef enum { SITE_PLAIN, SITE_FALLBACK, SITE_DISABLED } fused_site_state_t;
+
+typedef struct {
+   jit_entry_fn_t *slot;     // &func->entry whose value SITE A baked
+   jit_entry_fn_t  cur_a;    // currently baked SITE A target (model thread)
+   jit_entry_fn_t  want_a;   // retarget from a tier-up publish (any thread)
+   uint32_t        off_a;    // SITE A slot offset from block base
+   uint32_t        off_b;    // SITE B slot offset from block base
+   uint8_t         state;    // fused_site_state_t
+} fused_site_t;
+
+typedef struct _fused_block {
+   uint8_t        *base;        // block entry / span base (RWX on Linux)
+   jit_entry_fn_t  entry;       // == base; context args unused
+   jit_scalar_t   *argbuf;      // shared JIT_MAX_ARGS scratch slots
+   rt_proc_t     **members;     // own copy of the fast-clk table at build
+   fused_site_t   *sites;       // member i -> its two call slots
+   unsigned        count;
+   model_thread_t *thread;      // baked model-thread pointer
+   int             patch_pending;   // set by retarget callback (any thread)
+   bool            running;     // dissolve must never happen mid-block
+} fused_block_t;
+
+static bool fused_block_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *e = getenv("NVC_FUSED_BLOCK");
+      enabled = (e != NULL && *e != '0');   // default OFF (A/B lever)
+   }
+   return enabled;
+}
+
+// (Re)write one 13-byte call slot. Model thread only; see block comment
+// for why no cross-modifying-code protocol is required.
+static void fused_patch_call(fused_block_t *fb, uint32_t off, void *target)
+{
+   uint8_t *site = fb->base + off;
+   const int64_t rel = (int64_t)((uint8_t *)target - (site + 5));
+
+   if (rel == (int64_t)(int32_t)rel) {
+      static const uint8_t nop8[8] =
+         { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
+      const int32_t r32 = (int32_t)rel;
+      site[0] = 0xE8;                // call rel32
+      memcpy(site + 1, &r32, 4);
+      memcpy(site + 5, nop8, 8);
+   }
+   else {
+      site[0] = 0x49; site[1] = 0xBB;          // movabs r11, target
+      memcpy(site + 2, &target, 8);
+      site[10] = 0x41; site[11] = 0xFF; site[12] = 0xD3;   // call r11
+   }
+}
+
+static void fused_member_unfuse(rt_model_t *m, rt_proc_t *proc);
+
+// Out-of-line per-member epilogue (SITE B for a PLAIN member): the exact
+// post-eval sequence proc_eval_direct + run_process would have performed --
+// anchor discipline, TLAB claim/release protocol, active_obj/active_scope
+// clear, static-wait finalize. Kept in C because it is branchy-but-cold;
+// nothing here is dropped, only moved out of the straight line.
+static void fused_member_epilogue(rt_model_t *m, rt_proc_t *proc,
+                                  jit_scalar_t *args)
+{
+   model_thread_t *thread = model_thread(m);
+
+   jit_thread_get()->anchor = NULL;   // stack-trace anchor discipline
+
+   void *result_ptr = args[0].pointer;
+
+   // TLAB claim/release protocol. proc->tlab is NULL for a fused-plain
+   // member (enforced at build and by unfuse-on-claim below) but the full
+   // protocol is replicated so no semantics are silently dropped.
+   if (unlikely(proc->tlab != NULL)) {
+      if (result_ptr == NULL) {
+         tlab_release(proc->tlab);
+         proc->tlab = NULL;
+      }
+   }
+   else if (unlikely(result_ptr != NULL)) {
+      TRACE("claiming TLAB for private use (used %u/%u)",
+            thread->tlab->alloc, thread->tlab->limit);
+      proc->tlab = thread->tlab;
+      thread->tlab = tlab_acquire(m->mspace);
+      // The block passes thread->tlab inline; a claimant needs its private
+      // one -- demote this member to the generic fallback path
+      fused_member_unfuse(m, proc);
+   }
+   else
+      tlab_reset(thread->tlab);
+
+   thread->active_obj = NULL;
+   thread->active_scope = NULL;
+
+   proc_static_wait_finalize(m, proc);
+
+   // The finalize may have demoted the wait set (direct_eval_uninstall
+   // removed the Phase A wrapper), or the eval may have armed a trigger:
+   // either invalidates the baked plain path from the next posedge on
+   if (unlikely(proc->vtable->eval != proc_eval_direct
+                || proc->wakeable.trigger != NULL))
+      fused_member_unfuse(m, proc);
+}
+
+// SITE B for a FALLBACK member: the full generic activation. The inline
+// stores before SITE A set active_obj/active_scope; undo them first so
+// run_process sees exactly what the unfused table loop would give it (in
+// particular the trigger filter runs with no active object).
+static void fused_member_fallback(rt_model_t *m, rt_proc_t *proc,
+                                  jit_scalar_t *args)
+{
+   model_thread_t *thread = model_thread(m);
+   thread->active_obj = NULL;
+   thread->active_scope = NULL;
+
+   run_process(m, proc);
+}
+
+// SITE B for a DISABLED member: only undo the inline active_obj/
+// active_scope stores (SITE A was the shared null-result stub).
+static void fused_member_skip(rt_model_t *m, rt_proc_t *proc,
+                              jit_scalar_t *args)
+{
+   model_thread_t *thread = model_thread(m);
+   thread->active_obj = NULL;
+   thread->active_scope = NULL;
+}
+
+// Demote one member to the generic path (model thread; patches sites the
+// current activation has already executed).
+static void fused_member_unfuse(rt_model_t *m, rt_proc_t *proc)
+{
+   fused_block_t *fb = m->fused_block;
+   if (fb == NULL)
+      return;
+
+   for (unsigned i = 0; i < fb->count; i++) {
+      if (fb->members[i] != proc)
+         continue;
+      fused_site_t *s = &(fb->sites[i]);
+      if (s->state == SITE_PLAIN) {
+         s->state = SITE_FALLBACK;
+         s->cur_a = m->fused_stub;
+         fused_patch_call(fb, s->off_a, (void *)m->fused_stub);
+         fused_patch_call(fb, s->off_b, (void *)fused_member_fallback);
+      }
+      return;   // a proc appears at most once in the table
+   }
+}
+
+// Disable a member outright (shared empty stub; enable/disable mechanism
+// for future live-edit demotion -- nothing calls this yet).
+__attribute__((unused))
+static void fused_member_disable(rt_model_t *m, rt_proc_t *proc)
+{
+   fused_block_t *fb = m->fused_block;
+   if (fb == NULL)
+      return;
+
+   for (unsigned i = 0; i < fb->count; i++) {
+      if (fb->members[i] != proc)
+         continue;
+      fused_site_t *s = &(fb->sites[i]);
+      if (s->state != SITE_DISABLED) {
+         s->state = SITE_DISABLED;
+         s->cur_a = m->fused_stub;
+         fused_patch_call(fb, s->off_a, (void *)m->fused_stub);
+         fused_patch_call(fb, s->off_b, (void *)fused_member_skip);
+      }
+      return;
+   }
+}
+
+// code_entry_watch callback: a tier-up published a new entry through a slot
+// SITE A baked. May run on the async compile thread -- record only; the
+// model thread applies pending patches at the next dispatch.
+static void fused_entry_retarget(jit_entry_fn_t *slot, jit_entry_fn_t entry,
+                                 void *ctx)
+{
+   fused_block_t *fb = ctx;
+   for (unsigned i = 0; i < fb->count; i++) {
+      if (fb->sites[i].slot == slot)
+         relaxed_store(&(fb->sites[i].want_a), entry);
+   }
+   store_release(&(fb->patch_pending), 1);
+}
+
+static void fused_apply_pending(rt_model_t *m, fused_block_t *fb)
+{
+   relaxed_store(&(fb->patch_pending), 0);
+
+   for (unsigned i = 0; i < fb->count; i++) {
+      fused_site_t *s = &(fb->sites[i]);
+      jit_entry_fn_t want = relaxed_load(&(s->want_a));
+      if (want == NULL || want == s->cur_a || s->state != SITE_PLAIN)
+         continue;
+      s->cur_a = want;
+      fused_patch_call(fb, s->off_a, (void *)want);
+      if (unlikely(getenv("NVC_FUSED_DEBUG") != NULL))
+         notef("fused: tier-up retarget member %u -> %p", i, (void *)want);
+   }
+}
+
+#define FUSED_EMIT(...) do {                            \
+      const uint8_t __b[] = { __VA_ARGS__ };            \
+      code_blob_emit(blob, __b, sizeof(__b));           \
+   } while (0)
+
+// movabs <reg>, imm64 (rex/opc select the register)
+static void fused_emit_movabs(code_blob_t *blob, uint8_t rex, uint8_t opc,
+                              uint64_t imm)
+{
+   uint8_t b[10] = { rex, opc };
+   memcpy(b + 2, &imm, 8);
+   code_blob_emit(blob, b, sizeof b);
+}
+
+// 48 <opc> <modrm> disp32: rax/rcx <-> [rbx+disp32]
+static void fused_emit_rbx_d32(code_blob_t *blob, uint8_t opc, uint8_t modrm,
+                               uint32_t disp)
+{
+   uint8_t b[7] = { 0x48, opc, modrm };
+   memcpy(b + 3, &disp, 4);
+   code_blob_emit(blob, b, sizeof b);
+}
+
+// Emit one 13-byte call slot targeting `target` at the current position
+static void fused_emit_call_slot(code_blob_t *blob, void *target)
+{
+   uint8_t *site = blob->wptr;
+   const int64_t rel = (int64_t)((uint8_t *)target - (site + 5));
+
+   if (rel == (int64_t)(int32_t)rel) {
+      uint8_t b[13] = { 0xE8, 0, 0, 0, 0,
+                        0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
+      const int32_t r32 = (int32_t)rel;
+      memcpy(b + 1, &r32, 4);
+      code_blob_emit(blob, b, sizeof b);
+   }
+   else {
+      uint8_t b[13] = { 0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0x41, 0xFF, 0xD3 };
+      memcpy(b + 2, &target, 8);
+      code_blob_emit(blob, b, sizeof b);
+   }
+}
+
+static void fused_emit_member(rt_model_t *m, fused_block_t *fb,
+                              code_blob_t *blob, uint8_t *start,
+                              rt_proc_t *p, fused_site_t *s)
+{
+   void *state = NULL, *context = NULL;
+   jit_func_t *func = NULL;
+   void *target_a, *target_b;
+
+   if (s->state == SITE_PLAIN) {
+      direct_eval_t *de = (direct_eval_t *)p->vtable;
+      state   = de->state;
+      context = de->context;
+      func    = de->func;
+      s->slot = &(de->func->entry);
+
+      // Register the watch BEFORE reading the entry so a tier-up publish
+      // between the two is re-applied as a pending patch, never lost.
+      // Dedupe: N instances of one process share a jit_func_t; one watch
+      // per (slot, block) suffices -- the callback retargets every site.
+      bool have = false;
+      for (const fused_site_t *o = fb->sites; o != s; o++)
+         have |= (o->slot == s->slot);
+      if (!have)
+         code_entry_watch(s->slot, fused_entry_retarget, fb);
+
+      target_a = (void *)load_acquire(s->slot);
+      target_b = (void *)fused_member_epilogue;
+   }
+   else {   // SITE_FALLBACK at build: full generic activation
+      target_a = (void *)m->fused_stub;
+      target_b = (void *)fused_member_fallback;
+   }
+   s->cur_a = (jit_entry_fn_t)target_a;
+
+   // args[0] = state, args[1] = context (per-proc constants post-reset)
+   fused_emit_movabs(blob, 0x48, 0xB8, (uint64_t)(uintptr_t)state);
+   FUSED_EMIT(0x49, 0x89, 0x04, 0x24);          // mov [r12], rax
+   fused_emit_movabs(blob, 0x48, 0xB8, (uint64_t)(uintptr_t)context);
+   FUSED_EMIT(0x49, 0x89, 0x44, 0x24, 0x08);    // mov [r12+8], rax
+
+   fused_emit_movabs(blob, 0x48, 0xB8, (uint64_t)(uintptr_t)&(p->wakeable));
+   fused_emit_rbx_d32(blob, 0x89, 0x83,         // mov [rbx+off], rax
+                      offsetof(model_thread_t, active_obj));
+   fused_emit_movabs(blob, 0x48, 0xB8, (uint64_t)(uintptr_t)p->scope);
+   fused_emit_rbx_d32(blob, 0x89, 0x83,
+                      offsetof(model_thread_t, active_scope));
+
+   fused_emit_rbx_d32(blob, 0x8B, 0x8B,         // mov rcx, [rbx+off(tlab)]
+                      offsetof(model_thread_t, tlab));
+   fused_emit_movabs(blob, 0x48, 0xBF, (uint64_t)(uintptr_t)func);   // rdi
+   FUSED_EMIT(0x31, 0xF6);                      // xor esi, esi (anchor NULL)
+   FUSED_EMIT(0x4C, 0x89, 0xE2);                // mov rdx, r12
+
+   s->off_a = blob->wptr - start;
+   fused_emit_call_slot(blob, target_a);        // SITE A
+
+   fused_emit_movabs(blob, 0x48, 0xBF, (uint64_t)(uintptr_t)m);   // rdi
+   fused_emit_movabs(blob, 0x48, 0xBE, (uint64_t)(uintptr_t)p);   // rsi
+   FUSED_EMIT(0x4C, 0x89, 0xE2);                // mov rdx, r12
+
+   s->off_b = blob->wptr - start;
+   fused_emit_call_slot(blob, target_b);        // SITE B
+}
+
+// Build the fused block over the freshly built fast-clk table. Every input
+// is static at this point: the table membership, each member's Phase A
+// wrapper constants and the current published entries.
+static void fused_block_build(rt_model_t *m)
+{
+   if (!fused_block_enabled() || !m->fastclk_on || m->fastclk_count == 0)
+      return;
+
+   assert(m->fused_block == NULL);   // aj_dissolve_fastclk ran first
+
+   if (m->fused_code == NULL)
+      m->fused_code = code_cache_new();
+
+   if (m->fused_stub == NULL) {
+      // Shared SITE A stub: null the result slot (args[0] = NULL -> the
+      // epilogue's TLAB protocol sees "no claim") and return.
+      code_blob_t *sb = code_blob_new(m->fused_code,
+                                      ident_new("fused_stub"), 64);
+      static const uint8_t stub[] = {
+         0x48, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00,   // mov qword [rdx], 0
+         0xC3                                        // ret
+      };
+      code_blob_emit(sb, stub, sizeof stub);
+      code_blob_finalise(sb, &(m->fused_stub));
+      if (m->fused_stub == NULL)
+         return;
+   }
+
+   const unsigned count = m->fastclk_count;
+   const size_t hint = 128 + (size_t)count * 160;
+   if (hint > 0x300000) {   // one code page (4MB) bounds a blob
+      notef("accel-jit: NVC_FUSED_BLOCK — %u members exceed the block size "
+            "budget, not fusing", count);
+      return;
+   }
+
+   fused_block_t *fb = xcalloc(sizeof(fused_block_t));
+   fb->count   = count;
+   fb->members = xmalloc_array(count, sizeof(rt_proc_t *));
+   fb->sites   = xcalloc_array(count, sizeof(fused_site_t));
+   fb->argbuf  = xmalloc_array(JIT_MAX_ARGS, sizeof(jit_scalar_t));
+   fb->thread  = model_thread(m);
+
+   memcpy(fb->members, m->fastclk_table, count * sizeof(rt_proc_t *));
+
+   code_blob_t *blob = code_blob_new(m->fused_code,
+                                     ident_new("fused_block"), hint);
+   uint8_t *start = blob->wptr;
+   fb->base = start;
+
+   static const uint8_t prologue[] = {
+      0x53,                     // push rbx
+      0x41, 0x54,               // push r12
+      0x48, 0x83, 0xEC, 0x08,   // sub rsp, 8 (16-byte call alignment)
+   };
+   code_blob_emit(blob, prologue, sizeof prologue);
+   fused_emit_movabs(blob, 0x48, 0xBB, (uint64_t)(uintptr_t)fb->thread);
+   fused_emit_movabs(blob, 0x49, 0xBC, (uint64_t)(uintptr_t)fb->argbuf);
+
+   unsigned nplain = 0;
+   for (unsigned i = 0; i < count; i++) {
+      rt_proc_t *p = fb->members[i];
+      fused_site_t *s = &(fb->sites[i]);
+      const bool plain = p->vtable->eval == proc_eval_direct
+         && p->wakeable.trigger == NULL
+         && p->tlab == NULL;
+      s->state = plain ? SITE_PLAIN : SITE_FALLBACK;
+      if (!plain && getenv("NVC_FUSED_DEBUG") != NULL)
+         notef("fused: member %s falls back: eval=%s trigger=%p tlab=%p",
+               istr(p->name),
+               p->vtable->eval == proc_eval_direct ? "direct" : "other",
+               (void *)p->wakeable.trigger, (void *)p->tlab);
+      if (plain)
+         nplain++;
+      fused_emit_member(m, fb, blob, start, p, s);
+   }
+
+   static const uint8_t outro[] = {
+      0x48, 0x83, 0xC4, 0x08,   // add rsp, 8
+      0x41, 0x5C,               // pop r12
+      0x5B,                     // pop rbx
+      0xC3,                     // ret
+   };
+   code_blob_emit(blob, outro, sizeof outro);
+
+   code_blob_finalise(blob, &(fb->entry));
+
+   if (fb->entry == NULL || (uint8_t *)fb->entry != start) {
+      // Overflow or relocation surprise: discard (watches may be live)
+      code_entry_unwatch(fb);
+      free(fb->members);
+      free(fb->sites);
+      free(fb->argbuf);
+      free(fb);
+      warnf("NVC_FUSED_BLOCK: block emission failed (%u members)", count);
+      return;
+   }
+
+   m->fused_block = fb;
+   notef("accel-jit: NVC_FUSED_BLOCK — fused %u/%u member(s)%s", nplain,
+         count, nplain == count ? "" : " (rest via generic fallback)");
+}
+
+// Run the fused block for this posedge. Returns false when the unfused
+// table loop must run instead (no block, no armed landing pad, tracing).
+static bool fused_block_dispatch(rt_model_t *m)
+{
+   fused_block_t *fb = m->fused_block;
+   if (fb == NULL)
+      return false;
+
+   // Hoisted ONCE per block: member entries are called in-region, so
+   // model_run's landing pad must be armed (model_step / shell / VHPI
+   // stepping arrive without one and take the unfused loop).
+   jit_thread_local_t *jthread = jit_thread_get();
+   if (unlikely(!jthread->jmp_buf_valid || jthread->state != JIT_RUNNING))
+      return false;
+
+   if (unlikely(__trace_on))
+      return false;   // per-member "run process" trace needs the loop path
+
+   if (unlikely(model_thread(m) != fb->thread))
+      return false;   // baked thread pointer no longer current
+
+   if (unlikely(load_acquire(&(fb->patch_pending))))
+      fused_apply_pending(m, fb);
+
+   assert(fb->thread->tlab != NULL);
+
+   // Hoisted ONCE per block: reclaim the previous eval's escaping
+   // unconstrained results. Member transients accumulate across the block
+   // (the arena grows by chaining; the next reset reclaims them all).
+   jit_eval_arena_reset();
+
+   fb->running = true;
+   (*fb->entry)(NULL, NULL, NULL, NULL);
+   fb->running = false;
+
+   return true;
+}
+
+// Dissolve at ANY delta boundary with zero state loss: the block owns no
+// simulation state, so dropping it reverts dispatch to the fast-clk table
+// (or to normal queued wakeup after aj_dissolve_fastclk). Called from the
+// fast-clk dissolve path (guard nexus fired), reset_process, and available
+// to future live-edit demotion.
+static void fused_block_dissolve(rt_model_t *m)
+{
+   fused_block_t *fb = m->fused_block;
+   if (fb == NULL)
+      return;
+
+   assert(!fb->running);   // delta-boundary only, never mid-block
+
+   m->fused_block = NULL;
+
+   // After this returns no retarget callback for this block is in flight
+   // (the watch lock serialises unwatch against notify)
+   code_entry_unwatch(fb);
+
+   // The emitted span cannot be returned to the code cache (spans have no
+   // individual free) and is abandoned; bounded by dissolve/rebuild count.
+   free(fb->members);
+   free(fb->sites);
+   free(fb->argbuf);
+   free(fb);
+}
+
+#else   // !ARCH_X86_64
+
+static void fused_block_build(rt_model_t *m)    { }
+static void fused_block_dissolve(rt_model_t *m) { }
+static bool fused_block_dispatch(rt_model_t *m) { return false; }
+
+#endif
 
 static res_memo_t *memo_resolution_fn(rt_model_t *m, rt_signal_t *signal,
                                       ffi_closure_t closure, int32_t nlits,
@@ -7778,9 +8372,17 @@ static void model_cycle(rt_model_t *m)
       // on rst AND their clk, so all get filtered) — try candidates in
       // fanout order until one yields a non-empty table.
       rt_nexus_t *tried[4] = { NULL, NULL, NULL, NULL };
+      // Fanout floor for a clock candidate: default 16 keeps the historic
+      // behaviour (only wide-fanout nexuses qualify); NVC_FAST_CLK_AUTO_MIN
+      // lowers it for small designs (A/B benchmarking of the dispatch path)
+      static int min_fanout = -1;
+      if (min_fanout < 0) {
+         const char *e = getenv("NVC_FAST_CLK_AUTO_MIN");
+         min_fanout = (e != NULL) ? MAX(atoi(e), 1) : 16;
+      }
       for (int k = 0; k < 4 && !m->fastclk_on; k++) {
          rt_nexus_t *best = NULL;
-         unsigned best_n = 15;
+         unsigned best_n = min_fanout - 1;
          for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
             if (n->width != 1 || n->signal->n_nexus != 1) continue;
             if (n == tried[0] || n == tried[1] || n == tried[2]) continue;
@@ -7805,9 +8407,14 @@ static void model_cycle(rt_model_t *m)
    if (m->fastclk_hit) {
       m->fastclk_hit = false;
       if (m->fastclk_data[0] & 1) {   // rising edge (event fired + now high)
-         rt_proc_t **pr = m->fastclk_table;
-         for (unsigned i = 0; i < m->fastclk_count; i++, pr++)
-            run_process(m, *pr);
+         // NVC_FUSED_BLOCK: one activation for the whole member set --
+         // falls back to the table loop when unavailable (identical
+         // semantics either way; only the dispatch mechanism differs)
+         if (!fused_block_dispatch(m)) {
+            rt_proc_t **pr = m->fastclk_table;
+            for (unsigned i = 0; i < m->fastclk_count; i++, pr++)
+               run_process(m, *pr);
+         }
 
          // NVC_ACCEL_BANK swap: the chunk STAGEd its registered outputs into
          // shadows; every clk-reader above has now read the OLD effective value
