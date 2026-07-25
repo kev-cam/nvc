@@ -190,7 +190,13 @@ static void emit_range(FILE *f, type_t type)
       if (w > 1) fprintf(f, "[%u:0] ", w - 1);
    }
    else if (type_is_integer(type))
-      fprintf(f, "[31:0] ");
+      // VHDL Integer is SIGNED. Rendering it as a plain (unsigned) reg[31:0]
+      // makes every comparison against a negative constant UNSIGNED in
+      // Verilog (one unsigned operand poisons the op), so tgt-vhdl's
+      // OOB_WriteV_Idx_N guards `idx >= -3` are constant-false and yosys
+      // const-folds the whole guarded write network away (VeeR lsu
+      // stbuf_numvld_any -> 8'h00 -> store-stall underflow at 695ns).
+      fprintf(f, "signed [31:0] ");
    // std_logic / boolean / enum -> single bit, no range
 }
 
