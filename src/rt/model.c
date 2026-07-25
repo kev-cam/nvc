@@ -174,6 +174,8 @@ typedef struct _rt_model {
    rt_nexus_t        *fastclk_nexus;
    uint8_t           *fastclk_data;    // clk effective bytes (bit0 = level)
    uint64_t           fastclk_auto_at; // NVC_FAST_CLK_AUTO: build table at this time (fs); 0=off
+   uint64_t           fastclk_built_at;  // sim time the current table went live
+   uint64_t           fastclk_backoff;   // re-arm delay after a dissolve (fs)
    rt_nexus_t       **fastclk_guard_nx;   // quiet-sensitivity guard nexuses
    const rt_nexus_vtable_t **fastclk_guard_orig; // their original vtables
    rt_nexus_vtable_t *fastclk_guard_vt;   // per-guard patched copies (notify -> dissolve)
@@ -2616,6 +2618,7 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
    m->fastclk_nexus = clkn;
    m->fastclk_data  = clkdata;
    m->fastclk_on    = true;
+   m->fastclk_built_at = m->now;   // hysteresis: survival measured from here
    notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
          m->fastclk_count);
 
@@ -2651,8 +2654,28 @@ static void aj_dissolve_fastclk(rt_model_t *m)
    free(m->fastclk_guard_vt);   m->fastclk_guard_vt = NULL;
    m->fastclk_nguards = 0;
    if (was_on) {
-      if (getenv("NVC_FAST_CLK_AUTO") != NULL)   // redo-as-we-go: re-arm;
-         m->fastclk_auto_at = m->now + UINT64_C(500000000);  // +500ns, each
+      if (getenv("NVC_FAST_CLK_AUTO") != NULL) {   // redo-as-we-go: re-arm
+         // Rebuild HYSTERESIS.  The flat +500ns re-arm thrashed on busy
+         // phases (VeeR: dissolve/rebuild every ~500-900ns for the whole
+         // run — each rebuild is a full nexus scan, plus a ~250KB block
+         // re-emission under NVC_FUSED_BLOCK — measured ~10% wall).
+         // Exponential backoff with survival-based reset: a table that
+         // lived >= 8x the current backoff paid for itself, so restart
+         // the ladder at the base; one that died young doubles the wait
+         // (capped).  The guard blacklist keeps converging membership at
+         // each attempt; hysteresis just spaces the attempts to match
+         // how hostile the current sim phase actually is.
+         const uint64_t base = UINT64_C(500000000);        // 500ns
+         const uint64_t cap  = UINT64_C(1000000000000);    // 1ms
+         const uint64_t survival = m->now - m->fastclk_built_at;
+         if (m->fastclk_backoff == 0)
+            m->fastclk_backoff = base;
+         else if (survival >= 8 * m->fastclk_backoff)
+            m->fastclk_backoff = base;
+         else
+            m->fastclk_backoff = MIN(cap, m->fastclk_backoff * 2);
+         m->fastclk_auto_at = m->now + m->fastclk_backoff;
+      }
       // rebuild excludes recently-active nexuses so membership converges.
       static unsigned dcount = 0;
       if (dcount++ < 10)
