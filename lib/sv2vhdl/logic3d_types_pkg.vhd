@@ -470,6 +470,27 @@ package logic3d_types_pkg is
     function l3d_pow(b, e : logic3d_vector;
                      bs, es : boolean) return logic3d_vector;
 
+    -- Gate-operator overloads: a design promoted from std_logic/bit to 3D-Logic
+    -- keeps its `a and b` / `not a` syntax. logic3d is a plain natural subtype
+    -- with no built-in logic operators, so these thin wrappers over the l3d_*
+    -- gate primitives supply them (scalar + element-wise vector). Return-type
+    -- overload resolution keeps the built-in boolean `and`/`or` (used by `=`
+    -- comparison chains in conditions) unaffected.
+    function "not" (a : logic3d) return logic3d;
+    function "and" (a, b : logic3d) return logic3d;
+    function "or"  (a, b : logic3d) return logic3d;
+    function "xor" (a, b : logic3d) return logic3d;
+    function "nand"(a, b : logic3d) return logic3d;
+    function "nor" (a, b : logic3d) return logic3d;
+    function "xnor"(a, b : logic3d) return logic3d;
+    function "not" (a : logic3d_vector) return logic3d_vector;
+    function "and" (a, b : logic3d_vector) return logic3d_vector;
+    function "or"  (a, b : logic3d_vector) return logic3d_vector;
+    function "xor" (a, b : logic3d_vector) return logic3d_vector;
+    function "nand"(a, b : logic3d_vector) return logic3d_vector;
+    function "nor" (a, b : logic3d_vector) return logic3d_vector;
+    function "xnor"(a, b : logic3d_vector) return logic3d_vector;
+
 end package;
 
 package body logic3d_types_pkg is
@@ -1698,5 +1719,21 @@ package body logic3d_types_pkg is
     begin
         return l3d_eq1(b, a);
     end function;
+
+    -- Gate-operator overloads (thin wrappers over the l3d_* primitives).
+    function "not" (a : logic3d) return logic3d is begin return l3d_not(a);     end function;
+    function "and" (a, b : logic3d) return logic3d is begin return l3d_and(a, b);  end function;
+    function "or"  (a, b : logic3d) return logic3d is begin return l3d_or(a, b);   end function;
+    function "xor" (a, b : logic3d) return logic3d is begin return l3d_xor(a, b);  end function;
+    function "nand"(a, b : logic3d) return logic3d is begin return l3d_nand(a, b); end function;
+    function "nor" (a, b : logic3d) return logic3d is begin return l3d_nor(a, b);  end function;
+    function "xnor"(a, b : logic3d) return logic3d is begin return l3d_xnor(a, b); end function;
+    function "not" (a : logic3d_vector) return logic3d_vector is begin return l3d_not(a);     end function;
+    function "and" (a, b : logic3d_vector) return logic3d_vector is begin return l3d_and(a, b);  end function;
+    function "or"  (a, b : logic3d_vector) return logic3d_vector is begin return l3d_or(a, b);   end function;
+    function "xor" (a, b : logic3d_vector) return logic3d_vector is begin return l3d_xor(a, b);  end function;
+    function "nand"(a, b : logic3d_vector) return logic3d_vector is begin return l3d_nand(a, b); end function;
+    function "nor" (a, b : logic3d_vector) return logic3d_vector is begin return l3d_nor(a, b);  end function;
+    function "xnor"(a, b : logic3d_vector) return logic3d_vector is begin return l3d_xnor(a, b); end function;
 
 end package body;
