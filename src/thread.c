@@ -1148,7 +1148,13 @@ static void create_workers(int needed)
    if (relaxed_load(&should_stop))
       return;
 
-   while (relaxed_load(&running_threads) < MIN(max_workers, needed)) {
+   // Even when the pool size is clamped to one, allow a single worker
+   // thread in addition to the main thread so that asynchronous tasks
+   // are never executed inline on the main thread (see async_do); the
+   // OS timeslices it against the main thread on a single CPU
+   const int limit = MAX(max_workers, 2);
+
+   while (relaxed_load(&running_threads) < MIN(limit, needed)) {
       static int counter = 0;
       char *name = xasprintf("worker thread %d", atomic_add(&counter, 1));
       SCOPED_LOCK(stop_lock);   // Avoid races with stop_world
@@ -1257,7 +1263,14 @@ void workq_drain(workq_t *wq)
 
 void async_do(task_fn_t fn, void *context, void *arg)
 {
-   if (max_workers == 1)
+   // Never execute asynchronous tasks inline on the main thread, even
+   // with a single-CPU worker pool: the only submitter is JIT tier-up
+   // and a large code generation job would otherwise stall the caller
+   // (the simulation event loop) for its full duration.  Instead lazily
+   // create one dedicated worker (see create_workers) and let the OS
+   // timeslice it.  Threads other than the main thread cannot create
+   // workers so retain the inline fallback there.
+   if (max_workers == 1 && my_thread->kind != MAIN_THREAD)
       (*fn)(context, arg);   // Single CPU
    else {
       const int npending = atomic_add(&async_pending, 1);
