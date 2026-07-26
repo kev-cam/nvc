@@ -8867,8 +8867,10 @@ static void model_cycle(rt_model_t *m)
       }
    }
 
-   swap_deferq(&m->next_driverq, &m->driverq);
-   deferq_run(m, &m->next_driverq);
+   if (m->driverq.count > 0) {
+      swap_deferq(&m->next_driverq, &m->driverq);
+      deferq_run(m, &m->next_driverq);
+   }
 
    while (heap_size(m->driving_heap) > 0) {
       rt_nexus_t *n = heap_extract_min(m->driving_heap);
@@ -8885,7 +8887,8 @@ static void model_cycle(rt_model_t *m)
    m->blocking_update = true;
 
    // Update implicit signals
-   deferq_run(m, &m->implicitq);
+   if (m->implicitq.count > 0)
+      deferq_run(m, &m->implicitq);
 
    assert(model_thread(m)->tlab->alloc == 0);
 
@@ -8894,8 +8897,12 @@ static void model_cycle(rt_model_t *m)
       dump_signals(m, m->root);
 #endif
 
+   // The epoch bump must stay unconditional: run_trigger memoises on it
+   // from the run_process filter and the inline blocking_update wake path,
+   // both outside this drain
    m->trigger_epoch++;
-   deferq_run(m, &m->triggerq);  // Sensitivity list filter
+   if (m->triggerq.count > 0)
+      deferq_run(m, &m->triggerq);  // Sensitivity list filter
 
    run_callbacks(m, START_OF_PROCESSES);
 
@@ -9093,7 +9100,8 @@ fastclk_done:;
       m->can_create_delta = false;
 
       // Run all postponed processes and event callbacks
-      deferq_run(m, &m->postponedq);
+      if (m->postponedq.count > 0)
+         deferq_run(m, &m->postponedq);
 
       run_callbacks(m, END_TIME_STEP);
 
