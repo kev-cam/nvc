@@ -192,6 +192,43 @@ typedef struct _rt_model {
    unsigned           fastclk_nguards;
    rt_nexus_t       **fastclk_bl;         // nexuses that ever dissolved the table
    unsigned           fastclk_nbl, fastclk_blmax;  // -> never guard again
+   // NVC_FAST_CLK_WIDE (default on; =0 restores the guard machinery
+   // wholesale): non-candidate single-bit overlap nexuses become
+   // COMPANIONS instead of unflag/guard triggers, so (clk,rst) procs are
+   // admitted as EVERY-EVENT members (wakeable.fastclk_ee). The table is
+   // partition-sorted at probation exit: posedge-only [0, ee_start),
+   // every-event [ee_start, count). Dispatch keys on a candidate
+   // VALUE-EDGE shadow (fastclk_clk_last), not the level bit: posedge
+   // runs the whole table, any other latched wake runs only the
+   // every-event tail. Companion admission IGNORES the candidate
+   // blacklist (a failed clock candidate -- rst -- is prime companion
+   // material).
+   rt_nexus_t       **fastclk_comp;       // registered companion nexuses
+   unsigned           fastclk_ncomp;
+   uint8_t            fastclk_clk_last;   // candidate value-edge shadow byte
+   unsigned           fastclk_ee_start;   // partition boundary (see above)
+   unsigned           fastclk_hit_deltas; // probation: hit deltas consumed;
+                                          // >=512 before 64 candidate edges
+                                          // => STALL (dissolve + cooldown)
+   bool               fastclk_evict_defer;// evicted members hold fused sites
+                                          // to patch at next dispatch preamble
+   uint64_t           fastclk_empty_backoff; // all-empty AUTO round re-arm:
+                                          // pure doubling, no survival reset
+   struct {                               // temporary candidate cooldown
+      rt_nexus_t     *nx;                 // (probation STALL verdicts): the
+      uint64_t        retry_at;           // scan skips nx until retry_at
+   }                  fastclk_cool[8];
+   unsigned           fastclk_cool_next;  // round-robin slot
+   rt_nexus_t        *fastclk_excl[8];    // busy-companion exclusion: these
+   unsigned           fastclk_nexcl;      // nexuses' procs are unflagged at
+                                          // rebuild (rate demote; NOT the bl)
+   uint32_t           fastclk_win_pos;    // rate window: posedge dispatches
+   uint32_t           fastclk_win_off;    // .. off-edge dispatches
+   uint32_t           fastclk_comp_off[8];// .. off-edge dispatches per companion
+   unsigned           fastclk_npending;   // members mid self-suspend (#0/wait-
+                                          // for-0 continuation queued): fused
+                                          // dispatch falls back to the table
+                                          // loop (which skips pending) while >0
    hash_t            *depositors;         // nexus -> last depositing rt_proc_t
                                           // (fused-cone force/release wakeups)
 
@@ -1045,21 +1082,65 @@ size_t signal_expand(rt_signal_t *s, uint64_t *buf, size_t max)
    return total;
 }
 
-static inline void set_pending(rt_wakeable_t *wake)
+// NVC_FAST_CLK: evict one member from the table (leaves a hole -- the
+// dispatch loops and the fused block skip !fastclk members). Fired from
+// every path that queues or re-registers a member OUTSIDE the table's
+// wake latch (timed wakes, #0 inactive-region waits, force/release
+// depositor queueing, wait-set demotes): a member both queued and
+// table-dispatched would run twice in one delta, and a table-dispatched
+// member resumed by the table keeps a stale eventq entry (delayed=true)
+// that later trips the deltaq_insert_proc assert. Timeouts are rare in
+// RTL FF procs; eviction preserves correctness at negligible cost. The
+// fused-block sites of an evicted member are patched at the next
+// dispatch preamble (never mid-block -- an evict can fire from inside
+// the member's own eval, where patching its not-yet-executed SITE B
+// would skip the TLAB/finalize epilogue).
+static void aj_fastclk_evict(rt_model_t *m, rt_wakeable_t *w, const char *why)
+{
+   if (!w->fastclk)
+      return;
+   w->fastclk = 0;
+   w->fastclk_ee = 0;
+   if (w->pending && m->fastclk_npending > 0)
+      m->fastclk_npending--;    // was counted as a self-suspended member
+   if (m->fused_block != NULL)
+      m->fastclk_evict_defer = true;
+   static unsigned ecount = 0;
+   if (ecount++ < 10 && getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+      notef("accel-jit: fast-clk member evicted (%s)", why);
+}
+
+static inline void set_pending(rt_model_t *m, rt_wakeable_t *wake)
 {
    assert(!wake->pending);
    assert(!wake->delayed);
+   if (unlikely(wake->fastclk)) {
+      // A member queueing ITSELF mid-activation (the NBA/#0 transform's
+      // `wait for 0 ns` -> inactiveq, x_sched_inactive) is a CONTINUATION
+      // of an activation the table delivered -- it stays a member; while
+      // it is pending both dispatch paths skip it (the same drop normal
+      // wakeup_one applies to pending procs), tracked by fastclk_npending
+      // so the fused block falls back to the checking loop. Queueing from
+      // OUTSIDE its own activation (eventq timed wake, force/release
+      // depositor requeue) evicts: the table would double-run it.
+      if (get_active_wakeable() == wake)
+         m->fastclk_npending++;
+      else
+         aj_fastclk_evict(m, wake, "queued outside the table");
+   }
    wake->pending = true;
 }
 
 static void deltaq_insert_proc(rt_model_t *m, uint64_t delta, rt_proc_t *proc)
 {
    if (delta == 0) {
-      set_pending(&proc->wakeable);
+      set_pending(m, &proc->wakeable);
       deferq_do(&m->procq, async_run_process, proc);
       m->next_is_delta = true;
    }
    else {
+      if (unlikely(proc->wakeable.fastclk))
+         aj_fastclk_evict(m, &proc->wakeable, "timed wake armed");
       assert(!proc->wakeable.delayed);
       proc->wakeable.delayed = true;
 
@@ -1096,7 +1177,8 @@ static void deltaq_insert_pseudo_source(rt_model_t *m, rt_source_t *src)
 static void direct_eval_uninstall(rt_proc_t *proc);
 static void fused_block_build(rt_model_t *m);
 static void fused_block_dissolve(rt_model_t *m);
-static bool fused_block_dispatch(rt_model_t *m);
+static bool fused_block_dispatch(rt_model_t *m, bool posedge);
+static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj);
 static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk);
 
 static void reset_process(rt_model_t *m, rt_proc_t *proc)
@@ -1139,7 +1221,7 @@ static void reset_process(rt_model_t *m, rt_proc_t *proc)
    thread->active_scope = NULL;
 
    // Schedule the process to run immediately
-   set_pending(&proc->wakeable);
+   set_pending(m, &proc->wakeable);
    deferq_do(&m->procq, async_run_process, proc);
 }
 
@@ -2780,6 +2862,25 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
 
    const uint64_t t_bind = get_timestamp_ns();
 
+   // If the fast-clk table / fused block hold members of this subtree,
+   // dissolve both BEFORE the register writeback: the writeback deposits
+   // reach wakeup_one, and a still-flagged member would latch
+   // fastclk_hit that the dissolve then clears -- a lost wakeup (stale
+   // downstream readers). Dissolved first, the deposits queue members
+   // normally. (They rebuild themselves with hysteresis; the fused
+   // block is dissolved by aj_dissolve_fastclk_ex.) Non-members keep
+   // their table. The stray sweep is skipped: no candidate build is in
+   // flight here, so the only flagged procs are exactly the committed
+   // table's members, which the dissolve unflags directly.
+   bool in_fastclk = false;
+   if (m->fastclk_table != NULL || m->fused_block != NULL)
+      for (unsigned i = 0; i < chunk->rr_count && !in_fastclk; i++)
+         if (chunk->rr_saved[i].proc->wakeable.fastclk)
+            in_fastclk = true;
+   if (in_fastclk)
+      aj_dissolve_fastclk_ex(m, false);
+   const uint64_t t_fc = get_timestamp_ns();
+
    // ---- 4. writeback: state_t -> signals (2-state -> L3D driven-certain) -
    const uint8_t *S = (const uint8_t *)chunk->state + psoff();
    uint8_t *buf = xmalloc(maxbuf);
@@ -2825,21 +2926,6 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
 
    const uint64_t t_vt = get_timestamp_ns();
 
-   // If the fast-clk table / fused block hold members of this subtree,
-   // dissolve both (they rebuild themselves with hysteresis; the fused
-   // block is dissolved by aj_dissolve_fastclk_ex). Non-members keep their
-   // table. The stray sweep is skipped: no candidate build is in flight
-   // here, so the only flagged procs are exactly the committed table's
-   // members, which the dissolve unflags directly.
-   bool in_fastclk = false;
-   if (m->fastclk_table != NULL || m->fused_block != NULL)
-      for (unsigned i = 0; i < chunk->rr_count && !in_fastclk; i++)
-         if (chunk->rr_saved[i].proc->wakeable.fastclk)
-            in_fastclk = true;
-   if (in_fastclk)
-      aj_dissolve_fastclk_ex(m, false);
-   const uint64_t t_fc = get_timestamp_ns();
-
    // ---- 6. unbind the chunk ----------------------------------------------
    // Publish any staged-but-unswapped deferred outputs first (they hold the
    // value the interp side is owed), exactly as the bank swap would.
@@ -2881,12 +2967,12 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
    // freed LAST (it names the chunk in the note below)
    const uint64_t dt = get_timestamp_ns() - t0;
    notef("accel-jit: DEMOTED '%s' — %d register(s) written back, %u/%u "
-         "proc vtable(s) restored, %.1f us (index %.1f bind %.1f wb %.1f "
-         "vt %.1f fastclk %.1f); interp resumes from this state",
+         "proc vtable(s) restored, %.1f us (index %.1f bind %.1f fastclk "
+         "%.1f wb %.1f vt %.1f); interp resumes from this state",
          top, nregs, restored, chunk->rr_count, (double)dt / 1000.0,
          (double)(t_ix - t0) / 1000.0, (double)(t_bind - t_ix) / 1000.0,
-         (double)(t_wb - t_bind) / 1000.0, (double)(t_vt - t_wb) / 1000.0,
-         (double)(t_fc - t_vt) / 1000.0);
+         (double)(t_fc - t_bind) / 1000.0, (double)(t_wb - t_fc) / 1000.0,
+         (double)(t_vt - t_wb) / 1000.0);
    free(chunk->rs_top);
    free(chunk);
    return true;
@@ -2919,8 +3005,120 @@ static bool aj_blacklisted(rt_model_t *m, rt_nexus_t *n)
    return false;
 }
 
-static void aj_flag_cb(rt_wakeable_t *w, void *ctx)   { w->fastclk = 1; }
-static void aj_unflag_cb(rt_wakeable_t *w, void *ctx) { w->fastclk = 0; }
+// Admission filter: only procs whose wakeup registration is STATIC
+// qualify -- wait_state==1 (promoted static-wait; direct-eval installed)
+// or trigger-armed sensitivity procs (trigger != NULL: these never
+// promote past wait_state 0 because proc_static_wait_finalize skips
+// them, but they re-register the same static sensitivity every
+// activation and both dispatch paths run the trigger filter). Excluded:
+// wait_state==2 (dynamic wait: re-registers on nexuses outside
+// candidate+companions, whose wakes would only latch -- lost activation
+// for a posedge-only member), wait_state==0 with no trigger (parked at a
+// plain `wait;` or first-activation limbo -- resuming those from the
+// table would run them spuriously), and delayed procs (a member resumed
+// by the table keeps a stale eventq entry that trips the
+// deltaq_insert_proc assert). The filter lives HERE rather than in
+// aj_pending_foreach so the unflag/stray sweeps stay unconditional (a
+// flagged proc must always be unflaggable even if its wait state moved).
+static void aj_flag_cb(rt_wakeable_t *w, void *ctx)
+{
+   if (!w->delayed && !w->pending    // mid-queue procs are not admitted
+       && (w->wait_state == 1
+           || (w->trigger != NULL && w->wait_state != 2)))
+      w->fastclk = 1;
+}
+
+static void aj_unflag_cb(rt_wakeable_t *w, void *ctx)
+{
+   w->fastclk = 0;
+   w->fastclk_ee = 0;
+}
+
+// Wide-mode pass 1 helpers: count currently-flagged procs on a pending
+// list (companion ranking) and mark the flagged overlap of a REGISTERED
+// companion as every-event members.
+static void aj_count_flagged_cb(rt_wakeable_t *w, void *ctx)
+{
+   if (w->fastclk)
+      (*(unsigned *)ctx)++;
+}
+
+static void aj_ee_mark_cb(rt_wakeable_t *w, void *ctx)
+{
+   if (w->fastclk)
+      w->fastclk_ee = 1;
+}
+
+// NVC_FAST_CLK_WIDE: default ON; =0 restores the guard machinery wholesale
+static bool fastclk_wide_enabled(void)
+{
+   static int en = -1;
+   if (en < 0) {
+      const char *e = getenv("NVC_FAST_CLK_WIDE");
+      en = (e == NULL || *e != '0');
+   }
+   return en;
+}
+
+static unsigned fastclk_companion_cap(void)
+{
+   static int cap = -1;
+   if (cap < 0) {
+      const char *e = getenv("NVC_FAST_CLK_COMPANIONS");
+      cap = (e != NULL) ? MAX(0, MIN(atoi(e), 64)) : 8;
+   }
+   return (unsigned)cap;
+}
+
+// Probation sim-time bound (P3): NVC_FAST_CLK_PROBATION_NS, default 10us
+static uint64_t fastclk_probation_fs(void)
+{
+   static uint64_t fs = 0;
+   if (fs == 0) {
+      const char *e = getenv("NVC_FAST_CLK_PROBATION_NS");
+      const uint64_t ns = (e != NULL && strtoull(e, NULL, 10) > 0)
+         ? strtoull(e, NULL, 10) : UINT64_C(10000);
+      fs = ns * UINT64_C(1000000);
+   }
+   return fs;
+}
+
+// Any registered companion evented THIS delta? (wake_next deposits
+// attribute to iteration+1 and are consumed post-increment, so the same
+// test covers them -- identical semantics to x_test_net_event.)
+static bool aj_companion_evented(rt_model_t *m)
+{
+   for (unsigned i = 0; i < m->fastclk_ncomp; i++) {
+      rt_nexus_t *n = m->fastclk_comp[i];
+      if (n->last_event == m->now && n->event_delta == m->iteration)
+         return true;
+   }
+   return false;
+}
+
+// Did THIS member's own registered sensitivity event this delta? Used on
+// NON-candidate-event dispatches (companion-only deltas): a member whose
+// own nexuses are quiet must NOT be activated -- normal wakeup would not
+// have run it, and a spurious activation is not harmless for STD_MX
+// translated bodies that run an unconditional `wait for 0 ns` (the
+// member would sit pending mid-#0 when its real clock edge arrives, and
+// the pending-skip would drop that edge -- measured on VeeR: mixed-clock
+// probation stalled the core within 20 cycles of the first build).
+// Trigger-armed members return true: run_process's run_trigger applies
+// exactly this filter before the body runs.
+static bool aj_member_evented(rt_model_t *m, rt_proc_t *p)
+{
+   if (p->wakeable.trigger != NULL)
+      return true;                  // run_trigger gates the body instead
+   if (p->wakeable.wait_state != 1 || p->wait_count == 0)
+      return true;                  // no static set recorded: conservative
+   for (unsigned i = 0; i < p->wait_count; i++) {
+      rt_nexus_t *n = p->wait_set[i];
+      if (n->last_event == m->now && n->event_delta == m->iteration)
+         return true;
+   }
+   return false;
+}
 
 static void aj_collect_cb(rt_wakeable_t *w, void *ctx)
 {
@@ -2960,69 +3158,155 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
    // Pass 0: provisionally flag every clk-pending proc.
    aj_pending_foreach(clkn->pending, aj_flag_cb, NULL);
 
-   // Pass 1: un-flag any that also appear on an ACTIVE other nexus. A
-   // QUIET other nexus (no event within QUIET_FS of now — e.g. released
-   // rst) does not disqualify its clk procs: mark it as a GUARD instead;
-   // any later event on a guard nexus dissolves the table and falls back
-   // to normal dispatch before the wakeup propagates (user directive:
-   // settle first, block-dispatch, fall back as needed).
-   const uint64_t QUIET_FS = UINT64_C(2000000000);  // 2us: only long-stable
-   // nexuses qualify as guards (at the first build only never-toggled ones)
    const bool strict = getenv("NVC_FAST_CLK_STRICT") != NULL;
-   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
-      if (n == clkn) continue;
-      if (aj_pending_count(n->pending) == 0) continue;
-      const bool quiet = !strict && !aj_blacklisted(m, n)
-         && (n->last_event > m->now || m->now - n->last_event > QUIET_FS);
-      if (quiet)
-         m->fastclk_nguards++;    // counted now, vtables patched below
-      else
-         aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
-   }
+   const bool wide   = fastclk_wide_enabled();
 
-   // Patch each guard nexus's vtable (post-elab vtable hack): a copy whose
-   // notify dissolves the table (restoring every vtable) before the event
-   // propagates, so member procs fall back to normal queued wakeup.
-   if (m->fastclk_nguards > 0) {
-      m->fastclk_guard_nx   = xmalloc_array(m->fastclk_nguards, sizeof(rt_nexus_t *));
-      m->fastclk_guard_orig = xmalloc_array(m->fastclk_nguards, sizeof(void *));
-      m->fastclk_guard_vt   = xmalloc_array(m->fastclk_nguards, sizeof(rt_nexus_vtable_t));
-      unsigned gi = 0;
+   if (wide) {
+      // WIDE pass 1: a non-candidate nexus qualifies as a COMPANION iff it
+      // is single-bit AND its pending list holds >=1 currently-flagged
+      // proc. Companion eligibility deliberately IGNORES the candidate
+      // blacklist -- that list means "not a clock", and a failed clock
+      // candidate (rst) is prime companion material. Qualifiers are
+      // ranked by flagged-overlap count; overflow past the cap unflags
+      // (as does any non-qualifying overlap: multi-bit, strict mode, or
+      // a busy-companion exclusion from a previous rate demote).
+      typedef struct { rt_nexus_t *nx; unsigned ovl; } comp_cand_t;
+      comp_cand_t *cand = NULL;
+      unsigned ncand = 0, maxcand = 0;
       for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
-         if (n == clkn || aj_pending_count(n->pending) == 0) continue;
-         if (strict || aj_blacklisted(m, n)
-             || !(n->last_event > m->now || m->now - n->last_event > QUIET_FS))
+         if (n == clkn) continue;
+         if (aj_pending_count(n->pending) == 0) continue;
+         unsigned ovl = 0;
+         aj_pending_foreach(n->pending, aj_count_flagged_cb, &ovl);
+         if (ovl == 0) continue;      // no member overlap: not our concern
+         bool excl = strict || n->width != 1;
+         for (unsigned x = 0; !excl && x < m->fastclk_nexcl; x++)
+            excl = (m->fastclk_excl[x] == n);
+         if (excl) {
+            aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
             continue;
-         m->fastclk_guard_nx[gi]   = n;
-         m->fastclk_guard_orig[gi] = n->vtable;
-         m->fastclk_guard_vt[gi]   = *n->vtable;
-         m->fastclk_guard_vt[gi].notify = aj_guard_notify;
-         n->vtable = &m->fastclk_guard_vt[gi];
-         gi++;
+         }
+         if (ncand == maxcand) {
+            maxcand = maxcand ? maxcand * 2 : 16;
+            cand = xrealloc_array(cand, maxcand, sizeof(comp_cand_t));
+         }
+         cand[ncand].nx  = n;
+         cand[ncand].ovl = ovl;
+         ncand++;
       }
-      m->fastclk_nguards = gi;
+      // rank by overlap descending (stable enough: insertion sort, the
+      // qualifier count is small on real designs -- a handful of resets)
+      for (unsigned i = 1; i < ncand; i++) {
+         comp_cand_t key = cand[i];
+         unsigned j = i;
+         for (; j > 0 && cand[j - 1].ovl < key.ovl; j--)
+            cand[j] = cand[j - 1];
+         cand[j] = key;
+      }
+      const unsigned cap = fastclk_companion_cap();
+      for (unsigned i = cap; i < ncand; i++)     // overflow: unflag procs
+         aj_pending_foreach(cand[i].nx->pending, aj_unflag_cb, NULL);
+      m->fastclk_ncomp = MIN(ncand, cap);
+      if (m->fastclk_ncomp > 0) {
+         m->fastclk_comp = xmalloc_array(m->fastclk_ncomp, sizeof(rt_nexus_t *));
+         for (unsigned i = 0; i < m->fastclk_ncomp; i++) {
+            m->fastclk_comp[i] = cand[i].nx;
+            // partition = static sensitivity: overlap procs are EVERY-EVENT
+            aj_pending_foreach(cand[i].nx->pending, aj_ee_mark_cb, NULL);
+         }
+      }
+      free(cand);
+   }
+   else {
+      // GUARD pass 1 (NVC_FAST_CLK_WIDE=0): un-flag any proc that also
+      // appears on an ACTIVE other nexus. A QUIET other nexus (no event
+      // within QUIET_FS of now — e.g. released rst) does not disqualify
+      // its clk procs: mark it as a GUARD instead; any later event on a
+      // guard nexus dissolves the table and falls back to normal
+      // dispatch before the wakeup propagates.
+      const uint64_t QUIET_FS = UINT64_C(2000000000);  // 2us: only long-
+      // stable nexuses qualify (at the first build only never-toggled)
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         if (n == clkn) continue;
+         if (aj_pending_count(n->pending) == 0) continue;
+         const bool quiet = !strict && !aj_blacklisted(m, n)
+            && (n->last_event > m->now || m->now - n->last_event > QUIET_FS);
+         if (quiet)
+            m->fastclk_nguards++;    // counted now, vtables patched below
+         else
+            aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
+      }
+
+      // Patch each guard nexus's vtable (post-elab vtable hack): a copy
+      // whose notify dissolves the table (restoring every vtable) before
+      // the event propagates, so member procs fall back to queued wakeup.
+      if (m->fastclk_nguards > 0) {
+         m->fastclk_guard_nx   = xmalloc_array(m->fastclk_nguards, sizeof(rt_nexus_t *));
+         m->fastclk_guard_orig = xmalloc_array(m->fastclk_nguards, sizeof(void *));
+         m->fastclk_guard_vt   = xmalloc_array(m->fastclk_nguards, sizeof(rt_nexus_vtable_t));
+         unsigned gi = 0;
+         for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+            if (n == clkn || aj_pending_count(n->pending) == 0) continue;
+            if (strict || aj_blacklisted(m, n)
+                || !(n->last_event > m->now || m->now - n->last_event > QUIET_FS))
+               continue;
+            m->fastclk_guard_nx[gi]   = n;
+            m->fastclk_guard_orig[gi] = n->vtable;
+            m->fastclk_guard_vt[gi]   = *n->vtable;
+            m->fastclk_guard_vt[gi].notify = aj_guard_notify;
+            n->vtable = &m->fastclk_guard_vt[gi];
+            gi++;
+         }
+         m->fastclk_nguards = gi;
+      }
    }
 
    // Pass 2: collect the survivors into the table.
    const unsigned maxn = aj_pending_count(clkn->pending);
-   if (maxn == 0) return;
+   if (maxn == 0) {
+      aj_dissolve_fastclk_ex(m, false);  // free the companion list; no
+      return;                            // procs were flagged -> no strays
+   }
    m->fastclk_table = xmalloc_array(maxn, sizeof(rt_proc_t *));
    aj_pending_foreach(clkn->pending, aj_collect_cb, m);
 
    if (m->fastclk_count == 0) {
-      aj_dissolve_fastclk(m);   // unpatch guards, unflag strays
+      // Every pass-0 flag was cleared in pass 1 and collect visited the
+      // entire pass-0 set, so there are provably no strays: skip the
+      // full-nexus sweep (tens of ms on a big design, per AUTO round).
+      aj_dissolve_fastclk_ex(m, false);
       return;
    }
    m->fastclk_nexus = clkn;
    m->fastclk_data  = clkdata;
    m->fastclk_on    = true;
    m->fastclk_built_at = m->now;   // hysteresis: survival measured from here
-   m->fastclk_probation = 64;      // classify members before going posedge-only
+   m->fastclk_probation = 64;      // candidate value-edge deltas to classify
+   m->fastclk_hit_deltas = 0;      // hit deltas consumed during probation
    m->fastclk_comb = xcalloc_array(m->fastclk_count, 1);
    m->fastclk_probe_member = -1;
-   if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)   // quiet by default: the note
+   m->fastclk_clk_last = clkdata[0];   // value-edge shadow (dispatch-site only)
+   m->fastclk_ee_start = m->fastclk_count;  // no partition until probation exit
+   m->fastclk_empty_backoff = 0;   // a live build resets the empty-round ladder
+   if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL) {  // quiet by default: the note
       notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
             m->fastclk_count);   // pollutes gold-output tests when default-on
+      if (wide) {
+         unsigned n_ee = 0;
+         for (unsigned i = 0; i < m->fastclk_count; i++)
+            n_ee += m->fastclk_table[i]->wakeable.fastclk_ee;
+         char comps[256] = "";
+         size_t cl = 0;
+         for (unsigned i = 0; i < m->fastclk_ncomp && cl + 2 < sizeof comps; i++)
+            cl += snprintf(comps + cl, sizeof comps - cl, " %s",
+                           istr(tree_ident(m->fastclk_comp[i]->signal->where)));
+         notef("accel-jit: fast-clk WIDE %s: %u member(s), %u posedge-only + "
+               "%u every-event, %u companion(s):%s",
+               istr(tree_ident(clksig->where)), m->fastclk_count,
+               m->fastclk_count - n_ee, n_ee, m->fastclk_ncomp,
+               m->fastclk_ncomp > 0 ? comps : " (none)");
+      }
+   }
 
    // NVC_FUSED_BLOCK fusion happens at PROBATION EXIT (the member set is
    // not final until comb fanout is evicted)
@@ -3035,9 +3319,25 @@ static void aj_dissolve_fastclk_ex(rt_model_t *m, bool sweep_strays)
    // The fused block sequences table members; it never outlives the table
    fused_block_dissolve(m);
 
+   // Latch rescue (belt): if a wake was latched but not yet consumed (a
+   // same-delta companion/guard event or a demote writeback reached the
+   // dissolve first), the members were never queued -- dropping the latch
+   // would lose that delta's activation. Re-wake every former member
+   // through the normal path after unflagging (spurious wakes are
+   // body-filtered via sync_event_cache, so over-waking is safe).
+   rt_proc_t **rescue = NULL;
+   unsigned nrescue = 0;
+   if (m->fastclk_hit && m->fastclk_count > 0 && m->fastclk_table != NULL) {
+      nrescue = m->fastclk_count;
+      rescue = xmalloc_array(nrescue, sizeof(rt_proc_t *));
+      memcpy(rescue, m->fastclk_table, nrescue * sizeof(rt_proc_t *));
+   }
+
    if (m->fastclk_table != NULL) {
-      for (unsigned i = 0; i < m->fastclk_count; i++)
+      for (unsigned i = 0; i < m->fastclk_count; i++) {
          m->fastclk_table[i]->wakeable.fastclk = 0;
+         m->fastclk_table[i]->wakeable.fastclk_ee = 0;
+      }
       free(m->fastclk_table);
       m->fastclk_table = NULL;
    }
@@ -3048,6 +3348,41 @@ static void aj_dissolve_fastclk_ex(rt_model_t *m, bool sweep_strays)
    free(m->fastclk_comb); m->fastclk_comb = NULL;
    m->fastclk_count = 0;
    m->fastclk_hit = false;
+   free(m->fastclk_comp); m->fastclk_comp = NULL;
+   m->fastclk_ncomp = 0;
+   m->fastclk_ee_start = 0;
+   m->fastclk_hit_deltas = 0;
+   m->fastclk_evict_defer = false;
+   m->fastclk_win_pos = m->fastclk_win_off = 0;
+   m->fastclk_npending = 0;
+   memset(m->fastclk_comp_off, 0, sizeof m->fastclk_comp_off);
+
+   // NVC_ACCEL_BANK: flush + de-bank. Once the table is gone the
+   // post-dispatch publish site is unreachable, so a staged-but-unswapped
+   // shadow would go stale forever; and a rebuilt table has no proof the
+   // new membership covers the banked readers. Publish anything dirty
+   // (the value the interp side is owed -- mirrors the chunk-demote
+   // flush) and permanently revert the outputs to the deposit path.
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      if (c->defer_outs == NULL) continue;
+      for (unsigned i = 0; i < c->defer_count; i++) {
+         aj_defer_out_t *d = &c->defer_outs[i];
+         if (!d->defer) continue;
+         if (d->dirty && d->nexus != NULL
+             && !cmp_bytes(d->eff, d->shadow, d->valuesz)) {
+            copy2(d->last, d->eff, d->shadow, d->valuesz);
+            d->nexus->event_delta = m->iteration + 1;
+            d->nexus->last_event  = m->now;
+            if (d->cache_event)
+               d->nexus->signal->shared.flags |= SIG_F_EVENT_FLAG;
+            m->trigger_epoch++;
+         }
+         d->dirty = false;
+         d->defer = false;    // de-bank: deposit path from now on
+      }
+      c->defer_pending = false;
+   }
    // Unflag EVERY stray (failed candidates leave pass-0 flags on procs not
    // in any table; with fastclk_on they would skip wakeups forever). This
    // sweeps ALL nexuses (tens of ms on a big design) — strays only exist
@@ -3093,11 +3428,42 @@ static void aj_dissolve_fastclk_ex(rt_model_t *m, bool sweep_strays)
       if (dcount++ < 10 && getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
          notef("accel-jit: fast-clk table dissolved (guard event)");
    }
+
+   // Latch rescue wakes (flags cleared above -> normal queued wakeup;
+   // pending/delayed dedup handled by wakeup_one/wake_proc as usual)
+   if (rescue != NULL) {
+      for (unsigned i = 0; i < nrescue; i++)
+         wakeup_one(m, &rescue[i]->wakeable);
+      free(rescue);
+   }
 }
 
 static void aj_dissolve_fastclk(rt_model_t *m)
 {
    aj_dissolve_fastclk_ex(m, true);
+}
+
+// Probation STALL verdict (P2/P3): the candidate is not accumulating
+// value-edges (a reset captured as candidate, or a gated/slow clock).
+// NEVER blacklist -- silence is not evidence of non-clockness (a gated
+// clock resumes; a reset makes a fine companion). Dissolve + backoff
+// re-arm + a TEMPORARY cooldown so the next scan round tries the
+// next-widest candidate instead; the round after may retry this one.
+static void aj_fastclk_stall(rt_model_t *m, const char *why)
+{
+   rt_nexus_t *cand = m->fastclk_nexus;
+   if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+      notef("accel-jit: fast-clk probation STALL (%s) — candidate %s on "
+            "cooldown, table dissolved", why,
+            cand != NULL ? istr(tree_ident(cand->signal->where)) : "?");
+   aj_dissolve_fastclk(m);   // re-arms fastclk_auto_at with backoff (was_on)
+   if (cand != NULL) {
+      const unsigned slot = m->fastclk_cool_next++ % ARRAY_LEN(m->fastclk_cool);
+      m->fastclk_cool[slot].nx = cand;
+      // skip exactly the next scan round (armed at now+backoff); if AUTO
+      // is off (fastclk_auto_at == 0) the entry is immediately stale
+      m->fastclk_cool[slot].retry_at = m->fastclk_auto_at + 1;
+   }
 }
 
 // Guard nexus fired: restore all vtables + fall back, then deliver the
@@ -3114,23 +3480,26 @@ static void aj_guard_notify(rt_model_t *m, rt_nexus_t *n)
    n->vtable->notify(m, n);
 }
 
-// True iff every static waiter on this output nexus is a clk-only fast-clk
-// proc (so it is dispatched off the clock edge and reads the OLD effective
-// value before the swap). Any non-W_PROC waiter, or a W_PROC that did not
-// survive the clk-only filter (fastclk==0), means a same-delta reader could
-// observe the new value -> not deferrable.
+// True iff every static waiter on this output nexus is a POSEDGE-ONLY
+// fast-clk proc (so it is dispatched off the clock edge and reads the OLD
+// effective value before the swap). Any non-W_PROC waiter, a W_PROC that
+// did not survive the clk-only filter (fastclk==0), OR an every-event
+// member (fastclk_ee -- its sensitivity may include this output, and the
+// publish's no-wakeup bookkeeping would starve its O-triggered
+// activation) means a same-delta reader could observe the new value or
+// miss the change -> not deferrable.
 static bool aj_out_pending_ok(void *pending)
 {
    if (pointer_tag(pending) == 1) {
       rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
-      return w->kind == W_PROC && w->fastclk;
+      return w->kind == W_PROC && w->fastclk && !w->fastclk_ee;
    }
    else if (pending != NULL) {
       rt_pending_t *p = untag_pointer(pending, rt_pending_t);
       for (int i = 0; i < p->count; i++) {
          rt_wakeable_t *w = p->wake[i];
          if (w == NULL) continue;
-         if (w->kind != W_PROC || !w->fastclk) return false;
+         if (w->kind != W_PROC || !w->fastclk || w->fastclk_ee) return false;
       }
    }
    return true;
@@ -3188,6 +3557,9 @@ static rt_nexus_t *aj_classify_output(rt_model_t *m, rt_signal_t *sig)
       if (n->outputs != NULL)            BANK_DECLINE("consumer nexus fans out further");
    }
    if (!aj_out_pending_ok(n->pending))   BANK_DECLINE("non-clk-only reader on consumer");
+   for (unsigned i = 0; i < m->fastclk_ncomp; i++)   // a companion event's
+      if (m->fastclk_comp[i] == n)       // off-edge dispatch must never read
+         BANK_DECLINE("output nexus is a registered fast-clk companion");
    return n;
    #undef BANK_DECLINE
 }
@@ -3427,6 +3799,13 @@ static void aj_accel_teardown(rt_model_t *m)
    m->fastclk_table = NULL;
    m->fastclk_count = 0;
    m->fastclk_on    = false;
+   m->fastclk_probation = 0;
+   m->fastclk_hit = false;
+   m->fastclk_evict_defer = false;
+   m->fastclk_npending = 0;
+   // member fastclk/fastclk_ee bits and the companion list are swept by
+   // the next build's leading aj_dissolve_fastclk, exactly as the flags
+   // always were (fastclk_on false gates the wakeup latch meanwhile)
    if (m->aj_chunk_count > 0) {
       aj_chunk_t *c = m->aj_chunks[--m->aj_chunk_count];
       if (c->defer_outs != NULL) {
@@ -5204,6 +5583,11 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
          proc->wait_set = NULL;
          proc->wait_count = proc->wait_cap = 0;
          obj->wait_state = 2;
+         if (unlikely(obj->fastclk))
+            // A dynamic-wait member registers outside candidate+companions;
+            // events there would only latch (lost wakeup for a posedge-only
+            // member). Evict back to normal queued wakeup.
+            aj_fastclk_evict(m, obj, "wait-set change");
          direct_eval_uninstall(proc);   // demoted: back to the generic path
          for (unsigned i = 0; i < proc->cur_count; i++)
             sched_event(m, &(proc->cur_set[i]->pending), obj);
@@ -5324,6 +5708,8 @@ typedef struct {
 typedef struct _fused_block {
    uint8_t        *base;        // block entry / span base (RWX on Linux)
    jit_entry_fn_t  entry;       // == base; context args unused
+   jit_entry_fn_t  entry_offedge;  // off-edge entry: duplicated prologue +
+                                   // fallthrough into the every-event tail
    jit_scalar_t   *argbuf;      // shared JIT_MAX_ARGS scratch slots
    rt_proc_t     **members;     // own copy of the fast-clk table at build
    fused_site_t   *sites;       // member i -> its two call slots
@@ -5425,6 +5811,9 @@ static void fused_member_fallback(rt_model_t *m, rt_proc_t *proc,
    model_thread_t *thread = model_thread(m);
    thread->active_obj = NULL;
    thread->active_scope = NULL;
+
+   if (unlikely(!proc->wakeable.fastclk || proc->wakeable.pending))
+      return;   // evicted from the table / already queued -- runs via procq
 
    run_process(m, proc);
 }
@@ -5651,7 +6040,7 @@ static void fused_block_build(rt_model_t *m)
    }
 
    const unsigned count = m->fastclk_count;
-   const size_t hint = 128 + (size_t)count * 160;
+   const size_t hint = 192 + (size_t)count * 160;   // +64: second prologue
    if (hint > 0x300000) {   // one code page (4MB) bounds a blob
       notef("accel-jit: NVC_FUSED_BLOCK — %u members exceed the block size "
             "budget, not fusing", count);
@@ -5681,8 +6070,35 @@ static void fused_block_build(rt_model_t *m)
    fused_emit_movabs(blob, 0x48, 0xBB, (uint64_t)(uintptr_t)fb->thread);
    fused_emit_movabs(blob, 0x49, 0xBC, (uint64_t)(uintptr_t)fb->argbuf);
 
+   // Two-entry layout over the partition-sorted table (posedge-only
+   // members [0, ee_start), every-event tail [ee_start, count)):
+   //
+   //   [prologue A][posedge-only members][jmp L_tail]
+   //   [prologue B: full duplicate -- push rbx/r12; sub rsp,8; movabs x2]
+   //   L_tail: [every-event members][outro]
+   //
+   // The posedge entry (== base) runs ALL members, falling over the
+   // second prologue into the tail; the off-edge entry starts at
+   // prologue B (a tail entry jumping past a prologue would inherit the
+   // caller's rbx/r12 and a misaligned rsp) and runs only the tail.
+   // Both share one outro. When the tail is empty the off-edge entry
+   // still exists but the dispatch site never selects it.
+   const unsigned ee_start = MIN(m->fastclk_ee_start, count);
+   uint32_t off_pb = 0;
+   bool have_pb = false;
+
    unsigned nplain = 0;
-   for (unsigned i = 0; i < count; i++) {
+   for (unsigned i = 0; i <= count; i++) {
+      if (i == ee_start && !have_pb) {
+         FUSED_EMIT(0xE9, 0x1B, 0x00, 0x00, 0x00);   // jmp L_tail (+27)
+         off_pb = blob->wptr - start;
+         code_blob_emit(blob, prologue, sizeof prologue);
+         fused_emit_movabs(blob, 0x48, 0xBB, (uint64_t)(uintptr_t)fb->thread);
+         fused_emit_movabs(blob, 0x49, 0xBC, (uint64_t)(uintptr_t)fb->argbuf);
+         have_pb = true;
+      }
+      if (i == count)
+         break;
       rt_proc_t *p = fb->members[i];
       fused_site_t *s = &(fb->sites[i]);
       const bool plain = p->vtable->eval == proc_eval_direct
@@ -5711,6 +6127,7 @@ static void fused_block_build(rt_model_t *m)
 
    if (fb->entry == NULL || (uint8_t *)fb->entry != start) {
       // Overflow or relocation surprise: discard (watches may be live)
+      fb->entry_offedge = NULL;
       code_entry_unwatch(fb);
       free(fb->members);
       free(fb->sites);
@@ -5720,14 +6137,22 @@ static void fused_block_build(rt_model_t *m)
       return;
    }
 
+   fb->entry_offedge = (jit_entry_fn_t)(start + off_pb);
+
    m->fused_block = fb;
-   notef("accel-jit: NVC_FUSED_BLOCK — fused %u/%u member(s)%s", nplain,
-         count, nplain == count ? "" : " (rest via generic fallback)");
+   notef("accel-jit: NVC_FUSED_BLOCK — fused %u/%u member(s), two-entry "
+         "%u posedge-only + %u every-event%s", nplain, count,
+         ee_start, count - ee_start,
+         nplain == count ? "" : " (rest via generic fallback)");
 }
 
-// Run the fused block for this posedge. Returns false when the unfused
-// table loop must run instead (no block, no armed landing pad, tracing).
-static bool fused_block_dispatch(rt_model_t *m)
+// Run the fused block for this dispatch (posedge = full table via the
+// head entry; otherwise the every-event tail via the off-edge entry).
+// Returns false when the unfused table loop must run instead (no block,
+// no armed landing pad, tracing). The FULL preamble runs on BOTH paths:
+// pending tier-up patches, deferred evict patches, landing-pad/trace/
+// thread guards, ONE arena reset and the running bracket.
+static bool fused_block_dispatch(rt_model_t *m, bool posedge)
 {
    fused_block_t *fb = m->fused_block;
    if (fb == NULL)
@@ -5746,8 +6171,30 @@ static bool fused_block_dispatch(rt_model_t *m)
    if (unlikely(model_thread(m) != fb->thread))
       return false;   // baked thread pointer no longer current
 
+   if (unlikely(m->fastclk_npending > 0))
+      return false;   // a member is mid self-suspend: the emitted block
+                      // has no pending check, the table loop does
+
    if (unlikely(load_acquire(&(fb->patch_pending))))
       fused_apply_pending(m, fb);
+
+   // Deferred evict patches: a member evicted mid-eval (timed wake, #0
+   // wait, wait-set demote) could not patch its own un-executed SITE B;
+   // apply here, on the model thread, never mid-block.
+   if (unlikely(m->fastclk_evict_defer)) {
+      m->fastclk_evict_defer = false;
+      for (unsigned i = 0; i < fb->count; i++) {
+         if (fb->members[i]->wakeable.fastclk)
+            continue;
+         fused_site_t *sd = &(fb->sites[i]);
+         if (sd->state != SITE_DISABLED) {
+            sd->state = SITE_DISABLED;
+            sd->cur_a = m->fused_stub;
+            fused_patch_call(fb, sd->off_a, (void *)m->fused_stub);
+            fused_patch_call(fb, sd->off_b, (void *)fused_member_skip);
+         }
+      }
+   }
 
    assert(fb->thread->tlab != NULL);
 
@@ -5756,8 +6203,12 @@ static bool fused_block_dispatch(rt_model_t *m)
    // (the arena grows by chaining; the next reset reclaims them all).
    jit_eval_arena_reset();
 
+   jit_entry_fn_t entry = posedge ? fb->entry : fb->entry_offedge;
+   if (unlikely(entry == NULL))
+      return false;
+
    fb->running = true;
-   (*fb->entry)(NULL, NULL, NULL, NULL);
+   (*entry)(NULL, NULL, NULL, NULL);
    fb->running = false;
 
    return true;
@@ -5794,7 +6245,7 @@ static void fused_block_dissolve(rt_model_t *m)
 
 static void fused_block_build(rt_model_t *m)    { }
 static void fused_block_dissolve(rt_model_t *m) { }
-static bool fused_block_dispatch(rt_model_t *m) { return false; }
+static bool fused_block_dispatch(rt_model_t *m, bool posedge) { return false; }
 
 #endif
 
@@ -6945,7 +7396,7 @@ static void schedule_implicit_update(rt_model_t *m, rt_nexus_t *n)
 
    if (!imp->wakeable.pending) {
       deferq_do(&m->implicitq, async_update_implicit_signal, imp);
-      set_pending(&imp->wakeable);
+      set_pending(m, &imp->wakeable);
    }
 }
 
@@ -7702,10 +8153,13 @@ static inline bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
 static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
                          uint64_t reject, const void *value, rt_proc_t *proc)
 {
-   // Fast-clk probation: driver activity during a NON-posedge activation
-   // marks the running member as combinational fanout (see fastclk_comb).
-   if (unlikely(m->fastclk_probe_member >= 0))
-      m->fastclk_comb[m->fastclk_probe_member] = 1;
+   // Fast-clk probation: VALUE-CHANGING driver activity during a
+   // NON-posedge activation marks the running member as combinational
+   // fanout (see fastclk_comb). Same-value re-drives deliberately do NOT
+   // mark (a held-in-reset FF re-driving Q<='0' on every probed delta is
+   // not comb; a comb reader's 1->z step still changes bytes and marks),
+   // so the attribution sits AFTER the same-value early-return below and
+   // behind an explicit compare on every other path.
    if (after == 0 && (n->flags & NET_F_FAST_DRIVER)) {
       rt_source_t *d = &(n->sources);
       assert(n->n_sources == 1);
@@ -7717,11 +8171,18 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
       rt_signal_t *signal = n->signal;
       rt_source_t *d0 = &(signal->nexus.sources);
 
-      if (d->fastqueued)
+      if (d->fastqueued) {
          assert(m->next_is_delta);
+         if (unlikely(m->fastclk_probe_member >= 0)
+             && !cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size))
+            m->fastclk_comb[m->fastclk_probe_member] = 1;
+      }
       else if ((signal->shared.flags & NET_F_FAST_DRIVER) && d0->sigqueued) {
          assert(m->next_is_delta);
          d->fastqueued = 1;
+         if (unlikely(m->fastclk_probe_member >= 0)
+             && !cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size))
+            m->fastclk_comb[m->fastclk_probe_member] = 1;
       }
       else if (cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size)) {
          m->next_is_delta = true;
@@ -7730,12 +8191,16 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
          return;
       }
       else if (signal->shared.flags & NET_F_FAST_DRIVER) {
+         if (unlikely(m->fastclk_probe_member >= 0))
+            m->fastclk_comb[m->fastclk_probe_member] = 1;
          deferq_do(&m->driverq, async_fast_all_drivers, signal);
          m->next_is_delta = true;
          d0->sigqueued = 1;
          d->fastqueued = 1;
       }
       else {
+         if (unlikely(m->fastclk_probe_member >= 0))
+            m->fastclk_comb[m->fastclk_probe_member] = 1;
          deferq_do(&m->driverq, async_fast_driver, d);
          m->next_is_delta = true;
          d->fastqueued = 1;
@@ -7746,6 +8211,13 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
    else {
       rt_source_t *d = find_driver(n, proc);
       assert(d != NULL);
+
+      // Probe attribution for the generic path: same value-compare skip,
+      // against the driver's current head-waveform value
+      if (unlikely(m->fastclk_probe_member >= 0)
+          && !cmp_bytes(value, value_ptr(n, &(d->u.driver.waveforms.value)),
+                        n->width * n->size))
+         m->fastclk_comb[m->fastclk_probe_member] = 1;
 
       if ((n->flags & NET_F_FAST_DRIVER) && d->fastqueued) {
          // A fast update to this driver is already scheduled
@@ -7831,6 +8303,9 @@ static void async_run_process(rt_model_t *m, void *arg)
 
    assert(proc->wakeable.pending);
    proc->wakeable.pending = false;
+
+   if (unlikely(proc->wakeable.fastclk) && m->fastclk_npending > 0)
+      m->fastclk_npending--;    // self-suspended member resumed
 
    run_process(m, proc);
 }
@@ -7980,7 +8455,7 @@ static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
       m->next_is_delta |= m->blocking_update;
    }
 
-   set_pending(obj);
+   set_pending(m, obj);
 }
 
 // Per-kind wake handlers -- the bodies of the old wakeup_one switch, now
@@ -8017,7 +8492,7 @@ static void wake_implicit(rt_model_t *m, rt_wakeable_t *obj)
          istr(jit_get_name(m->jit, imp->closure.handle)));
 
    deferq_do(&m->implicitq, async_update_implicit_signal, imp);
-   set_pending(obj);
+   set_pending(m, obj);
 }
 
 static void wake_watch(rt_model_t *m, rt_wakeable_t *obj)
@@ -8046,7 +8521,7 @@ static void wake_trigger(rt_model_t *m, rt_wakeable_t *obj)
 
    if (!m->blocking_update) {
       deferq_do(&m->triggerq, async_run_trigger, t);
-      set_pending(obj);
+      set_pending(m, obj);
    }
    else if (run_trigger(m, t))
       wakeup_all(m, &(t->pending));
@@ -8063,7 +8538,7 @@ static void wake_assign(rt_model_t *m, rt_wakeable_t *obj)
       update_assignment(m, proc);
    else {
       deferq_do(&m->implicitq, async_run_process, proc);
-      set_pending(obj);
+      set_pending(m, obj);
    }
 }
 
@@ -8906,6 +9381,17 @@ static void model_cycle(rt_model_t *m)
 
    run_callbacks(m, START_OF_PROCESSES);
 
+   // Probation sim-time bound (P3): a candidate that stops accumulating
+   // value-edges (gated clock during halt, slow clock domain, captured
+   // reset) must not pin a table in probation forever, blocking re-pick
+   // of a better candidate. STALL = dissolve + backoff + cooldown, never
+   // blacklist. Guarded with !fastclk_hit so a latched delta is never
+   // dropped -- the dispatch below consumes it first; the timeout fires
+   // on the next quiet delta (plentiful: stalled candidates are quiet).
+   if (unlikely(m->fastclk_on && m->fastclk_probation > 0 && !m->fastclk_hit
+                && m->now - m->fastclk_built_at >= fastclk_probation_fs()))
+      aj_fastclk_stall(m, "sim-time probation timeout");
+
    // NVC_FAST_CLK_AUTO: standalone posedge-table build, no accel install
    // needed. After the requested settle time, pick the widest-fanout
    // single-bit nexus as the clock (the clock pending list dwarfs all
@@ -8914,10 +9400,11 @@ static void model_cycle(rt_model_t *m)
    // everything on the shared sensitivity.
    if (unlikely(m->fastclk_auto_at != 0 && !m->fastclk_on
                 && m->now >= m->fastclk_auto_at)) {
-      m->fastclk_auto_at = 0;   // one shot
+      m->fastclk_auto_at = 0;   // one shot (re-armed below if all-empty)
       // Widest-fanout single-bit nexus is often rst (async-reset procs pend
-      // on rst AND their clk, so all get filtered) — try candidates in
-      // fanout order until one yields a non-empty table.
+      // on rst AND their clk, so under NVC_FAST_CLK_WIDE=0 all get
+      // filtered) — try candidates in fanout order until one yields a
+      // non-empty table.
       rt_nexus_t *tried[4] = { NULL, NULL, NULL, NULL };
       // Fanout floor for a clock candidate: default 16 keeps the historic
       // behaviour (only wide-fanout nexuses qualify); NVC_FAST_CLK_AUTO_MIN
@@ -8936,11 +9423,16 @@ static void model_cycle(rt_model_t *m)
          unsigned best_n = min_fanout - 1;
          for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
             if (n->width != 1 || n->signal->n_nexus != 1) continue;
-            if (n == tried[0] || n == tried[1] || n == tried[2]) continue;
-            bool bl = false;   // probation-failed candidates never re-picked
-            for (unsigned b = 0; b < m->fastclk_nbl; b++)
-               if (m->fastclk_bl[b] == n) { bl = true; break; }
-            if (bl) continue;
+            bool skip = false;
+            for (int t = 0; t < 4; t++)          // all four slots checked
+               if (n == tried[t]) { skip = true; break; }
+            for (unsigned b = 0; !skip && b < m->fastclk_nbl; b++)
+               if (m->fastclk_bl[b] == n) skip = true;  // never re-picked
+            for (unsigned c = 0; !skip && c < ARRAY_LEN(m->fastclk_cool); c++)
+               if (m->fastclk_cool[c].nx == n           // temporary cooldown
+                   && m->fastclk_cool[c].retry_at > m->now)
+                  skip = true;
+            if (skip) continue;
             const unsigned c = aj_pending_count(n->pending);
             if (c > best_n) { best_n = c; best = n; }
          }
@@ -8951,34 +9443,85 @@ static void model_cycle(rt_model_t *m)
                   istr(tree_ident(best->signal->where)), best_n);
          aj_build_fastclk(m, best->signal, nexus_effective(best));
       }
+      if (!m->fastclk_on) {
+         // All-empty round: re-arm with SEPARATE bookkeeping -- pure
+         // doubling from 500ns to a 100us cap, NO survival reset (the
+         // dissolve hysteresis's fastclk_built_at is stale when nothing
+         // went live, so its survival clause would peg the backoff at
+         // base and re-scan every 500ns -- the measured ~10% VeeR wall
+         // thrash). A successful build resets this ladder.
+         const uint64_t base = UINT64_C(500000000);        // 500ns
+         const uint64_t cap  = UINT64_C(100000000000000);  // 100us
+         m->fastclk_empty_backoff = (m->fastclk_empty_backoff == 0)
+            ? base : MIN(cap, m->fastclk_empty_backoff * 2);
+         m->fastclk_auto_at = m->now + m->fastclk_empty_backoff;
+      }
    }
 
-   // NVC_FAST_CLK fast path. A clk-only process woke this delta (latched in
-   // wakeup_one, those procs were not queued). If clk is now high it was a
-   // rising edge, so run the flat fanout table directly — at the exact point
-   // run_procq would have run them (after the driving/effective heaps and the
-   // trigger filter), so each proc reads the same settled values it would on
-   // the normal path; only the dispatch mechanism differs. Bit-identical, but
-   // skips the wakeup_all/procq_do/deferq/async_run_process round-trip.
+   // NVC_FAST_CLK fast path. A member process woke this delta (latched in
+   // wakeup_one, those procs were not queued) -- by the candidate clock
+   // or, in wide mode, a registered companion. The candidate VALUE-EDGE
+   // shadow (sampled HERE, at the dispatch site: wake_next deposits
+   // update the value plane one delta before their attributed event)
+   // classifies the delta: a posedge runs the whole table; anything else
+   // runs only the every-event tail. Members run at the exact point
+   // run_procq would have run them (after the driving/effective heaps
+   // and the trigger filter), so each proc reads the same settled values
+   // it would on the normal path; spurious activations are body-filtered
+   // (sync_event_cache ran above, so rising_edge/'event read false on a
+   // no-clk-event delta). Bit-identical, but skips the wakeup_all/
+   // procq_do/deferq/async_run_process round-trip.
    if (m->fastclk_hit) {
       m->fastclk_hit = false;
+      const uint8_t clk_now = m->fastclk_data[0];
+      const bool edged = (clk_now != m->fastclk_clk_last);
+      const bool posedge = edged && (clk_now & 1) != 0;
+      m->fastclk_clk_last = clk_now;   // probation included (P1)
       if (unlikely(m->fastclk_probation > 0)) {
-         // PROBATION: dispatch members on EVERY event of the candidate
-         // (correct for both clocked and comb members) and attribute
-         // driver activity on non-posedge activations via sched_driver.
-         const bool pos = (m->fastclk_data[0] & 1) != 0;
+         // PROBATION: dispatch ALL members on EVERY hit delta (correct
+         // for both clocked and comb members) and attribute VALUE-
+         // CHANGING driver activity on non-posedge activations via
+         // sched_driver. Every-event members are exempt from probing on
+         // deltas where a registered companion evented (their reset
+         // branch is not comb evidence); posedge-only-destined members
+         // are ALWAYS probed on !posedge deltas -- a candidate falling
+         // edge probes them even when a companion co-events, keeping the
+         // pr2305307b comb-starvation defense intact.
+         const bool comp_ev = m->fastclk_ncomp > 0 && aj_companion_evented(m);
          rt_proc_t **pr = m->fastclk_table;
          for (unsigned i = 0; i < m->fastclk_count; i++, pr++) {
-            if (!pos) m->fastclk_probe_member = (int)i;
+            rt_wakeable_t *w = &((*pr)->wakeable);
+            if (!w->fastclk || w->pending)
+               continue;   // evicted mid-probation / queued outside table
+            if (!edged && !aj_member_evented(m, *pr))
+               continue;   // companion-only delta, own sensitivity quiet
+            if (!posedge && !(w->fastclk_ee && comp_ev))
+               m->fastclk_probe_member = (int)i;
             run_process(m, *pr);
             m->fastclk_probe_member = -1;
          }
-         if (--m->fastclk_probation == 0) {
+         m->fastclk_hit_deltas++;
+         bool done = false;
+         if (edged)   // P2: only candidate value-edges count down
+            done = (--m->fastclk_probation == 0);
+         if (!done && unlikely(m->fastclk_hit_deltas >= 512)) {
+            // P2 STALL: companion wakes vastly outnumber candidate edges
+            // (a captured reset: all clk edges, no candidate edges).
+            // Dissolve + cooldown; the next round tries the next-widest.
+            aj_fastclk_stall(m, "512 hit deltas before 64 candidate edges");
+            goto fastclk_done;
+         }
+         if (done) {
             // classify: evict comb members; none left => not a clock
             unsigned kept = 0;
             for (unsigned i = 0; i < m->fastclk_count; i++) {
-               if (m->fastclk_comb[i])
-                  m->fastclk_table[i]->wakeable.fastclk = 0;   // evict
+               rt_wakeable_t *w = &(m->fastclk_table[i]->wakeable);
+               if (m->fastclk_comb[i] || !w->fastclk) {
+                  if (w->fastclk && w->pending && m->fastclk_npending > 0)
+                     m->fastclk_npending--;
+                  w->fastclk = 0;   // evict (or already evicted via hooks)
+                  w->fastclk_ee = 0;
+               }
                else
                   m->fastclk_table[kept++] = m->fastclk_table[i];
             }
@@ -8988,35 +9531,88 @@ static void model_cycle(rt_model_t *m)
                notef("accel-jit: fast-clk probation done — kept %u evicted %u",
                      kept, evicted);
             if (kept == 0) {
-               // blacklist the candidate so AUTO never re-picks it
-               if (m->fastclk_nbl == m->fastclk_blmax) {
-                  m->fastclk_blmax = m->fastclk_blmax ? m->fastclk_blmax * 2 : 64;
-                  m->fastclk_bl = xrealloc_array(m->fastclk_bl, m->fastclk_blmax,
-                                                 sizeof(rt_nexus_t *));
+               if (m->fastclk_ncomp > 0) {
+                  // P6: a table that HAD companions may have been built
+                  // inside a reset window (held-in-reset drives look
+                  // comb); the real clock must stay retryable — dissolve
+                  // + backoff re-arm, NO blacklist.
+                  if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+                     notef("accel-jit: fast-clk all-evicted with companions "
+                           "— dissolve without blacklist");
+                  aj_dissolve_fastclk(m);
                }
-               m->fastclk_bl[m->fastclk_nbl++] = m->fastclk_nexus;
-               aj_dissolve_fastclk(m);
+               else {
+                  // no companions (pr2305307b shape: a data net feeding
+                  // comb readers): blacklist so AUTO never re-picks it
+                  if (m->fastclk_nbl == m->fastclk_blmax) {
+                     m->fastclk_blmax = m->fastclk_blmax ? m->fastclk_blmax * 2 : 64;
+                     m->fastclk_bl = xrealloc_array(m->fastclk_bl, m->fastclk_blmax,
+                                                    sizeof(rt_nexus_t *));
+                  }
+                  m->fastclk_bl[m->fastclk_nbl++] = m->fastclk_nexus;
+                  aj_dissolve_fastclk(m);
+               }
             }
-            else
-               fused_block_build(m);   // member set final: fuse now
+            else {
+               // Partition-sort (D3): posedge-only members first
+               // [0, ee_start), every-event tail [ee_start, count).
+               // fastclk_table is permuted HERE, before fused_block_build
+               // memcpys it, so the fallback loop and the emitted block
+               // agree on member order; comb[] has no post-probation
+               // reader and is freed below (P7).
+               rt_proc_t **sorted = xmalloc_array(kept, sizeof(rt_proc_t *));
+               unsigned n_pos = 0;
+               for (unsigned i = 0; i < kept; i++)
+                  if (!m->fastclk_table[i]->wakeable.fastclk_ee)
+                     sorted[n_pos++] = m->fastclk_table[i];
+               unsigned n_all = n_pos;
+               for (unsigned i = 0; i < kept; i++)
+                  if (m->fastclk_table[i]->wakeable.fastclk_ee)
+                     sorted[n_all++] = m->fastclk_table[i];
+               memcpy(m->fastclk_table, sorted, kept * sizeof(rt_proc_t *));
+               free(sorted);
+               m->fastclk_ee_start = n_pos;
+               free(m->fastclk_comb);   // P7: no reader past this point
+               m->fastclk_comb = NULL;
+               if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+                  notef("accel-jit: fast-clk partitions — %u posedge-only, "
+                        "%u every-event", n_pos, kept - n_pos);
+               fused_block_build(m);   // member set + order final: fuse now
+            }
          }
          goto fastclk_done;
       }
-      if (m->fastclk_data[0] & 1) {   // rising edge (event fired + now high)
-         // NVC_FUSED_BLOCK: one activation for the whole member set --
-         // falls back to the table loop when unavailable (identical
-         // semantics either way; only the dispatch mechanism differs)
-         if (!fused_block_dispatch(m)) {
-            rt_proc_t **pr = m->fastclk_table;
-            for (unsigned i = 0; i < m->fastclk_count; i++, pr++)
+      // Steady state: posedge => whole table; any other latched wake =>
+      // every-event tail only (skipped outright when the tail is empty).
+      if (posedge || m->fastclk_ee_start < m->fastclk_count) {
+         // NVC_FUSED_BLOCK: one activation for the dispatched partition --
+         // falls back to the partitioned table loop when unavailable
+         // (identical semantics either way). The block is only entered on
+         // candidate-event (edged) deltas, where EVERY member's own
+         // sensitivity provably evented; companion-only deltas take the
+         // loop, which applies the per-member own-event guard.
+         if (!(edged && fused_block_dispatch(m, posedge))) {
+            const unsigned first = posedge ? 0 : m->fastclk_ee_start;
+            rt_proc_t **pr = m->fastclk_table + first;
+            for (unsigned i = first; i < m->fastclk_count; i++, pr++) {
+               rt_wakeable_t *w = &((*pr)->wakeable);
+               if (!w->fastclk || w->pending)
+                  continue;   // evicted via hooks / queued outside table
+               if (!edged && !aj_member_evented(m, *pr))
+                  continue;   // companion-only delta, own sensitivity quiet
                run_process(m, *pr);
+            }
          }
 
          // NVC_ACCEL_BANK swap: the chunk STAGEd its registered outputs into
-         // shadows; every clk-reader above has now read the OLD effective value
-         // (the delta-delay / NBA semantics). Publish shadow->effective so the
-         // new value is visible at the NEXT clock edge. No wakeup / no extra
-         // delta — the gate proved all readers are in the table just dispatched.
+         // shadows; every reader in the dispatched partition has now read the
+         // OLD effective value (the delta-delay / NBA semantics). Publish
+         // shadow->effective so the new value is visible at the NEXT edge.
+         // Runs after EITHER entry: an off-edge (reset) dispatch stages
+         // shadows too, and skipping the publish would leave the next
+         // posedge reading pre-reset values. No wakeup / no extra delta —
+         // the gate proved all readers are posedge-only members of the
+         // table just dispatched (or dispatched at their next posedge).
          for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
             aj_chunk_t *c = m->aj_chunks[ci];
             if (!c->defer_pending) continue;
@@ -9034,6 +9630,43 @@ static void model_cycle(rt_model_t *m)
                }
             }
             c->defer_pending = false;
+         }
+
+         // Busy-companion rate demote (D5): a companion whose events
+         // outnumber posedges over a 256-dispatch window converts every
+         // event into a full tail sweep — dissolve and rebuild with that
+         // nexus's procs excluded (local exclusion, NOT the blacklist).
+         if (posedge)
+            m->fastclk_win_pos++;
+         else {
+            m->fastclk_win_off++;
+            for (unsigned i = 0; i < m->fastclk_ncomp
+                    && i < ARRAY_LEN(m->fastclk_comp_off); i++) {
+               rt_nexus_t *cn = m->fastclk_comp[i];
+               if (cn->last_event == m->now && cn->event_delta == m->iteration)
+                  m->fastclk_comp_off[i]++;
+            }
+         }
+         if (unlikely(m->fastclk_win_pos + m->fastclk_win_off >= 256)) {
+            rt_nexus_t *busy = NULL;
+            for (unsigned i = 0; i < m->fastclk_ncomp
+                    && i < ARRAY_LEN(m->fastclk_comp_off) && busy == NULL; i++)
+               if (m->fastclk_comp_off[i] > m->fastclk_win_pos)
+                  busy = m->fastclk_comp[i];
+            if (busy != NULL) {
+               if (m->fastclk_nexcl < ARRAY_LEN(m->fastclk_excl))
+                  m->fastclk_excl[m->fastclk_nexcl++] = busy;
+               if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+                  notef("accel-jit: fast-clk companion %s busy (off-edge "
+                        "dispatches exceed posedges) — dissolve, its procs "
+                        "excluded from the rebuild",
+                        istr(tree_ident(busy->signal->where)));
+               aj_dissolve_fastclk(m);   // re-arms with backoff
+            }
+            else {
+               m->fastclk_win_pos = m->fastclk_win_off = 0;
+               memset(m->fastclk_comp_off, 0, sizeof m->fastclk_comp_off);
+            }
          }
       }
 fastclk_done:;
@@ -10022,7 +10655,7 @@ void x_sched_process(int64_t delay)
    // driver updates land a delta after the wakeup.
    rt_model_t *m = get_model();
    if (delay == 0 && standard() == STD_MX) {
-      set_pending(&proc->wakeable);
+      set_pending(m, &proc->wakeable);
       deferq_do(&m->inactiveq, async_run_process, proc);
       m->next_is_delta = true;
       return;
@@ -10038,7 +10671,7 @@ void x_sched_inactive(void)
 
    TRACE("schedule process %s in inactive region", istr(proc->name));
 
-   set_pending(&proc->wakeable);
+   set_pending(m, &proc->wakeable);
    deferq_do(&m->inactiveq, async_run_process, proc);
    m->next_is_delta = true;
 }
@@ -10812,7 +11445,7 @@ sig_shared_t *x_implicit_signal(uint32_t count, uint32_t size, tree_t where,
    wakeable_set_kind(&imp->wakeable, W_IMPLICIT);
 
    deferq_do(&m->implicitq, async_update_implicit_signal, imp);
-   set_pending(&(imp->wakeable));
+   set_pending(m, &(imp->wakeable));
 
    if (kind == IMPLICIT_STABLE || kind == IMPLICIT_QUIET) {
       add_source(m, &(imp->signal.nexus), SOURCE_DRIVER);
