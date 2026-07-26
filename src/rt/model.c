@@ -176,6 +176,16 @@ typedef struct _rt_model {
    uint64_t           fastclk_auto_at; // NVC_FAST_CLK_AUTO: build table at this time (fs); 0=off
    uint64_t           fastclk_built_at;  // sim time the current table went live
    uint64_t           fastclk_backoff;   // re-arm delay after a dissolve (fs)
+   // PROBATION: a fresh table dispatches on EVERY clock-nexus event for the
+   // first N events (bit-correct for any member class) while sched_driver
+   // attributes driver activity on NON-posedge activations to the running
+   // member -- such members are combinational fanout, not clocked, and are
+   // EVICTED at probation exit (posedge-only dispatch would starve them:
+   // pr2305307b's reduction wires went stale on the 1->z step).  All members
+   // evicted => the candidate was never a clock: dissolve + blacklist it.
+   unsigned           fastclk_probation; // events left; 0 = passed/off
+   uint8_t           *fastclk_comb;      // per-member: drove on non-posedge
+   int                fastclk_probe_member; // running member during non-posedge
    rt_nexus_t       **fastclk_guard_nx;   // quiet-sensitivity guard nexuses
    const rt_nexus_vtable_t **fastclk_guard_orig; // their original vtables
    rt_nexus_vtable_t *fastclk_guard_vt;   // per-guard patched copies (notify -> dissolve)
@@ -635,6 +645,8 @@ rt_model_t *model_new(jit_t *jit, cover_data_t *cover)
    // stock 1.22: fused b12 median +8% with clean separation, b17 +3%;
    // VeeR parity post-hysteresis; correctness byte-identical everywhere
    // tested).  NVC_FAST_CLK_AUTO=<ns> overrides the time; =0 disables.
+   m->fastclk_probe_member = -1;   // 0 would mean "member 0 probing"
+
    const char *fca = getenv("NVC_FAST_CLK_AUTO");
    if (fca == NULL)
       m->fastclk_auto_at = UINT64_C(1000) * UINT64_C(1000000);
@@ -2630,12 +2642,15 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
    m->fastclk_data  = clkdata;
    m->fastclk_on    = true;
    m->fastclk_built_at = m->now;   // hysteresis: survival measured from here
+   m->fastclk_probation = 64;      // classify members before going posedge-only
+   m->fastclk_comb = xcalloc_array(m->fastclk_count, 1);
+   m->fastclk_probe_member = -1;
    if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)   // quiet by default: the note
       notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
             m->fastclk_count);   // pollutes gold-output tests when default-on
 
-   // NVC_FUSED_BLOCK: fuse the fresh table into one emitted block
-   fused_block_build(m);
+   // NVC_FUSED_BLOCK fusion happens at PROBATION EXIT (the member set is
+   // not final until comb fanout is evicted)
 }
 
 // Tear the posedge table down (guard nexus fired, or install replaced it):
@@ -2653,6 +2668,9 @@ static void aj_dissolve_fastclk(rt_model_t *m)
    }
    const bool was_on = m->fastclk_on;
    m->fastclk_on = false;
+   m->fastclk_probation = 0;
+   m->fastclk_probe_member = -1;
+   free(m->fastclk_comb); m->fastclk_comb = NULL;
    m->fastclk_count = 0;
    m->fastclk_hit = false;
    // Unflag EVERY stray (failed candidates leave pass-0 flags on procs not
@@ -7203,6 +7221,10 @@ static inline bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
 static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
                          uint64_t reject, const void *value, rt_proc_t *proc)
 {
+   // Fast-clk probation: driver activity during a NON-posedge activation
+   // marks the running member as combinational fanout (see fastclk_comb).
+   if (unlikely(m->fastclk_probe_member >= 0))
+      m->fastclk_comb[m->fastclk_probe_member] = 1;
    if (after == 0 && (n->flags & NET_F_FAST_DRIVER)) {
       rt_source_t *d = &(n->sources);
       assert(n->n_sources == 1);
@@ -8427,6 +8449,10 @@ static void model_cycle(rt_model_t *m)
          for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
             if (n->width != 1 || n->signal->n_nexus != 1) continue;
             if (n == tried[0] || n == tried[1] || n == tried[2]) continue;
+            bool bl = false;   // probation-failed candidates never re-picked
+            for (unsigned b = 0; b < m->fastclk_nbl; b++)
+               if (m->fastclk_bl[b] == n) { bl = true; break; }
+            if (bl) continue;
             const unsigned c = aj_pending_count(n->pending);
             if (c > best_n) { best_n = c; best = n; }
          }
@@ -8448,6 +8474,46 @@ static void model_cycle(rt_model_t *m)
    // skips the wakeup_all/procq_do/deferq/async_run_process round-trip.
    if (m->fastclk_hit) {
       m->fastclk_hit = false;
+      if (unlikely(m->fastclk_probation > 0)) {
+         // PROBATION: dispatch members on EVERY event of the candidate
+         // (correct for both clocked and comb members) and attribute
+         // driver activity on non-posedge activations via sched_driver.
+         const bool pos = (m->fastclk_data[0] & 1) != 0;
+         rt_proc_t **pr = m->fastclk_table;
+         for (unsigned i = 0; i < m->fastclk_count; i++, pr++) {
+            if (!pos) m->fastclk_probe_member = (int)i;
+            run_process(m, *pr);
+            m->fastclk_probe_member = -1;
+         }
+         if (--m->fastclk_probation == 0) {
+            // classify: evict comb members; none left => not a clock
+            unsigned kept = 0;
+            for (unsigned i = 0; i < m->fastclk_count; i++) {
+               if (m->fastclk_comb[i])
+                  m->fastclk_table[i]->wakeable.fastclk = 0;   // evict
+               else
+                  m->fastclk_table[kept++] = m->fastclk_table[i];
+            }
+            const unsigned evicted = m->fastclk_count - kept;
+            m->fastclk_count = kept;
+            if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+               notef("accel-jit: fast-clk probation done — kept %u evicted %u",
+                     kept, evicted);
+            if (kept == 0) {
+               // blacklist the candidate so AUTO never re-picks it
+               if (m->fastclk_nbl == m->fastclk_blmax) {
+                  m->fastclk_blmax = m->fastclk_blmax ? m->fastclk_blmax * 2 : 64;
+                  m->fastclk_bl = xrealloc_array(m->fastclk_bl, m->fastclk_blmax,
+                                                 sizeof(rt_nexus_t *));
+               }
+               m->fastclk_bl[m->fastclk_nbl++] = m->fastclk_nexus;
+               aj_dissolve_fastclk(m);
+            }
+            else
+               fused_block_build(m);   // member set final: fuse now
+         }
+         goto fastclk_done;
+      }
       if (m->fastclk_data[0] & 1) {   // rising edge (event fired + now high)
          // NVC_FUSED_BLOCK: one activation for the whole member set --
          // falls back to the table loop when unavailable (identical
@@ -8482,6 +8548,7 @@ static void model_cycle(rt_model_t *m)
             c->defer_pending = false;
          }
       }
+fastclk_done:;
    }
 
    if (m->shuffle)
