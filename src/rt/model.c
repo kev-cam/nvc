@@ -1097,6 +1097,7 @@ static void direct_eval_uninstall(rt_proc_t *proc);
 static void fused_block_build(rt_model_t *m);
 static void fused_block_dissolve(rt_model_t *m);
 static bool fused_block_dispatch(rt_model_t *m);
+static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk);
 
 static void reset_process(rt_model_t *m, rt_proc_t *proc)
 {
@@ -1915,6 +1916,15 @@ struct _aj_chunk {
    // once. Held across the dedup check + eval; different chunks have distinct
    // locks so they still run concurrently. (No-op cost in the serial path.)
    nvc_lock_t       eval_lock;
+   // Reversible demotion (aj_chunk_demote): every proc rerouted to this
+   // chunk, with its PRE-reroute vtable, saved by aj_reroute so the demote
+   // can restore each proc EXACTLY (default vtable, direct-eval wrapper, ...)
+   // instead of guessing.
+   struct aj_rr_saved {
+      rt_proc_t              *proc;
+      const rt_proc_vtable_t *vt;
+   }               *rr_saved;
+   unsigned         rr_count, rr_max;
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -2042,6 +2052,14 @@ static int64_t parse_fork_time(const char *s)
    else return -1;
    return (int64_t)(base * mult);
 }
+
+// NVC_ACCEL_DEMOTE_AT=<time>: at the first settled time step at/after this
+// sim time, demote EVERY installed accel chunk back to interpreted
+// execution (aj_chunk_demote — the API is the deliverable; this env is the
+// live-test harness for it). Accepts parse_fork_time units ("5000ns") or a
+// bare number of ns.
+static int64_t g_aj_demote_at = -2;    // fs; -2 = not parsed, -1 = disabled
+static bool    g_aj_demoted   = false;
 
 // Any element where the interpreter value is DEFINED (logic3d 2/3 = '0'/'1')
 // disagrees with the accel value (which is always 2/3). Interpreter metavalues
@@ -2504,11 +2522,22 @@ static aj_chunk_t *aj_chunk_new(rt_model_t *m)
 }
 
 // Route every process in a subtree to ITS chunk's vtable (recovered later by
-// aj_proc_eval via the vtable-first-field trick).
+// aj_proc_eval via the vtable-first-field trick). Each proc's PRE-reroute
+// vtable is saved on the chunk so aj_chunk_demote can reverse this exactly.
 static void aj_reroute(rt_scope_t *scope, aj_chunk_t *chunk)
 {
-   for (int pi = 0; pi < scope->procs.count; pi++)
-      proc_set_vtable(scope->procs.items[pi], &chunk->vtable);
+   for (int pi = 0; pi < scope->procs.count; pi++) {
+      rt_proc_t *p = scope->procs.items[pi];
+      if (chunk->rr_count == chunk->rr_max) {
+         chunk->rr_max = chunk->rr_max ? chunk->rr_max * 2 : 64;
+         chunk->rr_saved = xrealloc_array(chunk->rr_saved, chunk->rr_max,
+                                          sizeof(struct aj_rr_saved));
+      }
+      chunk->rr_saved[chunk->rr_count].proc = p;
+      chunk->rr_saved[chunk->rr_count].vt   = p->vtable;
+      chunk->rr_count++;
+      proc_set_vtable(p, &chunk->vtable);
+   }
    for (int ci = 0; ci < scope->children.count; ci++)
       aj_reroute(scope->children.items[ci], chunk);
 }
@@ -2535,6 +2564,352 @@ static void aj_pending_foreach(void *pending,
 
 static void aj_guard_notify(rt_model_t *m, rt_nexus_t *n);
 static void aj_dissolve_fastclk(rt_model_t *m);
+static void aj_dissolve_fastclk_ex(rt_model_t *m, bool sweep_strays);
+
+// ===================================================================
+// Reversible accel-chunk DEMOTION (the REVERSIBILITY DIRECTIVE's missing
+// case: promoted forms must demote at a delta boundary with ZERO state
+// loss so a live sim keeps rolling through design edits).
+//
+// aj_chunk_demote() runs at a settled delta boundary and:
+//   1. quiesces  — asserts no chunk eval is in flight (the
+//      fused_block_dissolve !running discipline);
+//   2. WRITES BACK every register of the .so's state_t into its bound nvc
+//      signal, as L3D driven-certain bytes (2-state bit -> 2|bit, i.e.
+//      '0'/'1' — the exact conversion the bridge's AJ_OUT output path
+//      uses), via deposit_signal;
+//   3. restores every rerouted proc's PRE-reroute vtable (saved by
+//      aj_reroute), so interp processes resume from the written-back
+//      signal state at their next wake — they were parked at their waits
+//      the whole time (reroute swaps vtables only; sensitivity/pending
+//      lists and coroutine resume PCs were never touched);
+//   4. unbinds the chunk (removed from m->aj_chunks, tables freed). The
+//      dlopen handle is deliberately LEAKED — bounded at one .so mapping
+//      per demoted chunk per run; dlclose while any stale pointer into
+//      the .so's rodata could survive is not worth the risk (precedent:
+//      the respecialization .so handle is also never closed).
+//
+// Register->signal binding is by NAME, the write-direction twin of the
+// _nvc.c sm_reg_names/sm_write_nvc glue: gen_statemachine names each
+// state_t field cname(<flattened yosys wire>) = leading '_' + the
+// '_'-joined vid()-sanitized instance path + signal name (vhdl2vlog emits
+// instances/wires via vid(): lowercase, non-alnum -> '_'; yosys flatten
+// joins with '.'; cname maps '.' and '\' to '_'). We rebuild the same
+// flattened name for every rt_signal_t in the chunk's scope subtree and
+// require an EXACT match for EVERY register.
+//
+// DECLINE (loudly, chunk stays accelerated) rather than miscompute when:
+//   - the .so predates the demote tables (stale cache — clear
+//     ~/.cache/nvc/accel after rebuilding nvc);
+//   - any register fails to bind, or binds to a width-mismatched signal;
+//   - the state_t contains a MEMORY (word order across vhdl2vlog/yosys/
+//     nvc array signals is unverified — writing a permuted RAM back would
+//     be silent corruption);
+//   - the chunk is wired chunk-to-chunk (NVC_ACCEL_HANDOFF, either
+//     direction): a producer would poke freed state / a consumer's
+//     deposit-bypassed inputs have no interp-visible home.
+//
+// PRIVDATA STALENESS (investigated for this design): a demoted-region
+// interp proc's privdata holds its resume PC plus process variables.
+// sv2vhdl emits blocking-assign shadows as variables RE-SEEDED from their
+// signal at the top of every activation (v_x := x; ... x <= v_x) and
+// blocking assigns land on SIGNALS (the := extension), so translated RTL
+// carries NO cross-activation variable state — the written-back signals
+// are the whole state. A process that DID carry read-before-write
+// variable state would not survive vhdl2vlog translation, and a subtree
+// that does not fully translate never installs — the install gate is the
+// detector for the unsafe class.
+// ===================================================================
+
+static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
+                                const void *values, int offset, size_t count,
+                                bool wake_next);
+
+typedef struct {
+   char         name[512];
+   rt_signal_t *sig;
+} aj_dm_ent_t;
+
+typedef struct {
+   aj_dm_ent_t *v;
+   int          n, max;
+} aj_dm_idx_t;
+
+// Append vid()-equivalent sanitization of `src` (basename after the last
+// '.', lowercased, non-alnum -> '_') to dst.
+static void aj_dm_cat(char *dst, size_t n, const char *src)
+{
+   size_t i = strlen(dst);
+   const char *dot = strrchr(src, '.');
+   if (dot != NULL) src = dot + 1;
+   for (const char *p = src; *p != '\0' && i + 1 < n; p++) {
+      char c = tolower((unsigned char)*p);
+      dst[i++] = isalnum((unsigned char)c) ? c : '_';
+   }
+   dst[i] = '\0';
+}
+
+static void aj_dm_add(aj_dm_idx_t *ix, const char *prefix, const char *nm,
+                      rt_signal_t *sig)
+{
+   if (ix->n == ix->max) {
+      ix->max = ix->max ? ix->max * 2 : 256;
+      ix->v = xrealloc_array(ix->v, ix->max, sizeof(aj_dm_ent_t));
+   }
+   aj_dm_ent_t *e = &ix->v[ix->n++];
+   snprintf(e->name, sizeof e->name, "%s", prefix);
+   aj_dm_cat(e->name, sizeof e->name, nm);
+   e->sig = sig;
+}
+
+static void aj_dm_walk(rt_scope_t *s, const char *prefix, aj_dm_idx_t *ix)
+{
+   for (int i = 0; i < s->signals.count; i++) {
+      rt_signal_t *sig = s->signals.items[i];
+      aj_dm_add(ix, prefix, istr(tree_ident(sig->where)), sig);
+   }
+   for (int i = 0; i < s->aliases.count; i++) {
+      rt_alias_t *a = s->aliases.items[i];
+      aj_dm_add(ix, prefix, istr(tree_ident(a->where)), a->signal);
+   }
+   for (int ci = 0; ci < s->children.count; ci++) {
+      rt_scope_t *c = s->children.items[ci];
+      char cp[512];
+      snprintf(cp, sizeof cp, "%s", prefix);
+      aj_dm_cat(cp, sizeof cp, istr(tree_ident(c->where)));
+      size_t l = strlen(cp);
+      if (l + 1 < sizeof cp) { cp[l] = '_'; cp[l + 1] = '\0'; }
+      aj_dm_walk(c, cp, ix);
+   }
+}
+
+static rt_signal_t *aj_dm_find(const aj_dm_idx_t *ix, const char *name)
+{
+   for (int i = 0; i < ix->n; i++)
+      if (strcmp(ix->v[i].name, name) == 0)
+         return ix->v[i].sig;
+   return NULL;
+}
+
+static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
+{
+   const uint64_t t0 = get_timestamp_ns();
+   const char *top = chunk->rs_top != NULL ? chunk->rs_top : "?";
+
+   // ---- 1. safe point: settled delta boundary, never mid-eval -------------
+   assert(g_aj_cur_chunk[thread_id()] == NULL);
+
+   if (chunk->rr_count == 0) {
+      notef("accel-jit: demote '%s' declined — chunk not rerouted "
+            "(VERIFY companion)", top);
+      return false;
+   }
+
+   // handoff-wired chunks (either direction) are not individually demotable
+   if (chunk->hoff_nedges > 0) {
+      notef("accel-jit: demote '%s' declined — %d packed handoff edge(s) "
+            "to consumer chunks (NVC_ACCEL_HANDOFF)", top, chunk->hoff_nedges);
+      return false;
+   }
+   if (chunk->hin_flags != NULL)
+      for (int i = 0; i < chunk->rs_npins; i++)
+         if (chunk->hin_flags[i]) {
+            notef("accel-jit: demote '%s' declined — input %d is handoff-fed "
+                  "by a producer chunk (NVC_ACCEL_HANDOFF)", top, i);
+            return false;
+         }
+
+   // ---- 2. demote tables from the .so (emitted by aj_emit_bridge) ---------
+   const char **rname            = dlsym(chunk->dl, "aj_reg_name");
+   const unsigned long *roff     = dlsym(chunk->dl, "aj_reg_off");
+   const int *rwidth             = dlsym(chunk->dl, "aj_reg_width");
+   const int *rdepth             = dlsym(chunk->dl, "aj_reg_depth");
+   int *pnregs                   = dlsym(chunk->dl, "aj_n_regs");
+   unsigned long (*psoff)(void)  = dlsym(chunk->dl, "aj_demote_state_off");
+   if (rname == NULL || roff == NULL || rwidth == NULL || rdepth == NULL
+       || pnregs == NULL || psoff == NULL) {
+      notef("accel-jit: demote '%s' declined — .so lacks demote tables "
+            "(stale cache: clear ~/.cache/nvc/accel)", top);
+      return false;
+   }
+   const int nregs = *pnregs;
+
+   // ---- 3. bind EVERY register to its nvc signal before touching anything -
+   rt_signal_t **bound = xcalloc_array(nregs > 0 ? nregs : 1,
+                                       sizeof(rt_signal_t *));
+   aj_dm_idx_t ix = { NULL, 0, 0 };
+   aj_dm_walk(chunk->scope, "", &ix);
+   const uint64_t t_ix = get_timestamp_ns();
+
+   int unmapped = 0, maxbuf = 1;
+   for (int r = 0; r < nregs; r++) {
+      const char *rn = rname[r];
+      while (*rn == '_') rn++;         // cname() of '\'-prefixed yosys name
+      if (rdepth[r] > 0) {
+         notef("accel-jit: demote '%s' declined — register '%s' is a "
+               "%d-word memory (writeback word order unverified)",
+               top, rn, rdepth[r]);
+         free(bound); free(ix.v);
+         return false;
+      }
+      rt_signal_t *sig = aj_dm_find(&ix, rn);
+      if (sig == NULL) {
+         if (unmapped++ < 8)
+            notef("accel-jit: demote '%s': register '%s' has no matching "
+                  "signal", top, rn);
+         continue;
+      }
+      const int elem  = (int)sig->nexus.size;
+      const int count = elem > 0 ? (int)(sig->shared.size / elem) : 0;
+      if (count != rwidth[r]) {
+         if (unmapped++ < 8)
+            notef("accel-jit: demote '%s': register '%s' width %d vs "
+                  "signal %d", top, rn, rwidth[r], count);
+         continue;
+      }
+      bound[r] = sig;
+      if (rwidth[r] * elem > maxbuf) maxbuf = rwidth[r] * elem;
+   }
+   free(ix.v);
+   if (unmapped > 0) {
+      notef("accel-jit: demote '%s' declined — %d/%d register(s) unbound; "
+            "state writeback would be lossy", top, unmapped, nregs);
+      free(bound);
+      return false;
+   }
+
+   const uint64_t t_bind = get_timestamp_ns();
+
+   // ---- 4. writeback: state_t -> signals (2-state -> L3D driven-certain) -
+   const uint8_t *S = (const uint8_t *)chunk->state + psoff();
+   uint8_t *buf = xmalloc(maxbuf);
+   for (int r = 0; r < nregs; r++) {
+      rt_signal_t *sig = bound[r];
+      const int w = rwidth[r], elem = (int)sig->nexus.size;
+      memset(buf, 0, (size_t)w * elem);
+      if (w <= 64) {
+         uint64_t v;
+         memcpy(&v, S + roff[r], sizeof v);
+         for (int b = 0; b < w; b++)
+            buf[(size_t)(w - 1 - b) * elem] = 2 | (unsigned)((v >> b) & 1);
+      }
+      else {
+         const uint32_t *lb = (const uint32_t *)(S + roff[r]);
+         for (int b = 0; b < w; b++)
+            buf[(size_t)(w - 1 - b) * elem] =
+               2 | (unsigned)((lb[b >> 5] >> (b & 31)) & 1);
+      }
+      // A signal read via 'event/rising_edge caches events (NET_F_CACHE_EVENT)
+      // and the immediate deposit path asserts it never sees one; route those
+      // through the wake_next path, which maintains the cached-event flags.
+      bool cache_ev = false;
+      rt_nexus_t *n = &sig->nexus;
+      for (unsigned nx = 0; nx < sig->n_nexus; nx++, n = n->chain)
+         if (n->flags & NET_F_CACHE_EVENT) { cache_ev = true; break; }
+      deposit_signal_impl(m, sig, buf, 0, w, cache_ev);
+   }
+   free(buf);
+   free(bound);
+   const uint64_t t_wb = get_timestamp_ns();
+
+   // ---- 5. restore every rerouted proc's original vtable ------------------
+   unsigned restored = 0;
+   for (unsigned i = 0; i < chunk->rr_count; i++) {
+      rt_proc_t *p = chunk->rr_saved[i].proc;
+      if (p->vtable == &chunk->vtable) {
+         proc_set_vtable(p, chunk->rr_saved[i].vt);
+         restored++;
+      }
+      // else: something else (reset_process) already replaced it — leave it
+   }
+
+   const uint64_t t_vt = get_timestamp_ns();
+
+   // If the fast-clk table / fused block hold members of this subtree,
+   // dissolve both (they rebuild themselves with hysteresis; the fused
+   // block is dissolved by aj_dissolve_fastclk_ex). Non-members keep their
+   // table. The stray sweep is skipped: no candidate build is in flight
+   // here, so the only flagged procs are exactly the committed table's
+   // members, which the dissolve unflags directly.
+   bool in_fastclk = false;
+   if (m->fastclk_table != NULL || m->fused_block != NULL)
+      for (unsigned i = 0; i < chunk->rr_count && !in_fastclk; i++)
+         if (chunk->rr_saved[i].proc->wakeable.fastclk)
+            in_fastclk = true;
+   if (in_fastclk)
+      aj_dissolve_fastclk_ex(m, false);
+   const uint64_t t_fc = get_timestamp_ns();
+
+   // ---- 6. unbind the chunk ----------------------------------------------
+   // Publish any staged-but-unswapped deferred outputs first (they hold the
+   // value the interp side is owed), exactly as the bank swap would.
+   if (chunk->defer_outs != NULL) {
+      for (unsigned i = 0; i < chunk->defer_count; i++) {
+         aj_defer_out_t *d = &chunk->defer_outs[i];
+         if (d->dirty && d->nexus != NULL
+             && !cmp_bytes(d->eff, d->shadow, d->valuesz)) {
+            copy2(d->last, d->eff, d->shadow, d->valuesz);
+            d->nexus->event_delta = m->iteration + 1;
+            d->nexus->last_event  = m->now;
+            if (d->cache_event)
+               d->nexus->signal->shared.flags |= SIG_F_EVENT_FLAG;
+            m->trigger_epoch++;
+         }
+         free(d->shadow);
+      }
+      free(chunk->defer_outs);
+   }
+
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++)
+      if (m->aj_chunks[ci] == chunk) {
+         memmove(&m->aj_chunks[ci], &m->aj_chunks[ci + 1],
+                 (m->aj_chunk_count - ci - 1) * sizeof(aj_chunk_t *));
+         m->aj_chunk_count--;
+         break;
+      }
+
+   free(chunk->bindtab);
+   free(chunk->state);
+   free(chunk->rr_saved);
+   free(chunk->rs_bridge);
+   free(chunk->rs_dutc);
+   free(chunk->rs_pins);
+   free(chunk->hoff_flags);
+   free(chunk->hin_flags);
+   free(chunk->hoff_edges);
+   // chunk->dl deliberately NOT dlclose'd (see header comment); rs_top is
+   // freed LAST (it names the chunk in the note below)
+   const uint64_t dt = get_timestamp_ns() - t0;
+   notef("accel-jit: DEMOTED '%s' — %d register(s) written back, %u/%u "
+         "proc vtable(s) restored, %.1f us (index %.1f bind %.1f wb %.1f "
+         "vt %.1f fastclk %.1f); interp resumes from this state",
+         top, nregs, restored, chunk->rr_count, (double)dt / 1000.0,
+         (double)(t_ix - t0) / 1000.0, (double)(t_bind - t_ix) / 1000.0,
+         (double)(t_wb - t_bind) / 1000.0, (double)(t_vt - t_wb) / 1000.0,
+         (double)(t_fc - t_vt) / 1000.0);
+   free(chunk->rs_top);
+   free(chunk);
+   return true;
+}
+
+// Public entry point (control-plane ops / future live-edit invalidation):
+// demote every installed chunk whose subtree name contains `tok` (NULL or
+// "" = all chunks), NVC_ACCEL_ONLY matching semantics. Must be called at a
+// settled delta boundary (the model_cycle NVC_ACCEL_DEMOTE_AT hook is the
+// in-tree caller). Returns the number of chunks demoted.
+int accel_demote(rt_model_t *m, const char *tok)
+{
+   int n = 0;
+   for (int ci = (int)m->aj_chunk_count - 1; ci >= 0; ci--) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      if (tok != NULL && tok[0] != '\0'
+          && (c->rs_top == NULL || strstr(c->rs_top, tok) == NULL))
+         continue;
+      if (aj_chunk_demote(m, c))
+         n++;
+   }
+   return n;
+}
 
 static bool aj_blacklisted(rt_model_t *m, rt_nexus_t *n)
 {
@@ -2655,7 +3030,7 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
 
 // Tear the posedge table down (guard nexus fired, or install replaced it):
 // unflag members so wakeup_one queues them normally again, clear guards.
-static void aj_dissolve_fastclk(rt_model_t *m)
+static void aj_dissolve_fastclk_ex(rt_model_t *m, bool sweep_strays)
 {
    // The fused block sequences table members; it never outlives the table
    fused_block_dissolve(m);
@@ -2674,9 +3049,14 @@ static void aj_dissolve_fastclk(rt_model_t *m)
    m->fastclk_count = 0;
    m->fastclk_hit = false;
    // Unflag EVERY stray (failed candidates leave pass-0 flags on procs not
-   // in any table; with fastclk_on they would skip wakeups forever).
-   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
-      aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
+   // in any table; with fastclk_on they would skip wakeups forever). This
+   // sweeps ALL nexuses (tens of ms on a big design) — strays only exist
+   // transiently inside aj_build_fastclk, so callers at a point where no
+   // candidate build is in flight (aj_chunk_demote) skip it: the committed
+   // table's members were unflagged exactly above.
+   if (sweep_strays)
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
+         aj_pending_foreach(n->pending, aj_unflag_cb, NULL);
    for (unsigned i = 0; i < m->fastclk_nguards; i++)
       m->fastclk_guard_nx[i]->vtable = m->fastclk_guard_orig[i];
    free(m->fastclk_guard_nx);   m->fastclk_guard_nx = NULL;
@@ -2713,6 +3093,11 @@ static void aj_dissolve_fastclk(rt_model_t *m)
       if (dcount++ < 10 && getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
          notef("accel-jit: fast-clk table dissolved (guard event)");
    }
+}
+
+static void aj_dissolve_fastclk(rt_model_t *m)
+{
+   aj_dissolve_fastclk_ex(m, true);
 }
 
 // Guard nexus fired: restore all vtables + fall back, then deliver the
@@ -3169,7 +3554,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    if (!f) { free(dut_text); return false; }
 
    fprintf(f, "#define SM_NO_MAIN 1\n");
-   fprintf(f, "#include <stdint.h>\n#include <string.h>\n");
+   fprintf(f, "#include <stdint.h>\n#include <string.h>\n"
+              "#include <stddef.h>\n");
    fprintf(f, "#include \"%s\"\n\n", dutc);
    // DE-BAKED BINDING. The .so contains NO run-specific addresses: the install
    // points the exported AJB table at a per-run array of {deposit_signal,
@@ -3243,6 +3629,83 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                          " unsigned char late_pend;" : "",
               raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
+
+   // DEMOTE WRITEBACK TABLES (aj_chunk_demote). Scrape the state_t struct
+   // out of the generated model text (the established cross-file contract:
+   // sm_extra_clocks / sm_output_order / aj_model_has_field all text-scrape
+   // the same file) and emit a register-descriptor table whose offsets the
+   // C compiler computes with offsetof against the REAL struct — exact by
+   // construction, immune to alignment/padding guesswork. Emitted BEFORE
+   // the `#define S (aj_cs->S)` below or that macro would poison
+   // offsetof(aj_cs_t, S). Three field spellings (gen_statemachine):
+   //   uint64_t _r;         // W bits            scalar register (W <= 64)
+   //   uint32_t _r[NL];     // W bits            wide register (32b limbs)
+   //   uint64_t _m[D];      // D x W-bit         memory (demote declines)
+   {
+      typedef struct { char name[512]; int width, depth; } aj_rdesc_t;
+      aj_rdesc_t *rd = NULL;
+      int nrd = 0, maxrd = 0;
+      const char *send = strstr(dut_text, "} state_t;");
+      const char *sbeg = NULL;
+      for (const char *p = dut_text; send != NULL && p < send; p++) {
+         const char *t = strstr(p, "typedef struct {");
+         if (t == NULL || t > send) break;
+         sbeg = t;
+         p = t;
+      }
+      const char *line = sbeg != NULL ? strchr(sbeg, '\n') : NULL;
+      while (line != NULL && line < send) {
+         line++;
+         const char *nl = strchr(line, '\n');
+         const char *q = line;
+         while (*q == ' ') q++;
+         if (strncmp(q, "uint64_t ", 9) == 0) q += 9;
+         else if (strncmp(q, "uint32_t ", 9) == 0) q += 9;
+         else { line = nl; continue; }
+         aj_rdesc_t e = { .name = "", .width = 0, .depth = 0 };
+         int ni = 0;
+         while ((isalnum((unsigned char)*q) || *q == '_') && ni < 511)
+            e.name[ni++] = *q++;
+         e.name[ni] = '\0';
+         const char *cm = strstr(q, "//");
+         if (ni == 0 || cm == NULL || (nl != NULL && cm > nl)) {
+            line = nl;
+            continue;
+         }
+         int a_ = 0, b_ = 0;
+         if (sscanf(cm, "// %d x %d-bit", &a_, &b_) == 2) {
+            e.depth = a_;
+            e.width = b_;
+         }
+         else if (sscanf(cm, "// %d bits", &a_) == 1)
+            e.width = a_;
+         else { line = nl; continue; }
+         if (nrd == maxrd) {
+            maxrd = maxrd ? maxrd * 2 : 64;
+            rd = xrealloc_array(rd, maxrd, sizeof(aj_rdesc_t));
+         }
+         rd[nrd++] = e;
+         line = nl;
+      }
+      fprintf(f, "const char *aj_reg_name[] = {");
+      for (int i = 0; i < nrd; i++) fprintf(f, "\"%s\",", rd[i].name);
+      fprintf(f, "0};\n");
+      fprintf(f, "const unsigned long aj_reg_off[] = {");
+      for (int i = 0; i < nrd; i++)
+         fprintf(f, "offsetof(state_t,%s),", rd[i].name);
+      fprintf(f, "0};\n");
+      fprintf(f, "const int aj_reg_width[] = {");
+      for (int i = 0; i < nrd; i++) fprintf(f, "%d,", rd[i].width);
+      fprintf(f, "0};\n");
+      fprintf(f, "const int aj_reg_depth[] = {");
+      for (int i = 0; i < nrd; i++) fprintf(f, "%d,", rd[i].depth);
+      fprintf(f, "0};\n");
+      fprintf(f, "int aj_n_regs = %d;\n", nrd);
+      fprintf(f, "unsigned long aj_demote_state_off(void)"
+                 "{ return offsetof(aj_cs_t, S); }\n\n");
+      free(rd);
+   }
+
    fprintf(f, "#define S (aj_cs->S)\n#define last_t (aj_cs->last_t)\n");
    if (nck == 0)
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
@@ -4490,6 +4953,24 @@ void accel_auto(rt_model_t *m)
    g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
    g_aj_verify_skipx = getenv("NVC_ACCEL_VERIFY_X") != NULL;
    g_aj_vtrack = getenv("NVC_ACCEL_VERIFY_TRACK") != NULL;
+
+   if (g_aj_demote_at == -2) {
+      const char *e = getenv("NVC_ACCEL_DEMOTE_AT");
+      if (e == NULL)
+         g_aj_demote_at = -1;
+      else {
+         int64_t t = parse_fork_time(e);
+         if (t < 0) {   // bare number = ns
+            char *end = NULL;
+            unsigned long long v = strtoull(e, &end, 10);
+            t = (*e != '\0' && end != NULL && *end == '\0')
+               ? (int64_t)v * 1000000 : -1;
+         }
+         g_aj_demote_at = t;
+         if (t < 0)
+            warnf("cannot parse NVC_ACCEL_DEMOTE_AT='%s' (want e.g. 5000ns)", e);
+      }
+   }
 
    const char *home = getenv("HOME");
    if (!home) home = "/tmp";
@@ -8628,6 +9109,16 @@ fastclk_done:;
          fork_checkpoint(m);
 
       m->can_create_delta = true;
+
+      // NVC_ACCEL_DEMOTE_AT: the state is settled (same safe point as the
+      // fork checkpoint, after can_create_delta so the writeback deposits
+      // legally open the next delta at THIS time) — demote every installed
+      // chunk; the interp re-settles the region before time advances.
+      if (unlikely(g_aj_demote_at >= 0 && !g_aj_demoted
+                   && m->now >= (uint64_t)g_aj_demote_at)) {
+         g_aj_demoted = true;   // one-shot, even if some chunks decline
+         accel_demote(m, NULL);
+      }
    }
    else if (m->stop_delta > 0 && m->iteration == m->stop_delta)
       reached_iteration_limit(m);
