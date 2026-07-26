@@ -610,7 +610,11 @@ typedef struct {
    uint32_t strtab;
 } pack_header_t;
 
-#define PACK_MAGIC "JIT1"
+// The pack payload serialises jit_ir_t verbatim, including raw
+// jit_exit_t numbers: any change to the exit enumeration (e.g. the
+// SCHED_WAVEFORM_FASTn family) is a format change and must bump this
+// magic, otherwise stale packs decode to the wrong exits.
+#define PACK_MAGIC "JIT2"
 
 static void write_fully(const void *buf, size_t size, FILE *f)
 {
@@ -680,8 +684,15 @@ jit_pack_t *jit_read_pack(FILE *f)
    jp->map_size = info.size;
 
    const pack_header_t *header = jp->mmap;
-   if (memcmp(header->magic, PACK_MAGIC, sizeof(header->magic)) != 0)
-      fatal("bad JIT pack magic");
+   if (memcmp(header->magic, PACK_MAGIC, sizeof(header->magic)) != 0) {
+      // The elaborated design body only exists in the pack, so a stale
+      // format cannot fall back to recompilation: fail here with a
+      // clear action rather than misdecoding or dying later with a
+      // confusing "missing body" error
+      fatal("JIT pack has incompatible format %.4s (expected %s): "
+            "re-run elaboration to regenerate it", header->magic,
+            PACK_MAGIC);
+   }
 
    const char *strtab = jp->mmap + header->strtab;
 

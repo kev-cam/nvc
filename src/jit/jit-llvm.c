@@ -140,11 +140,17 @@ typedef enum {
    LLVM_UNPACK,
    LLVM_VEC4OP,
 
-   // Native-projection pilot: per-size inlined scalar delta assignment
-   // (bodies emitted by cgen_inline_drive_body, always-inlined at O0)
+   // Native-projection pilot: per-size specialized scalar delta assignment
+   // (bodies emitted by cgen_inline_drive_body; per-site alwaysinline or
+   // shared noinline per cgen_inline_drive_mode).  Contiguous by element
+   // size: DRIVEn <=> n-byte element.
    LLVM_INLINE_DRIVE1,
    LLVM_INLINE_DRIVE2,
+   LLVM_INLINE_DRIVE3,
    LLVM_INLINE_DRIVE4,
+   LLVM_INLINE_DRIVE5,
+   LLVM_INLINE_DRIVE6,
+   LLVM_INLINE_DRIVE7,
    LLVM_INLINE_DRIVE8,
 
    LLVM_LAST_FN,
@@ -296,6 +302,8 @@ static LLVMValueRef llvm_ptr(llvm_obj_t *obj, void *ptr)
    return LLVMConstIntToPtr(llvm_intptr(obj, (intptr_t)ptr),
                             obj->types[LLVM_PTR]);
 }
+
+static int cgen_inline_drive_mode(void);
 
 static LLVMValueRef llvm_real(llvm_obj_t *obj, double r)
 {
@@ -900,7 +908,11 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
 
    case LLVM_INLINE_DRIVE1:
    case LLVM_INLINE_DRIVE2:
+   case LLVM_INLINE_DRIVE3:
    case LLVM_INLINE_DRIVE4:
+   case LLVM_INLINE_DRIVE5:
+   case LLVM_INLINE_DRIVE6:
+   case LLVM_INLINE_DRIVE7:
    case LLVM_INLINE_DRIVE8:
       {
          // Same shape as the __nvc_sched_waveform exit call it replaces;
@@ -915,11 +927,14 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
 
          char name[32];
          checked_sprintf(name, sizeof(name), "nvc.inline.drive.%d",
-                         1 << (which - LLVM_INLINE_DRIVE1));
+                         which - LLVM_INLINE_DRIVE1 + 1);
 
          fn = llvm_add_fn(obj, name, obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
-         llvm_add_func_attr(obj, fn, FUNC_ATTR_ALWAYSINLINE, -1);
+         if (cgen_inline_drive_mode() == 2)
+            llvm_add_func_attr(obj, fn, FUNC_ATTR_NOINLINE, -1);
+         else
+            llvm_add_func_attr(obj, fn, FUNC_ATTR_ALWAYSINLINE, -1);
       }
       break;
 
@@ -2093,21 +2108,37 @@ static void cgen_macro_memset(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    }
 }
 
-// Native-projection pilot: NVC_INLINE_DRIVE (default on) selects the inlined
-// scalar delta-assignment fast path for statically-shaped SCHED_WAVEFORM
-// sites.  Requires the runtime to have published a usable layout.  Cached
-// after the first call; the benign race between compile threads is
-// idempotent.
-static bool cgen_inline_drive_enabled(void)
+// Native-projection pilot: NVC_INLINE_DRIVE selects the specialized scalar
+// delta-assignment fast path for statically-shaped SCHED_WAVEFORM sites.
+//   0 -> off (byte-identical spec emission)
+//   1 -> per-site always-inlined body (the original pilot's shape)
+//   2 -> one shared noinline body per size per module, direct call at
+//        each site (the default).  Same generated body either way; the
+//        shared form trades a call/ret per event for O(sites) less IR to
+//        optimize -- the per-site form's LLVM compile cost scales with
+//        assignment-site count and dominates short runs (b14: 90 sites in
+//        one process function, +25% wall; b22: 280 sites, +34%; measured
+//        2026-07-26 pinned interleaved) -- and re-shares the same-value
+//        compare's branch history across sites (misses giveback drops to
+//        ~+6%).  Outlined-call beat both OFF and per-site on every ITC row
+//        pinned and unpinned.
+// Requires the runtime to have published a usable layout.  Cached after
+// the first call; the benign race between compile threads is idempotent.
+static int cgen_inline_drive_mode(void)
 {
 #ifndef LLVM_HAS_OPAQUE_POINTERS
-   return false;   // Typed-pointer emission not implemented for the pilot
+   return 0;   // Typed-pointer emission not implemented for the pilot
 #else
    static volatile int cached = -1;
    int c = cached;
    if (c < 0) {
       const char *env = getenv("NVC_INLINE_DRIVE");
-      c = (env == NULL || *env != '0') && jit_drive_layout()->valid;
+      if (!jit_drive_layout()->valid)
+         c = 0;
+      else if (env == NULL)
+         c = 2;
+      else
+         c = MIN(MAX(atoi(env), 0), 2);
       cached = c;
    }
    return c;
@@ -2122,12 +2153,16 @@ static void cgen_macro_exit(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    case JIT_EXIT_SCHED_WAVEFORM:
    case JIT_EXIT_SCHED_WAVEFORM_FAST1:
    case JIT_EXIT_SCHED_WAVEFORM_FAST2:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST3:
    case JIT_EXIT_SCHED_WAVEFORM_FAST4:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST5:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST6:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST7:
    case JIT_EXIT_SCHED_WAVEFORM_FAST8:
       {
          llvm_fn_t which = LLVM_SCHED_WAVEFORM;
          if (ir->arg1.exit != JIT_EXIT_SCHED_WAVEFORM
-             && cgen_inline_drive_enabled())
+             && cgen_inline_drive_mode() != 0)
             which = LLVM_INLINE_DRIVE1
                + (ir->arg1.exit - JIT_EXIT_SCHED_WAVEFORM_FAST1);
 
@@ -3146,12 +3181,7 @@ static void cgen_inline_drive_body(llvm_obj_t *obj, llvm_fn_t which)
    const jit_drive_layout_t *l = jit_drive_layout();
    assert(l->valid);
 
-   const int size = 1 << (which - LLVM_INLINE_DRIVE1);
-
-   static const llvm_type_t vtypes[] = {
-      LLVM_INT8, LLVM_INT16, LLVM_INT32, LLVM_INT64
-   };
-   const llvm_type_t vtype = vtypes[which - LLVM_INLINE_DRIVE1];
+   const int size = which - LLVM_INLINE_DRIVE1 + 1;
 
    LLVMValueRef fn = obj->fns[which];
    LLVMSetLinkage(fn, LLVMPrivateLinkage);
@@ -3286,15 +3316,42 @@ static void cgen_inline_drive_body(llvm_obj_t *obj, llvm_fn_t which)
                                  llvm_int8(obj, 0), ""),
                    copy_bb, cmp_bb);
 
-   // Value comparison over exactly width*size bytes (cmp_bytes equivalent)
+   // Value comparison over exactly width*size bytes (cmp_bytes equivalent).
+   // Power-of-two sizes use an exact-width load + compare; odd sizes use a
+   // full-qword load with the byte mask baked into this body.  Both qword
+   // operands are complete 8-byte objects -- w->value is the rt_value_t
+   // union embedded in rt_source_t (STATIC_ASSERT'd == 8 in the layout
+   // probe) and value64 is this exit's 64-bit args slot -- so no load here
+   // reads outside its object; the mask discards exactly the bytes
+   // cmp_bytes never looks at (little-endian low-byte order, as the spec
+   // path's full-qword copy_value_ptr store already assumes).
    LLVMPositionBuilderAtEnd(obj->builder, cmp_bb);
 
-   LLVMValueRef wv = drive_load(obj, vtype, src, l->source_value, "wv");
-   LLVMValueRef vk = size == 8 ? value64
-      : LLVMBuildTrunc(obj->builder, value64, obj->types[vtype], "vk");
-   LLVMBuildCondBr(obj->builder,
-                   LLVMBuildICmp(obj->builder, LLVMIntEQ, wv, vk, ""),
-                   same_bb, queue_bb);
+   LLVMValueRef same;
+   if (is_power_of_2(size)) {
+      static const llvm_type_t vtypes[] = {   // Indexed by log2(size)
+         LLVM_INT8, LLVM_INT16, LLVM_INT32, LLVM_INT64
+      };
+      const llvm_type_t vtype = vtypes[ilog2(size)];
+
+      LLVMValueRef wv = drive_load(obj, vtype, src, l->source_value, "wv");
+      LLVMValueRef vk = size == 8 ? value64
+         : LLVMBuildTrunc(obj->builder, value64, obj->types[vtype], "vk");
+      same = LLVMBuildICmp(obj->builder, LLVMIntEQ, wv, vk, "");
+   }
+   else {
+      const uint64_t mask = (UINT64_C(1) << (size * 8)) - 1;
+
+      LLVMValueRef wv = drive_load(obj, LLVM_INT64, src,
+                                   l->source_value, "wv");
+      LLVMValueRef diff = LLVMBuildXor(obj->builder, wv, value64, "diff");
+      LLVMValueRef sig = LLVMBuildAnd(obj->builder, diff,
+                                      llvm_int64(obj, mask), "sig");
+      same = LLVMBuildICmp(obj->builder, LLVMIntEQ, sig,
+                           llvm_int64(obj, 0), "");
+   }
+
+   LLVMBuildCondBr(obj->builder, same, same_bb, queue_bb);
 
    // New value: defer the same async_fast_driver continuation the C path does
    LLVMPositionBuilderAtEnd(obj->builder, queue_bb);

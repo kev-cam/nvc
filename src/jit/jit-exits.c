@@ -485,8 +485,12 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
    case JIT_EXIT_SCHED_WAVEFORM:
    case JIT_EXIT_SCHED_WAVEFORM_FAST1:   // Statically-shaped variants: the
    case JIT_EXIT_SCHED_WAVEFORM_FAST2:   // interp/x86 tiers always take the
-   case JIT_EXIT_SCHED_WAVEFORM_FAST4:   // full spec path; only the LLVM
-   case JIT_EXIT_SCHED_WAVEFORM_FAST8:   // backend may inline (NVC_INLINE_DRIVE)
+   case JIT_EXIT_SCHED_WAVEFORM_FAST3:   // full spec path; only the LLVM
+   case JIT_EXIT_SCHED_WAVEFORM_FAST4:   // backend may inline (NVC_INLINE_DRIVE)
+   case JIT_EXIT_SCHED_WAVEFORM_FAST5:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST6:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST7:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST8:
       __nvc_sched_waveform(anchor, args, tlab);
       break;
 

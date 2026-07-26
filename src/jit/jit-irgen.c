@@ -3509,13 +3509,19 @@ static jit_exit_t irgen_sched_waveform_exit(jit_irgen_t *g, mir_value_t n)
    // Element assignment into an array signal: strip to the element type
    for (mir_type_t e; !mir_is_null(e = mir_get_elem(g->mu, base)); base = e);
 
-   switch (irgen_size_bytes(g, base)) {
-   case 1: return JIT_EXIT_SCHED_WAVEFORM_FAST1;
-   case 2: return JIT_EXIT_SCHED_WAVEFORM_FAST2;
-   case 4: return JIT_EXIT_SCHED_WAVEFORM_FAST4;
-   case 8: return JIT_EXIT_SCHED_WAVEFORM_FAST8;
-   default: return JIT_EXIT_SCHED_WAVEFORM;
-   }
+   // Any element size that fits rt_value_t's inline qword (1..8 bytes) has
+   // a specialized exit: FASTn <=> n-byte element.  Odd sizes arise only
+   // from user-declared integer BASE types (`type T is range 0 to 2**20-1'
+   // = 3 bytes): `integer range ...' subtypes erase to 4-byte INTEGER on
+   // both this side (lower_type recurses to type_base) and the runtime
+   // side (type_byte_width), so the two computations stay consistent and
+   // the emitted n->size guard is a belt-and-braces decline, not the
+   // common case.
+   const int bytes = irgen_size_bytes(g, base);
+   if (bytes >= 1 && bytes <= 8)
+      return JIT_EXIT_SCHED_WAVEFORM_FAST1 + (bytes - 1);
+   else
+      return JIT_EXIT_SCHED_WAVEFORM;
 }
 
 static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)

@@ -192,13 +192,19 @@ typedef enum {
 
    // Native-projection pilot (NVC_INLINE_DRIVE): a SCHED_WAVEFORM site whose
    // static shape is a scalar delta assignment (after == 0, reject == 0,
-   // scalar value of 1/2/4/8 bytes).  Every backend except LLVM treats these
-   // exactly like JIT_EXIT_SCHED_WAVEFORM; the LLVM backend may replace the
-   // runtime call with an inlined guarded fast path specialized against the
-   // runtime's frozen layout (see cgen_inline_drive_body in jit-llvm.c).
+   // scalar value of 1..8 bytes; FASTn = n-byte element).  Every backend
+   // except LLVM treats these exactly like JIT_EXIT_SCHED_WAVEFORM; the LLVM
+   // backend may replace the runtime call with an inlined guarded fast path
+   // specialized against the runtime's frozen layout (see
+   // cgen_inline_drive_body in jit-llvm.c).  Contiguous by size so that
+   // size == exit - JIT_EXIT_SCHED_WAVEFORM_FAST1 + 1.
    JIT_EXIT_SCHED_WAVEFORM_FAST1,
    JIT_EXIT_SCHED_WAVEFORM_FAST2,
+   JIT_EXIT_SCHED_WAVEFORM_FAST3,
    JIT_EXIT_SCHED_WAVEFORM_FAST4,
+   JIT_EXIT_SCHED_WAVEFORM_FAST5,
+   JIT_EXIT_SCHED_WAVEFORM_FAST6,
+   JIT_EXIT_SCHED_WAVEFORM_FAST7,
    JIT_EXIT_SCHED_WAVEFORM_FAST8,
 } jit_exit_t;
 
