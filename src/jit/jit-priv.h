@@ -189,6 +189,17 @@ typedef enum {
    JIT_EXIT_PIPE_READ,
    JIT_EXIT_PIPE_FULL,
    JIT_EXIT_PIPE_EMPTY,
+
+   // Native-projection pilot (NVC_INLINE_DRIVE): a SCHED_WAVEFORM site whose
+   // static shape is a scalar delta assignment (after == 0, reject == 0,
+   // scalar value of 1/2/4/8 bytes).  Every backend except LLVM treats these
+   // exactly like JIT_EXIT_SCHED_WAVEFORM; the LLVM backend may replace the
+   // runtime call with an inlined guarded fast path specialized against the
+   // runtime's frozen layout (see cgen_inline_drive_body in jit-llvm.c).
+   JIT_EXIT_SCHED_WAVEFORM_FAST1,
+   JIT_EXIT_SCHED_WAVEFORM_FAST2,
+   JIT_EXIT_SCHED_WAVEFORM_FAST4,
+   JIT_EXIT_SCHED_WAVEFORM_FAST8,
 } jit_exit_t;
 
 // 32-bit virtual register index: very large elaborated units (e.g. a VeeR

@@ -19,6 +19,7 @@
 #include "array.h"
 #include "hash.h"
 #include "ident.h"
+#include "jit/jit-exits.h"
 #include "jit/jit-priv.h"
 #include "lib.h"
 #include "object.h"
@@ -139,6 +140,13 @@ typedef enum {
    LLVM_UNPACK,
    LLVM_VEC4OP,
 
+   // Native-projection pilot: per-size inlined scalar delta assignment
+   // (bodies emitted by cgen_inline_drive_body, always-inlined at O0)
+   LLVM_INLINE_DRIVE1,
+   LLVM_INLINE_DRIVE2,
+   LLVM_INLINE_DRIVE4,
+   LLVM_INLINE_DRIVE8,
+
    LLVM_LAST_FN,
 } llvm_fn_t;
 
@@ -233,6 +241,7 @@ typedef enum {
    FUNC_ATTR_OPTNONE,
    FUNC_ATTR_NOALIAS,
    FUNC_ATTR_INLINE,
+   FUNC_ATTR_ALWAYSINLINE,
 
    // Attributes requiring special handling
    FUNC_ATTR_PRESERVE_FP,
@@ -321,7 +330,7 @@ static void llvm_add_func_attr(llvm_obj_t *obj, LLVMValueRef fn,
       const char *names[] = {
          "nounwind", "noreturn", "readonly", "nocapture", "byval",
          "uwtable", "noinline", "writeonly", "nonnull", "cold", "optnone",
-         "noalias", "inlinehint",
+         "noalias", "inlinehint", "alwaysinline",
       };
       assert(attr < ARRAY_LEN(names));
 
@@ -886,6 +895,31 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOCAPTURE, 1);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOCAPTURE, 2);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOCAPTURE, 3);
+      }
+      break;
+
+   case LLVM_INLINE_DRIVE1:
+   case LLVM_INLINE_DRIVE2:
+   case LLVM_INLINE_DRIVE4:
+   case LLVM_INLINE_DRIVE8:
+      {
+         // Same shape as the __nvc_sched_waveform exit call it replaces;
+         // module-private, body emitted later by cgen_inline_drive_body
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],    // anchor
+            obj->types[LLVM_PTR],    // args
+            obj->types[LLVM_PTR],    // tlab
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         char name[32];
+         checked_sprintf(name, sizeof(name), "nvc.inline.drive.%d",
+                         1 << (which - LLVM_INLINE_DRIVE1));
+
+         fn = llvm_add_fn(obj, name, obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_ALWAYSINLINE, -1);
       }
       break;
 
@@ -2059,19 +2093,50 @@ static void cgen_macro_memset(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    }
 }
 
+// Native-projection pilot: NVC_INLINE_DRIVE (default on) selects the inlined
+// scalar delta-assignment fast path for statically-shaped SCHED_WAVEFORM
+// sites.  Requires the runtime to have published a usable layout.  Cached
+// after the first call; the benign race between compile threads is
+// idempotent.
+static bool cgen_inline_drive_enabled(void)
+{
+#ifndef LLVM_HAS_OPAQUE_POINTERS
+   return false;   // Typed-pointer emission not implemented for the pilot
+#else
+   static volatile int cached = -1;
+   int c = cached;
+   if (c < 0) {
+      const char *env = getenv("NVC_INLINE_DRIVE");
+      c = (env == NULL || *env != '0') && jit_drive_layout()->valid;
+      cached = c;
+   }
+   return c;
+#endif
+}
+
 static void cgen_macro_exit(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
 {
    cgen_sync_irpos(obj, cgb, ir);
 
    switch (ir->arg1.exit) {
    case JIT_EXIT_SCHED_WAVEFORM:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST1:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST2:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST4:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST8:
       {
+         llvm_fn_t which = LLVM_SCHED_WAVEFORM;
+         if (ir->arg1.exit != JIT_EXIT_SCHED_WAVEFORM
+             && cgen_inline_drive_enabled())
+            which = LLVM_INLINE_DRIVE1
+               + (ir->arg1.exit - JIT_EXIT_SCHED_WAVEFORM_FAST1);
+
          LLVMValueRef args[] = {
             PTR(cgb->func->anchor),
             cgb->func->args,
             cgb->func->tlab,
          };
-         llvm_call_fn(obj, LLVM_SCHED_WAVEFORM, args, ARRAY_LEN(args));
+         llvm_call_fn(obj, which, args, ARRAY_LEN(args));
       }
       break;
 
@@ -3030,6 +3095,297 @@ static void cgen_tlab_alloc_body(llvm_obj_t *obj)
    LLVMBuildRet(obj->builder, slow_ptr);
 }
 
+#ifdef LLVM_HAS_OPAQUE_POINTERS
+
+////////////////////////////////////////////////////////////////////////////////
+// Native-projection pilot (NVC_INLINE_DRIVE): inlined scalar delta assignment.
+//
+// This emits, per value size, the sched_driver NET_F_FAST_DRIVER fast path
+// specialized against the runtime layout published by jit_drive_layout():
+// the common case of "single fast driver, no resolution, delta assignment"
+// becomes a handful of loads/stores inline in the compiled process, and the
+// C spec path (__nvc_sched_waveform) survives only behind the guards whose
+// generality is actually needed (parallel eval, tracing, probation windows,
+// postponed processes, split/multi-source/forced nexuses, full deferq).
+// Semantics are bit-exact with rt/model.c sched_driver: same stores, same
+// full-qword value copy, same active_delta/was_active bookkeeping; anything
+// not provably identical declines to the spec path.
+
+static LLVMValueRef drive_gep(llvm_obj_t *obj, LLVMValueRef base, int64_t off)
+{
+   LLVMValueRef idx[] = { llvm_intptr(obj, off) };
+   return LLVMBuildInBoundsGEP2(obj->builder, obj->types[LLVM_INT8], base,
+                                idx, ARRAY_LEN(idx), "");
+}
+
+static LLVMValueRef drive_load(llvm_obj_t *obj, llvm_type_t type,
+                               LLVMValueRef base, int64_t off,
+                               const char *name)
+{
+   return LLVMBuildLoad2(obj->builder, obj->types[type],
+                         drive_gep(obj, base, off), name);
+}
+
+typedef struct {
+   llvm_obj_t       *obj;
+   LLVMValueRef      fn;
+   LLVMBasicBlockRef fallback;
+} drive_ctx_t;
+
+// Continue in a fresh block when `ok`, otherwise take the spec path
+static void drive_guard(drive_ctx_t *ctx, LLVMValueRef ok)
+{
+   llvm_obj_t *obj = ctx->obj;
+   LLVMBasicBlockRef next = llvm_append_block(obj, ctx->fn, "");
+   LLVMBuildCondBr(obj->builder, ok, next, ctx->fallback);
+   LLVMPositionBuilderAtEnd(obj->builder, next);
+}
+
+static void cgen_inline_drive_body(llvm_obj_t *obj, llvm_fn_t which)
+{
+   const jit_drive_layout_t *l = jit_drive_layout();
+   assert(l->valid);
+
+   const int size = 1 << (which - LLVM_INLINE_DRIVE1);
+
+   static const llvm_type_t vtypes[] = {
+      LLVM_INT8, LLVM_INT16, LLVM_INT32, LLVM_INT64
+   };
+   const llvm_type_t vtype = vtypes[which - LLVM_INLINE_DRIVE1];
+
+   LLVMValueRef fn = obj->fns[which];
+   LLVMSetLinkage(fn, LLVMPrivateLinkage);
+
+#ifdef PRESERVE_FRAME_POINTER
+   llvm_add_func_attr(obj, fn, FUNC_ATTR_PRESERVE_FP, 0);
+#endif
+
+   LLVMBasicBlockRef entry_bb = llvm_append_block(obj, fn, "entry");
+   LLVMBasicBlockRef fallback_bb = llvm_append_block(obj, fn, "fallback");
+
+   LLVMPositionBuilderAtEnd(obj->builder, entry_bb);
+
+   LLVMValueRef anchor = LLVMGetParam(fn, 0);
+   LLVMSetValueName(anchor, "anchor");
+
+   LLVMValueRef args = LLVMGetParam(fn, 1);
+   LLVMSetValueName(args, "args");
+
+   LLVMValueRef tlab = LLVMGetParam(fn, 2);
+   LLVMSetValueName(tlab, "tlab");
+
+   drive_ctx_t ctx = { obj, fn, fallback_bb };
+
+   // Exit arguments as stored by the preceding SEND ops
+   LLVMTypeRef i64_type = obj->types[LLVM_INT64];
+   LLVMValueRef idx1[] = { llvm_intptr(obj, 1) };
+   LLVMValueRef idx3[] = { llvm_intptr(obj, 3) };
+   LLVMValueRef shared_i =
+      LLVMBuildLoad2(obj->builder, i64_type, args, "shared_i");
+   LLVMValueRef offset = LLVMBuildLoad2(
+      obj->builder, i64_type,
+      LLVMBuildInBoundsGEP2(obj->builder, i64_type, args, idx1, 1, ""),
+      "offset");
+   LLVMValueRef value64 = LLVMBuildLoad2(
+      obj->builder, i64_type,
+      LLVMBuildInBoundsGEP2(obj->builder, i64_type, args, idx3, 1, ""),
+      "value");
+
+   LLVMValueRef shared = LLVMBuildIntToPtr(obj->builder, shared_i,
+                                           obj->types[LLVM_PTR], "shared");
+
+   // Dynamic eligibility guards: each declines to the unchanged C spec path
+   LLVMValueRef par = drive_load(obj, LLVM_INT32,
+                                 llvm_ptr(obj, l->par_active_var), 0, "par");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, par,
+                                   llvm_int32(obj, 0), ""));
+
+   LLVMValueRef trc = drive_load(obj, LLVM_INT8,
+                                 llvm_ptr(obj, l->trace_var), 0, "trc");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, trc,
+                                   llvm_int8(obj, 0), ""));
+
+   LLVMValueRef model = drive_load(obj, LLVM_PTR,
+                                   llvm_ptr(obj, l->model_var), 0, "model");
+   drive_guard(&ctx, LLVMBuildIsNotNull(obj->builder, model, ""));
+
+   // Fast-clk probation window: the C path attributes driver activity
+   LLVMValueRef probe = drive_load(obj, LLVM_INT32, model,
+                                   l->model_probe_member, "probe");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntSLT, probe,
+                                   llvm_int32(obj, 0), ""));
+
+   // Postponed processes must hit the C path's delta-cycle error check
+   LLVMValueRef thread = drive_load(obj, LLVM_PTR, model,
+                                    l->model_thread0, "thread");
+   drive_guard(&ctx, LLVMBuildIsNotNull(obj->builder, thread, ""));
+
+   LLVMValueRef wobj = drive_load(obj, LLVM_PTR, thread,
+                                  l->thread_active_obj, "wobj");
+   drive_guard(&ctx, LLVMBuildIsNotNull(obj->builder, wobj, ""));
+
+   LLVMValueRef wbits = drive_load(obj, LLVM_INT8, wobj,
+                                   l->wakeable_bits, "wbits");
+   LLVMValueRef post = LLVMBuildAnd(obj->builder, wbits,
+      llvm_int8(obj, l->wakeable_postponed_mask), "");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, post,
+                                   llvm_int8(obj, 0), ""));
+
+   // Whole-signal scalar assignment only (split_nexus fast case)
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, offset,
+                                   llvm_int64(obj, 0), ""));
+
+   LLVMValueRef sig = drive_gep(obj, shared, -(int64_t)l->signal_shared);
+   LLVMValueRef nx = drive_gep(obj, sig, l->signal_nexus);
+
+   LLVMValueRef nf = drive_load(obj, LLVM_INT8, nx, l->nexus_flags, "nf");
+   LLVMValueRef fast = LLVMBuildAnd(obj->builder, nf,
+      llvm_int8(obj, l->net_f_fast_driver), "");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntNE, fast,
+                                   llvm_int8(obj, 0), ""));
+
+   LLVMValueRef ns = drive_load(obj, LLVM_INT8, nx, l->nexus_n_sources, "ns");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, ns,
+                                   llvm_int8(obj, 1), ""));
+
+   LLVMValueRef wd = drive_load(obj, LLVM_INT32, nx, l->nexus_width, "wd");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, wd,
+                                   llvm_int32(obj, 1), ""));
+
+   LLVMValueRef sz = drive_load(obj, LLVM_INT8, nx, l->nexus_size, "sz");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, sz,
+                                   llvm_int8(obj, size), ""));
+
+   // Signal-level fast-driver protocol (sigqueued) stays on the spec path
+   LLVMValueRef sf = drive_load(obj, LLVM_INT32, shared,
+                                l->shared_flags, "sf");
+   LLVMValueRef sfast = LLVMBuildAnd(obj->builder, sf,
+      llvm_int32(obj, l->net_f_fast_driver), "");
+   drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, sfast,
+                                   llvm_int32(obj, 0), ""));
+
+   // Committed: mirror of sched_driver's NET_F_FAST_DRIVER branch
+   LLVMValueRef src = drive_gep(obj, nx, l->nexus_sources);
+
+   LLVMValueRef now = drive_load(obj, LLVM_INT64, model, l->model_now, "now");
+   LLVMBuildStore(obj->builder, now, drive_gep(obj, src, l->source_when));
+
+   LLVMValueRef sbits = drive_load(obj, LLVM_INT8, src,
+                                   l->source_bits, "sbits");
+
+   LLVMBasicBlockRef cmp_bb = llvm_append_block(obj, fn, "cmp");
+   LLVMBasicBlockRef queue_bb = llvm_append_block(obj, fn, "queue");
+   LLVMBasicBlockRef qok_bb = llvm_append_block(obj, fn, "qok");
+   LLVMBasicBlockRef copy_bb = llvm_append_block(obj, fn, "copy");
+   LLVMBasicBlockRef same_bb = llvm_append_block(obj, fn, "same");
+
+   LLVMValueRef fq = LLVMBuildAnd(obj->builder, sbits,
+      llvm_int8(obj, l->source_fastqueued_mask), "fq");
+   LLVMBuildCondBr(obj->builder,
+                   LLVMBuildICmp(obj->builder, LLVMIntNE, fq,
+                                 llvm_int8(obj, 0), ""),
+                   copy_bb, cmp_bb);
+
+   // Value comparison over exactly width*size bytes (cmp_bytes equivalent)
+   LLVMPositionBuilderAtEnd(obj->builder, cmp_bb);
+
+   LLVMValueRef wv = drive_load(obj, vtype, src, l->source_value, "wv");
+   LLVMValueRef vk = size == 8 ? value64
+      : LLVMBuildTrunc(obj->builder, value64, obj->types[vtype], "vk");
+   LLVMBuildCondBr(obj->builder,
+                   LLVMBuildICmp(obj->builder, LLVMIntEQ, wv, vk, ""),
+                   same_bb, queue_bb);
+
+   // New value: defer the same async_fast_driver continuation the C path does
+   LLVMPositionBuilderAtEnd(obj->builder, queue_bb);
+
+   LLVMValueRef cnt = drive_load(obj, LLVM_INT32, model,
+                                 l->driverq_count, "cnt");
+   LLVMValueRef qmax = drive_load(obj, LLVM_INT32, model,
+                                  l->driverq_max, "qmax");
+
+   LLVMBuildCondBr(obj->builder,
+                   LLVMBuildICmp(obj->builder, LLVMIntNE, cnt, qmax, ""),
+                   qok_bb, fallback_bb);   // Full queue: C path grows it
+
+   LLVMPositionBuilderAtEnd(obj->builder, qok_bb);
+
+   LLVMValueRef tasks = drive_load(obj, LLVM_PTR, model,
+                                   l->driverq_tasks, "tasks");
+   LLVMValueRef slotoff =
+      LLVMBuildMul(obj->builder,
+                   LLVMBuildZExt(obj->builder, cnt, i64_type, ""),
+                   llvm_int64(obj, l->task_size), "");
+   LLVMValueRef sidx[] = { slotoff };
+   LLVMValueRef slot = LLVMBuildInBoundsGEP2(obj->builder,
+                                             obj->types[LLVM_INT8], tasks,
+                                             sidx, 1, "slot");
+
+   LLVMBuildStore(obj->builder, llvm_ptr(obj, l->fast_driver_fn),
+                  drive_gep(obj, slot, l->task_fn));
+   LLVMBuildStore(obj->builder, src, drive_gep(obj, slot, l->task_arg));
+   LLVMBuildStore(obj->builder,
+                  LLVMBuildAdd(obj->builder, cnt, llvm_int32(obj, 1), ""),
+                  drive_gep(obj, model, l->driverq_count));
+   LLVMBuildStore(obj->builder, llvm_int8(obj, 1),
+                  drive_gep(obj, model, l->model_next_is_delta));
+   LLVMBuildStore(obj->builder,
+                  LLVMBuildOr(obj->builder, sbits,
+                              llvm_int8(obj, l->source_fastqueued_mask), ""),
+                  drive_gep(obj, src, l->source_bits));
+   LLVMBuildBr(obj->builder, copy_bb);
+
+   // Store the full qword exactly as copy_value_ptr does for small values
+   LLVMPositionBuilderAtEnd(obj->builder, copy_bb);
+   LLVMBuildStore(obj->builder, value64,
+                  drive_gep(obj, src, l->source_value));
+   LLVMBuildRetVoid(obj->builder);
+
+   // Unchanged value: driver is active but no update is scheduled
+   LLVMPositionBuilderAtEnd(obj->builder, same_bb);
+
+   LLVMBuildStore(obj->builder, llvm_int8(obj, 1),
+                  drive_gep(obj, model, l->model_next_is_delta));
+
+   LLVMValueRef iter = drive_load(obj, LLVM_INT32, model,
+                                  l->model_iteration, "iter");
+   LLVMValueRef ad = LLVMBuildZExt(
+      obj->builder,
+      drive_load(obj, LLVM_INT16, nx, l->nexus_active_delta, "ad"),
+      obj->types[LLVM_INT32], "");
+   LLVMValueRef was = LLVMBuildICmp(obj->builder, LLVMIntEQ, ad, iter, "was");
+   LLVMValueRef wa_clear = LLVMBuildAnd(obj->builder, sbits,
+      llvm_int8(obj, (uint8_t)~l->source_was_active_mask), "");
+   LLVMValueRef wa_bit = LLVMBuildSelect(
+      obj->builder, was, llvm_int8(obj, l->source_was_active_mask),
+      llvm_int8(obj, 0), "");
+   LLVMBuildStore(obj->builder,
+                  LLVMBuildOr(obj->builder, wa_clear, wa_bit, ""),
+                  drive_gep(obj, src, l->source_bits));
+
+   LLVMValueRef iter1 = LLVMBuildTrunc(
+      obj->builder,
+      LLVMBuildAdd(obj->builder, iter, llvm_int32(obj, 1), ""),
+      obj->types[LLVM_INT16], "");
+   LLVMBuildStore(obj->builder, iter1,
+                  drive_gep(obj, nx, l->nexus_active_delta));
+   LLVMBuildRetVoid(obj->builder);
+
+   // Anything the inline path cannot prove identical: the executable spec
+   LLVMPositionBuilderAtEnd(obj->builder, fallback_bb);
+
+   LLVMValueRef spec_args[] = { anchor, args, tlab };
+   llvm_call_fn(obj, LLVM_SCHED_WAVEFORM, spec_args, ARRAY_LEN(spec_args));
+   LLVMBuildRetVoid(obj->builder);
+
+   // Lay the fallback out LAST so every guard falls through on the fast
+   // path: not-taken forward branches cost no BTB entries and the decline
+   // path stays out of the hot I-stream (survives AlwaysInliner layout)
+   LLVMMoveBasicBlockAfter(fallback_bb, LLVMGetLastBasicBlock(fn));
+}
+
+#endif  // LLVM_HAS_OPAQUE_POINTERS
+
 static void cgen_exp_overflow_body(llvm_obj_t *obj, llvm_fn_t which,
                                    jit_size_t sz, llvm_fn_t mulbase)
 {
@@ -3278,6 +3634,14 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
 
    if (obj.fns[LLVM_TLAB_ALLOC] != NULL)
       cgen_tlab_alloc_body(&obj);
+
+#ifdef LLVM_HAS_OPAQUE_POINTERS
+   for (llvm_fn_t which = LLVM_INLINE_DRIVE1;
+        which <= LLVM_INLINE_DRIVE8; which++) {
+      if (obj.fns[which] != NULL)
+         cgen_inline_drive_body(&obj, which);
+   }
+#endif
 
    for (jit_size_t sz = JIT_SZ_8; sz <= JIT_SZ_64; sz++) {
       if (obj.fns[LLVM_EXP_OVERFLOW_S8 + sz] != NULL)

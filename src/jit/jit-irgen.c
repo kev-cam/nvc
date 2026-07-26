@@ -3464,6 +3464,60 @@ static void irgen_op_last_value(jit_irgen_t *g, mir_value_t n)
    j_add(g, last_value, last_value, scaled);
 }
 
+// ---------------------------------------------------------------------------
+// Native-projection pilot: SPECIALIZATION DECISION for signal assignment.
+//
+// The event-driven runtime is an executable spec; a sched_waveform site whose
+// static shape is "scalar delta assignment" (after == 0, reject == 0, scalar
+// value) is a candidate for having the spec's driver-update path inlined into
+// the compiled process code, guarded by the per-nexus dynamic eligibility
+// tests (single fast driver, no resolution, not postponed, ...) which the
+// LLVM backend emits inline (cgen_inline_drive_body).  This function is the
+// COMPILE-TIME half of that decision and is deliberately separable:
+// ldx-extraction material -- the decision "which uses of a runtime primitive
+// have a statically known shape that admits specialization" is independent of
+// nvc's plumbing; only the arguments inspected are nvc-specific.
+//
+// The handle compiled here is shared by every instance of the design unit, so
+// ONLY link-time facts may be used: the delay/reject literals and the value's
+// scalarness are per-DESIGN properties identical for all instances.  Anything
+// per-INSTANCE (driver count, resolution, forcing, probation, postponed
+// processes reached through shared procedures) is left to the inline runtime
+// guards, which decline to the unchanged C spec path.
+static jit_exit_t irgen_sched_waveform_exit(jit_irgen_t *g, mir_value_t n)
+{
+   mir_value_t value = mir_get_arg(g->mu, n, 2);
+   if (mir_is(g->mu, value, MIR_TYPE_POINTER))
+      return JIT_EXIT_SCHED_WAVEFORM;   // Vector assignment: spec path
+
+   int64_t after, reject;
+   if (!mir_get_const(g->mu, mir_get_arg(g->mu, n, 4), &after) || after != 0)
+      return JIT_EXIT_SCHED_WAVEFORM;   // Delayed assignment: spec path
+   else if (!mir_get_const(g->mu, mir_get_arg(g->mu, n, 3), &reject)
+            || reject != 0)
+      return JIT_EXIT_SCHED_WAVEFORM;   // Pulse rejection: spec path
+
+   // The runtime element size is type_byte_width of the SIGNAL's base type
+   // (see lower_signal_decl); the value operand may be wider.  A mismatch
+   // is still caught by the emitted n->size guard, so this only has to be
+   // right for the fast path to engage, not for correctness.
+   mir_type_t sigtype = mir_get_type(g->mu, mir_get_arg(g->mu, n, 0));
+   mir_type_t base = mir_get_base(g->mu, sigtype);
+   if (mir_is_null(base))
+      return JIT_EXIT_SCHED_WAVEFORM;
+
+   // Element assignment into an array signal: strip to the element type
+   for (mir_type_t e; !mir_is_null(e = mir_get_elem(g->mu, base)); base = e);
+
+   switch (irgen_size_bytes(g, base)) {
+   case 1: return JIT_EXIT_SCHED_WAVEFORM_FAST1;
+   case 2: return JIT_EXIT_SCHED_WAVEFORM_FAST2;
+   case 4: return JIT_EXIT_SCHED_WAVEFORM_FAST4;
+   case 8: return JIT_EXIT_SCHED_WAVEFORM_FAST8;
+   default: return JIT_EXIT_SCHED_WAVEFORM;
+   }
+}
+
 static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
@@ -3483,7 +3537,7 @@ static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)
    j_send(g, 5, reject);
    j_send(g, 6, scalar);
 
-   macro_exit(g, JIT_EXIT_SCHED_WAVEFORM);
+   macro_exit(g, irgen_sched_waveform_exit(g, n));
 }
 
 static void irgen_op_disconnect(jit_irgen_t *g, mir_value_t n)

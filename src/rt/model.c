@@ -10120,6 +10120,130 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
    }
 }
 
+////////////////////////////////////////////////////////////////////////////
+// Native-projection pilot (NVC_INLINE_DRIVE): publish the frozen layout of
+// the sched_driver fast path (see jit_drive_layout_t in jit-exits.h) so the
+// LLVM backend can inline the common-case scalar delta assignment.  This is
+// pure DESCRIPTION -- no policy: the eligibility decision lives in
+// jit-irgen.c (static shape) and in the emitted guards (dynamic state).
+// Bitfield positions are probed rather than assumed; if any probe finds a
+// layout we cannot describe, `valid` stays false and every backend keeps
+// the spec path.
+
+static jit_drive_layout_t drive_layout;
+
+static bool drive_layout_probe(const void *obj, size_t size, int32_t *off,
+                               uint8_t *mask)
+{
+   const uint8_t *p = obj;
+   for (size_t i = 0; i < size; i++) {
+      if (p[i] != 0) {
+         // Exactly one bit in exactly one byte
+         if (__builtin_popcount(p[i]) != 1)
+            return false;
+         for (size_t j = i + 1; j < size; j++) {
+            if (p[j] != 0)
+               return false;
+         }
+         *off = i;
+         *mask = p[i];
+         return true;
+      }
+   }
+
+   return false;
+}
+
+__attribute__((constructor))
+static void drive_layout_init(void)
+{
+   jit_drive_layout_t *l = &drive_layout;
+
+   rt_source_t src;
+   memset(&src, '\0', sizeof(src));
+   src.fastqueued = 1;
+   if (!drive_layout_probe(&src, sizeof(src), &l->source_bits,
+                           &l->source_fastqueued_mask))
+      return;
+
+   memset(&src, '\0', sizeof(src));
+   src.was_active = 1;
+   int32_t wa_off;
+   if (!drive_layout_probe(&src, sizeof(src), &wa_off,
+                           &l->source_was_active_mask))
+      return;
+   else if (wa_off != l->source_bits)
+      return;   // Both flags must share one byte for the RMW sequence
+
+   rt_wakeable_t wake;
+   memset(&wake, '\0', sizeof(wake));
+   wake.postponed = 1;
+   if (!drive_layout_probe(&wake, sizeof(wake), &l->wakeable_bits,
+                           &l->wakeable_postponed_mask))
+      return;
+
+   l->model_var         = &__model;
+   l->par_active_var    = (void *)&g_par_active;
+   l->trace_var         = (void *)&__trace_on;
+   l->fast_driver_fn    = (void *)async_fast_driver;
+
+   l->signal_shared     = offsetof(rt_signal_t, shared);
+   l->signal_nexus      = offsetof(rt_signal_t, nexus);
+   l->shared_flags      = offsetof(sig_shared_t, flags);
+   l->nexus_flags       = offsetof(rt_nexus_t, flags);
+   l->nexus_size        = offsetof(rt_nexus_t, size);
+   l->nexus_n_sources   = offsetof(rt_nexus_t, n_sources);
+   l->nexus_width       = offsetof(rt_nexus_t, width);
+   l->nexus_active_delta = offsetof(rt_nexus_t, active_delta);
+   l->nexus_sources     = offsetof(rt_nexus_t, sources);
+
+   l->source_when       = offsetof(rt_source_t, u.driver.waveforms.when);
+   l->source_value      = offsetof(rt_source_t, u.driver.waveforms.value);
+
+   l->model_now          = offsetof(rt_model_t, now);
+   l->model_iteration    = offsetof(rt_model_t, iteration);
+   l->model_next_is_delta = offsetof(rt_model_t, next_is_delta);
+   l->model_probe_member = offsetof(rt_model_t, fastclk_probe_member);
+   l->model_thread0      = offsetof(rt_model_t, threads);
+   l->thread_active_obj  = offsetof(model_thread_t, active_obj);
+
+   l->driverq_tasks     = offsetof(rt_model_t, driverq)
+      + offsetof(deferq_t, tasks);
+   l->driverq_count     = offsetof(rt_model_t, driverq)
+      + offsetof(deferq_t, count);
+   l->driverq_max       = offsetof(rt_model_t, driverq)
+      + offsetof(deferq_t, max);
+   l->task_size         = sizeof(defer_task_t);
+   l->task_fn           = offsetof(defer_task_t, fn);
+   l->task_arg          = offsetof(defer_task_t, arg);
+
+   l->net_f_fast_driver = NET_F_FAST_DRIVER;
+
+   // The emitted fast path assumes the model thread is the only thread
+   // scheduling drivers outside a g_par_active window and stores the value
+   // as a full 8-byte qword (copy_value_ptr's small-value behaviour)
+   STATIC_ASSERT(sizeof(rt_value_t) == 8);
+   STATIC_ASSERT(sizeof(delta_cycle_t) == 2);
+   STATIC_ASSERT(sizeof(net_flags_t) == 1);
+   STATIC_ASSERT(sizeof(((rt_model_t *)0)->next_is_delta) == 1);
+   STATIC_ASSERT(sizeof(((rt_model_t *)0)->iteration) == 4);
+   STATIC_ASSERT(sizeof(((rt_model_t *)0)->now) == 8);
+   STATIC_ASSERT(sizeof(((rt_model_t *)0)->fastclk_probe_member) == 4);
+   STATIC_ASSERT(sizeof(((deferq_t *)0)->count) == 4);
+   STATIC_ASSERT(sizeof(((rt_nexus_t *)0)->width) == 4);
+   STATIC_ASSERT(sizeof(((sig_shared_t *)0)->flags) == 4);
+   STATIC_ASSERT(sizeof(((waveform_t *)0)->when) == 8);
+
+#if !RT_MULTITHREADED
+   l->valid = true;
+#endif
+}
+
+const jit_drive_layout_t *jit_drive_layout(void)
+{
+   return &drive_layout;
+}
+
 void x_transfer_signal(sig_shared_t *target_ss, uint32_t toffset,
                        sig_shared_t *source_ss, uint32_t soffset,
                        int32_t count, int64_t after, int64_t reject)
