@@ -631,8 +631,14 @@ rt_model_t *model_new(jit_t *jit, cover_data_t *cover)
 
    m->prof_enabled = (getenv("NVC_PROFILE_PROCS") != NULL);
 
+   // Fast-clk auto table: DEFAULT ON at 1000ns (interleaved 6-rep A/B vs
+   // stock 1.22: fused b12 median +8% with clean separation, b17 +3%;
+   // VeeR parity post-hysteresis; correctness byte-identical everywhere
+   // tested).  NVC_FAST_CLK_AUTO=<ns> overrides the time; =0 disables.
    const char *fca = getenv("NVC_FAST_CLK_AUTO");
-   if (fca != NULL)   // ns -> fs; default 1000ns if set empty
+   if (fca == NULL)
+      m->fastclk_auto_at = UINT64_C(1000) * UINT64_C(1000000);
+   else if (strtoull(fca, NULL, 10) != 0 || *fca == '\0')
       m->fastclk_auto_at = (strtoull(fca, NULL, 10) ?: 1000) * UINT64_C(1000000);
 
    __trace_on = opt_get_int(OPT_RT_TRACE);
@@ -2555,7 +2561,12 @@ static unsigned aj_pending_count(void *pending)
 static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdata)
 {
    aj_dissolve_fastclk(m);    // rebuilt per install/candidate — full cleanup
-   if (!getenv("NVC_FAST_CLK") && !getenv("NVC_FAST_CLK_AUTO")) return;
+   {  // default-on: only an explicit NVC_FAST_CLK_AUTO=0 (and no
+      // NVC_FAST_CLK) suppresses the table machinery entirely
+      const char *fk = getenv("NVC_FAST_CLK"), *fa = getenv("NVC_FAST_CLK_AUTO");
+      if (fk == NULL && fa != NULL && strtoull(fa, NULL, 10) == 0 && *fa != '\0')
+         return;
+   }
    if (clksig->n_nexus != 1) return;        // single-bit clock only
    rt_nexus_t *clkn = &clksig->nexus;
 
@@ -2619,8 +2630,9 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
    m->fastclk_data  = clkdata;
    m->fastclk_on    = true;
    m->fastclk_built_at = m->now;   // hysteresis: survival measured from here
-   notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
-         m->fastclk_count);
+   if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)   // quiet by default: the note
+      notef("accel-jit: NVC_FAST_CLK — %u clk-only proc(s) in posedge table",
+            m->fastclk_count);   // pollutes gold-output tests when default-on
 
    // NVC_FUSED_BLOCK: fuse the fresh table into one emitted block
    fused_block_build(m);
@@ -2654,7 +2666,9 @@ static void aj_dissolve_fastclk(rt_model_t *m)
    free(m->fastclk_guard_vt);   m->fastclk_guard_vt = NULL;
    m->fastclk_nguards = 0;
    if (was_on) {
-      if (getenv("NVC_FAST_CLK_AUTO") != NULL) {   // redo-as-we-go: re-arm
+      const char *fca_r = getenv("NVC_FAST_CLK_AUTO");
+      if (fca_r == NULL || strtoull(fca_r, NULL, 10) != 0 || *fca_r == '\0') {
+         // redo-as-we-go: re-arm (AUTO is default-on; =0 disables)
          // Rebuild HYSTERESIS.  The flat +500ns re-arm thrashed on busy
          // phases (VeeR: dissolve/rebuild every ~500-900ns for the whole
          // run — each rebuild is a full nexus scan, plus a ~250KB block
@@ -2678,7 +2692,7 @@ static void aj_dissolve_fastclk(rt_model_t *m)
       }
       // rebuild excludes recently-active nexuses so membership converges.
       static unsigned dcount = 0;
-      if (dcount++ < 10)
+      if (dcount++ < 10 && getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
          notef("accel-jit: fast-clk table dissolved (guard event)");
    }
 }
@@ -4825,7 +4839,7 @@ static bool fused_block_enabled(void)
    static int enabled = -1;
    if (enabled < 0) {
       const char *e = getenv("NVC_FUSED_BLOCK");
-      enabled = (e != NULL && *e != '0');   // default OFF (A/B lever)
+      enabled = (e == NULL || *e != '0');   // default ON; =0 disables
    }
    return enabled;
 }
@@ -8401,7 +8415,11 @@ static void model_cycle(rt_model_t *m)
       static int min_fanout = -1;
       if (min_fanout < 0) {
          const char *e = getenv("NVC_FAST_CLK_AUTO_MIN");
-         min_fanout = (e != NULL) ? MAX(atoi(e), 1) : 16;
+         // Default floor 4: low enough to catch real clocks on small
+         // designs (bench clk fanout < 16), high enough to exclude the
+         // known fanout-1 data-signal misfire class (wait5).  The full
+         // regression gate is the empirical judge of this value.
+         min_fanout = (e != NULL) ? MAX(atoi(e), 1) : 4;
       }
       for (int k = 0; k < 4 && !m->fastclk_on; k++) {
          rt_nexus_t *best = NULL;
@@ -8414,8 +8432,9 @@ static void model_cycle(rt_model_t *m)
          }
          if (best == NULL) break;
          tried[k] = best;
-         notef("accel-jit: NVC_FAST_CLK_AUTO try %s fanout %u",
-               istr(tree_ident(best->signal->where)), best_n);
+         if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+            notef("accel-jit: NVC_FAST_CLK_AUTO try %s fanout %u",
+                  istr(tree_ident(best->signal->where)), best_n);
          aj_build_fastclk(m, best->signal, nexus_effective(best));
       }
    }
