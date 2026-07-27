@@ -325,6 +325,8 @@ static void clear_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void reset_scope(rt_model_t *m, rt_scope_t *s);
 static void async_run_process(rt_model_t *m, void *arg);
+static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
+                     void *arg);
 static void evproc_shutdown(void);
 static void async_update_property(rt_model_t *m, void *arg);
 static void async_update_driver(rt_model_t *m, void *arg);
@@ -1220,9 +1222,12 @@ static void reset_process(rt_model_t *m, rt_proc_t *proc)
    thread->active_obj = NULL;
    thread->active_scope = NULL;
 
-   // Schedule the process to run immediately
-   set_pending(m, &proc->wakeable);
-   deferq_do(&m->procq, async_run_process, proc);
+   // Schedule the process to run immediately.  Route through procq_do so a
+   // POSTPONED process lands in the postponed queue: LRM 08 section 14.7.5.1
+   // requires every nonpostponed process to run to suspension before any
+   // postponed process during initialisation, and the resumption path has
+   // always honoured that -- only this first activation did not.
+   procq_do(m, &proc->wakeable, async_run_process, proc);
 }
 
 static void reset_property(rt_model_t *m, rt_prop_t *prop)
