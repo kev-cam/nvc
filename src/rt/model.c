@@ -1963,6 +1963,7 @@ typedef struct {
    rt_signal_t *sig;         // output: driven signal
    int          width;
    int          elem;
+   char         name[64];    // port name (X/Z detection names the offender)
 } aj_bpin_t;
 
 struct _aj_chunk {
@@ -2311,6 +2312,57 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
 {
    rt_model_t *m = g_aj_model;
    aj_chunk_t *c = g_aj_cur_chunk[thread_id()];
+
+   // NVC_ACCEL_OUT_TRACE=<n>: log the first <n> output pushes -- ordinal, sim
+   // time, delta, the edge/cone-class flags and the packed value -- so
+   // "was this net ever deposited, and with what?" is answered by evidence
+   // rather than inference. The t=0 seed pass shows up as delta 0xffffffff.
+   // NVC_ACCEL_OUT_TRACE_ORD/_FROM narrow it to one output / one start time.
+   {  static int _ot = -1, _oord = -2; static long long _ofrom = -1;
+      static long _n = 0;
+      if (_ot < 0) { const char *e = getenv("NVC_ACCEL_OUT_TRACE");
+                     _ot = e ? atoi(e) : 0;
+                     const char *o = getenv("NVC_ACCEL_OUT_TRACE_ORD");
+                     _oord = o ? atoi(o) : -2;
+                     const char *f = getenv("NVC_ACCEL_OUT_TRACE_FROM");
+                     _ofrom = f ? atoll(f) : -1; }
+      if (_ot > 0 && _n < _ot && (_oord == -2 || _oord == ord)
+          && (_ofrom < 0 || (m != NULL && (long long)m->now >= _ofrom))) {
+         _n++;
+         // Byte STRIDE is the port's element size, not 1: a logic3d/std_logic
+         // element is 4 bytes wide, so bit b lives at buf[(width-1-b)*elem].
+         // Decoding with stride 1 reads the padding and every wide value comes
+         // out 0 -- a trace artefact that looks exactly like "the chunk computes
+         // zero". Recover elem from the defer table (valuesz = width*elem).
+         int esz0 = 1;
+         if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
+             && width > 0)
+            esz0 = (int)(c->defer_outs[ord].valuesz / width);
+         if (esz0 < 1) esz0 = 1;
+         const unsigned char *p2 = buf;
+         uint64_t v = 0;
+         for (int b = 0; b < width && b < 64; b++)
+            if (p2[(size_t)(width - 1 - b) * esz0] & 1) v |= (uint64_t)1 << b;
+         // Also decode the net's CURRENT interpreter-side bytes. In VERIFY mode
+         // the interpreter still drives, so this column is the reference
+         // timeline for the same net at the same (t,delta) -- the thing the
+         // driving run has to be compared against. `e` is the per-element byte
+         // stride (defer_outs[ord].valuesz / width when the table is built).
+         uint64_t iv = 0;
+         const unsigned char *ip =
+            (sigp != NULL) ? ((rt_signal_t *)sigp)->shared.data : NULL;
+         const int esz = esz0;
+         if (ip != NULL)
+            for (int b = 0; b < width && b < 64; b++)
+               if (ip[(size_t)(width - 1 - b) * esz] & 1) iv |= (uint64_t)1 << b;
+         fprintf(stderr, "#AJOUT ord=%d t=%llu d=%u w=%d pe=%d val=0x%llx "
+                 "net=0x%llx chunk=%s\n", ord,
+                 (unsigned long long)(m ? m->now : 0),
+                 m ? m->iteration : 0, width, posedge,
+                 (unsigned long long)v, (unsigned long long)iv,
+                 (c != NULL && c->rs_top != NULL) ? c->rs_top : "?");
+      }
+   }
 
    // NVC_ACCEL_VERIFY: passive check — the interpreter drives the net; compare the
    // accel bytes against its settled value and report the first divergence per
@@ -3108,6 +3160,96 @@ int accel_demote(rt_model_t *m, const char *tok)
          n++;
    }
    return n;
+}
+
+// ---------------------------------------------------------------------------
+// X/Z FALLBACK: the .so's demote REQUEST (GAP 2)
+//
+// The value-plane engine models 2 states. Its bridge now marks aj_cs->x_seen
+// the moment a boundary input byte is not driven-certain (aj_scan_inputs), and
+// exports that through the optional accel_x_seen symbol. This poll is the
+// model's half: at the SETTLED end-of-time-step safe point (beside the
+// NVC_ACCEL_DEMOTE_AT hook and the fork checkpoint — state settled, after
+// can_create_delta so a writeback may legally open the next delta at this
+// time), read every chunk's flag and, if the action is armed, hand the chunk
+// back to the interpreter through the existing aj_chunk_demote machinery.
+//
+// DETECTION IS ALWAYS ON; THE ACTION IS NOT. nvc's certainty-0 init doctrine
+// means every signal powers on uncertain and reset pulses legitimately drive
+// X, so an always-on demote would fire in the first delta and disable accel
+// entirely. NVC_ACCEL_XDEMOTE=1 arms the action; NVC_ACCEL_XDEMOTE_AFTER=<time>
+// additionally ignores (and re-arms past) hits before that sim time, which is
+// what makes "power-on U" distinguishable from "a real X appeared mid-run".
+static int   g_aj_xdemote = -1;    // -1 = unparsed, 0 = detect only, 1 = act
+static int64_t g_aj_xarm  = 0;     // fs; hits before this are cleared, not acted on
+static bool  g_aj_have_xdet = false;   // any installed .so exports the detector
+static int   g_aj_xnote = 0;       // report sightings (JIT_DEBUG, or acting)
+
+static void aj_xseen_poll(rt_model_t *m)
+{
+   if (g_aj_xdemote < 0) {
+      const char *e = getenv("NVC_ACCEL_XDEMOTE");
+      g_aj_xdemote = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0);
+      const char *a = getenv("NVC_ACCEL_XDEMOTE_AFTER");
+      if (a != NULL && a[0] != '\0') {
+         int64_t t = parse_fork_time(a);
+         if (t < 0) {   // bare number = ns, as NVC_ACCEL_DEMOTE_AT
+            char *end = NULL;
+            unsigned long long v = strtoull(a, &end, 10);
+            t = (*a != '\0' && end != NULL && *end == '\0')
+               ? (int64_t)v * 1000000 : -1;
+         }
+         if (t < 0)
+            warnf("cannot parse NVC_ACCEL_XDEMOTE_AFTER='%s' (want e.g. 200ns)",
+                  a);
+         else
+            g_aj_xarm = t;
+      }
+      // Detection is always live, but a sighting is only WORTH a line when it
+      // explains something: the user asked for JIT debug, or it is about to
+      // change behaviour.
+      g_aj_xnote = g_aj_xdemote || getenv("NVC_ACCEL_JIT_DEBUG") != NULL;
+   }
+
+   const bool armed = m->now >= (uint64_t)g_aj_xarm;
+
+   // downwards: aj_chunk_demote removes the chunk from m->aj_chunks and frees
+   // it, so nothing below the current index shifts under us and `c` is dead
+   // the instant the demote succeeds.
+   for (int ci = (int)m->aj_chunk_count - 1; ci >= 0; ci--) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      if (c->x_seen_fn == NULL || c->state == NULL) continue;
+      if (!(*c->x_seen_fn)(c->state)) continue;
+
+      if (!armed) {
+         // Pre-arm sighting: re-arm the detector so the report names the FIRST
+         // post-arm event rather than power-on U.
+         if (c->x_clear_fn != NULL) (*c->x_clear_fn)(c->state);
+         continue;
+      }
+
+      unsigned hits = 0, pin = 0;
+      if (c->x_info_fn != NULL) (*c->x_info_fn)(c->state, &hits, &pin);
+      const char *pname = "?";
+      if (pin > 0 && c->b_in != NULL && (int)pin <= c->n_bin)
+         pname = c->b_in[pin - 1].name;
+
+      if (!c->x_reported && g_aj_xnote) {
+         c->x_reported = true;
+         notef("accel-jit: X/Z at accel boundary of '%s' — input '%s' "
+               "(bridge ordinal %u) not driven-certain, %u hit(s), first seen "
+               "at or before %s%s",
+               c->rs_top != NULL ? c->rs_top : "?", pname,
+               pin > 0 ? pin - 1 : 0, hits, trace_time(m->now),
+               g_aj_xdemote ? " — demoting" : " (detect only; set "
+               "NVC_ACCEL_XDEMOTE=1 to fall back to the interpreter)");
+      }
+
+      if (!g_aj_xdemote) continue;
+      if (c->x_demote_tried) continue;   // a decline is permanent — don't spam
+      c->x_demote_tried = true;
+      aj_chunk_demote(m, c);             // c is freed on success
+   }
 }
 
 static bool aj_blacklisted(rt_model_t *m, rt_nexus_t *n)
@@ -4099,11 +4241,19 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // writes this chunk's in_live directly — the logic3d bytes never change so
    // the raw-shadow memcmp can't see it. o_prev: previous packed outputs, gates
    // the poke (poke-on-change = fixpoint termination on cross-chunk comb loops).
+   // x_seen/x_hits/x_pin: BOUNDARY UNCERTAINTY (the value-plane engine models
+   // 2 states, so an input byte that is not driven-certain is data the model
+   // CANNOT represent). Set by aj_scan_inputs' repack loop (one XOR per
+   // changed input bit, zero cost on an unchanged pin); read by the model
+   // through the optional accel_x_seen accessor, which is how a .so asks to be
+   // demoted. x_seen is sticky; x_hits counts every scan that saw uncertainty;
+   // x_pin is the bridge ordinal (+1) of the first offender.
    if (nck == 0)
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0;"
                  " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
                  " outputs_t o_prev;"
+                 " unsigned char x_seen; unsigned short x_pin; unsigned x_hits;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", raw_total);
    else
       // per-extra-clock last value, for value-edge detection across deltas.
@@ -4116,6 +4266,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  "%s"
                  " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
                  " outputs_t o_prev;"
+                 " unsigned char x_seen; unsigned short x_pin; unsigned x_hits;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck,
               has_late ? " state_t snapS; inputs_t snapIn;"
                          " unsigned char late_pend;" : "",
@@ -4203,12 +4354,14 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
                  " aj_cs->shadow_valid = 0; aj_cs->ext_chg = 0;"
+                 " aj_cs->x_seen = 0; aj_cs->x_pin = 0; aj_cs->x_hits = 0;"
                  " memset(&aj_cs->o_prev, 0, sizeof aj_cs->o_prev);"
                  " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live); }\n\n");
    else
       fprintf(f, "void accel_reset(void *p){ aj_cs_t *aj_cs = p;"
                  " sm_reset(&S); last_t = -1; aj_cs->clk_last0 = 0;"
                  " aj_cs->shadow_valid = 0; aj_cs->ext_chg = 0;"
+                 " aj_cs->x_seen = 0; aj_cs->x_pin = 0; aj_cs->x_hits = 0;"
                  " memset(&aj_cs->o_prev, 0, sizeof aj_cs->o_prev);"
                  " memset(&aj_cs->in_live, 0, sizeof aj_cs->in_live);"
                  "%s"
@@ -4251,6 +4404,43 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // `in` resolves to the PERSISTENT packed inputs in chunk state. Emitted
    // after the model #include so the model's own `in` parameters are untouched.
    fprintf(f, "#define in (aj_cs->in_live)\n");
+   // X/Z BOUNDARY DETECTION (GAP 1). The repack loop keeps only bit 0 of each
+   // logic3d/std_logic element, so the driven/uncertain planes are dropped and
+   // nothing downstream can ever see an X. The test is one compare against the
+   // port's OWN '0' position: a byte is DRIVEN-CERTAIN iff (byte>>1)==(base>>1).
+   //   logic3d  base=2: L3D_0=2,L3D_1=3 -> 1 (pass); Z=4,W=5 -> 2; X=6,U=7 -> 3
+   //   std_logic base=2: '0'=2,'1'=3   -> 1 (pass); U=0,X=1 -> 0; Z=4,W=5 -> 2;
+   //                                      L=6,H=7 -> 3; '-'=8 -> 4
+   //   BIT/BOOLEAN base=0: only 0,1 exist, both >>1 == 0 == base>>1 — the test
+   //     can never fire, so it is NOT EMITTED at all for those ports.
+   // CAVEAT (measured, not assumed): the test is "driven AND certain", so the
+   // weak-but-known states ('L'/'H', L3D_L/L3D_H) also trip it even though
+   // their value bit IS faithful. That is conservative — over-detection can
+   // only cost accel, never correctness — and the raw byte is reported so a
+   // weak-drive hit is distinguishable from a real X.
+   // NVC_ACCEL_NO_XDET: emit the ORIGINAL repack loop (no detection, no
+   // accessors, so the model's poll disappears too). The A/B control for
+   // measuring what the detection costs, and the escape hatch if it ever
+   // does. Clear the .so cache when toggling — the cache key is the DUT
+   // logic, not the bridge text.
+   const bool no_xdet = getenv("NVC_ACCEL_NO_XDET") != NULL;
+   if (!no_xdet) {
+      fprintf(f, "static int g_xdbg = -1;\n");
+      fprintf(f, "static void aj_x_first(aj_cs_t *aj_cs, void **AJB, int _ord,"
+                 " const char *_nm, const unsigned char *_p, int _w, int _e,"
+                 " unsigned _xb){\n"
+                 "  unsigned _raw = 0;\n"
+                 "  for(int b=0;b<_w;b++){ unsigned _v=_p[b*_e];"
+                 " if((_v>>1)!=_xb){ _raw=_v; break; } }\n"
+                 "  aj_cs->x_seen = 1; aj_cs->x_pin = (unsigned short)(_ord+1);\n"
+                 "  if(g_xdbg<0) g_xdbg = getenv(\"NVC_ACCEL_JIT_DEBUG\")?1:0;\n"
+                 "  if(g_xdbg>0){ unsigned _d; long long _t = NOW(MDL,&_d);\n"
+                 "    fprintf(stderr, \"#AJX %%s: input '%%s' (ordinal %%d) not"
+                 " driven-certain, raw byte %%u, at %%lld fs delta %%u\\n\","
+                 " \"%s\", _nm, _ord, _raw, _t, _d); }\n"
+                 "}\n",
+              chunk->rs_top != NULL ? chunk->rs_top : "accel chunk");
+   }
    // aj_scan_inputs: apply the CURRENT delta's boundary values to the
    // persistent packed inputs (translate-on-change against the raw shadow).
    // A FUNCTION so the caller controls WHEN this delta's inputs become
@@ -4319,20 +4509,54 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                        " memcpy(aj_cs->raw_shadow+%zu,p,%zu);%s\n",
                     bridged_in, bridged_in, raw_off, nb, raw_off, nb,
                     is_ck ? "" : " _chg=1;");
+         // X/Z detection folded into the repack: _xa accumulates
+         // (byte>>1)^(base>>1) over the bits this pin just changed — branchless,
+         // one XOR+OR per changed bit, and nothing at all for an unchanged pin
+         // (the memcmp gate above already short-circuits). Ports whose type
+         // cannot express an uncertain value (BIT/BOOLEAN, base<2) emit the
+         // original loop unchanged.
+         const bool xdet = pins[i].base >= 2 && !no_xdet;
+         const unsigned xb = (unsigned)pins[i].base >> 1;
          if (pins[i].width > 64) {
             // Wide port: gen_statemachine declares in._<name> as a uint32_t[N]
             // limb array; place each bit in its limb.
             const int nl = (pins[i].width + 31) / 32;
-            fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
-                       " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
-                       " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } } }\n",
-                    nl, pins[i].name, pins[i].width, pins[i].width,
-                    pins[i].name, pins[i].elem);
+            if (xdet)
+               fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
+                          " unsigned _xa=0;"
+                          " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
+                          " unsigned _v=p[b*%d]; _xa|=(_v>>1)^%uu;"
+                          " in._%s[_bp>>5]|=(uint32_t)(_v&1)<<(_bp&31); }"
+                          " if(_xa){ aj_cs->x_hits++;"
+                          " if(!aj_cs->x_seen)"
+                          " aj_x_first(aj_cs,AJB,%d,\"%s\",p,%d,%d,%uu); } } }\n",
+                       nl, pins[i].name, pins[i].width, pins[i].width,
+                       pins[i].elem, xb, pins[i].name,
+                       bridged_in, pins[i].name, pins[i].width, pins[i].elem, xb);
+            else
+               fprintf(f, "    for(int _l=0;_l<%d;_l++) in._%s[_l]=0;"
+                          " for(int b=0;b<%d;b++){ int _bp=%d-1-b;"
+                          " in._%s[_bp>>5]|=(uint32_t)(p[b*%d]&1)<<(_bp&31); } } }\n",
+                       nl, pins[i].name, pins[i].width, pins[i].width,
+                       pins[i].name, pins[i].elem);
          } else {
-            fprintf(f, "    uint64_t v=0;"
-                       " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b);"
-                       " in._%s=v; } }\n",
-                    pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
+            if (xdet)
+               fprintf(f, "    uint64_t v=0; unsigned _xa=0;"
+                          " for(int b=0;b<%d;b++){ unsigned _v=p[b*%d];"
+                          " _xa|=(_v>>1)^%uu;"
+                          " v|=(uint64_t)(_v&1)<<(%d-1-b); }"
+                          " in._%s=v;"
+                          " if(_xa){ aj_cs->x_hits++;"
+                          " if(!aj_cs->x_seen)"
+                          " aj_x_first(aj_cs,AJB,%d,\"%s\",p,%d,%d,%uu); } } }\n",
+                       pins[i].width, pins[i].elem, xb, pins[i].width,
+                       pins[i].name, bridged_in, pins[i].name, pins[i].width,
+                       pins[i].elem, xb);
+            else
+               fprintf(f, "    uint64_t v=0;"
+                          " for(int b=0;b<%d;b++) v|=(uint64_t)(p[b*%d]&1)<<(%d-1-b);"
+                          " in._%s=v; } }\n",
+                       pins[i].width, pins[i].elem, pins[i].width, pins[i].name);
          }
       }
       bin_pin[bridged_in] = i;
@@ -4349,6 +4573,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          aj_pin_t *pp = &pins[bin_pin[bi]];
          chunk->b_in[bi] = (aj_bpin_t){ .data = pp->data, .sig = pp->sig,
                                         .width = pp->width, .elem = pp->elem };
+         snprintf(chunk->b_in[bi].name, sizeof chunk->b_in[bi].name,
+                  "%s", pp->name);
       }
    }
    fprintf(f, "  return _chg;\n}\n\n");
@@ -4824,6 +5050,24 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "  fprintf(stderr, \"#AJVD\\n\");\n");
    fprintf(f, "  sm_dump_comb(&S, &(aj_cs->in_live), stderr); }\n");
    fprintf(f, "#endif\n");
+   // THE DEMOTE REQUEST (GAP 2). Optional symbols, dlsym'd NULL-tolerantly at
+   // install exactly like accel_dump/accel_in_addr — no AJB slot is taken, so
+   // the fixed indices (FORCE/NOW/MDL/AJ_OUT/CLK/RST, then IN_ADDR/OUT_SIG)
+   // are untouched and a stale cached .so simply reports "no detector".
+   //   accel_x_seen  — 1 once a boundary input carried an uncertain value
+   //   accel_x_info  — hit count + first offending bridge ordinal (+1)
+   //   accel_x_clear — re-arm (used by the model to ignore hits before
+   //                   NVC_ACCEL_XDEMOTE_AFTER; power-on U is not a defect)
+   if (!no_xdet) {
+      fprintf(f, "int accel_x_seen(void *p){ aj_cs_t *aj_cs = p;"
+                 " return aj_cs->x_seen; }\n");
+      fprintf(f, "void accel_x_info(void *p, unsigned *hits, unsigned *pin){"
+                 " aj_cs_t *aj_cs = p;"
+                 " if(hits) *hits = aj_cs->x_hits;"
+                 " if(pin) *pin = aj_cs->x_pin; }\n");
+      fprintf(f, "void accel_x_clear(void *p){ aj_cs_t *aj_cs = p;"
+                 " aj_cs->x_seen = 0; aj_cs->x_pin = 0; }\n");
+   }
    fprintf(f, "void *accel_in_addr(void *p, int _iord, unsigned long *nb){\n");
    fprintf(f, "  aj_cs_t *aj_cs = p;\n  switch(_iord){\n");
    fprintf(f, "  case -1: return &aj_cs->ext_chg;\n");
@@ -5190,6 +5434,10 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    //    baked bridge (builds the chunk's deferred-output table) and compile.
    aj_chunk_t *chunk = aj_chunk_new(m);
    chunk->scope   = scope;
+   // Named BEFORE the bridge is emitted: the emitted X/Z sighting message bakes
+   // the chunk name in as a literal (it used to read "accel chunk" because
+   // rs_top was only filled in after the dlopen below).
+   chunk->rs_top  = xstrdup(top);
    chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 4, sizeof(void *));
    aj_build_fastclk(m, clk.sig, clk.data);
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
@@ -5235,12 +5483,19 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    chunk->eval  = eval;
    chunk->reset = reset;
    chunk->dl    = dl;
+   // X/Z detector: OPTIONAL symbols (a .so cached before this existed simply
+   // has none — no AJB slot, no version check, no failure mode). The state
+   // layout is identical across the respec swap, so the generic .so's
+   // accessors keep reading the live state correctly after chunk->eval moves.
+   chunk->x_seen_fn  = dlsym(dl, "accel_x_seen");
+   chunk->x_info_fn  = dlsym(dl, "accel_x_info");
+   chunk->x_clear_fn = dlsym(dl, "accel_x_clear");
+   if (chunk->x_seen_fn != NULL) g_aj_have_xdet = true;
    chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
    // keep the emission inputs for post-link respecialization (re-emit the
    // bridge with the link results baked in, compile, swap eval)
    chunk->rs_bridge = xstrdup(bridge);
    chunk->rs_dutc   = xstrdup(dutc);
-   chunk->rs_top    = xstrdup(top);
    chunk->rs_pins   = xmalloc_array(npins > 0 ? npins : 1, sizeof(aj_pin_t));
    memcpy(chunk->rs_pins, pins, (npins > 0 ? npins : 1) * sizeof(aj_pin_t));
    chunk->rs_npins  = npins;
@@ -5555,7 +5810,12 @@ void accel_auto(rt_model_t *m)
    // comb eval once (clk is low at t=0 => the bridge takes the sm_comb path and
    // deposits reset-state outputs), mirroring the interpreter's initial settle.
    // VERIFY mode never reroutes, so it needs no seeding.
-   if (!g_aj_verify) {
+   // NVC_ACCEL_NO_SEED: bisection knob (mirrors NVC_ACCEL_NO_SETTLE /
+   // NVC_ACCEL_NO_FORCE). Skipping the t=0 seed reproduces, on demand, the
+   // pre-6d47cb570 symptom -- an accel output net that is never deposited
+   // before the first clock edge, so a reader sampling it on that edge
+   // captures 'U'. Y=0 plus "TO_INTEGER metavalue detected".
+   if (!g_aj_verify && getenv("NVC_ACCEL_NO_SEED") == NULL) {
       const int tid = thread_id();
       model_thread_t *thread = model_thread(m);
       rt_wakeable_t *save_obj   = thread->active_obj;
@@ -10570,6 +10830,12 @@ fastclk_done:;
          g_aj_demoted = true;   // one-shot, even if some chunks decline
          accel_demote(m, NULL);
       }
+
+      // X/Z FALLBACK: same settled safe point — a chunk whose boundary went
+      // uncertain asks (via accel_x_seen) to be handed back to the interpreter.
+      // Detection is always compiled in; the ACTION needs NVC_ACCEL_XDEMOTE=1.
+      if (unlikely(g_aj_have_xdet) && m->aj_chunk_count > 0)
+         aj_xseen_poll(m);
    }
    else if (m->stop_delta > 0 && m->iteration == m->stop_delta)
       reached_iteration_limit(m);
