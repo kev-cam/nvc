@@ -2016,6 +2016,22 @@ struct _aj_chunk {
       const rt_proc_vtable_t *vt;
    }               *rr_saved;
    unsigned         rr_count, rr_max;
+   // CLOCK SUBSCRIPTION (see aj_subscribe_clocks). The bridge derives its edges
+   // by SAMPLING the bound clock bytes, so it is only correct if the chunk is
+   // actually evaluated in the delta where a clock transitions. Rerouting kills
+   // the internal activity that used to wake the subtree's procs, so these are
+   // the signals we must explicitly stay sensitive to: the main clk plus every
+   // sm_extra_clocks[] input.
+   rt_signal_t     *ck_sigs[17];
+   int              n_ck_sigs;
+   // X/Z FALLBACK (GAP 2): the .so's optional detector accessors. NULL when
+   // the .so predates the detector (stale ~/.cache/nvc/accel build) — every
+   // use is NULL-tolerant, exactly like accel_dump/accel_in_addr.
+   int            (*x_seen_fn)(void *);
+   void           (*x_info_fn)(void *, unsigned *, unsigned *);
+   void           (*x_clear_fn)(void *);
+   bool             x_reported;      // first-sighting note already emitted
+   bool             x_demote_tried;  // demote attempted (declines are sticky)
 };
 
 static rt_model_t *g_aj_model     = NULL;  // the model (for deposit_signal)
@@ -2631,6 +2647,66 @@ static void aj_reroute(rt_scope_t *scope, aj_chunk_t *chunk)
    }
    for (int ci = 0; ci < scope->children.count; ci++)
       aj_reroute(scope->children.items[ci], chunk);
+}
+
+// Keep a rerouted chunk sensitive to its own clocks.
+//
+// WHY THIS IS REQUIRED FOR CORRECTNESS, not performance. The generated bridge
+// does not receive an edge; it INFERS one by sampling the bound clock bytes at
+// whatever deltas it happens to run:
+//
+//    driving:  posedge = (_clk && t != last_t)          // first eval this
+//                                                       // timestep with clk high
+//    extra ck: rise    = (_n && !aj_cs->ck_last[k])     // vs its LAST sample
+//
+// Both rules are only sound if the chunk is evaluated in the delta where the
+// clock actually transitions. Before the reroute that was incidentally true:
+// the subtree's own processes drove its internal nets, so the subtree was busy
+// every delta. Rerouting replaces every one of those procs with the chunk eval,
+// which deposits ONLY the boundary outputs -- the internal nets go quiet, the
+// mutual wakeups disappear, and the chunk is left waking on boundary-input
+// events alone. Measured on VeeR-EH2 eh2_ifu_ifc_ctl (600ns, one chunk):
+// 58 chunk evals driving vs 2486 in VERIFY, all of them at delta 16..54, none
+// at the delta 0..4 where clk and active_clk actually move. Consequences:
+//
+//   * a timestep with no boundary-input change during clk-high evaluates the
+//     chunk zero times, so `t != last_t` never fires and the clock edge is
+//     SILENTLY DROPPED (t=155ns and 185ns in that run);
+//   * an edge that does fire fires at an arbitrary late delta instead of the
+//     real one, so every value the chunk publishes is a delta (or a cycle) out
+//     of step with the interpreted flops around it;
+//   * a gated/derived clock is worse: active_clk had already settled high by
+//     the chunk's first sample, so `_n && !ck_last` never saw the transition
+//     and its whole register group stopped advancing -- the edge mask degraded
+//     from 0x3 to 0x1 permanently after t=135ns.
+//
+// This is exactly why NVC_ACCEL_VERIFY sees nothing: the companion is stepped
+// every delta AND compiles a different rule (`_clk && !clk_last0`, a real edge
+// detect), so the passive path never executes the broken one. It is also why a
+// structural miter proves the chunk equivalent -- the COMPUTE is right; it is
+// being clocked at the wrong deltas and skipping edges.
+//
+// The fix is to restore the sensitivity the reroute destroyed: subscribe one of
+// the chunk's own rerouted procs to each clock net, so every clock event wakes
+// the chunk in the delta the event happens. `t != last_t` then always fires on
+// the first eval of a clk-high timestep (which is now the clk-event delta), and
+// the extra-clock sampler observes the 0->1 transition it was missing.
+//
+// Cost is bounded: one extra wakeup per clock event per chunk, collapsed by
+// aj_proc_eval's per-(time,delta) dedup into at most one eval.
+static void aj_subscribe_clocks(rt_model_t *m, aj_chunk_t *chunk)
+{
+   if (chunk->rr_count == 0)
+      return;
+   // Any rerouted proc works: they all share the chunk's vtable, so waking any
+   // one of them runs aj_proc_eval for this chunk.
+   rt_wakeable_t *obj = &(chunk->rr_saved[0].proc->wakeable);
+   for (int k = 0; k < chunk->n_ck_sigs; k++) {
+      rt_signal_t *sig = chunk->ck_sigs[k];
+      rt_nexus_t *n = &(sig->nexus);
+      for (unsigned nx = 0; nx < sig->n_nexus; nx++, n = n->chain)
+         sched_event(m, &(n->pending), obj);
+   }
 }
 
 // ---- NVC_FAST_CLK posedge-table dispatch -----------------------------------
@@ -4185,6 +4261,16 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       bool is_ck = strcmp(pins[i].name, "clk") == 0;
       for (int k = 0; k < nck && !is_ck; k++)
          if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
+      // Record every clock INPUT signal for aj_subscribe_clocks (below). This
+      // is the only place that knows which pins are clocks: `clk` by name and
+      // the rest from the model's sm_extra_clocks[] table.
+      if (!spec && is_ck && pins[i].sig != NULL
+          && chunk->n_ck_sigs < (int)ARRAY_LEN(chunk->ck_sigs)) {
+         bool dup = false;
+         for (int k = 0; k < chunk->n_ck_sigs; k++)
+            if (chunk->ck_sigs[k] == pins[i].sig) { dup = true; break; }
+         if (!dup) chunk->ck_sigs[chunk->n_ck_sigs++] = pins[i].sig;
+      }
       // spec + handoff-fed: the pin's logic3d bytes are frozen (deposit
       // bypassed) and the poke is the only writer — emit NOTHING, not even
       // the memcmp. raw_off still advances so aj_cs_t stays layout-identical.
@@ -5016,6 +5102,56 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       }
    }
    if (!have_clk) {
+      // No port literally named `clk`. gen_statemachine keys the MAIN flop
+      // group on the wire whose cname is "_clk"; every other clock net becomes
+      // an EXTRA group that the bridge edge-detects from that clock's own
+      // marshalled input field (`sm_extra_clocks[]`). A design whose clock port
+      // is spelled anything else — `clock` in every ITC'99 circuit — therefore
+      // has ALL of its flops in extra groups, and used to be declined outright
+      // even though the model is perfectly usable.
+      //
+      // Recover structurally (no name guessing): ask the synthesized model
+      // which nets it considers clocks, and adopt the first one that is a
+      // boundary INPUT of this chunk as the CLK pin. It stays in pins[] as an
+      // ordinary marshalled input as well — it must, because the extra-group
+      // edge detect reads `in._<name>`, which only the pin marshalling fills.
+      // (Duplication is harmless: the marshalling loop already classifies an
+      // extra-clock pin as `is_ck` and so does not let it force a re-settle.)
+      char *mtext = aj_read_file(dutc);
+      if (mtext != NULL) {
+         const char *start = strstr(mtext, "const char *sm_extra_clocks[] = {");
+         const char *end   = start ? strchr(start, '}') : NULL;
+         const char *p = start ? start + strlen("const char *sm_extra_clocks[] = {") : NULL;
+         while (p != NULL && end != NULL && !have_clk) {
+            const char *q = strchr(p, '"');
+            if (q == NULL || q >= end) break;
+            const char *e = strchr(q + 1, '"');
+            if (e == NULL || e >= end) break;
+            char nm[64];
+            const int len = (int)(e - q - 1);
+            if (len > 0 && len < (int)sizeof nm) {
+               memcpy(nm, q + 1, len);
+               nm[len] = '\0';
+               // strip a per-bit "__b<N>" suffix: the PORT is the vector wire
+               char *b = strstr(nm, "__b");
+               if (b != NULL && b[3] != '\0'
+                   && strspn(b + 3, "0123456789") == strlen(b + 3))
+                  *b = '\0';
+               for (int i = 0; i < npins; i++) {
+                  if (pins[i].is_output || strcmp(pins[i].name, nm)) continue;
+                  clk = pins[i];
+                  have_clk = true;
+                  notef("accel-jit: '%s' has no 'clk' port — using synthesized "
+                        "clock '%s' as the chunk clock", top, nm);
+                  break;
+               }
+            }
+            p = e + 1;
+         }
+         free(mtext);
+      }
+   }
+   if (!have_clk) {
       notef("accel-jit: no clk port found for '%s' — leaving in nvc", top);
       return false;
    }
@@ -5094,7 +5230,18 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    }
    else {
       aj_reroute(scope, chunk);
-      notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model", top);
+      // The reroute silences the subtree's internal nets, which is what used to
+      // wake it every delta. Re-arm the one sensitivity the bridge's sampled
+      // edge detection cannot do without. NVC_ACCEL_NO_CKSUB disables it as a
+      // bisection knob (mirrors NVC_ACCEL_NO_SETTLE / NO_FORCE / NO_SEED).
+      if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
+         aj_subscribe_clocks(m, chunk);
+      // Say "installed" as well as ACTIVE: the benchmark harnesses detect a
+      // real install with /accel-jit:.*(installed|driving)/, and until now the
+      // only line carrying that word was the VERIFY companion — so a chunk
+      // that installed and drove perfectly was still scored as "declined".
+      notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model "
+            "(accel installed)", top);
       // Dead-output pruning: an output whose consumer-visible nexus has NO
       // readers (empty pending list — wave watchers and processes both live
       // there — and no downstream port) is never observed; clear its bit in
