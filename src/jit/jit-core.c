@@ -1016,6 +1016,11 @@ ident_t jit_get_name(jit_t *j, jit_handle_t handle)
    return jit_get_func(j, handle)->name;
 }
 
+jit_pack_t *jit_get_pack(jit_t *j)
+{
+   return j->pack;
+}
+
 object_t *jit_get_object(jit_t *j, jit_handle_t handle)
 {
    jit_func_t *f = jit_get_func(j, handle);

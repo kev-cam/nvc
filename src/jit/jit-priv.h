@@ -511,7 +511,23 @@ void code_blob_align(code_blob_t *blob, unsigned align);
 void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry);
 void code_blob_mark(code_blob_t *blob, jit_label_t label);
 void code_blob_patch(code_blob_t *blob, jit_label_t label, code_patch_fn_t fn);
-void code_load_object(code_blob_t *blob, const void *data, size_t size);
+
+// Resolver for the loader-patched nvc.* symbol namespace emitted in
+// cacheable mode (persistent JIT cache): returns the address for `name`
+// or NULL if unknown.  Consulted after the fixed runtime symbol table.
+typedef void *(*code_resolve_fn_t)(const char *name, void *ctx);
+
+void code_load_object(code_blob_t *blob, const void *data, size_t size,
+                      code_resolve_fn_t resolve, void *rctx);
+
+// Fail-soft validating prepass for objects read back from the persistent
+// cache (validate-before-mutate): checks every header/offset against
+// `size`, every relocation type against the supported set, and resolves
+// every symbol -- WITHOUT touching any code blob.  Returns false on any
+// doubt so the caller can treat the record as a cache MISS instead of
+// hitting one of code_load_elf's fatal paths.  linux/x86_64 only.
+bool code_object_probe(code_cache_t *code, ident_t name, const void *data,
+                       size_t size, code_resolve_fn_t resolve, void *rctx);
 
 #ifdef DEBUG
 __attribute__((format(printf, 2, 3)))
@@ -525,8 +541,10 @@ void code_blob_print_ir(code_blob_t *blob, jit_ir_t *ir);
 #endif
 
 bool jit_pack_fill(jit_pack_t *jp, jit_t *j, jit_func_t *f);
+bool jit_pack_has(jit_pack_t *jp, ident_t name);
 void jit_pack_put(jit_pack_t *jp, ident_t name, const uint8_t *cpool,
                   const char *strtab, const uint8_t *buf);
+jit_pack_t *jit_get_pack(jit_t *j);
 
 pack_writer_t *pack_writer_new(void);
 void pack_writer_emit(pack_writer_t *pw, jit_t *j, jit_handle_t handle,

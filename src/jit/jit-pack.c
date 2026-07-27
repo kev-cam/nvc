@@ -381,6 +381,11 @@ void jit_pack_free(jit_pack_t *jp)
    free(jp);
 }
 
+bool jit_pack_has(jit_pack_t *jp, ident_t name)
+{
+   return chash_get(jp->funcs, name) != NULL;
+}
+
 void jit_pack_put(jit_pack_t *jp, ident_t name, const uint8_t *cpool,
                   const char *strtab, const uint8_t *buf)
 {

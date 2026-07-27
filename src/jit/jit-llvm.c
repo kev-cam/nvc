@@ -19,6 +19,7 @@
 #include "array.h"
 #include "hash.h"
 #include "ident.h"
+#include "jit/jit-cache.h"
 #include "jit/jit-exits.h"
 #include "jit/jit-priv.h"
 #include "lib.h"
@@ -200,6 +201,15 @@ typedef struct _llvm_obj {
    LLVMTypeRef           fntypes[LLVM_LAST_FN];
    LLVMValueRef          strtab;
    unsigned              opt_hint;
+   // Cacheable emission (persistent JIT cache): per-process values are
+   // materialised as NAMED EXTERNAL GLOBALS resolved by the loader
+   // instead of baked integer immediates.  Same IR semantics, only the
+   // materialisation changes.  The inline closure is recorded in
+   // encounter order for the cache manifest.
+   bool                  cacheable;
+   jit_func_t          **inlined;
+   unsigned              ninlined;
+   unsigned              maxinlined;
 } llvm_obj_t;
 
 typedef struct _cgen_block {
@@ -301,6 +311,19 @@ static LLVMValueRef llvm_ptr(llvm_obj_t *obj, void *ptr)
 {
    return LLVMConstIntToPtr(llvm_intptr(obj, (intptr_t)ptr),
                             obj->types[LLVM_PTR]);
+}
+
+// Cacheable emission: a named external global whose ADDRESS the loader
+// patches (Large code model => movabs + R_X86_64_64, which code_load_elf
+// already applies).  The nvc.* namespace is resolved from a symbol table
+// built out of the loading run's own validated IR (see jit-cache.c).
+static LLVMValueRef cgen_reloc_global(llvm_obj_t *obj, const char *name)
+{
+   LLVMValueRef g = LLVMGetNamedGlobal(obj->module, name);
+   if (g == NULL)
+      g = LLVMAddGlobal(obj->module, obj->types[LLVM_INT8], name);
+
+   return g;
 }
 
 static int cgen_inline_drive_mode(void);
@@ -1210,6 +1233,18 @@ static LLVMValueRef cgen_get_value(llvm_obj_t *obj, cgen_block_t *cgb,
       return llvm_real(obj, value.dval);
    case JIT_ADDR_CPOOL:
       assert(value.int64 >= 0 && value.int64 <= cgb->func->source->cpoolsz);
+      if (obj->cacheable) {
+         // Per-source-function pool symbol: an inlined callee's constant
+         // reads must bind to the CALLEE's cpool, not the caller's (F3)
+         LOCAL_TEXT_BUF tb = tb_new();
+         tb_cat(tb, "nvc.cpool.");
+         tb_istr(tb, cgb->func->source->name);
+         LLVMValueRef base = cgen_reloc_global(obj, tb_get(tb));
+         if (value.int64 == 0)
+            return base;
+         LLVMValueRef indexes[] = { llvm_intptr(obj, value.int64) };
+         return LLVMConstGEP2(obj->types[LLVM_INT8], base, indexes, 1);
+      }
       return llvm_ptr(obj, cgb->func->source->cpool + value.int64);
    case JIT_ADDR_REG:
       {
@@ -1232,12 +1267,44 @@ static LLVMValueRef cgen_get_value(llvm_obj_t *obj, cgen_block_t *cgb,
    case JIT_VALUE_EXIT:
       return llvm_int32(obj, value.exit);
    case JIT_VALUE_HANDLE:
+      if (obj->cacheable && value.handle != JIT_HANDLE_INVALID) {
+         // Handles renumber per run in lazy-compile order: emit a
+         // loader-patched value via nvc.handle.<callee> whose "address"
+         // is the current run's handle biased by +1 so handle 0 is not
+         // mistaken for an unresolved symbol (F2)
+         jit_func_t *hf =
+            jit_get_func(cgb->func->source->jit, value.handle);
+         LOCAL_TEXT_BUF tb = tb_new();
+         tb_cat(tb, "nvc.handle.");
+         tb_istr(tb, hf->name);
+         LLVMValueRef g = cgen_reloc_global(obj, tb_get(tb));
+         LLVMValueRef biased = LLVMBuildPtrToInt(obj->builder, g,
+                                                 obj->types[LLVM_INT32], "");
+         return LLVMBuildSub(obj->builder, biased, llvm_int32(obj, 1), "");
+      }
       return llvm_int32(obj, value.handle);
    case JIT_ADDR_ABS:
+      // irgen only ever emits the null pointer here; non-null values
+      // are declined from cacheable mode by jit_cache_cacheable_ir
+      assert(!obj->cacheable || value.int64 == 0);
       return llvm_ptr(obj, (void *)(intptr_t)value.int64);
    case JIT_ADDR_COVER:
+      // Coverage functions are excluded from the cache pre-cgen (F14)
+      assert(!obj->cacheable);
       return llvm_ptr(obj, jit_get_cover_ptr(cgb->func->source, value));
    case JIT_VALUE_LOCUS:
+      if (obj->cacheable && value.locus != NULL) {
+         // Loci live in per-module object arenas: one symbol per locus
+         // carrying (module, disp), resolved from the loading run's own
+         // IR (F4); locus words STAY in the manifest IR hash
+         ident_t module;
+         ptrdiff_t disp;
+         object_locus(value.locus, &module, &disp);
+         LOCAL_TEXT_BUF tb = tb_new();
+         tb_printf(tb, "nvc.locus.%s:%llx", istr(module),
+                   (unsigned long long)disp);
+         return cgen_reloc_global(obj, tb_get(tb));
+      }
       return llvm_ptr(obj, value.locus);
    default:
       fatal_trace("cannot handle value kind %d", value.kind);
@@ -1400,6 +1467,12 @@ static LLVMValueRef cgen_maybe_inline(llvm_obj_t *obj, jit_func_t *callee)
    if (callee->nirs > INLINE_LIMIT)
       return NULL;
 
+   // A cacheable module must not inline a callee whose IR bakes per-run
+   // pointers with no symbolic form (coverage counters); calling through
+   // the entry pointer instead is always legal
+   if (obj->cacheable && !jit_cache_cacheable_ir(callee))
+      return NULL;
+
    LOCAL_TEXT_BUF tb = tb_new();
    tb_istr(tb, callee->name);
    tb_cat(tb, "!inline");
@@ -1407,6 +1480,16 @@ static LLVMValueRef cgen_maybe_inline(llvm_obj_t *obj, jit_func_t *callee)
    LLVMValueRef exist = LLVMGetNamedFunction(obj->module, tb_get(tb));
    if (exist != NULL)
       return exist;
+
+   // Record the inline closure in encounter order for the cache manifest
+   if (obj->cacheable) {
+      if (obj->ninlined == obj->maxinlined) {
+         obj->maxinlined = MAX(obj->maxinlined * 2, 16);
+         obj->inlined = xrealloc_array(obj->inlined, obj->maxinlined,
+                                       sizeof(jit_func_t *));
+      }
+      obj->inlined[obj->ninlined++] = callee;
+   }
 
    cgen_func_t func = {
       .name   = tb_claim(tb),
@@ -1935,7 +2018,18 @@ static void cgen_op_call(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
 
    jit_func_t *callee = jit_get_func(cgb->func->source->jit, ir->arg1.handle);
 
-   LLVMValueRef fptr = llvm_ptr(obj, callee);
+   LLVMValueRef fptr;
+   if (obj->cacheable) {
+      // The jit_func_t is heap-allocated per run: reference it by name
+      // and let the loader patch the address (the call itself stays
+      // indirect through the entry pointer at struct offset 0)
+      LOCAL_TEXT_BUF tb = tb_new();
+      tb_cat(tb, "nvc.func.");
+      tb_istr(tb, callee->name);
+      fptr = cgen_reloc_global(obj, tb_get(tb));
+   }
+   else
+      fptr = llvm_ptr(obj, callee);
 
    LLVMValueRef entry = cgen_maybe_inline(obj, callee);
    if (entry == NULL) {
@@ -2280,7 +2374,18 @@ static void cgen_macro_salloc(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
 static void cgen_macro_getpriv(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
 {
    jit_func_t *f = jit_get_func(cgb->func->source->jit, ir->arg1.handle);
-   LLVMValueRef ptrptr = llvm_ptr(obj, jit_get_privdata_ptr(f->jit, f));
+
+   LLVMValueRef ptrptr;
+   if (obj->cacheable) {
+      // The privdata mptr slot moves between runs: resolve by name at
+      // load (the slot itself is stable for the process lifetime)
+      LOCAL_TEXT_BUF tb = tb_new();
+      tb_cat(tb, "nvc.priv.");
+      tb_istr(tb, f->name);
+      ptrptr = cgen_reloc_global(obj, tb_get(tb));
+   }
+   else
+      ptrptr = llvm_ptr(obj, jit_get_privdata_ptr(f->jit, f));
 
 #ifndef LLVM_HAS_OPAQUE_POINTERS
    LLVMTypeRef ptr_type = LLVMPointerType(obj->types[LLVM_PTR], 0);
@@ -3224,19 +3329,25 @@ static void cgen_inline_drive_body(llvm_obj_t *obj, llvm_fn_t which)
    LLVMValueRef shared = LLVMBuildIntToPtr(obj->builder, shared_i,
                                            obj->types[LLVM_PTR], "shared");
 
+   // The four exe-static addresses move under ASLR/PIE: in cacheable
+   // mode they resolve at load through nvc.gpar/traceon/model/fastdrv
+   LLVMValueRef gpar_ptr = obj->cacheable
+      ? cgen_reloc_global(obj, "nvc.gpar") : llvm_ptr(obj, l->par_active_var);
+   LLVMValueRef trace_ptr = obj->cacheable
+      ? cgen_reloc_global(obj, "nvc.traceon") : llvm_ptr(obj, l->trace_var);
+   LLVMValueRef model_ptr = obj->cacheable
+      ? cgen_reloc_global(obj, "nvc.model") : llvm_ptr(obj, l->model_var);
+
    // Dynamic eligibility guards: each declines to the unchanged C spec path
-   LLVMValueRef par = drive_load(obj, LLVM_INT32,
-                                 llvm_ptr(obj, l->par_active_var), 0, "par");
+   LLVMValueRef par = drive_load(obj, LLVM_INT32, gpar_ptr, 0, "par");
    drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, par,
                                    llvm_int32(obj, 0), ""));
 
-   LLVMValueRef trc = drive_load(obj, LLVM_INT8,
-                                 llvm_ptr(obj, l->trace_var), 0, "trc");
+   LLVMValueRef trc = drive_load(obj, LLVM_INT8, trace_ptr, 0, "trc");
    drive_guard(&ctx, LLVMBuildICmp(obj->builder, LLVMIntEQ, trc,
                                    llvm_int8(obj, 0), ""));
 
-   LLVMValueRef model = drive_load(obj, LLVM_PTR,
-                                   llvm_ptr(obj, l->model_var), 0, "model");
+   LLVMValueRef model = drive_load(obj, LLVM_PTR, model_ptr, 0, "model");
    drive_guard(&ctx, LLVMBuildIsNotNull(obj->builder, model, ""));
 
    // Fast-clk probation window: the C path attributes driver activity
@@ -3378,8 +3489,10 @@ static void cgen_inline_drive_body(llvm_obj_t *obj, llvm_fn_t which)
                                              obj->types[LLVM_INT8], tasks,
                                              sidx, 1, "slot");
 
-   LLVMBuildStore(obj->builder, llvm_ptr(obj, l->fast_driver_fn),
-                  drive_gep(obj, slot, l->task_fn));
+   LLVMValueRef fastdrv = obj->cacheable
+      ? cgen_reloc_global(obj, "nvc.fastdrv")
+      : llvm_ptr(obj, l->fast_driver_fn);
+   LLVMBuildStore(obj->builder, fastdrv, drive_gep(obj, slot, l->task_fn));
    LLVMBuildStore(obj->builder, src, drive_gep(obj, slot, l->task_arg));
    LLVMBuildStore(obj->builder,
                   LLVMBuildAdd(obj->builder, cnt, llvm_int32(obj, 1), ""),
@@ -3635,6 +3748,9 @@ static void cgen_memset_body(llvm_obj_t *obj, llvm_fn_t which,
 
 typedef struct {
    code_cache_t *code;
+   jit_cache_t  *cache;
+   bool          cache_init;
+   nvc_lock_t    cache_lock;
 } llvm_jit_state_t;
 
 static void *jit_llvm_init(jit_t *jit)
@@ -3645,6 +3761,26 @@ static void *jit_llvm_init(jit_t *jit)
    state->code = code_cache_new();
 
    return state;
+}
+
+// Lazy so the drive layout constructor and runtime options are settled.
+// NOTE tier-up bursts run cgen on MULTIPLE workers concurrently
+// (async_do grows the pool to npending+1) so first-use is locked.
+static jit_cache_t *jit_llvm_get_cache(llvm_jit_state_t *state, jit_t *j)
+{
+#ifdef LLVM_HAS_OPAQUE_POINTERS
+   if (!load_acquire(&state->cache_init)) {
+      SCOPED_LOCK(state->cache_lock);
+      if (!state->cache_init) {
+         char *triple = LLVMGetDefaultTargetTriple();
+         state->cache = jit_cache_open(j, triple, (int)JIT_CODE_MODEL,
+                                       cgen_inline_drive_mode());
+         LLVMDisposeMessage(triple);
+         store_release(&state->cache_init, true);
+      }
+   }
+#endif
+   return state->cache;
 }
 
 static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
@@ -3661,12 +3797,39 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
 
    const uint64_t start_us = get_timestamp_us();
 
+   // Persistent JIT cache: probe before constructing any LLVM state; a
+   // hit replays the stored object through the existing publish path
+   jit_cache_t *jc = jit_llvm_get_cache(state, j);
+   jit_cache_pending_t *pending = NULL;
+   bool cacheable = false;
+   if (jc != NULL) {
+      jit_fill_irbuf(f);
+      if (!jit_cache_cacheable_ir(f))
+         jit_cache_decline(jc);
+      else {
+         cacheable = true;
+         switch (jit_cache_load(jc, state->code, f, &pending)) {
+         case JIT_CACHE_HIT:
+            if (opt_get_int(OPT_JIT_LOG)) {
+               const uint64_t end_us = get_timestamp_us();
+               debugf("%s cache hit [%"PRIi64" us]", istr(f->name),
+                      end_us - start_us);
+            }
+            return;
+         case JIT_CACHE_VERIFY:   // Record held: compare after fresh cgen
+         case JIT_CACHE_MISS:
+            break;
+         }
+      }
+   }
+
    LLVMTargetMachineRef tm = llvm_target_machine(LLVMRelocStatic,
                                                  JIT_CODE_MODEL);
 
    llvm_obj_t obj = {
-      .context = LLVMContextCreate(),
-      .target  = tm,
+      .context   = LLVMContextCreate(),
+      .target    = tm,
+      .cacheable = cacheable,
    };
 
    LOCAL_TEXT_BUF tb = tb_new();
@@ -3736,17 +3899,42 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
 
    const size_t objsz = LLVMGetBufferSize(buf);
 
+   shash_t *symtab = NULL;
+   if (cacheable) {
+      STATIC_ASSERT(LLVM_LAST_FN <= 64);
+      uint64_t helper_mask = 0;
+      for (int i = 0; i < LLVM_LAST_FN; i++) {
+         if (obj.fns[i] != NULL)
+            helper_mask |= UINT64_C(1) << i;
+      }
+
+      // Verify-compare against any held record (fatal on divergence
+      // under an equal manifest) and/or store; returns the symbol table
+      // for resolving this object's nvc.* references at load
+      symtab = jit_cache_finish(jc, f, obj.inlined, obj.ninlined,
+                                obj.opt_hint > 0 ? 1 : 0, helper_mask,
+                                LLVMGetBufferStart(buf), objsz, pending);
+   }
+
    code_blob_t *blob = code_blob_new(state->code, f->name, objsz);
-   if (blob == NULL)
+   if (blob == NULL) {
+      if (symtab != NULL)
+         shash_free(symtab);
+      jit_cache_pending_free(pending);
       return;
+   }
 
    const uint8_t *base = blob->wptr;
    const void *entry_addr = blob->wptr;
 
-   code_load_object(blob, LLVMGetBufferStart(buf), objsz);
+   code_load_object(blob, LLVMGetBufferStart(buf), objsz,
+                    symtab != NULL ? jit_cache_resolve : NULL, symtab);
 
    const size_t size = blob->wptr - base;
    code_blob_finalise(blob, &(f->entry));
+
+   if (symtab != NULL)
+      shash_free(symtab);
 
    if (opt_get_int(OPT_JIT_LOG)) {
       const uint64_t end_us = get_timestamp_us();
@@ -3763,12 +3951,15 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
    LLVMDisposeBuilder(obj.builder);
    DWARF_ONLY(LLVMDisposeDIBuilder(obj.debuginfo));
    LLVMContextDispose(obj.context);
+   jit_cache_pending_free(pending);
+   free(obj.inlined);
    free(func.name);
 }
 
 static void jit_llvm_cleanup(void *context)
 {
    llvm_jit_state_t *state = context;
+   jit_cache_close(state->cache);
    code_cache_free(state->code);
    free(state);
 }
