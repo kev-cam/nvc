@@ -119,6 +119,10 @@ struct _rt_proc {
    rt_nexus_t   **wait_set;
    unsigned       wait_count, wait_cap;   // wait_set[] registrations
    unsigned       wait_fpcount;            // fingerprint sched-call count
+   // Phase D S2a partition id (PART_NONE when unpartitioned).  Placed in the
+   // existing 4-byte alignment hole between wait_fpcount and wait_sig, so
+   // sizeof(rt_proc_t) is unchanged at 144 bytes -- see rt/partition.h.
+   uint16_t       part;
    uint64_t       wait_sig;
    unsigned       cur_count;
    uint64_t       cur_sig;

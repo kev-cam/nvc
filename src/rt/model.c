@@ -32,6 +32,7 @@
 #include "rt/copy.h"
 #include "rt/heap.h"
 #include "rt/model.h"
+#include "rt/partition.h"
 #include "vhdl2vlog.h"
 #include "rt/random.h"
 #include "rt/structs.h"
@@ -327,6 +328,7 @@ static void reset_scope(rt_model_t *m, rt_scope_t *s);
 static void async_run_process(rt_model_t *m, void *arg);
 static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
                      void *arg);
+static void part_final_report(rt_model_t *m);
 static void evproc_shutdown(void);
 static void async_update_property(rt_model_t *m, void *arg);
 static void async_update_driver(rt_model_t *m, void *arg);
@@ -810,6 +812,8 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
 
 void model_free(rt_model_t *m)
 {
+   part_final_report(m);
+
    evproc_shutdown();
 
    if (unlikely(m->prof_enabled))
@@ -7785,6 +7789,622 @@ static void check_undriven_std_logic(rt_nexus_t *n)
    n->signal->shared.flags &= ~SIG_F_STD_LOGIC;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Phase D stage S2a: partition map + boundary classification.
+//
+// Builds, ONCE, a static map from process -> partition plus a classification
+// of every nexus against that map.  Nothing in the scheduler consults it
+// yet: stage S3 (schedule-time driver posting, one runner thread per
+// partition) is the first consumer.  See rt/partition.h for the API and the
+// environment variables.
+//
+// WHY THE HOOK IS THE END OF THE FIRST CYCLE, NOT THE END OF model_reset.
+// Boundary classification needs the reader (pending) lists, and those are
+// populated in TWO places.  A process whose last statement is a static wait
+// gets a single _sched_event emitted into its reset block (lower.c,
+// lower_process), so it is registered by the time reset_process returns --
+// that is most of synthesizable RTL.  A process with a dynamic wait
+// registers only when its body actually executes the wait, which happens on
+// its first activation, i.e. during the first model_cycle.  The
+// end-of-first-cycle hook therefore sees a strict SUPERSET of what an
+// end-of-model_reset hook sees, at no cost, and it also lands after the
+// initial-value settle where sched_driver performs its first round of nexus
+// splits.  NVC_PART_HOOK=reset builds at the earlier point so the
+// difference stays checkable rather than asserted.  Measured with it: b12 /
+// b17 / b22 each lose exactly one reader link (the testbench process, whose
+// wait is dynamic); VeeR-EH2 loses 4644 reader links of 249072 and 2749
+// nexuses of 1347609 (the splits that the initial settle performs).
+//
+// Neither hook is a substitute for a structure-mutation freeze: nexuses
+// keep splitting later in the run (b12: 18 at the hook, 24 at end of run).
+//
+// The map is a snapshot.  g_split_count/g_split_last are latched at build
+// time so S4 can detect post-build structure mutation (nexus splits,
+// pending-list reallocation) and dissolve back to serial; the debug report
+// re-runs the census at model_free and prints the drift.
+
+typedef struct {
+   rt_scope_t *scope;      // the level-N scope this group cuts at
+   uint64_t    weight;     // profile weight, else process count
+   uint32_t    nprocs;
+   uint16_t    part;
+   bool        profiled;   // weight came from NVC_PART_PROFILE
+} part_group_t;
+
+typedef struct {
+   uint64_t weight;
+   uint32_t nprocs;
+   uint32_t ngroups;
+} part_bin_t;
+
+typedef struct {
+   uint64_t nexuses;
+   uint64_t interior;
+   uint64_t xdrv;          // crossing on the nexus's own reader list
+   uint64_t xport;         // crossing through the port/output fan-out
+   uint64_t undriven;
+   uint64_t reader_links;  // (nexus, W_PROC reader) links
+   uint64_t xreader_links; // ... whose partition holds none of the drivers
+   uint64_t multi_driven;  // nexus driven from more than one partition
+   uint64_t xboth;         // crossing on BOTH reader list and port chain
+   uint64_t api_mismatch;  // part_{class_,}of_nexus() disagreed with the walk
+} part_census_t;
+
+static int           g_part_n       = -1;   // -1 = env unread, 0 = off
+static int           g_part_level   = 5;
+static bool          g_part_at_reset = false;  // NVC_PART_HOOK=reset
+static int           g_part_debug   = 0;   // 1 = summary, 2 = per group
+static const char   *g_part_profile = NULL;
+static bool          g_part_pending_build = false;
+static bool          g_part_built   = false;
+
+static part_group_t *g_part_groups  = NULL;
+static unsigned      g_part_ngroups = 0, g_part_gmax = 0;
+static unsigned      g_part_nprofiled = 0;
+static hash_t       *g_part_gmap    = NULL;   // rt_scope_t * -> gid + 1
+static shash_t      *g_part_pmap    = NULL;   // scope name -> uint64_t *
+static part_bin_t    g_part_bins[PART_MAX_PARTITIONS];
+static uint32_t      g_part_nprocs  = 0;
+
+// Side table: ONLY the boundary nexuses (a few thousand of ~1.3M on
+// VeeR-EH2).  Value is 1 + (owner << 2 | class), so a miss is a clean NULL
+// and INTERIOR/UNDRIVEN are recomputed from the short sources chain.
+static hash_t       *g_part_nexmap  = NULL;
+
+static part_census_t g_part_census;
+static uint64_t      g_part_build_ns   = 0;
+static uint64_t      g_part_split_at   = 0;   // g_split_count at build time
+static uint64_t      g_part_built_time = 0;   // sim time (fs) of the build
+
+static void part_env_init(void)
+{
+   if (likely(g_part_n >= 0))
+      return;
+
+   const char *e = getenv("NVC_PARTITIONS");
+   g_part_n = (e == NULL) ? 0 : atoi(e);
+   if (g_part_n < 0)
+      g_part_n = 0;
+   else if (g_part_n > PART_MAX_PARTITIONS) {
+      warnf("NVC_PARTITIONS=%d exceeds the maximum %d; clamping",
+            g_part_n, PART_MAX_PARTITIONS);
+      g_part_n = PART_MAX_PARTITIONS;
+   }
+
+   const char *l = getenv("NVC_PART_LEVEL");
+   if (l != NULL)
+      g_part_level = MAX(0, atoi(l));
+
+   const char *d = getenv("NVC_PARTITIONS_DEBUG");
+   g_part_debug = (d == NULL) ? 0 : MAX(1, atoi(d));
+   g_part_profile = getenv("NVC_PART_PROFILE");
+
+   // NVC_PART_HOOK=reset builds at the end of model_reset instead.  Kept as
+   // an option purely so the hook choice is checkable rather than asserted:
+   // at that point no process body has run, so x_sched_event has registered
+   // nothing and the census reports reader_links=0 / x_driver_reader=0.
+   const char *h = getenv("NVC_PART_HOOK");
+   g_part_at_reset = h != NULL && strcmp(h, "reset") == 0;
+}
+
+unsigned part_count(void)
+{
+   return g_part_n > 0 ? (unsigned)g_part_n : 0;
+}
+
+bool part_active(void)
+{
+   return g_part_built;
+}
+
+unsigned part_of_proc(rt_proc_t *proc)
+{
+   return g_part_built ? proc->part : PART_NONE;
+}
+
+// The owner of a non-boundary nexus is simply its first driver's partition
+static unsigned part_first_driver(rt_nexus_t *n)
+{
+   for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+      if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+         continue;
+      const unsigned p = s->u.driver.proc->part;
+      if (p != PART_NONE)
+         return p;
+   }
+
+   return PART_NONE;
+}
+
+unsigned part_of_nexus(rt_nexus_t *n)
+{
+   if (!g_part_built)
+      return PART_NONE;
+
+   void *v = hash_get(g_part_nexmap, n);
+   if (v != NULL)
+      return ((unsigned)(uintptr_t)v - 1) >> 2;
+
+   return part_first_driver(n);
+}
+
+part_class_t part_class_of_nexus(rt_nexus_t *n)
+{
+   if (!g_part_built)
+      return PART_INTERIOR;
+
+   void *v = hash_get(g_part_nexmap, n);
+   if (v != NULL)
+      return (part_class_t)(((unsigned)(uintptr_t)v - 1) & 3);
+
+   return part_first_driver(n) == PART_NONE ? PART_UNDRIVEN : PART_INTERIOR;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Weights: NVC_PART_PROFILE, else the group's process count
+
+// Accepts either "<scope-name> <weight>" or a milestone-0 census line
+// "PD-GRP <i> part=<p> ns=<weight> <scope-name>" -- the latter is what the
+// M0 per-scope timing runs already emit.
+static void part_load_profile(const char *path)
+{
+   FILE *f = fopen(path, "r");
+   if (f == NULL) {
+      warnf("cannot open NVC_PART_PROFILE %s: %s", path, strerror(errno));
+      return;
+   }
+
+   g_part_pmap = shash_new(1024);
+
+   char *line = NULL;
+   size_t cap = 0;
+   ssize_t len;
+
+   while ((len = getline(&line, &cap, f)) > 0) {
+      while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+         line[--len] = '\0';
+
+      char *p = line;
+      while (*p == ' ' || *p == '\t') p++;
+      if (*p == '\0' || *p == '#')
+         continue;
+
+      char *name = NULL;
+      uint64_t weight = 0;
+
+      const char *key = NULL;
+      if (strncmp(p, "PD-GRP", 6) == 0)
+         key = " ns=";              // milestone-0 census line
+      else if (strncmp(p, "PART-GRP", 8) == 0)
+         key = " weight=";          // this report's own per-group line
+
+      if (key != NULL) {
+         char *ns = strstr(p, key);
+         if (ns == NULL)
+            continue;
+         weight = strtoull(ns + strlen(key), NULL, 10);
+
+         // The scope name is the LAST whitespace-delimited field, which is
+         // true of both report formats however many key=value fields sit
+         // between the weight and it
+         char *end = p + strlen(p);
+         while (end > p && (end[-1] == ' ' || end[-1] == '\t'))
+            *--end = '\0';
+         name = end;
+         while (name > p && name[-1] != ' ' && name[-1] != '\t')
+            name--;
+         if (*name == '\0')
+            continue;
+      }
+      else {
+         name = p;
+         char *sp = p;
+         while (*sp != '\0' && *sp != ' ' && *sp != '\t') sp++;
+         if (*sp == '\0')
+            continue;   // no weight column
+         *sp++ = '\0';
+         while (*sp == ' ' || *sp == '\t') sp++;
+         weight = strtoull(sp, NULL, 10);
+      }
+
+      uint64_t *slot = shash_get(g_part_pmap, name);
+      if (slot != NULL)
+         *slot += weight;   // duplicate keys accumulate
+      else {
+         slot = xmalloc(sizeof(uint64_t));
+         *slot = weight;
+         shash_put(g_part_pmap, name, slot);
+      }
+   }
+
+   free(line);
+   fclose(f);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Grouping: an rt_scope_t at hierarchy depth NVC_PART_LEVEL
+
+static unsigned part_group_for(rt_scope_t *s)
+{
+   void *v = hash_get(g_part_gmap, s);
+   if (v != NULL)
+      return (unsigned)(uintptr_t)v - 1;
+
+   if (g_part_ngroups == g_part_gmax) {
+      g_part_gmax = MAX(64, g_part_gmax * 2);
+      g_part_groups = xrealloc_array(g_part_groups, g_part_gmax,
+                                     sizeof(part_group_t));
+   }
+
+   const unsigned gid = g_part_ngroups++;
+   g_part_groups[gid] = (part_group_t){ .scope = s };
+   hash_put(g_part_gmap, s, (void *)(uintptr_t)(gid + 1));
+   return gid;
+}
+
+// Pre-order walk of the instance tree.  A process in a scope at depth d
+// belongs to its ancestor at depth min(d, NVC_PART_LEVEL); CUT carries that
+// ancestor down once the walk is below the cut level.
+static void part_walk(rt_scope_t *s, int depth, rt_scope_t *cut, bool assign)
+{
+   rt_scope_t *g = (depth <= g_part_level) ? s : cut;
+
+   if (s->procs.count > 0 && g != NULL) {
+      const unsigned gid = part_group_for(g);
+      for (int i = 0; i < s->procs.count; i++) {
+         if (assign)
+            s->procs.items[i]->part = g_part_groups[gid].part;
+         else {
+            g_part_groups[gid].nprocs++;
+            g_part_nprocs++;
+         }
+      }
+   }
+
+   rt_scope_t *childcut =
+      (depth + 1 > g_part_level) ? (depth == g_part_level ? s : cut) : NULL;
+
+   for (int i = 0; i < s->children.count; i++)
+      part_walk(s->children.items[i], depth + 1, childcut, assign);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Assignment: greedy longest-processing-time into N bins
+
+static int part_cmp_group(const void *a, const void *b)
+{
+   const unsigned ia = *(const unsigned *)a, ib = *(const unsigned *)b;
+   const uint64_t wa = g_part_groups[ia].weight, wb = g_part_groups[ib].weight;
+
+   if (wa != wb)
+      return wa > wb ? -1 : 1;
+   else
+      return ia < ib ? -1 : (ia > ib ? 1 : 0);
+}
+
+static void part_assign(void)
+{
+   memset(g_part_bins, '\0', sizeof(g_part_bins));
+
+   if (g_part_ngroups == 0)
+      return;   // design has no processes
+
+   unsigned *order = xmalloc_array(g_part_ngroups, sizeof(unsigned));
+   for (unsigned i = 0; i < g_part_ngroups; i++)
+      order[i] = i;
+
+   qsort(order, g_part_ngroups, sizeof(unsigned), part_cmp_group);
+
+   for (unsigned i = 0; i < g_part_ngroups; i++) {
+      part_group_t *g = &(g_part_groups[order[i]]);
+
+      // Least loaded bin; ties broken on group count so that a run of
+      // zero-weight groups (a profile that does not cover them) still
+      // spreads instead of piling onto partition 0
+      unsigned best = 0;
+      for (int b = 1; b < g_part_n; b++) {
+         if (g_part_bins[b].weight < g_part_bins[best].weight
+             || (g_part_bins[b].weight == g_part_bins[best].weight
+                 && g_part_bins[b].ngroups < g_part_bins[best].ngroups))
+            best = b;
+      }
+
+      g->part = best;
+      g_part_bins[best].weight  += g->weight;
+      g_part_bins[best].nprocs  += g->nprocs;
+      g_part_bins[best].ngroups += 1;
+   }
+
+   free(order);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Boundary classification
+
+static inline void part_reader_bit(rt_wakeable_t *w, uint64_t *mask,
+                                   uint64_t *nlinks)
+{
+   if (w == NULL || w->kind != W_PROC)
+      return;
+
+   rt_proc_t *p = container_of(w, rt_proc_t, wakeable);
+   if (p->part == PART_NONE)
+      return;
+
+   *mask |= UINT64_C(1) << p->part;
+   if (nlinks != NULL)
+      (*nlinks)++;
+}
+
+static uint64_t part_reader_mask(void *pending, uint64_t *nlinks)
+{
+   uint64_t mask = 0;
+
+   if (pointer_tag(pending) == 1)
+      part_reader_bit(untag_pointer(pending, rt_wakeable_t), &mask, nlinks);
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      for (int i = 0; i < p->count; i++)
+         part_reader_bit(p->wake[i], &mask, nlinks);
+   }
+
+   return mask;
+}
+
+// Count reader links whose partition holds NONE of the drivers -- these are
+// the wakes that S3 must deliver across cores.
+static uint64_t part_xreader_links(void *pending, uint64_t dmask)
+{
+   uint64_t rmask = 0, links = 0, n = 0;
+
+   if (pointer_tag(pending) == 1) {
+      part_reader_bit(untag_pointer(pending, rt_wakeable_t), &rmask, &links);
+      if (rmask & ~dmask)
+         n = 1;
+   }
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      for (int i = 0; i < p->count; i++) {
+         uint64_t one = 0;
+         part_reader_bit(p->wake[i], &one, &links);
+         if (one & ~dmask)
+            n++;
+      }
+   }
+
+   return n;
+}
+
+static void part_classify(rt_model_t *m, part_census_t *c, bool record,
+                          bool check)
+{
+   memset(c, '\0', sizeof(part_census_t));
+
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      c->nexuses++;
+
+      uint64_t dmask = 0, rmask = 0, pmask = 0;
+      unsigned owner = PART_NONE;
+
+      for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+         if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+            continue;
+         const unsigned p = s->u.driver.proc->part;
+         if (p == PART_NONE)
+            continue;
+         dmask |= UINT64_C(1) << p;
+         if (owner == PART_NONE)
+            owner = p;
+      }
+
+      rmask = part_reader_mask(n->pending, &(c->reader_links));
+
+      for (rt_source_t *o = n->outputs; o != NULL; o = o->chain_output) {
+         if (o->tag != SOURCE_PORT || o->u.port.output == NULL)
+            continue;
+         pmask |= part_reader_mask(o->u.port.output->pending, NULL);
+      }
+
+      const uint64_t rx = rmask & ~dmask, px = pmask & ~dmask;
+      part_class_t cls;
+
+      if (dmask == 0) {
+         cls = PART_UNDRIVEN;
+         c->undriven++;
+      }
+      else {
+         if (dmask & (dmask - 1))
+            c->multi_driven++;
+
+         c->xreader_links += part_xreader_links(n->pending, dmask);
+
+         if (rx == 0 && px == 0) {
+            cls = PART_INTERIOR;
+            c->interior++;
+         }
+         else {
+            // Counted the way milestone 0 counted them: a nexus that crosses
+            // on BOTH its own reader list and the port chain increments both
+            // buckets.  The side table stores ONE class, driver-reader first,
+            // because that is the crossing that needs a cross-core wake.
+            if (rx != 0) c->xdrv++;
+            if (px != 0) c->xport++;
+            if (rx != 0 && px != 0) c->xboth++;
+
+            cls = rx ? PART_BOUNDARY_DRIVER_READER : PART_BOUNDARY_PORT;
+
+            if (record)
+               hash_put(g_part_nexmap, n,
+                        (void *)(uintptr_t)(1 + ((owner << 2) | cls)));
+         }
+      }
+
+      // Validate the S3-facing API against the walk that produced it
+      if (check && (part_class_of_nexus(n) != cls || part_of_nexus(n) != owner))
+         c->api_mismatch++;
+   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Build + report
+
+static void part_report_census(const char *tag, const part_census_t *c)
+{
+   printf("%s nexuses=%"PRIu64" interior=%"PRIu64" x_driver_reader=%"PRIu64
+          " x_port_chain=%"PRIu64" undriven=%"PRIu64" reader_links=%"PRIu64
+          " x_reader_links=%"PRIu64" multi_part_driven=%"PRIu64
+          " x_both=%"PRIu64"\n", tag,
+          c->nexuses, c->interior, c->xdrv, c->xport, c->undriven,
+          c->reader_links, c->xreader_links, c->multi_driven, c->xboth);
+}
+
+static void part_report(void)
+{
+   uint64_t total = 0;
+   for (int b = 0; b < g_part_n; b++)
+      total += g_part_bins[b].weight;
+
+   printf("PART: partitions=%d level=%d groups=%u procs=%u profile=%s "
+          "profiled_groups=%u build_ms=%.2f built_at=%"PRIu64"ns "
+          "splits_at_build=%"PRIu64"\n",
+          g_part_n, g_part_level, g_part_ngroups, g_part_nprocs,
+          g_part_profile ?: "none", g_part_nprofiled,
+          g_part_build_ns / 1e6, g_part_built_time / 1000000,
+          g_part_split_at);
+
+   for (int b = 0; b < g_part_n; b++)
+      printf("PART-P %2d weight=%"PRIu64" (%5.2f%%) procs=%u groups=%u\n", b,
+             g_part_bins[b].weight,
+             total ? 100.0 * g_part_bins[b].weight / total : 0.0,
+             g_part_bins[b].nprocs, g_part_bins[b].ngroups);
+
+   if (g_part_debug > 1) {
+      // Same shape as the milestone-0 PD-GRP lines, and accepted verbatim by
+      // NVC_PART_PROFILE: one measured run feeds the next partitioning
+      for (unsigned i = 0; i < g_part_ngroups; i++)
+         printf("PART-GRP %u part=%u weight=%"PRIu64" procs=%u %s\n", i,
+                g_part_groups[i].part, g_part_groups[i].weight,
+                g_part_groups[i].nprocs, istr(g_part_groups[i].scope->name));
+   }
+
+   part_report_census("PART-BOUNDARY", &g_part_census);
+   fflush(stdout);
+}
+
+static void part_build(rt_model_t *m)
+{
+   const uint64_t t0 = get_timestamp_ns();
+
+   g_part_gmap   = hash_new(1024);
+   g_part_nexmap = hash_new(1024);
+
+   if (g_part_profile != NULL)
+      part_load_profile(g_part_profile);
+
+   part_walk(m->root, 0, NULL, false);
+
+   for (unsigned i = 0; i < g_part_ngroups; i++) {
+      part_group_t *g = &(g_part_groups[i]);
+      const uint64_t *pw = g_part_pmap != NULL
+         ? shash_get(g_part_pmap, istr(g->scope->name)) : NULL;
+      if (pw != NULL) {
+         g->weight   = *pw;
+         g->profiled = true;
+         g_part_nprofiled++;
+      }
+      else if (g_part_pmap != NULL)
+         g->weight = 0;   // a profile IS the measurement: absent = unmeasured.
+                          // Deliberately NOT the process count -- mixing a
+                          // time weight with a count weight in one bin sum is
+                          // meaningless.  profiled_groups in the report is the
+                          // coverage figure to watch.
+      else
+         g->weight = g->nprocs;   // no profile: fall back to process count
+   }
+
+   part_assign();
+   part_walk(m->root, 0, NULL, true);
+
+   part_classify(m, &g_part_census, true, false);
+
+   g_part_built      = true;
+   g_part_build_ns   = get_timestamp_ns() - t0;
+   g_part_split_at   = g_split_count;
+   g_part_built_time = m->now;
+
+   if (g_part_debug) {
+      part_report();
+
+      // Nothing else calls the S3 API yet, so prove it here: re-derive every
+      // nexus's class and owner through part_class_of_nexus/part_of_nexus and
+      // compare against the walk that built the side table
+      part_census_t chk;
+      part_classify(m, &chk, false, true);
+      printf("PART-API mismatches=%"PRIu64" of %"PRIu64" nexuses\n",
+             chk.api_mismatch, chk.nexuses);
+      fflush(stdout);
+   }
+}
+
+// Called at the end of every simulation cycle; the first one builds the map
+static inline void part_maybe_build(rt_model_t *m)
+{
+   if (likely(!g_part_pending_build))
+      return;
+
+   g_part_pending_build = false;
+   part_build(m);
+}
+
+static void part_arm(rt_model_t *m)
+{
+   part_env_init();
+
+   if (g_part_n <= 0)
+      return;
+   else if (g_part_at_reset)
+      part_build(m);
+   else
+      g_part_pending_build = true;
+}
+
+// Debug only: re-run the census at end of run so drift from nexus splits and
+// pending-list growth after the build hook is visible and quantified
+static void part_final_report(rt_model_t *m)
+{
+   if (!g_part_built || !g_part_debug)
+      return;
+
+   part_census_t now;
+   part_classify(m, &now, false, false);
+
+   part_report_census("PART-RECENSUS", &now);
+   printf("PART-DRIFT nexuses +%"PRId64" splits +%"PRIu64" (last split at %"
+          PRIu64"ns)\n", (int64_t)now.nexuses - (int64_t)g_part_census.nexuses,
+          g_split_count - g_part_split_at, g_split_last / 1000000);
+   fflush(stdout);
+}
+
 static void create_processes(rt_model_t *m, rt_scope_t *s)
 {
    for (int i = 0; i < s->children.count; i++) {
@@ -7815,6 +8435,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
 
             rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
             p->vtable    = &proc_default_vtable;
+            p->part      = PART_NONE;
             p->where     = t;
             p->name      = ident_prefix(path, ident_downcase(name), ':');
             p->wakeable.fused_cone =
@@ -7852,6 +8473,7 @@ static void create_processes(rt_model_t *m, rt_scope_t *s)
 
             rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
             p->vtable    = &proc_default_vtable;
+            p->part      = PART_NONE;
             p->where     = t;
             p->name      = ident_prefix(path, ident_downcase(name), ':');
             p->wakeable.fused_cone =
@@ -7997,6 +8619,13 @@ void model_reset(rt_model_t *m)
    const char *accel_env = getenv("NVC_USE_ACCEL");
    if (accel_env != NULL)
       accel_load(m, accel_env);
+
+   // Phase D S2a: arm the partition map.  It is built at the END of the
+   // first simulation cycle so that processes with a DYNAMIC wait have
+   // registered their sensitivity too (static-wait processes registered in
+   // their reset block, which has already run here) -- see the hook
+   // discussion above part_build.
+   part_arm(m);
 }
 
 static void update_property(rt_model_t *m, rt_prop_t *prop)
@@ -9768,6 +10397,8 @@ fastclk_done:;
    }
    else if (m->stop_delta > 0 && m->iteration == m->stop_delta)
       reached_iteration_limit(m);
+
+   part_maybe_build(m);   // Phase D S2a: one-shot, first cycle only
 }
 
 static bool should_stop_now(rt_model_t *m, uint64_t stop_time)
@@ -11760,6 +12391,7 @@ void x_process_init(jit_handle_t handle, tree_t where)
 
    rt_proc_t *p = xcalloc(sizeof(rt_proc_t));
    p->vtable    = &proc_default_vtable;
+   p->part      = PART_NONE;
    p->where     = where;
    p->name      = name;
    p->handle    = handle;

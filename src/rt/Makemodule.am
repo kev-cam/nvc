@@ -13,6 +13,7 @@ lib_libnvc_a_SOURCES += \
 	src/rt/standard.c \
 	src/rt/simpkg.c \
 	src/rt/structs.h \
+	src/rt/partition.h \
 	src/rt/model.h \
 	src/rt/model.c \
 	src/rt/fileio.c \
