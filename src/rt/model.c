@@ -1933,6 +1933,9 @@ typedef struct {
    bool          is_output;
    int           width;        // bits (sub-elements)
    int           elem;         // bytes per sub-element (logic3d = natural)
+   int           base;         // enum position of '0' in the port's own type
+                               // (std_logic/logic3d = 2, BIT/BOOLEAN = 0):
+                               // a deposited byte is base|valuebit
    uint8_t      *data;         // shared.data (read inputs)
    rt_signal_t  *sig;          // signal (force outputs via force_signal)
 } aj_pin_t;
@@ -2593,6 +2596,31 @@ static bool aj_marshallable_type(type_t t)
    return aj_type_named(et, "LOGIC3D") || aj_type_named(et, "STD_LOGIC")
        || aj_type_named(et, "STD_ULOGIC") || aj_type_named(et, "BIT")
        || aj_type_named(et, "BOOLEAN");
+}
+
+// nvc stores a bit-like scalar as its ENUM POSITION, and that position is
+// type-dependent: '0'/'1' sit at 2/3 in std_(u)logic and in logic3d (L3D_0=2,
+// L3D_1=3) but at 0/1 in BIT and BOOLEAN. The output bridge writes
+// `base | valuebit`, so it needs the '0' position of the PORT'S OWN type.
+// It used to hard-code 2; a BIT-typed output (every ITC'99 circuit) was then
+// deposited as 2/3 — not a legal BIT position — so every downstream compare
+// against '0' or '1' was false and the design's outputs read as constant
+// garbage even though the model computed them correctly.
+static int aj_bit_base(type_t t)
+{
+   type_t et = type_is_array(t) ? type_elem(t) : t;
+   type_t b = type_base_recur(et);
+   if (type_kind(b) != T_ENUM) return 2;
+   const unsigned n = type_enum_literals(b);
+   for (unsigned i = 0; i < n; i++) {
+      tree_t lit = type_enum_literal(b, i);
+      if (!tree_has_ident(lit)) continue;
+      const char *s = istr(tree_ident(lit));
+      if (!strcmp(s, "'0'") || !strcasecmp(s, "L3D_0")
+          || !strcasecmp(s, "FALSE"))
+         return (int)i;
+   }
+   return 2;   // unrecognised: keep the historical logic3d encoding
 }
 
 // Collect distinct recovered-Verilog source files across the subtree.
@@ -4737,11 +4765,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                // value-change detection for events.
                fprintf(f, "  %s{ uint8_t buf[%d]; memset(buf,0,sizeof buf);"
                           " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]="
-                          "2|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
+                          "%d|(unsigned)((o._%s[b>>5]>>(b&31))&1);"
                           " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                        spec ? "" : "else ",
                        bufsz, pins[i].width, pins[i].width, pins[i].elem,
-                       pins[i].name, ord, ord, pins[i].width, pe_i);
+                       pins[i].base, pins[i].name, ord, ord, pins[i].width, pe_i);
             }
          }
          else {
@@ -4757,11 +4785,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             }
             if (!spec || !hoff) {
                fprintf(f, "  %s{ uint8_t buf[%d]; memset(buf,0,sizeof buf); uint64_t v=o._%s;"
-                          " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=2|(unsigned)((v>>b)&1);"
+                          " for(int b=0;b<%d;b++) buf[(%d-1-b)*%d]=%d|(unsigned)((v>>b)&1);"
                           " AJ_OUT(%d,OUT_SIG(%d),buf,%d,%s); }\n",
                        spec ? "" : "else ",
                        bufsz, pins[i].name, pins[i].width, pins[i].width, pins[i].elem,
-                       ord, ord, pins[i].width, pe_i);
+                       pins[i].base, ord, ord, pins[i].width, pe_i);
             }
          }
       }
@@ -5075,6 +5103,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       pin.width    = pin.elem ? (int)(sig->shared.size / pin.elem) : 1;
       pin.data     = (uint8_t *)sig->shared.data;
       pin.sig      = sig;
+      pin.base     = aj_bit_base(tree_type(p));
       // PORT_BUFFER is an output (a readable-back registered output); classify it
       // with PORT_OUT so the bridge DEPOSITS it rather than trying to drive it in,
       // matching vhdl2vlog emitting `buffer` ports as Verilog `output`.
