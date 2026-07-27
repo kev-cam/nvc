@@ -186,6 +186,7 @@ static void emit_range(FILE *f, type_t type)
    if (type_is_logic3d(type) && !type_is_array(type))
       return;   // scalar logic3d -> 1-bit value (bit0), no range
    if (type_is_array(type)) {
+      if (!type_const_bounds(type)) { g_unhandled++; return; }  // unconstrained
       const unsigned w = type_width(type);
       if (w > 1) fprintf(f, "[%u:0] ", w - 1);
    }
@@ -232,6 +233,13 @@ static hset_t *g_sig_names = NULL;   // module signal+port idents
 // clean tooling reject). Emit '=' for signal assigns inside a comb process to
 // recover the blocking semantics and break the loop.
 static bool g_comb_proc = false;
+
+// Design (non-package) function translation. g_func_set holds the names of the
+// module's own functions so a call to one emits a Verilog function call (not the
+// unhandled `/*fn*/` marker); g_func_ret_name is the current function's name, so
+// a `return x` inside its body emits `<name> = x`.
+static hset_t    *g_func_set = NULL;
+static const char *g_func_ret_name = NULL;
 
 static const char *ren_suffix(tree_t d)
 {
@@ -306,6 +314,23 @@ static const char *vlog_op(const char *fn)
    return NULL;
 }
 
+// logic3d relational FUNCTIONS (not operators): the sv2vhdl `<`/`<=`/... on a
+// signed field lower to l3d_lt_s/le_s/... value-plane comparisons. Returns the
+// Verilog operator and sets *sgn (signed variants wrap operands in $signed).
+static const char *l3d_relop(const char *base, bool *sgn)
+{
+   static const struct { const char *n; const char *o; bool s; } m[] = {
+      {"l3d_lt_s","<",true},  {"l3d_le_s","<=",true},
+      {"l3d_gt_s",">",true},  {"l3d_ge_s",">=",true},
+      {"l3d_lt","<",false},   {"l3d_le","<=",false},
+      {"l3d_gt",">",false},   {"l3d_ge",">=",false},
+      {NULL,NULL,false}
+   };
+   for (int i = 0; m[i].n; i++)
+      if (!strcasecmp(base, m[i].n)) { *sgn = m[i].s; return m[i].o; }
+   return NULL;
+}
+
 // basename of a (possibly library/package-qualified) identifier
 static const char *id_base(const char *nm)
 {
@@ -365,7 +390,15 @@ static const char *vlog_l3d_op(const char *fn, int *kind)
       {"unsigned_to_l3d_bit","",2}, {"l3d_to_bit","",2}, {"to_bit","",2},
       // width adjusters: Verilog's assignment context resizes -- emit the value
       {"resize","",2}, {"to_unsigned","",2}, {"to_signed","",2},
+      // to_l3d(value, width): bring a numeric value into logic3d at width w.
+      // Every overload (unsigned/signed/integer/logic3d_vector) is a resize on
+      // the value plane, and kind 2 emits only param 0 so the trailing width
+      // argument is dropped -- Verilog's assignment context does the resize,
+      // exactly as for `resize` above.
+      {"to_l3d","",2},
       {"reduce_or","|",3}, {"reduce_and","&",3}, {"reduce_xor","^",3},
+      // value-plane equality (all overloads: l3d / l3d_vector)
+      {"l3d_eq1","==",0}, {"l3d_ne1","!=",0},
       {NULL,NULL,0}
    };
    for (int i = 0; m[i].n; i++)
@@ -559,8 +592,9 @@ static void emit_expr(FILE *f, tree_t e)
             fputc('}', f);
             break;
          }
-         // sv2vhdl's Ternary_Unsigned(T, X, Y) is a plain mux: T ? X : Y
-         if (strcasecmp(vid(tree_ident(e)), "ternary_unsigned") == 0
+         // sv2vhdl's Ternary_Unsigned/ternary_logic(T, X, Y) is a plain mux.
+         if ((strcasecmp(vid(tree_ident(e)), "ternary_unsigned") == 0
+              || strcasecmp(vid(tree_ident(e)), "ternary_logic") == 0)
              && nparams == 3) {
             fputs("((", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
@@ -570,6 +604,91 @@ static void emit_expr(FILE *f, tree_t e)
             emit_expr(f, tree_value(tree_param(e, 2)));
             fputs("))", f);
             break;
+         }
+         // l3d_bit_read(a, idx) -> value bit idx of a: ((a >> idx) & 1). Works
+         // for any base expression and a variable index (mirrors the const-base
+         // T_ARRAY_REF lowering).
+         if (strcasecmp(vid(tree_ident(e)), "l3d_bit_read") == 0
+             && nparams == 2) {
+            fputs("(((", f);
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            fputs(") >> (", f);
+            emit_expr(f, tree_value(tree_param(e, 1)));
+            fputs(")) & 1'b1)", f);
+            break;
+         }
+         // logic3d relational functions (l3d_lt_s/le_s/gt_s/ge_s, unsigned too)
+         // -> Verilog comparison; signed variants wrap operands in $signed.
+         {
+            bool rsgn = false;
+            const char *rop = l3d_relop(id_base(istr(tree_ident(e))), &rsgn);
+            if (rop != NULL && nparams == 2) {
+               fputc('(', f);
+               if (rsgn) fputs("$signed(", f);
+               emit_expr(f, tree_value(tree_param(e, 0)));
+               if (rsgn) fputc(')', f);
+               fprintf(f, " %s ", rop);
+               if (rsgn) fputs("$signed(", f);
+               emit_expr(f, tree_value(tree_param(e, 1)));
+               if (rsgn) fputc(')', f);
+               fputc(')', f);
+               break;
+            }
+         }
+         // l3d_index(a, s) -> a as an integer index (value plane). s=true is a
+         // SIGNED index (l3d_to_signed) -> $signed(a); s=false unsigned -> a.
+         if (strcasecmp(vid(tree_ident(e)), "l3d_index") == 0 && nparams == 2) {
+            int64_t sgn;
+            const bool s = folded_int(tree_value(tree_param(e, 1)), &sgn) && sgn;
+            if (s) fputs("$signed(", f);
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            if (s) fputc(')', f);
+            break;
+         }
+         // l3d_resize_s(a, w) -> signed resize on the value plane. Drop w and
+         // wrap in $signed so the surrounding context sign-extends.
+         if (strcasecmp(vid(tree_ident(e)), "l3d_resize_s") == 0
+             && nparams == 2) {
+            fputs("$signed(", f);
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            fputc(')', f);
+            break;
+         }
+         // l3d_part_read(a, base, w) -> w-bit value slice a[base +: w], LSB-
+         // aligned. Emit ((a >> base) & mask(w)); w must fold to a constant
+         // (numeric_std natural), else fall through to the unhandled marker so
+         // the leaf is declined rather than mis-translated.
+         if (strcasecmp(vid(tree_ident(e)), "l3d_part_read") == 0
+             && nparams == 3) {
+            int64_t w;
+            tree_t a = tree_value(tree_param(e, 0));
+            if (folded_int(tree_value(tree_param(e, 2)), &w) && w > 0) {
+               if (w <= 64) {
+                  // narrow: shift + mask (works for any base expression)
+                  fputs("(((", f);
+                  emit_expr(f, a);
+                  fputs(") >> (", f);
+                  emit_expr(f, tree_value(tree_param(e, 1)));
+                  // w==64: (1<<64)-1 overflows int64; emit the Verilog-sized
+                  // all-ones mask directly (a C `0x..ull` literal is NOT valid
+                  // Verilog -- yosys read it as `0` then a stray identifier,
+                  // "unexpected TOK_ID", failing the whole ic_mem subtree synth).
+                  if (w == 64) fputs(")) & 64'hffffffffffffffff)", f);
+                  else fprintf(f, ")) & %lld)", (long long)((INT64_C(1) << w)-1));
+                  break;
+               }
+               else if (tree_kind(a) == T_REF) {
+                  // wide (>64b): Verilog indexed part-select on a net; yosys
+                  // lowers it to $shiftx (wide dynamic select). The base may be
+                  // a variable/expression; the width is the folded constant.
+                  emit_expr(f, a);
+                  fputs("[(", f);
+                  emit_expr(f, tree_value(tree_param(e, 1)));
+                  fprintf(f, ") +: %lld]", (long long)w);
+                  break;
+               }
+               // wide read of a non-net expression -> fall through to decline
+            }
          }
          // sv2vhdl one-hot decoders: bit i of the result is (x == i), i.e. a
          // shifted 1. Works for any argument expression.
@@ -616,6 +735,25 @@ static void emit_expr(FILE *f, tree_t e)
                for (int b = 0; b < w; b++)
                   fprintf(f, " + %s[%d]", nm, b);
                fputc(')', f);
+               break;
+            }
+         }
+         // `a mod 2**k` (positive power-of-two constant modulus) -> `a & (2**k-1)`.
+         // EXACT, not an approximation: VHDL's mod takes the sign of the RIGHT
+         // operand, so with a positive modulus the result is always in [0, m),
+         // which for m = 2**k is precisely the low k bits of a two's-complement
+         // `a` — negative operands included. Verilog's `%` would be WRONG here
+         // (it takes the sign of the LEFT operand), so `mod` is never mapped to
+         // `%`; anything but a power-of-two constant modulus keeps declining.
+         // (`reg3 mod 2**20`, `(count+1) mod 2**COD_COLOR` — the ITC'99 idiom
+         // for "wrap to an N-bit field".)
+         if (!strcmp(fn, "\"mod\"") && nparams == 2) {
+            int64_t m;
+            if (folded_int(tree_value(tree_param(e, 1)), &m)
+                && m > 0 && m <= (INT64_C(1) << 30) && (m & (m - 1)) == 0) {
+               fputc('(', f);
+               emit_expr(f, tree_value(tree_param(e, 0)));
+               fprintf(f, " & %"PRIi64")", m - 1);
                break;
             }
          }
@@ -700,6 +838,16 @@ static void emit_expr(FILE *f, tree_t e)
             }
             else
                emit_expr(f, a0);
+         }
+         else if (g_func_set != NULL
+                  && hset_contains(g_func_set, ident_new(vid(tree_ident(e))))) {
+            // call to a module-local design function -> Verilog function call
+            fprintf(f, "%s(", vid(tree_ident(e)));
+            for (int i = 0; i < nparams; i++) {
+               if (i) fputs(", ", f);
+               emit_expr(f, tree_value(tree_param(e, i)));
+            }
+            fputc(')', f);
          }
          else {
             // rising_edge / unhandled function: surface for inspection
@@ -836,18 +984,99 @@ static void emit_expr(FILE *f, tree_t e)
    }
 }
 
+// Recognise a folded '0'/'1' literal of a bit-like enum type. The enum
+// POSITION of '1' differs per type -- 1 in BIT, 3 in std_(u)logic and in
+// logic3d (L3D_0=2, L3D_1=3) -- so resolve the position through the type's
+// own literal list instead of hard-coding one encoding. *one = it is '1'.
+static bool folded_bit(tree_t e, bool *one)
+{
+   int64_t lv;
+   if (e == NULL || !folded_int(e, &lv) || lv < 0) return false;
+   if (!tree_has_type(e)) return false;
+   type_t b = type_base_recur(tree_type(e));
+   if (type_kind(b) != T_ENUM) return false;
+   if (lv >= type_enum_literals(b)) return false;
+   tree_t lit = type_enum_literal(b, lv);
+   if (!tree_has_ident(lit)) return false;
+   const char *s = id_base(istr(tree_ident(lit)));
+   if (!strcmp(s, "'0'") || !strcasecmp(s, "L3D_0")) { *one = false; return true; }
+   if (!strcmp(s, "'1'") || !strcasecmp(s, "L3D_1")) { *one = true;  return true; }
+   return false;
+}
+
+// Two expressions naming the SAME object (same resolved declaration). Used to
+// require `clk'event and clk = '1'` -- `clk'event and rst = '1'` is not an edge.
+static bool same_object(tree_t a, tree_t b)
+{
+   if (a == NULL || b == NULL) return false;
+   if (tree_kind(a) != T_REF || tree_kind(b) != T_REF) return false;
+   if (!tree_has_ref(a) || !tree_has_ref(b)) return false;
+   return tree_ref(a) == tree_ref(b);
+}
+
+// `<sig>'EVENT` -> the prefix signal, else NULL.
+static tree_t event_attr_of(tree_t e)
+{
+   if (e == NULL || tree_kind(e) != T_ATTR_REF) return NULL;
+   if (tree_subkind(e) != ATTR_EVENT) return NULL;
+   if (!tree_has_name(e)) return NULL;
+   return tree_name(e);
+}
+
+// `<sig> = '1'` / `<sig> = '0'` -> the tested signal, *one = compared to '1'.
+// Accepts the VHDL "=" operator and the logic3d value-plane equality.
+static tree_t level_test_of(tree_t e, bool *one)
+{
+   if (e == NULL || tree_kind(e) != T_FCALL) return NULL;
+   const char *fn = id_base(istr(tree_ident(e)));
+   if (strcasecmp(fn, "\"=\"") && strcasecmp(fn, "l3d_eq1")
+       && strcasecmp(fn, "l3d_eq")) return NULL;
+   if (tree_params(e) < 2) return NULL;
+   tree_t l = tree_value(tree_param(e, 0)), r = tree_value(tree_param(e, 1));
+   if (folded_bit(r, one)) return l;    // sig = '1'
+   if (folded_bit(l, one)) return r;    // '1' = sig
+   return NULL;
+}
+
 // Extract clock/reset edges from an if-condition: a single rising/falling_edge,
-// or an OR of them (async-reset flop, translated from `always @(posedge clk or
-// negedge rst)`). Fills sig[]/pe[] (pe = posedge), returns edge count or 0.
+// the VHDL-87 `clk'event and clk = '1'` idiom, or an OR of them (async-reset
+// flop, translated from `always @(posedge clk or negedge rst)`). Fills
+// sig[]/pe[] (pe = posedge), returns edge count or 0.
 static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
 {
-   if (test == NULL || tree_kind(test) != T_FCALL || max < 1) return 0;
+   if (test == NULL || max < 1) return 0;
+   if (tree_kind(test) != T_FCALL) return 0;
    const char *fn = id_base(istr(tree_ident(test)));
    if (!strcasecmp(fn, "RISING_EDGE") || !strcasecmp(fn, "FALLING_EDGE")) {
       if (tree_params(test) < 1) return 0;
       sig[0] = tree_value(tree_param(test, 0));
       pe[0]  = !strcasecmp(fn, "RISING_EDGE");
       return 1;
+   }
+   // The pre-`rising_edge` edge idiom: `clk'event and clk = '1'` (posedge) /
+   // `... = '0'` (negedge) -- how every ITC'99 / VHDL-87-era design writes a
+   // flop. Either operand order, and the conjunction may be the predefined
+   // boolean "and" or the logic3d l3d_and (promoted sources). The 'EVENT
+   // prefix and the level-tested signal MUST be the same object: `clk'event
+   // and rst = '1'` is a level test qualified by a clock event, NOT an edge,
+   // and must keep declining. Anything else about the shape -> decline.
+   if (!strcasecmp(fn, "\"and\"") || !strcasecmp(fn, "l3d_and")) {
+      if (tree_params(test) < 2) return 0;
+      tree_t a = tree_value(tree_param(test, 0));
+      tree_t b = tree_value(tree_param(test, 1));
+      tree_t ev = event_attr_of(a), lvl = b;
+      if (ev == NULL) { ev = event_attr_of(b); lvl = a; }
+      if (ev != NULL) {
+         bool one = false;
+         tree_t lsig = level_test_of(lvl, &one);
+         if (lsig != NULL && same_object(ev, lsig)) {
+            sig[0] = ev;
+            pe[0]  = one;
+            return 1;
+         }
+         return 0;      // 'event present but not the edge shape -> decline
+      }
+      return 0;
    }
    // OR of two edge tests (boolean "or" or logic3d l3d_or)
    if (!strcasecmp(fn, "\"or\"") || !strcasecmp(fn, "l3d_or")) {
@@ -911,15 +1140,15 @@ static tree_t areset_of(tree_t ifstmt, tree_t clockcond, tree_t *rsig,
       tree_t c = tree_cond(ifstmt, i);
       if (c == clockcond || !tree_has_value(c)) continue;   // clock / bare else
       tree_t test = tree_value(c);
-      if (tree_kind(test) != T_FCALL) continue;
-      // operator function names are quoted in the tree ("=", not =)
-      if (strcasecmp(id_base(istr(tree_ident(test))), "\"=\"")) continue;
-      if (tree_params(test) < 2) continue;
-      int64_t lv;
-      if (!folded_int(tree_value(tree_param(test, 1)), &lv)) continue;
-      if (lv != 2 && lv != 3) continue;   // std_logic '0'=2, '1'=3
-      *rsig   = tree_value(tree_param(test, 0));
-      *rpe    = (lv == 3);
+      // `rst = '0'|'1'` on any bit-like type. Was hard-coded to the std_logic
+      // enum positions ('0'=2, '1'=3), so a BIT-typed reset ('0'=0, '1'=1) --
+      // what every ITC'99 design uses -- was not recognised and the whole
+      // reset branch was then silently DROPPED from the always block.
+      bool one = false;
+      tree_t rs = level_test_of(test, &one);
+      if (rs == NULL) continue;
+      *rsig   = rs;
+      *rpe    = one;
       *before = (i < clk_idx);
       return c;
    }
@@ -1047,16 +1276,128 @@ static void emit_seq(FILE *f, tree_t s, int ind)
       // stays interpreted instead of crashing the whole-subtree synth.
       g_unhandled++; tab(f, ind); fputs("/*?while-loop*/\n", f);
       break;
+   case T_LOOP:
+      {
+         // `loop <body> wait on <sens>; end loop` is a process-sensitivity loop
+         // (the body runs once per wake) -- emit the body inline; the trailing
+         // T_WAIT is skipped by its case. A loop with NO wait is a real
+         // (bounded/exit) loop we don't translate yet -> decline.
+         bool has_wait = false;
+         for (int i = 0; i < tree_stmts(s); i++)
+            if (tree_kind(tree_stmt(s, i)) == T_WAIT) { has_wait = true; break; }
+         if (has_wait)
+            emit_stmt_list(f, s, ind);
+         else { g_unhandled++; tab(f, ind); fputs("/*?loop-no-wait*/\n", f); }
+      }
+      break;
    case T_WAIT:
       break;   // process sensitivity — not emitted
+   case T_RETURN:
+      // Inside a function body: `return x` -> `<func> = x` (Verilog assigns the
+      // result to the function name). Only the trailing return is reached in the
+      // simple combinational functions handled here.
+      if (g_func_ret_name != NULL && tree_has_value(s)) {
+         tab(f, ind);
+         fprintf(f, "%s = ", g_func_ret_name);
+         emit_expr(f, tree_value(s));
+         fputs(";\n", f);
+      }
+      else { g_unhandled++; tab(f, ind); fputs("/*?return*/\n", f); }
+      break;
    default:
       g_unhandled++; tab(f, ind); fprintf(f, "/*?seq k=%d*/\n", tree_kind(s));
       break;
    }
 }
 
-static void emit_process(FILE *f, tree_t p)
+// A function whose calls are already translated inline (a vlog_l3d_op table
+// entry or a special emit_expr handler) must NOT also be emitted as a Verilog
+// function: the definition is dead (calls never reach it) and its body may use
+// constructs we don't translate (e.g. Reduce_OR's `for I in X'Range`).
+static bool fn_is_builtin(const char *ident)
 {
+   int k;
+   if (vlog_l3d_op(ident, &k) != NULL) return true;
+   const char *b = id_base(ident);
+   static const char *const sp[] = {
+      "ternary_unsigned", "ternary_logic", "l3d_bit_read", "l3d_part_read",
+      "l3d_index", "l3d_resize_s", NULL };
+   for (int i = 0; sp[i]; i++)
+      if (!strcasecmp(b, sp[i])) return true;
+   return false;
+}
+
+// Emit a VHDL design function (T_FUNC_BODY) as a Verilog function. Handles the
+// simple combinational shape sv2ghdl produces for SV helper functions: value
+// parameters, local variables, straight-line body, a trailing `return`. Any
+// body construct that can't translate bumps g_unhandled -> the whole module
+// declines, so a partially-translated function never ships.
+static void emit_function(FILE *f, tree_t fn)
+{
+   const char *name = vid(tree_ident(fn));
+
+   // The signature return type is unconstrained (`logic3d_vector`), so take the
+   // result width from the LAST return's (constrained) value type. If it isn't a
+   // top-level return with a const-bounded type, decline the module.
+   type_t rt = NULL;
+   for (int i = tree_stmts(fn) - 1; i >= 0 && rt == NULL; i--) {
+      tree_t s = tree_stmt(fn, i);
+      if (tree_kind(s) == T_RETURN && tree_has_value(s)
+          && tree_has_type(tree_value(s)))
+         rt = tree_type(tree_value(s));
+   }
+   if (rt == NULL || (type_is_array(rt) && !type_const_bounds(rt))) {
+      g_unhandled++;
+      return;
+   }
+
+   fputs("  function ", f);
+   emit_range(f, rt);
+   fprintf(f, "%s;\n", name);
+
+   const int nports = tree_ports(fn);
+   for (int i = 0; i < nports; i++) {
+      tree_t p = tree_port(fn, i);
+      fputs("    input ", f);
+      emit_range(f, tree_type(p));
+      fprintf(f, "%s;\n", vid(tree_ident(p)));
+   }
+   for (int i = 0; i < tree_decls(fn); i++) {
+      tree_t d = tree_decl(fn, i);
+      if (tree_kind(d) != T_VAR_DECL) continue;
+      fputs("    reg ", f);
+      emit_range(f, tree_type(d));
+      fprintf(f, "%s;\n", vid(tree_ident(d)));
+   }
+
+   fputs("    begin\n", f);
+   const char *save = g_func_ret_name;
+   g_func_ret_name = name;
+   emit_stmt_list(f, fn, 6);
+   g_func_ret_name = save;
+   fputs("    end\n  endfunction\n", f);
+}
+
+// A process whose body is `loop <stmts> wait on <sens>; end loop` is iverilog's
+// rendering of an SV always block -- the loop just re-runs the body on each
+// wake. Return the wrapping T_LOOP as the effective statement container (its
+// trailing T_WAIT is skipped by emit_seq); otherwise return the process itself.
+static tree_t proc_body(tree_t p)
+{
+   tree_t loop = NULL;
+   const int n = tree_stmts(p);
+   for (int i = 0; i < n; i++) {
+      tree_t s = tree_stmt(p, i);
+      if (tree_kind(s) == T_WAIT) continue;
+      if (tree_kind(s) == T_LOOP && loop == NULL) loop = s;
+      else return p;   // anything besides one bare loop -> not the pattern
+   }
+   return loop != NULL ? loop : p;
+}
+
+static void emit_process(FILE *f, tree_t p0)
+{
+   tree_t p = proc_body(p0);   // unwrap the process-sensitivity loop
    tree_t body_if = NULL, sig[8], ifstmt = NULL;
    bool pe[8];
    int ne = 0;
@@ -1371,7 +1712,15 @@ static bool is_counter_while(tree_t init_stmt, tree_t while_stmt, tree_t *Vout,
 
    if (!is_static_expr(tree_value(init_stmt), NULL)) return false;   // init static
    tree_t c = tree_value(while_stmt);                                // condition
-   if (tree_kind(c) != T_FCALL || vlog_op(istr(tree_ident(c))) == NULL) return false;
+   // The condition is a comparison: either a Verilog operator (id_base the
+   // qualified ident, like emit_expr) OR a logic3d relational FUNCTION
+   // (l3d_lt_s/... -- the sv2vhdl `<` on a signed field lowers to these).
+   if (tree_kind(c) != T_FCALL) return false;
+   {
+      const char *cb = id_base(istr(tree_ident(c)));
+      bool _s;
+      if (vlog_op(cb) == NULL && l3d_relop(cb, &_s) == NULL) return false;
+   }
    if (!binop_const_operand(c, Vd)) return false;                   // V <relop> CONST
    tree_t iv = tree_value(inc);                                      // increment RHS
    if (!binop_const_operand(iv, Vd)) return false;                  // V <op> CONST
@@ -1440,6 +1789,72 @@ static void reg_scan_cb(tree_t t, void *ctx)
       hset_insert((hset_t *)ctx, tree_ident(tree_ref(tgt)));
 }
 
+// Mirror emit_process's decision: a NON-clocked process whose only non-wait
+// statement is a single T_SIGNAL_ASSIGN is emitted as a *continuous* `assign`
+// (line ~1340), so its target must stay a wire -- NOT a reg. Return that lone
+// assign (for conc-set scanning) or NULL if the process becomes an always block.
+// Must match emit_process exactly: else a lone-assign target lands in g_reg_set,
+// gets declared `reg = <init>`, and the continuous assign folds a driven flop
+// input to a constant ("dffs.dout is driving constant bits" in yosys).
+static tree_t proc_cont_assign_target(tree_t p0)
+{
+   tree_t p = proc_body(p0);
+   tree_t body_if = NULL, sig[8], ifstmt = NULL;
+   bool pe[8];
+   int ne = 0;
+   if (clock_of(p, &body_if, sig, pe, &ne, &ifstmt) != NULL)
+      return NULL;   // clocked -> always block -> reg
+   tree_t only = NULL; int cnt = 0;
+   const int nst = tree_stmts(p);
+   for (int i = 0; i < nst; i++) {
+      tree_t s = tree_stmt(p, i);
+      if (tree_kind(s) == T_WAIT) continue;
+      only = s; cnt++;
+   }
+   return (cnt == 1 && tree_kind(only) == T_SIGNAL_ASSIGN) ? only : NULL;
+}
+
+// A signal wired to a child instance's OUTPUT (or inout/buffer) port is driven
+// by that instance -- exactly like a concurrent assign. Record its base ident in
+// `set` (g_conc_set) so (a) it is declared `wire`, not `reg`, and (b) the
+// undriven-signal fallback does NOT add a second `assign <sig> = <init>`. Without
+// this, an init'd signal fed by an instance output got both the instance driver
+// AND `assign sig = 0`; yosys folded the flop/gate output to the constant
+// ("Cell port ...dffs.dout is driving constant bits: N'0"), the dominant EH2
+// whole-core synth failure. Modes come from the child T_BLOCK's ports (elaborated
+// instance) or, for a bare T_INSTANCE, the referenced unit's ports.
+static void scan_inst_outputs(tree_t s, hset_t *set)
+{
+   const tree_kind_t sk = tree_kind(s);
+   tree_t unit = NULL;
+   if (sk == T_BLOCK) unit = s;
+   else if (sk == T_INSTANCE && tree_has_ref(s)) unit = tree_ref(s);
+   if (unit == NULL) return;
+   const int nports  = tree_ports(unit);
+   const int nparams = tree_params(s);
+   for (int i = 0; i < nparams; i++) {
+      tree_t p = tree_param(s, i);
+      tree_t formal = NULL;
+      if (tree_subkind(p) == P_NAMED) {
+         tree_t nm = tree_name(p);
+         if (tree_kind(nm) == T_REF && tree_has_ref(nm)) formal = tree_ref(nm);
+      }
+      else if (i < nports)
+         formal = tree_port(unit, i);
+      if (formal == NULL || tree_kind(formal) != T_PORT_DECL) continue;
+      const port_mode_t mode = tree_subkind(formal);
+      if (mode != PORT_OUT && mode != PORT_INOUT && mode != PORT_BUFFER) continue;
+      tree_t act = tree_value(p);
+      if (act == NULL || tree_kind(act) == T_OPEN) continue;
+      tree_kind_t ak = tree_kind(act);
+      while (ak == T_ARRAY_REF || ak == T_ARRAY_SLICE || ak == T_RECORD_REF) {
+         act = tree_value(act); ak = tree_kind(act);
+      }
+      if (ak == T_REF && tree_has_ref(act))
+         hset_insert(set, tree_ident(tree_ref(act)));
+   }
+}
+
 static void build_reg_set(tree_t block)
 {
    if (g_reg_set != NULL) hset_free(g_reg_set);
@@ -1449,10 +1864,18 @@ static void build_reg_set(tree_t block)
    const int nstmts = tree_stmts(block);
    for (int i = 0; i < nstmts; i++) {
       tree_t s = tree_stmt(block, i);
-      if (tree_kind(s) == T_PROCESS)
-         tree_visit(s, reg_scan_cb, g_reg_set);
-      else if (tree_kind(s) == T_SIGNAL_ASSIGN)   // concurrent assign
+      const tree_kind_t k = tree_kind(s);
+      if (k == T_PROCESS) {
+         tree_t ca = proc_cont_assign_target(s);
+         if (ca != NULL)
+            reg_scan_cb(ca, g_conc_set);   // lone signal-assign -> wire
+         else
+            tree_visit(s, reg_scan_cb, g_reg_set);
+      }
+      else if (k == T_SIGNAL_ASSIGN)   // concurrent assign
          reg_scan_cb(s, g_conc_set);
+      else if (k == T_BLOCK || k == T_INSTANCE)   // instance output -> driven wire
+         scan_inst_outputs(s, g_conc_set);
    }
 }
 
@@ -1517,6 +1940,29 @@ static bool type_synth_ok(type_t t)
       if (type_is_enum(el) && enum_is_bitlike(el)) return true;
       if (type_is_array(el)) return type_synth_ok(el);   // multi-dim: recurse
       if (type_is_character_array(t)) return false;       // genuine strings
+      // Array of a MULTI-BIT SCALAR — ITC'99 b12's
+      //   type RAM is array (31 downto 0) of natural range 0 to 3
+      // A declaration only becomes an indexed Verilog memory when mem_shape()
+      // finds an ARRAY element; with a scalar element it falls through to the
+      // flat `reg [W-1:0]` path, so every entry collapses to ONE bit and each
+      // `memory(i)` silently reads the wrong value (b12: data_out truncated to
+      // 0/1, the accelerated run's whole game state wrong with no marker
+      // emitted). No representation exists -> reject the leaf rather than
+      // mistranslate it.
+      //
+      // logic3d is EXEMPT and must stay so. `subtype logic3d is natural range
+      // 0 to 7` is an integer subtype, so an unqualified integer-element test
+      // rejects logic3d_vector — i.e. every sv2vhdl port in the design, which
+      // takes ALL of VeeR out of --accel (measured: eh2_ifu_ifc_ctl declined at
+      // its first vector port, EXU_FLUSH_PATH_FINAL, emitting 0 modules). The
+      // one-bit-per-element collapse that is a silent bug for a natural RAM is
+      // the DEFINED representation here: emit_range() renders scalar logic3d as
+      // bit0 and a logic3d array as one bit per element, which is precisely the
+      // 2-state value plane --accel is built on (see type_is_logic3d). So the
+      // guard must key on "no bit-level representation exists", not on "the
+      // element happens to be an integer".
+      if (!type_is_logic3d(el) && (type_is_integer(el) || type_is_physical(el)))
+         return false;
       return type_synth_ok(el);
    }
    if (type_is_integer(t)) return true;
@@ -1636,6 +2082,11 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
       for (int i = 0; i < tree_stmts(s); i++)
          emit_proc_locals(f, tree_stmt(s, i), seen, nseen);
       break;
+   case T_LOOP:   // process-sensitivity loop (proc_body unwraps it) OR a bare
+                  // loop: descend so for-indices nested inside get hoisted. Without
+                  // this, a `for oob_p in ...` inside the sensitivity loop emitted a
+                  // procedural for over an UNDECLARED index -> yosys "LHS of for-loop
+                  // is not a register", failing ic_mem/ic_data whole-subtree synth.
    case T_WHILE:
    case T_BLOCK:
    case T_CASE:
@@ -1672,6 +2123,17 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       return false;
 
    build_reg_set(block);   // one walk; is_reg() is then a set lookup
+
+   // module-local design functions: register their (sanitized) names so calls
+   // emit a Verilog function call rather than the unhandled marker.
+   if (g_func_set != NULL) hset_free(g_func_set);
+   g_func_set = hset_new(64);
+   for (int i = 0; i < tree_decls(block); i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) == T_FUNC_BODY
+          && !fn_is_builtin(istr(tree_ident(d))))
+         hset_insert(g_func_set, ident_new(vid(tree_ident(d))));
+   }
 
    // module signal/port name set — hoisted locals colliding with these get
    // renamed (__lp) to keep yosys from rejecting the module
@@ -1763,6 +2225,13 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
          emit_expr(f, tree_value(d));
          fputs(";\n", f);
       }
+   }
+
+   // design functions -> Verilog functions (before the processes that call them)
+   for (int i = 0; i < tree_decls(block); i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) == T_FUNC_BODY && !fn_is_builtin(istr(tree_ident(d))))
+         emit_function(f, d);
    }
 
    const int nstmts = tree_stmts(block);
