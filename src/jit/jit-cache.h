@@ -89,11 +89,15 @@ jit_cache_status_t jit_cache_load(jit_cache_t *jc, code_cache_t *code,
 // table for publishing the fresh object (caller frees with shash_free).
 // The pending record is NOT consumed: release it with
 // jit_cache_pending_free on every exit path.
+// storable=false still resolves symbols (and still verifies against a held
+// record) but must NOT write the object: the caller knows this module came
+// out worse than the same input could produce, and a cache that froze it
+// would replay the inferior code on every later run
 shash_t *jit_cache_finish(jit_cache_t *jc, jit_func_t *f,
                           jit_func_t **inlined, unsigned ninlined,
                           int opt_level, uint64_t helper_mask,
                           const void *obj_data, size_t obj_size,
-                          jit_cache_pending_t *pending);
+                          bool storable, jit_cache_pending_t *pending);
 
 void jit_cache_pending_free(jit_cache_pending_t *pending);
 

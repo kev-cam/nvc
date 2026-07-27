@@ -207,6 +207,7 @@ typedef struct _llvm_obj {
    // materialisation changes.  The inline closure is recorded in
    // encounter order for the cache manifest.
    bool                  cacheable;
+   bool                  inline_raced;
    jit_func_t          **inlined;
    unsigned              ninlined;
    unsigned              maxinlined;
@@ -1461,8 +1462,17 @@ static void cgen_debug_loc(llvm_obj_t *obj, cgen_func_t *func, const loc_t *loc)
 
 static LLVMValueRef cgen_maybe_inline(llvm_obj_t *obj, jit_func_t *callee)
 {
-   if (load_acquire(&callee->state) != JIT_FUNC_READY)
+   if (load_acquire(&callee->state) != JIT_FUNC_READY) {
+      // Whether the callee HAPPENED to be compiled yet is a race, so the
+      // same design can be emitted with this call inlined on one run and
+      // not on the next -- and an un-inlined module also loses the O1
+      // pipeline (see opt_hint below).  Forcing the IR here would eagerly
+      // lower the whole callee closure and is far more expensive than the
+      // inlining is worth, so instead record that this module came out
+      // WORSE than it might have: jit_cache must not freeze it.
+      obj->inline_raced = true;
       return NULL;
+   }
 
    if (callee->nirs > INLINE_LIMIT)
       return NULL;
@@ -3913,7 +3923,8 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
       // for resolving this object's nvc.* references at load
       symtab = jit_cache_finish(jc, f, obj.inlined, obj.ninlined,
                                 obj.opt_hint > 0 ? 1 : 0, helper_mask,
-                                LLVMGetBufferStart(buf), objsz, pending);
+                                LLVMGetBufferStart(buf), objsz,
+                                !obj.inline_raced, pending);
    }
 
    code_blob_t *blob = code_blob_new(state->code, f->name, objsz);

@@ -215,6 +215,7 @@ typedef struct _jit_cache {
    unsigned   n_declines;
    unsigned   n_stores;
    unsigned   n_store_errors;
+   unsigned   n_unstorable;   // emitted worse than achievable: not frozen
    unsigned   n_forced_fills;
    unsigned   n_verify_ok;
    unsigned   n_verify_fresh;
@@ -1156,7 +1157,7 @@ shash_t *jit_cache_finish(jit_cache_t *jc, jit_func_t *f,
                           jit_func_t **inlined, unsigned ninlined,
                           int opt_level, uint64_t helper_mask,
                           const void *obj_data, size_t obj_size,
-                          jit_cache_pending_t *pending)
+                          bool storable, jit_cache_pending_t *pending)
 {
    if (jc == NULL)
       return NULL;
@@ -1194,7 +1195,9 @@ shash_t *jit_cache_finish(jit_cache_t *jc, jit_func_t *f,
       }
    }
 
-   if (store)
+   if (store && !storable)
+      relaxed_add(&jc->n_unstorable, 1);
+   else if (store)
       jit_cache_store(jc, f, manifest, msize, obj_data, obj_size);
 
    free(manifest);
@@ -1466,14 +1469,14 @@ void jit_cache_close(jit_cache_t *jc)
    if (jc->stats) {
       fprintf(stderr, "NVC_JIT_CACHE_STATS: hits=%u misses=%u (absent=%u "
               "record=%u manifest=%u probe=%u) declines=%u stores=%u "
-              "store_errors=%u forced_fills=%u verify_ok=%u verify_fresh=%u\n",
+              "store_errors=%u unstorable=%u forced_fills=%u verify_ok=%u verify_fresh=%u\n",
               jc->n_hits,
               jc->n_miss_absent + jc->n_miss_record + jc->n_miss_manifest
               + jc->n_miss_probe,
               jc->n_miss_absent, jc->n_miss_record, jc->n_miss_manifest,
               jc->n_miss_probe, jc->n_declines, jc->n_stores,
-              jc->n_store_errors, jc->n_forced_fills, jc->n_verify_ok,
-              jc->n_verify_fresh);
+              jc->n_store_errors, jc->n_unstorable, jc->n_forced_fills,
+              jc->n_verify_ok, jc->n_verify_fresh);
       fflush(stderr);
    }
 
