@@ -5791,11 +5791,41 @@ void accel_auto(rt_model_t *m)
       }
    }
 
-   const char *home = getenv("HOME");
-   if (!home) home = "/tmp";
-
+   // Cache location, resolved exactly like the JIT cache (jit-cache.c): explicit
+   // override, then $XDG_CACHE_HOME, then $HOME.  Two reasons this is not just
+   // "$HOME/.cache":
+   //
+   //   * a CONTAINER ON AN ALIEN FARM mounts its root read-only and may not set
+   //     a writable HOME, so the write target has to be redirectable to a
+   //     bind-mounted path or --accel is simply unusable there;
+   //   * the old `if (!home) home = "/tmp"` fallback was a MULTI-USER HOLE --
+   //     a shared world-writable directory from which we dlopen().  Another
+   //     user could plant aj_<design>.so and have it loaded.  jit-cache.c
+   //     already refuses to do this and names this path as the bad precedent.
+   //
+   // With no override and no HOME we fall back to a PRIVATE mkdtemp (0700)
+   // rather than a shared path: accel keeps working, nothing is reused across
+   // runs, and no other user can write to it.
    char accel_dir[512];
-   snprintf(accel_dir, sizeof(accel_dir), "%s/.cache/nvc/accel", home);
+   const char *ovr = getenv("NVC_ACCEL_CACHE_DIR");
+   const char *xdg = getenv("XDG_CACHE_HOME");
+   const char *home = getenv("HOME");
+
+   if (ovr != NULL && ovr[0] != '\0')
+      snprintf(accel_dir, sizeof(accel_dir), "%s", ovr);
+   else if (xdg != NULL && xdg[0] != '\0')
+      snprintf(accel_dir, sizeof(accel_dir), "%s/nvc/accel", xdg);
+   else if (home != NULL && home[0] != '\0')
+      snprintf(accel_dir, sizeof(accel_dir), "%s/.cache/nvc/accel", home);
+   else {
+      char tmpl[] = "/tmp/nvc-accel-XXXXXX";
+      const char *priv = mkdtemp(tmpl);
+      if (priv == NULL) {
+         warnf("--accel: no writable cache directory (set NVC_ACCEL_CACHE_DIR)");
+         return;
+      }
+      snprintf(accel_dir, sizeof(accel_dir), "%s", priv);
+   }
    aj_mkdir_p(accel_dir);   // JIT writes aj_*.c/.so here; may not exist yet
 
    accel_scan_scope(m, root_scope(m), accel_dir);
