@@ -24,6 +24,7 @@
 #include <inttypes.h>
 
 static void emit_expr(FILE *f, tree_t e);
+
 static void emit_seq(FILE *f, tree_t s, int ind);
 static bool emit_agg_general(FILE *f, tree_t e);
 // Emit a statement list with the while->for counter-loop peephole. _range emits
@@ -37,6 +38,62 @@ static void emit_stmt_list_range(FILE *f, tree_t container, int lo, int hi, int 
 // Emitting wrong-but-parseable Verilog would silently corrupt results — worse
 // than not accelerating.
 static int g_unhandled = 0;
+
+// "The expression about to be emitted is a CONCATENATION ELEMENT."
+//
+// Verilog resizes every operand to its context width in every context except
+// two: a concatenation element and a replication operand.  Everywhere else an
+// emitted expression that is wider or narrower than its VHDL type is harmless
+// (the assignment or the operator resizes it); inside {} it silently shreds the
+// surrounding vector -- which is exactly how the l3d_bit_read width defect
+// destroyed every VeeR GPR write while yosys reported zero errors.
+//
+// Sensitivity stops at a SELF-DETERMINED operand position and flows through a
+// CONTEXT-DETERMINED one (IEEE 1364-2005 Table 5-22).  emit_expr therefore
+// CONSUMES the flag on entry -- each emission decides for itself -- and hands it
+// back down only where an operand's own width can still escape into the result:
+//   * verbatim pass-throughs   -- type conversion / qualified / inertial, and
+//                                 the l3dk==2 IDENTITY emissions (resize,
+//                                 to_l3d, unsigned_to_l3d, l3d_to_unsigned,
+//                                 to_unsigned/to_signed, is_one, ...), which
+//                                 print their operand and nothing else;
+//   * both operands of + - * & | ^ ~& ~| ~^ and of unary ~ / -, and both arms
+//     of ?:  -- the result is max(L,R) wide, so a too-WIDE operand poisons it;
+//   * the LEFT operand of << / >>  -- the result is that operand's width.
+// It must NOT flow into a self-determined position -- a relational operand
+// (result is 1 bit), a reduction operand, a shift AMOUNT, an index, or a
+// replication count -- because no width can escape from there.
+//
+// Getting this wrong in the "stops too early" direction is what made the
+// original guard one node deep: the dominant sv2vhdl idiom is
+// unsigned_to_l3d(Resize(l3d_to_unsigned(X), N)) (2539 `resize` and 370
+// `unsigned_to_l3d_bit` calls in VeeR's design.vhd), so ANY width-wrong emission
+// under one of those wrappers escaped every guard.
+//
+// Emissions whose Verilog SELF-DETERMINED width is not the VHDL type width test
+// the consumed flag and bump g_unhandled, i.e. DECLINE, rather than emit a
+// silently shredded vector.
+static bool g_concat_elem = false;
+
+// Emit one element of a concatenation/replication (width-sensitive context).
+static void emit_concat_elem(FILE *f, tree_t e)
+{
+   const bool save = g_concat_elem;
+   g_concat_elem = true;
+   emit_expr(f, e);
+   g_concat_elem = save;
+}
+
+// Emit a CONTEXT-DETERMINED operand, propagating the caller's (already
+// consumed) width sensitivity into it.  `celem` false makes this a plain
+// emit_expr, so it is safe to use unconditionally.
+static void emit_ctx_operand(FILE *f, tree_t e, bool celem)
+{
+   const bool save = g_concat_elem;
+   g_concat_elem = celem;
+   emit_expr(f, e);
+   g_concat_elem = save;
+}
 
 static void tab(FILE *f, int n) { for (int i = 0; i < n; i++) fputc(' ', f); }
 
@@ -406,6 +463,87 @@ static const char *vlog_l3d_op(const char *fn, int *kind)
    return NULL;
 }
 
+// Does this Verilog operator take its width FROM its operands?  Equality and
+// the relationals are exactly one bit whatever they compare, so their operands
+// are sealed off; everything else vlog_op/vlog_l3d_op emits (+ - * & | ^ ~& ~|
+// ~^ ~ << >>) is max(L,R) or L wide, i.e. its operands' widths escape.
+static bool vlog_op_ctx_width(const char *o)
+{
+   return !(!strcmp(o, "==") || !strcmp(o, "!=") || !strcmp(o, "<")
+            || !strcmp(o, ">") || !strcmp(o, "<=") || !strcmp(o, ">="));
+}
+
+// ---- Verilog SELF-DETERMINED width of what emit_expr() will actually PRINT ---
+//
+// Not the same thing as the VHDL type width: the l3dk==2 identities DROP their
+// width argument and print their operand verbatim, so `resize(x, 32)` emits
+// width(x) bits, not 32.  Everywhere but inside {} that is harmless (the
+// enclosing assignment or operator resizes it); inside {} nothing resizes, so
+// the concat-element guard has to know the real emitted width.
+//
+// Returns -1 for "not statically known", which the caller treats as a MISMATCH
+// (decline).  Answering "I don't know" costs a chunk; answering wrongly ships a
+// shredded vector, so every shape not resolved below returns -1.
+//
+// Descending the identity CHAIN is the point: sv2vhdl's dominant idiom is
+//     unsigned_to_l3d(Resize(l3d_to_unsigned(X), N))
+// in which every intermediate carries an UNCONSTRAINED numeric_std type, so the
+// operand's own VHDL type width is unknown at every level and only walking down
+// to X recovers the width that will really be emitted.
+static int emitted_width(tree_t e, int depth)
+{
+   if (e == NULL || depth > 16) return -1;
+   switch (tree_kind(e)) {
+   case T_TYPE_CONV:
+   case T_QUALIFIED:
+   case T_INERTIAL:
+      return emitted_width(tree_value(e), depth + 1);   // printed verbatim
+   case T_STRING:
+      {
+         const int n = tree_chars(e);        // sized literal: `N'b...`
+         return n > 0 ? n : -1;
+      }
+   case T_FCALL:
+      {
+         const char *fn = istr(tree_ident(e));
+         int k = -1;
+         if (vlog_op(fn) != NULL) return -1;
+         if (vlog_l3d_op(fn, &k) == NULL || k != 2 || tree_params(e) < 1)
+            return -1;
+         // l3dk==2 identity: prints param 0 verbatim, except for the widening
+         // zero-extend branch, which prints `{nw-aw'b0, param0}`.  Mirror that
+         // branch's EXACT condition (see emit_expr) or the answer is fiction.
+         tree_t a0 = tree_value(tree_param(e, 0));
+         const int in = emitted_width(a0, depth + 1);
+         const bool sgn = tree_has_type(e) && type_is_signed(tree_type(e));
+         int64_t nwi = -1;
+         int nw = -1, aw = -1;
+         if (tree_params(e) >= 2
+             && folded_int(tree_value(tree_param(e, 1)), &nwi))
+            nw = (int)nwi;
+         if (tree_has_type(a0) && type_is_array(tree_type(a0))
+             && type_const_bounds(tree_type(a0)))
+            aw = (int)type_width(tree_type(a0));
+         if (!sgn && nw > 0 && aw > 0 && nw > aw)
+            return in > 0 ? (nw - aw) + in : -1;    // {nw-aw'b0, a0}
+         return in;                                  // $signed(a0) / bare a0
+      }
+   default:
+      break;
+   }
+   if (!tree_has_type(e)) return -1;
+   type_t t = tree_type(e);
+   // Exactly emit_range()'s model -- that is what the module's own declarations
+   // use, so it is the width every identifier reference really has.  logic3d is
+   // an INTEGER subtype (natural range 0 to 7), so it must be tested first.
+   if (type_is_logic3d(t) && !type_is_array(t)) return 1;
+   if (type_is_array(t))
+      return type_const_bounds(t) ? (int)type_width(t) : -1;
+   if (type_is_integer(t)) return 32;                  // `signed [31:0]`
+   if (type_is_enum(t)) return 1;                      // std_logic/bit/boolean
+   return -1;                                          // real/physical/record/...
+}
+
 static void emit_lit(FILE *f, tree_t e)
 {
    int64_t i;
@@ -510,7 +648,7 @@ static bool emit_agg_general(FILE *f, tree_t e)
       fputc('{', f);
       for (int b = 0; b < W; b++) {
          if (b) fputs(", ", f);
-         emit_expr(f, slot[is_downto ? b : (W - 1 - b)]);
+         emit_concat_elem(f, slot[is_downto ? b : (W - 1 - b)]);
       }
       fputc('}', f);
    }
@@ -520,6 +658,11 @@ static bool emit_agg_general(FILE *f, tree_t e)
 
 static void emit_expr(FILE *f, tree_t e)
 {
+   // consume the concat-element flag: this emission decides for itself, and its
+   // operands (which the operator resizes) must not inherit it.
+   const bool celem = g_concat_elem;
+   g_concat_elem = false;
+
    if (e == NULL) {   // e.g. a null/unaffected waveform value — decline, don't crash
       g_unhandled++; fputs("/*null*/0", f);
       return;
@@ -547,7 +690,8 @@ static void emit_expr(FILE *f, tree_t e)
             tree_t ref = tree_has_ref(e) ? tree_ref(e) : NULL;
             const tree_kind_t rk = ref != NULL ? tree_kind(ref) : T_REF;
             if (rk == T_CONST_DECL && tree_has_value(ref))
-               emit_expr(f, tree_value(ref));
+               // inlined VERBATIM -> width sensitivity passes through
+               emit_ctx_operand(f, tree_value(ref), celem);
             else if (rk == T_CONST_DECL || rk == T_GENERIC_DECL) {
                g_unhandled++; fprintf(f, "/*ref %s*/0", bn);
             }
@@ -586,9 +730,9 @@ static void emit_expr(FILE *f, tree_t e)
          // VHDL concatenation "&" -> Verilog {a, b}
          if (strcmp(fn, "\"&\"") == 0 && nparams == 2) {
             fputc('{', f);
-            emit_expr(f, tree_value(tree_param(e, 0)));
+            emit_concat_elem(f, tree_value(tree_param(e, 0)));
             fputs(", ", f);
-            emit_expr(f, tree_value(tree_param(e, 1)));
+            emit_concat_elem(f, tree_value(tree_param(e, 1)));
             fputc('}', f);
             break;
          }
@@ -596,25 +740,46 @@ static void emit_expr(FILE *f, tree_t e)
          if ((strcasecmp(vid(tree_ident(e)), "ternary_unsigned") == 0
               || strcasecmp(vid(tree_ident(e)), "ternary_logic") == 0)
              && nparams == 3) {
+            // `?:` is max(L,R) wide: BOTH arms are context-determined, so a
+            // width-wrong arm escapes into the concat.  The condition is
+            // self-determined (only its truth matters) -- flag not passed.
             fputs("((", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
             fputs(") ? (", f);
-            emit_expr(f, tree_value(tree_param(e, 1)));
+            emit_ctx_operand(f, tree_value(tree_param(e, 1)), celem);
             fputs(") : (", f);
-            emit_expr(f, tree_value(tree_param(e, 2)));
+            emit_ctx_operand(f, tree_value(tree_param(e, 2)), celem);
             fputs("))", f);
             break;
          }
-         // l3d_bit_read(a, idx) -> value bit idx of a: ((a >> idx) & 1). Works
-         // for any base expression and a variable index (mirrors the const-base
-         // T_ARRAY_REF lowering).
+         // l3d_bit_read(a, idx) -> value bit idx of a. Works for any base
+         // expression and a variable index (mirrors the const-base T_ARRAY_REF
+         // lowering).
+         //
+         // The obvious rendering, `((a >> idx) & 1'b1)`, has the right VALUE but
+         // the WRONG WIDTH: Verilog gives a shift/bitwise expression the
+         // SELF-DETERMINED width of its left operand, so it is width(a) bits,
+         // not 1. Verilog has exactly two contexts that do NOT resize their
+         // parts -- a concatenation element and a replication operand -- and
+         // vhdl2vlog puts bit-reads into both (`&` -> {a,b}, aggregates,
+         // (others=>X) -> {W{X}}). There each bit_read occupies width(a) slots
+         // instead of one, so bit k of an N-element concat lands at Verilog bit
+         // k*width(a) and the intended vector is silently shredded.
+         //
+         // sv2vhdl's register-file write masks are exactly that shape:
+         // eh2_dec_gpr_ctl's `l3d_and({32 x l3d_bit_read(v_w0v,j)}, wd0)` with
+         // width(v_w0v)=31 emitted a 992-bit concat whose low 32 bits are
+         // 32'h80000001 -- only bits 0 and 31 of every GPR write were stored.
+         // Trailing `!= 1'b0` makes the result SELF-DETERMINED 1 BIT WIDE (a
+         // relational always is), which is what the VHDL scalar return type
+         // says, without changing the value.
          if (strcasecmp(vid(tree_ident(e)), "l3d_bit_read") == 0
              && nparams == 2) {
-            fputs("(((", f);
+            fputs("((((", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
             fputs(") >> (", f);
             emit_expr(f, tree_value(tree_param(e, 1)));
-            fputs(")) & 1'b1)", f);
+            fputs(")) & 1'b1) != 1'b0)", f);
             break;
          }
          // logic3d relational functions (l3d_lt_s/le_s/gt_s/ge_s, unsigned too)
@@ -649,6 +814,9 @@ static void emit_expr(FILE *f, tree_t e)
          // wrap in $signed so the surrounding context sign-extends.
          if (strcasecmp(vid(tree_ident(e)), "l3d_resize_s") == 0
              && nparams == 2) {
+            // the target width is DROPPED (the context resizes) -- so this is
+            // width(a), not the requested width: unsafe inside a concatenation.
+            if (celem) g_unhandled++;
             fputs("$signed(", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
             fputc(')', f);
@@ -664,7 +832,11 @@ static void emit_expr(FILE *f, tree_t e)
             tree_t a = tree_value(tree_param(e, 0));
             if (folded_int(tree_value(tree_param(e, 2)), &w) && w > 0) {
                if (w <= 64) {
-                  // narrow: shift + mask (works for any base expression)
+                  // narrow: shift + mask (works for any base expression).
+                  // Self-determined width is max(width(a), width(mask literal)),
+                  // NOT w -- fine in a resizing context, fatal inside a
+                  // concatenation, so decline there.
+                  if (celem) g_unhandled++;
                   fputs("(((", f);
                   emit_expr(f, a);
                   fputs(") >> (", f);
@@ -681,6 +853,9 @@ static void emit_expr(FILE *f, tree_t e)
                   // wide (>64b): Verilog indexed part-select on a net; yosys
                   // lowers it to $shiftx (wide dynamic select). The base may be
                   // a variable/expression; the width is the folded constant.
+                  // Unlike the mask form above this is EXACTLY w bits wide --
+                  // an indexed part-select is self-determined at its width --
+                  // so it needs no concat-element guard.
                   emit_expr(f, a);
                   fputs("[(", f);
                   emit_expr(f, tree_value(tree_param(e, 1)));
@@ -751,6 +926,9 @@ static void emit_expr(FILE *f, tree_t e)
             int64_t m;
             if (folded_int(tree_value(tree_param(e, 1)), &m)
                 && m > 0 && m <= (INT64_C(1) << 30) && (m & (m - 1)) == 0) {
+               // the unsized decimal mask makes this max(width(a), 32) wide,
+               // not the k bits the VHDL type has -- unsafe inside a concat.
+               if (celem) g_unhandled++;
                fputc('(', f);
                emit_expr(f, tree_value(tree_param(e, 0)));
                fprintf(f, " & %"PRIi64")", m - 1);
@@ -768,13 +946,26 @@ static void emit_expr(FILE *f, tree_t e)
             const bool sgn =
                (tree_has_type(a0) && type_is_signed(tree_type(a0)))
                || (tree_has_type(a1) && type_is_signed(tree_type(a1)));
+            // numeric_std `*` returns wa+wb bits in VHDL but only max(wa,wb)
+            // self-determined in Verilog -- a concatenation element would be
+            // truncated.  Every other operator in vlog_op is width-preserving
+            // (+/- are max(wa,wb) in both; bitwise/shift keep the left width;
+            // relationals are 1 bit in both).
+            if (celem && strcmp(op, "*") == 0) g_unhandled++;
+            // ...and the operands are CONTEXT-determined for every one of those
+            // width-preserving operators, so a too-WIDE operand still poisons
+            // the result: max(L,R) is only right when L and R are.  $signed()
+            // does not change a self-determined width, so it passes through too.
+            // A shift AMOUNT is self-determined -- nothing escapes from there.
+            const bool ctxw = vlog_op_ctx_width(op);
+            const bool shft = (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0);
             fputc('(', f);
             if (sgn) fputs("$signed(", f);
-            emit_expr(f, a0);
+            emit_ctx_operand(f, a0, celem && ctxw);
             if (sgn) fputc(')', f);
             fprintf(f, " %s ", op);
             if (sgn) fputs("$signed(", f);
-            emit_expr(f, a1);
+            emit_ctx_operand(f, a1, celem && ctxw && !shft);
             if (sgn) fputc(')', f);
             fputc(')', f);
          }
@@ -783,20 +974,27 @@ static void emit_expr(FILE *f, tree_t e)
                               && type_is_signed(tree_type(tree_value(tree_param(e, 0)))));
             fprintf(f, "%s(", op);
             if (sgn) fputs("$signed(", f);
-            emit_expr(f, tree_value(tree_param(e, 0)));
+            // unary `~` / `-`: result is the operand's width -> context-determined
+            emit_ctx_operand(f, tree_value(tree_param(e, 0)), celem);
             if (sgn) fputc(')', f);
             fputc(')', f);
          }
          else if (l3dop != NULL && l3dk == 0 && nparams == 2) {
+            // bitwise l3d_and/or/xor/... are max(L,R) wide (context-determined
+            // operands); l3d_eq1/ne1 emit `==`/`!=` and are always 1 bit.
+            const bool ctxw = vlog_op_ctx_width(l3dop);
             fputc('(', f);
-            emit_expr(f, tree_value(tree_param(e, 0)));
+            emit_ctx_operand(f, tree_value(tree_param(e, 0)), celem && ctxw);
             fprintf(f, " %s ", l3dop);
-            emit_expr(f, tree_value(tree_param(e, 1)));
+            emit_ctx_operand(f, tree_value(tree_param(e, 1)), celem && ctxw);
             fputc(')', f);
          }
          else if (l3dop != NULL && (l3dk == 1 || l3dk == 3) && nparams >= 1) {
+            // kind 1 is `~a` -- as wide as its operand, so sensitivity passes
+            // through.  Kind 3 is a REDUCTION (`|a`, `&a`, `^a`): always exactly
+            // one bit, operand self-determined, nothing escapes.
             fprintf(f, "(%s", l3dop);
-            emit_expr(f, tree_value(tree_param(e, 0)));
+            emit_ctx_operand(f, tree_value(tree_param(e, 0)), celem && l3dk == 1);
             fputc(')', f);
          }
          else if (l3dop != NULL && l3dk == 2 && nparams >= 1) {
@@ -826,18 +1024,45 @@ static void emit_expr(FILE *f, tree_t e)
             if (tree_has_type(a0) && type_is_array(tree_type(a0))
                 && type_const_bounds(tree_type(a0)))
                aw = (int)type_width(tree_type(a0));
+            // IDENTITY EMISSION, i.e. a verbatim pass-through -- so it is
+            // width-transparent in BOTH directions inside a concatenation:
+            //  (a) its own result is width(a0)-as-EMITTED, not the requested nw;
+            //  (b) whatever a0 emits lands straight in the concat, so a
+            //      width-wrong expression NESTED under it must still be caught.
+            // (b) is why these emissions have to hand the flag down exactly like
+            // T_TYPE_CONV -- without that, resize/to_l3d/unsigned_to_l3d/... were
+            // an unguarded tunnel through the guard, and they are the single most
+            // common wrappers sv2vhdl emits.
+            //
+            // For (a) compare against emitted_width(a0), NOT the VHDL type width:
+            // the operand of a resize is normally an unconstrained numeric_std
+            // intermediate whose type width is unknown, while the width that will
+            // really be printed is recoverable by descending the identity chain.
+            // Unknown (-1) never equals nw, so it declines -- correct, because an
+            // unknown width inside {} genuinely cannot be shown safe.  The check
+            // applies only to the two IDENTITY branches: the zero-extend branch
+            // below prints an exactly-nw-bit form, so testing it there would be a
+            // false positive.
+            const bool ident_bad =
+               (celem && nw > 0 && emitted_width(a0, 0) != nw);
             if (sgn) {
+               if (ident_bad) g_unhandled++;
+               // $signed(x) keeps x's self-determined width -> transparent.
                fputs("$signed(", f);
-               emit_expr(f, a0);
+               emit_ctx_operand(f, a0, celem);
                fputc(')', f);
             }
             else if (nw > 0 && aw > 0 && nw > aw) {
+               // exact nw bits PROVIDED a0 really emits aw -- emit_concat_elem
+               // makes a0 prove that for itself.
                fprintf(f, "{%d'b0, ", nw - aw);
-               emit_expr(f, a0);
+               emit_concat_elem(f, a0);
                fputc('}', f);
             }
-            else
-               emit_expr(f, a0);
+            else {
+               if (ident_bad) g_unhandled++;
+               emit_ctx_operand(f, a0, celem);
+            }
          }
          else if (g_func_set != NULL
                   && hset_contains(g_func_set, ident_new(vid(tree_ident(e))))) {
@@ -860,6 +1085,7 @@ static void emit_expr(FILE *f, tree_t e)
    case T_TYPE_CONV:
    case T_QUALIFIED:
    case T_INERTIAL:   // inertial-delay waveform wrapper -> inner value
+      g_concat_elem = celem;         // emitted verbatim: width sensitivity passes through
       emit_expr(f, tree_value(e));   // numeric/std_logic_vector casts: no-op in Verilog
       break;
    case T_ARRAY_REF:
@@ -872,8 +1098,12 @@ static void emit_expr(FILE *f, tree_t e)
          const bool const_base = (tree_kind(base) == T_REF && tree_has_ref(base)
                                   && tree_kind(tree_ref(base)) == T_CONST_DECL);
          if (const_base && tree_params(e) == 1) {
-            fputs("(((", f); emit_expr(f, base); fputs(") >> (", f);
-            emit_expr(f, tree_value(tree_param(e, 0))); fputs(")) & 1'b1)", f);
+            // `!= 1'b0` forces the SELF-DETERMINED width to 1 -- see the
+            // l3d_bit_read case above; a bare shift+mask is as wide as the
+            // inlined constant and corrupts any enclosing concatenation.
+            fputs("((((", f); emit_expr(f, base); fputs(") >> (", f);
+            emit_expr(f, tree_value(tree_param(e, 0)));
+            fputs(")) & 1'b1) != 1'b0)", f);
          }
          else {
             // Element width: a 2-D array `array(..) of vector(W-1 downto 0)` is
@@ -938,7 +1168,7 @@ static void emit_expr(FILE *f, tree_t e)
                const int w = type_width(tree_type(e));
                if (w > 0) {
                   fprintf(f, "{%d{", w);
-                  emit_expr(f, tree_value(tree_assoc(e, 0)));
+                  emit_concat_elem(f, tree_value(tree_assoc(e, 0)));
                   fputs("}}", f);
                   break;
                }
@@ -957,7 +1187,7 @@ static void emit_expr(FILE *f, tree_t e)
                fputc('{', f);
                for (int i = 0; i < n; i++) {
                   if (i) fputs(", ", f);
-                  emit_expr(f, tree_value(tree_assoc(e, i)));
+                  emit_concat_elem(f, tree_value(tree_assoc(e, i)));
                }
                fputc('}', f);
                break;
@@ -1197,17 +1427,19 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          // (tree_decl 0) is hoisted to a module-level `integer` by the caller.
          tree_t r = tree_range(s, 0);
          tree_t idecl = tree_decls(s) > 0 ? tree_decl(s, 0) : NULL;
-         static char ivbuf[96];
-         const char *iv = "i";
-         if (idecl != NULL) {
-            if (ren_decl(idecl)) {
-               snprintf(ivbuf, sizeof ivbuf, "%s%s", vid(tree_ident(idecl)),
-                        ren_suffix(idecl));
-               iv = ivbuf;
-            }
-            else
-               iv = vid(tree_ident(idecl));
-         }
+         // Own storage, not vid()'s rotating static buffer and not a `static`:
+         // `iv` is re-printed after emit_expr() on the loop bounds, and a call
+         // in a bound would wrap vid()'s 8-slot ring and rename the loop
+         // variable mid-header. (Same class of bug as emit_function's `name`.)
+         // Sized to match emit_proc_locals' `mn[120]`, which emits the matching
+         // module-level `integer` declaration -- a shorter buffer here would
+         // truncate a long index name to a DIFFERENT string than the one
+         // declared, leaving the for-header driving an undeclared identifier.
+         char ivbuf[120] = "i";
+         const char *iv = ivbuf;
+         if (idecl != NULL)
+            snprintf(ivbuf, sizeof ivbuf, "%s%s", vid(tree_ident(idecl)),
+                     ren_decl(idecl) ? ren_suffix(idecl) : "");
          const bool to = (tree_subkind(r) == RANGE_TO);
          if (tree_subkind(r) != RANGE_TO && tree_subkind(r) != RANGE_DOWNTO) {
             g_unhandled++; tab(f, ind);
@@ -1327,6 +1559,56 @@ static bool fn_is_builtin(const char *ident)
    return false;
 }
 
+// True if some `return` in this statement list is NOT in TAIL position.
+//
+// A Verilog function body has no early exit: emit_seq lowers `return x` to
+// `<name> = x` and then FALLS THROUGH to whatever follows. That is faithful
+// only for a return in tail position -- the last statement of the body, or the
+// last statement of a branch that is itself in tail position. An early return
+// followed by more statements emits an UNGUARDED assignment that a later one
+// overwrites (last write wins), so
+//     if c then return A; end if;
+//     return B;
+// computes B for every input, including c = true. Nothing else in emit_function
+// catches this: the return-type scan below finds the trailing top-level return,
+// so the function is accepted and silently ships the wrong value. `tail` says
+// whether this container itself sits in tail position; a return anywhere inside
+// a LOOP is never faithful (the loop would keep iterating), hence tail=false
+// there.
+static bool has_nontail_return(tree_t container, bool tail)
+{
+   const int n = tree_stmts(container);
+   for (int i = 0; i < n; i++) {
+      tree_t s = tree_stmt(container, i);
+      const bool last = (i == n - 1);
+      switch (tree_kind(s)) {
+      case T_RETURN:
+         if (!tail || !last) return true;
+         break;
+      case T_IF:
+         {
+            const int nc = tree_conds(s);
+            for (int j = 0; j < nc; j++)
+               if (has_nontail_return(tree_cond(s, j), tail && last)) return true;
+         }
+         break;
+      case T_CASE:
+         {
+            const int na = tree_stmts(s);   // alternatives
+            for (int j = 0; j < na; j++)
+               if (has_nontail_return(tree_stmt(s, j), tail && last)) return true;
+         }
+         break;
+      case T_FOR: case T_LOOP: case T_WHILE:
+         if (has_nontail_return(s, false)) return true;
+         break;
+      default:
+         break;
+      }
+   }
+   return false;
+}
+
 // Emit a VHDL design function (T_FUNC_BODY) as a Verilog function. Handles the
 // simple combinational shape sv2ghdl produces for SV helper functions: value
 // parameters, local variables, straight-line body, a trailing `return`. Any
@@ -1334,7 +1616,15 @@ static bool fn_is_builtin(const char *ident)
 // declines, so a partially-translated function never ships.
 static void emit_function(FILE *f, tree_t fn)
 {
-   const char *name = vid(tree_ident(fn));
+   // COPY the name -- do NOT borrow vid()'s pointer. vid() returns one of 8
+   // ROTATING static buffers, and the body emission below issues far more than
+   // 8 vid() calls (emit_expr's T_FCALL dispatch chain alone burns up to 12 for
+   // a single call, and every T_REF operand burns one). A borrowed pointer is
+   // therefore overwritten with the last-emitted callee/operand identifier
+   // before the trailing `return` prints g_func_ret_name, yielding e.g.
+   // `l3d_and = pipe_to_thr_result;` instead of `pipe_to_thr = ...`.
+   char name[256];
+   snprintf(name, sizeof name, "%s", vid(tree_ident(fn)));
 
    // The signature return type is unconstrained (`logic3d_vector`), so take the
    // result width from the LAST return's (constrained) value type. If it isn't a
@@ -1347,6 +1637,14 @@ static void emit_function(FILE *f, tree_t fn)
          rt = tree_type(tree_value(s));
    }
    if (rt == NULL || (type_is_array(rt) && !type_const_bounds(rt))) {
+      g_unhandled++;
+      return;
+   }
+
+   // Verilog has no early `return` -- decline rather than mistranslate. See
+   // has_nontail_return: without this an early return silently loses to the
+   // trailing one.
+   if (has_nontail_return(fn, true)) {
       g_unhandled++;
       return;
    }

@@ -47,6 +47,36 @@ ana "$HERE/scmin.vhd"     || { echo "analyze scmin FAILED";    exit 2; }
 ana "$HERE/scmin_tb.vhd"  || { echo "analyze scmin_tb FAILED"; exit 2; }
 ana "$HERE/wscmp.vhd"     || { echo "analyze wscmp FAILED";    exit 2; }
 ana "$HERE/wscmp_tb.vhd"  || { echo "analyze wscmp_tb FAILED"; exit 2; }
+# design-declared VHDL FUNCTIONS -- emit_function had NO coverage here at all.
+# fnret   = straight-line, single trailing return: must translate and install.
+# fnearly = same design with an EARLY return.  Verilog functions have no early
+# exit, so the lowering `return x` -> `<name> = x` falls through and the trailing
+# return overwrites the saturating one; vhdl2vlog must DECLINE rather than
+# install that.  Both must reproduce the interpreter's Y.
+ana "$HERE/fnret.vhd"      || { echo "analyze fnret FAILED";      exit 2; }
+ana "$HERE/fnret_tb.vhd"   || { echo "analyze fnret_tb FAILED";   exit 2; }
+ana "$HERE/fnearly.vhd"    || { echo "analyze fnearly FAILED";    exit 2; }
+ana "$HERE/fnearly_tb.vhd" || { echo "analyze fnearly_tb FAILED"; exit 2; }
+# CONCATENATION-ELEMENT WIDTH.  Verilog resizes operands everywhere except inside
+# {}, so an element whose emitted self-determined width differs from its VHDL
+# width silently shreds the vector.  mulcat puts a numeric_std `*` (VHDL wa+wb
+# bits, Verilog max(wa,wb)) in a concat: vhdl2vlog must DECLINE.  This is the
+# std_logic sibling of l3dcat_run.sh's logic3d bit-read case.
+ana "$HERE/mulcat.vhd"     || { echo "analyze mulcat FAILED";     exit 2; }
+ana "$HERE/mulcat_tb.vhd"  || { echo "analyze mulcat_tb FAILED";  exit 2; }
+# ...and the SAME defect NESTED under a wrapper.  mulcat puts the `*` straight
+# into the concat, so a one-node-deep guard sees it.  rszcat wraps it in
+# `resize(...,16)`, which vhdl2vlog emits as a verbatim IDENTITY -- the guard
+# only ever sees it if that identity hands the width sensitivity DOWN.  It must
+# DECLINE (measured without the propagation: installs, Y=136746172 instead of
+# 1768636092).  rszok is the control: the two resize-in-concat forms that ARE
+# expressible ({N'b0,a}, and an identity whose widths really match) must still
+# INSTALL -- otherwise the guard has just taken the accelerator away from
+# sv2vhdl's commonest construct and nothing else here would notice.
+ana "$HERE/rszcat.vhd"     || { echo "analyze rszcat FAILED";     exit 2; }
+ana "$HERE/rszcat_tb.vhd"  || { echo "analyze rszcat_tb FAILED";  exit 2; }
+ana "$HERE/rszok.vhd"      || { echo "analyze rszok FAILED";      exit 2; }
+ana "$HERE/rszok_tb.vhd"   || { echo "analyze rszok_tb FAILED";   exit 2; }
 
 fails=0
 run_case() {
@@ -78,5 +108,10 @@ run_case whl_tb
 run_case meal_tb
 run_case scmin_tb
 run_case wscmp_tb
+run_case fnret_tb
+run_case fnearly_tb
+run_case mulcat_tb
+run_case rszcat_tb
+run_case rszok_tb
 echo "=== $fails failure(s) ==="
 exit $fails
