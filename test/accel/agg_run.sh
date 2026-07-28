@@ -20,7 +20,7 @@ $NVC "${A[@]}" -e agg_tb >/dev/null 2>&1 || { echo "elaborate FAILED"; exit 2; }
 
 echo "=== aggregate-translation accel test ==="
 ref=$($NVC "${A[@]}" -r agg_tb 2>&1 | grep -oE 'Y=[0-9]+' | tail -1)
-out=$(NVC_ACCEL=1 NVC_ACCEL_JIT=1 NVC_ACCEL_FROM_VHDL=1 NVC_ACCEL_CC=cc \
+out=$(NVC_ACCEL=1 NVC_ACCEL_JIT=1 NVC_ACCEL_FROM_VHDL=1 NVC_ACCEL_CC="${NVC_ACCEL_CC:-gcc -O2}" \
       $NVC "${A[@]}" -r agg_tb 2>&1)
 acc=$(echo "$out" | grep -oE 'Y=[0-9]+' | tail -1)
 inst=$(echo "$out" | grep -ciE 'accel-jit:.*(reroute|active|installed)|rerouted to native|subtree.*active')

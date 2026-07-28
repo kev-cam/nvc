@@ -26,7 +26,7 @@ test_design() {
   ref=$($NVC "${A[@]}" --work="$work" -r "${dut_base}_tb" 2>&1 | grep -oE 'Y=[0-9]+' | tail -1)
   
   # Accel run
-  out=$(NVC_ACCEL_MIN_MODULES=1 NVC_ACCEL=1 NVC_ACCEL_JIT=1 NVC_ACCEL_FROM_VHDL=1 NVC_ACCEL_CC=cc \
+  out=$(NVC_ACCEL_MIN_MODULES=1 NVC_ACCEL=1 NVC_ACCEL_JIT=1 NVC_ACCEL_FROM_VHDL=1 NVC_ACCEL_CC="${NVC_ACCEL_CC:-gcc -O2}" \
         $NVC "${A[@]}" --work="$work" -r "${dut_base}_tb" 2>&1)
   acc=$(echo "$out" | grep -oE 'Y=[0-9]+' | tail -1)
   

@@ -13,7 +13,7 @@ LIB="${NVC_LIBDIR:-/usr/local/src/nvc-build/lib}"
 XVAL="${1:-X}"
 A=(-M 256m -H 256m --std=2008 -L "$LIB")
 ACC=(NVC_ACCEL_MIN_MODULES=1 NVC_ACCEL=1 NVC_ACCEL_JIT=1 NVC_ACCEL_FROM_VHDL=1
-     NVC_ACCEL_CC=cc)
+     NVC_ACCEL_CC="${NVC_ACCEL_CC:-gcc -O2}")
 work="/tmp/accel_test_xdemo_$XVAL"
 cd "$(dirname "$0")" || exit 1
 
