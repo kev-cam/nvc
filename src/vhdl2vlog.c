@@ -717,6 +717,27 @@ static void emit_expr(FILE *f, tree_t e)
             fputs(bn[4] == '1' ? "1'b1" : "1'b0", f);
          else if (strcmp(bn, "'0'") == 0) fputs("1'b0", f);   // raw basename: vid() now sanitizes '0'->_0_
          else if (strcmp(bn, "'1'") == 0) fputs("1'b1", f);
+         // The WEAK drives carry a definite value on the 2-state value plane,
+         // so they are ordinary constants here.
+         else if (strcmp(bn, "'L'") == 0) fputs("1'b0", f);
+         else if (strcmp(bn, "'H'") == 0) fputs("1'b1", f);
+         // 'U' 'X' 'Z' 'W' '-' have NO value-plane representation.  Without
+         // this they reached the bare-name fallthrough below, where vid()
+         // renders them as _u_ / _x_ / _z_ / _w_ / _-_ -- identifiers that are
+         // DECLARED NOWHERE in the emitted module.  yosys reads an undeclared
+         // identifier as a fresh undriven wire and reports nothing, so the
+         // chunk installs ACTIVE and the value is silently wrong.  MEASURED in
+         // the artifact corpus: aj_mvvu_dut_subtree.v emits
+         //     r <= {8{_u_}};
+         // with _u_ declared zero times in the whole module.  Decline instead;
+         // uncertainty is what the interpreter's logic3d planes are for, and
+         // the runtime X-detect/demote path handles it correctly.
+         else if (bn[0] == '\'' && bn[1] != '\0' && bn[2] == '\''
+                  && bn[3] == '\0'
+                  && strchr("UXZW-", toupper((unsigned char)bn[1])) != NULL) {
+            g_unhandled++;
+            fprintf(f, "/*meta %s*/0", bn);
+         }
          else {
             // Ports/signals/process-vars ARE declared in the emitted module, so a
             // bare name is correct. An architecture-level CONSTANT is NOT declared
