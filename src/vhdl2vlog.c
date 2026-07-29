@@ -238,6 +238,22 @@ const char *vhdl2vlog_variant_name(ident_t entity_id, tree_t block)
 static bool type_is_logic3d(type_t t);   // defined below
 
 // bit width of a type as a Verilog range prefix ("[3:0] " or "" for 1-bit)
+// The Verilog width emit_range() below gives a declaration of this type.
+// MIRRORS emit_range case for case -- if one changes, change both, or the
+// concat-element guard will disagree with what is actually emitted.  Returns
+// -1 for "not statically known" (an unconstrained array), which callers must
+// treat as a mismatch rather than as permission to pass through.
+static int type_vlog_width(type_t type)
+{
+   if (type_is_logic3d(type) && !type_is_array(type))
+      return 1;                    // scalar logic3d -> bit0 only
+   if (type_is_array(type))
+      return type_const_bounds(type) ? (int)type_width(type) : -1;
+   if (type_is_integer(type))
+      return 32;                   // VHDL Integer -> signed [31:0]
+   return 1;                       // std_logic / boolean / enum -> single bit
+}
+
 static void emit_range(FILE *f, type_t type)
 {
    if (type_is_logic3d(type) && !type_is_array(type))
@@ -507,9 +523,29 @@ static int emitted_width(tree_t e, int depth)
       {
          const char *fn = istr(tree_ident(e));
          int k = -1;
-         if (vlog_op(fn) != NULL) return -1;
-         if (vlog_l3d_op(fn, &k) == NULL || k != 2 || tree_params(e) < 1)
-            return -1;
+         // An operator whose result is ONE BIT WHATEVER ITS OPERANDS answers 1
+         // here, not "unknown": equality and the relationals (vlog_op_ctx_width
+         // encodes exactly that set, per IEEE 1364-2005 Table 5-22), the signed
+         // logic3d relationals, and the unary reductions (l3dk==3).
+         //
+         // This is not a refinement for its own sake. -1 means "not statically
+         // known", which the concat-element guard MUST treat as a mismatch, so
+         // every unknown costs a whole chunk. MEASURED on VeeR: with these
+         // returning -1, adding the one-parameter identity width check declined
+         // 13 chunks INCLUDING eh2_dec, and every one of the 256 firings was
+         // boolean_to_logic(nw=1, ew=-1) whose argument was a comparison --
+         // l3d_eq1 or "=" -- i.e. already exactly one bit. The declines were
+         // pure false positives from this function's ignorance, not real
+         // width errors.
+         const char *vop = vlog_op(fn);
+         if (vop != NULL) return vlog_op_ctx_width(vop) ? -1 : 1;
+         bool rsgn = false;
+         if (l3d_relop(id_base(fn), &rsgn) != NULL) return 1;
+         const char *lop = vlog_l3d_op(fn, &k);
+         if (lop == NULL) return -1;
+         if (k == 3) return 1;              // unary reduction -> one bit
+         if (k != 2) return vlog_op_ctx_width(lop) ? -1 : 1;
+         if (tree_params(e) < 1) return -1;
          // l3dk==2 identity: prints param 0 verbatim, except for the widening
          // zero-extend branch, which prints `{nw-aw'b0, param0}`.  Mirror that
          // branch's EXACT condition (see emit_expr) or the answer is fiction.
@@ -1021,6 +1057,24 @@ static void emit_expr(FILE *f, tree_t e)
             int nw = -1, aw = -1;
             if (nparams >= 2 && folded_int(tree_value(tree_param(e, 1)), &nwi))
                nw = (int)nwi;
+            // A ONE-PARAMETER identity has no width argument, so without this
+            // nw stays -1, the `nw > 0` in ident_bad below is false, and the
+            // concat-element width check CANNOT FIRE -- an unguarded tunnel
+            // through the very guard this code exists to be.  Five of the
+            // sixteen identities return a SCALAR while taking a vector
+            // (unsigned_to_l3d_bit, l3d_to_bit, to_bit, is_one,
+            // boolean_to_logic), so each occupies width(operand) concat slots
+            // instead of one -- the same shredded-vector shape as the
+            // l3d_bit_read defect f251009c0 fixed, reached through a different
+            // door.  MEASURED with test/accel/l3did: eight
+            // unsigned_to_l3d_bit(u) elements over a 4-bit u emitted as
+            // `{{{{{{{u,u},u},u},u},u},u},u}` -- 32 bits into an 8-bit target,
+            // ref Y=21760 vs accel Y=15602056, chunk installed, yosys silent.
+            //
+            // Take the width from the CALL'S OWN RESULT TYPE, which is what
+            // the VHDL says the value is.
+            if (nw < 0 && tree_has_type(e))
+               nw = type_vlog_width(tree_type(e));
             if (tree_has_type(a0) && type_is_array(tree_type(a0))
                 && type_const_bounds(tree_type(a0)))
                aw = (int)type_width(tree_type(a0));
