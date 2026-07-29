@@ -5175,10 +5175,22 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cannot reach min_mod modules. This skips the ~21k tiny primitive-cell
    // (sv_and / rvdff) emit attempts that dominated the scan on real designs.
    {
+      // Default 1 = no size gate.  The old default of 8 counted INSTANCE
+      // SCOPES, which is blind to the amount of work: a flat monolithic
+      // entity counts 1 at any size and could never install, while 64 copies
+      // of one leaf (128 comb cells) was refused where 33 distinct modules
+      // (64 cells) was admitted.  Measured crossover is TWO pipeline stages,
+      // ~30x below the old threshold, and of 4,514 regression designs the
+      // largest emitted subtree is 3 modules -- so the old default admitted
+      // exactly none of them.  This gate is about COST, never correctness.
       const char *minenv = getenv("NVC_ACCEL_MIN_MODULES");
-      const int min_mod = minenv ? atoi(minenv) : 8;
-      if (aj_count_instances(scope) < min_mod)
+      const int min_mod = minenv ? atoi(minenv) : 1;
+      const int ninst = aj_count_instances(scope);
+      if (ninst < min_mod) {
+         notef("accel-jit: subtree '%s' below instance gate (%d < %d) "
+               "— leaving in nvc", istr(tree_ident(scope->where)), ninst, min_mod);
          return false;
+      }
    }
 
    // Bisection knobs (localize a miscompiling subtree by name):
@@ -5232,7 +5244,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // explosion (10k+). Only chunks with real datapath are worth a .so. Gate
       // on module count (env NVC_ACCEL_MIN_MODULES, default 8) BEFORE synth.
       const char *minenv = getenv("NVC_ACCEL_MIN_MODULES");
-      const int min_mod = minenv ? atoi(minenv) : 8;
+      const int min_mod = minenv ? atoi(minenv) : 1;
       if (nseen < min_mod) {
          notef("accel-jit: subtree '%s' too small (%d modules) — leaving in nvc",
                top0, nseen);
@@ -5366,7 +5378,19 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          return false;
       }
       if (strcmp(lname, "clk") == 0) { clk = pin; have_clk = true; }
-      else if (strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
+      // NOTE: a port named "rst" used to be pulled out here and driven into
+      // `if(RST[0]&1) sm_reset(&S);`, i.e. the SPELLING of the port decided it
+      // was an active-HIGH synchronous whole-state reset.  That is wrong for an
+      // active-low or asynchronous reset that happens to be called `rst`, and
+      // it was silently wrong -- correct while the old size gate declined the
+      // design, wrong as soon as it was admitted (confirmed with
+      // NVC_ACCEL_VERIFY on a 20-line active-low design).
+      //
+      // It is also redundant: gen_statemachine already models resets IN THE
+      // NETLIST -- $adff carries arst_expr/arst_const, and a synchronous reset
+      // is just a mux on D like any other logic.  So `rst` is an ordinary
+      // bridged pin and the reset semantics come from the RTL, not the name.
+      // accel_reset() still calls sm_reset() once at install for initial state.
       else if (npins < AJ_MAX_PINS) pins[npins++] = pin;
       else {
          notef("accel-jit: subtree '%s' exceeds %d boundary pins — leaving in nvc",
