@@ -2298,7 +2298,13 @@ static void l3d_not_vector(jit_func_t *func, jit_anchor_t *anchor,
 
 ////////////////////////////////////////////////////////////////////////////////
 // Packed 3D-logic word (l3dw): one int32 lane holds a GROUP of 8 wires as byte
-// planes -- byte0 value, byte1 driven, byte2 uncertain, byte3 reserved. So a
+// planes -- byte0 value, byte1 driven, byte2 kind-hi (K1), byte3 kind-lo (K0).
+// Certainty is a 2-BIT ENUM per wire, ordered so numeric max is semantic
+// dominance: 00 certain, 01 W/'-', 10 X, 11 U. K1 is the byte that used to be
+// the lone `uncertain` plane, so pre-existing words (K0 = 0) still read as X.
+// MUST MATCH lib/sv2vhdl/logic3dw_pkg.vhd EXACTLY -- they are two independent
+// implementations of one semantics, and test/regress/logic3dw1 is what holds
+// them together. So a
 // logic3dw_vector of W words carries 8*W wires at 4 bytes / 8 wires (vs
 // logic3d's 4 bytes / wire and std_logic's 1 byte / wire).
 //
@@ -2314,34 +2320,59 @@ static void l3d_not_vector(jit_func_t *func, jit_anchor_t *anchor,
 
 #define L3DW_PAD0 0x00FF00   // value 0, driven 0xFF, uncertain 0
 
+// Byte-parallel 2-bit MAX of two certainty codes -- the C twin of
+// logic3dw_pkg's kmax. Because the codes are ordered certain(00) < W(01) <
+// X(10) < U(11), dominance is an ordinary magnitude compare, done bit-planar
+// over all 8 wires at once with no cross-wire carry.
+#define L3DW_KMAX(A1, A0, B1, B0, R1, R0)                                   \
+   do {                                                                     \
+      const uint32_t agt_ =                                                 \
+         ((A1) & ~(B1)) | (~((A1) ^ (B1)) & (A0) & ~(B0));                  \
+      (R1) = ((agt_ & (A1)) | (~agt_ & (B1))) & 0xFFu;                      \
+      (R0) = ((agt_ & (A0)) | (~agt_ & (B0))) & 0xFFu;                      \
+   } while (0)
+
 __attribute__((always_inline))
 static inline int32_t __l3dw_and_word(int32_t a, int32_t b)
 {
-   const int32_t Va = a & 0xFF, Ua = (a >> 16) & 0xFF;
-   const int32_t Vb = b & 0xFF, Ub = (b >> 16) & 0xFF;
-   const int32_t Vc = Va & Vb;
-   const int32_t c0 = (~(Va | Ua) | ~(Vb | Ub)) & 0xFF;   // some operand cert 0
-   const int32_t Uc = (Ua | Ub) & ~c0 & 0xFF;
-   return Vc | 0xFF00 | (Uc << 16);
+   const uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+   const uint32_t Va = ua & 0xFF, Ka1 = (ua >> 16) & 0xFF, Ka0 = (ua >> 24) & 0xFF;
+   const uint32_t Vb = ub & 0xFF, Kb1 = (ub >> 16) & 0xFF, Kb0 = (ub >> 24) & 0xFF;
+   const uint32_t Ua = Ka1 | Ka0, Ub = Kb1 | Kb0;       // uncertain at all
+   const uint32_t Vc = Va & Vb;
+   const uint32_t c0 = (~(Va | Ua) | ~(Vb | Ub)) & 0xFF;   // some operand cert 0
+   const uint32_t keep = ~c0 & 0xFF;
+   uint32_t Kr1, Kr0;
+   L3DW_KMAX(Ka1, Ka0, Kb1, Kb0, Kr1, Kr0);
+   return (int32_t)(Vc | 0xFF00u | ((Kr1 & keep) << 16) | ((Kr0 & keep) << 24));
 }
 
 __attribute__((always_inline))
 static inline int32_t __l3dw_or_word(int32_t a, int32_t b)
 {
-   const int32_t Va = a & 0xFF, Ua = (a >> 16) & 0xFF;
-   const int32_t Vb = b & 0xFF, Ub = (b >> 16) & 0xFF;
-   const int32_t Vc = Va | Vb;
-   const int32_t c1 = ((Va & ~Ua) | (Vb & ~Ub)) & 0xFF;   // some operand cert 1
-   const int32_t Uc = (Ua | Ub) & ~c1 & 0xFF;
-   return Vc | 0xFF00 | (Uc << 16);
+   const uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+   const uint32_t Va = ua & 0xFF, Ka1 = (ua >> 16) & 0xFF, Ka0 = (ua >> 24) & 0xFF;
+   const uint32_t Vb = ub & 0xFF, Kb1 = (ub >> 16) & 0xFF, Kb0 = (ub >> 24) & 0xFF;
+   const uint32_t Ua = Ka1 | Ka0, Ub = Kb1 | Kb0;
+   const uint32_t Vc = Va | Vb;
+   const uint32_t c1 = ((Va & ~Ua) | (Vb & ~Ub)) & 0xFF;   // some operand cert 1
+   const uint32_t keep = ~c1 & 0xFF;
+   uint32_t Kr1, Kr0;
+   L3DW_KMAX(Ka1, Ka0, Kb1, Kb0, Kr1, Kr0);
+   return (int32_t)(Vc | 0xFF00u | ((Kr1 & keep) << 16) | ((Kr0 & keep) << 24));
 }
 
 __attribute__((always_inline))
 static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
 {
-   const int32_t Vc = (a ^ b) & 0xFF;
-   const int32_t Uc = ((a | b) >> 16) & 0xFF;             // uncertainty union
-   return Vc | 0xFF00 | (Uc << 16);
+   const uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
+   const uint32_t Ka1 = (ua >> 16) & 0xFF, Ka0 = (ua >> 24) & 0xFF;
+   const uint32_t Kb1 = (ub >> 16) & 0xFF, Kb0 = (ub >> 24) & 0xFF;
+   const uint32_t Vc = (ua ^ ub) & 0xFF;
+   // xor cannot be forced by either operand, so uncertainty always survives
+   uint32_t Kr1, Kr0;
+   L3DW_KMAX(Ka1, Ka0, Kb1, Kb0, Kr1, Kr0);
+   return (int32_t)(Vc | 0xFF00u | (Kr1 << 16) | (Kr0 << 24));
 }
 
 // The 2-state fast path is the whole point of the packed word: once reset has
@@ -2386,7 +2417,9 @@ static inline int32_t __l3dw_xor_word(int32_t a, int32_t b)
          result[j] = (VAL_OP);                                         \
          unc |= a | b;                                                 \
       }                                                                 \
-      if (unlikely(unc & 0x00FF0000)) {                                \
+      /* BOTH kind planes, not just K1: a W wire (K0 only) would otherwise \
+         take the 2-state path and lose its uncertainty silently. */        \
+      if (unlikely((uint32_t)unc & 0x00FF0000u)) {                                \
          for (int j = la - n; j < la; j++)                             \
             result[j] = WORD_FN(adata[j], bdata[j + d]);               \
       }                                                                 \
@@ -2432,7 +2465,8 @@ static void l3dw_not_vector(jit_func_t *func, jit_anchor_t *anchor,
       int32_t *result = __tlab_alloc(tlab, la * sizeof(int32_t), 8);
       for (int j = 0; j < la; j++) {
          const int32_t a = adata[j];
-         result[j] = ((~a) & 0xFF) | (a & 0xFFFF00);   // ~value, keep drv+unc
+         result[j] = (int32_t)(((uint32_t)~a & 0xFFu)
+                               | ((uint32_t)a & 0xFFFFFF00u));  // ~value, keep drv+kind
       }
       args[0].pointer = result;
    }
