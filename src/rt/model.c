@@ -5391,6 +5391,27 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // is just a mux on D like any other logic.  So `rst` is an ordinary
       // bridged pin and the reset semantics come from the RTL, not the name.
       // accel_reset() still calls sm_reset() once at install for initial state.
+      // A port literally named `rst` is driven out of band (AJB[5]) into
+      // sm_reset() rather than bridged as an ordinary input.  This is UGLY --
+      // the SPELLING of the port decides it is an active-HIGH synchronous
+      // whole-state reset, which is wrong for an active-low or asynchronous
+      // reset that happens to be called `rst` (see below) -- but it is one
+      // half of a TWO-SIDED protocol and must not be removed alone.
+      //
+      // gen_statemachine keeps `_rst` OUT of inputs_t (gen_statemachine.cpp
+      // :1315/2095/2452/3011/3124/3186 all skip `_clk`/`_rst`, and :2954
+      // documents the split), so the generated model has no field to receive
+      // it.  Dropping this line therefore does not make `rst` an ordinary
+      // pin -- it makes reset UNREACHABLE, and every design with a sync reset
+      // silently produces wrong values.  Measured: it broke 16 of the 19
+      // accelbench designs (e.g. deep_d8 Y=1609704590 vs interp 1241718724)
+      // while nvc's own test/accel and the ivtest gate both stayed green.
+      //
+      // The name-based rule is still a real latent bug (an active-low `rst`
+      // is mismodelled once admitted).  Fixing it means changing BOTH sides
+      // together: gen_statemachine must stop skipping `_rst` and model it as
+      // an ordinary input so the reset semantics come from the RTL.
+      else if (strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
       else if (npins < AJ_MAX_PINS) pins[npins++] = pin;
       else {
          notef("accel-jit: subtree '%s' exceeds %d boundary pins — leaving in nvc",
