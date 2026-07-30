@@ -39,6 +39,32 @@ static void emit_stmt_list_range(FILE *f, tree_t container, int lo, int hi, int 
 // than not accelerating.
 static int g_unhandled = 0;
 
+// EVERY decline goes through here.  The COUNTER is what decides admission
+// (vhdl2vlog_module returns g_unhandled == 0); the LOG is what makes a decline
+// diagnosable, and until now most were not.  Ten of the 29 decline paths wrote
+// nothing identifiable into the Verilog, and block_types_synth refuses a module
+// before a single byte is emitted -- so its .v is empty AND the counter never
+// moves.  Measured over the regression corpus, 42-54% of real declines were
+// invisible: 412 of 991 declining designs emitted zero markers, and 52 of 97
+// declined named subtrees were marker-free in every copy, including essentially
+// the whole VeeR EH2 chunk set.  Ranking blockers off marker counts therefore
+// under-weighted type-level declines about two-fold.
+//
+// PURELY DIAGNOSTIC: nothing here writes to `f`, so with GSM_LOG unset the
+// emitted Verilog is byte-identical to before.  That is a checkable invariant --
+// the whole-VeeR per-chunk md5 set must not move.
+static void aj_decline(const char *why, const char *fn, int line)
+{
+   static int log = -1;
+   g_unhandled++;
+   if (log < 0) log = getenv("GSM_LOG") != NULL;
+   if (log)
+      fprintf(stderr, "vhdl2vlog: DECLINE %-30s (%s:%d)\n", why, fn, line);
+}
+
+#define DECLINE(why) aj_decline((why), __func__, __LINE__)
+
+
 // "The expression about to be emitted is a CONCATENATION ELEMENT."
 //
 // Verilog resizes every operand to its context width in every context except
@@ -259,7 +285,7 @@ static void emit_range(FILE *f, type_t type)
    if (type_is_logic3d(type) && !type_is_array(type))
       return;   // scalar logic3d -> 1-bit value (bit0), no range
    if (type_is_array(type)) {
-      if (!type_const_bounds(type)) { g_unhandled++; return; }  // unconstrained
+      if (!type_const_bounds(type)) { DECLINE("unconstrained-array-range"); return; }  // unconstrained
       const unsigned w = type_width(type);
       if (w > 1) fprintf(f, "[%u:0] ", w - 1);
    }
@@ -595,11 +621,11 @@ static void emit_lit(FILE *f, tree_t e)
    // std_logic enum literal '0'/'1' etc. A literal with no ident (real, string,
    // physical, ...) is not a bit-enum lit -- mark unhandled (the leaf declines)
    // rather than fatal in tree_ident.
-   if (!tree_has_ident(e)) { g_unhandled++; fputs("/*lit?*/0", f); return; }
+   if (!tree_has_ident(e)) { DECLINE("literal-without-ident"); fputs("/*lit?*/0", f); return; }
    const char *s = istr(tree_ident(e));
    if (strcmp(s, "'0'") == 0) fputs("1'b0", f);
    else if (strcmp(s, "'1'") == 0) fputs("1'b1", f);
-   else { g_unhandled++; fprintf(f, "/*lit %s*/0", s); }
+   else { DECLINE("literal-unsupported"); fprintf(f, "/*lit %s*/0", s); }
 }
 
 // General 1-D bit-vector aggregate: NAMED / RANGE / positional / OTHERS (mixed),
@@ -700,7 +726,7 @@ static void emit_expr(FILE *f, tree_t e)
    g_concat_elem = false;
 
    if (e == NULL) {   // e.g. a null/unaffected waveform value — decline, don't crash
-      g_unhandled++; fputs("/*null*/0", f);
+      DECLINE("null-literal"); fputs("/*null*/0", f);
       return;
    }
    switch (tree_kind(e)) {
@@ -735,7 +761,7 @@ static void emit_expr(FILE *f, tree_t e)
          else if (bn[0] == '\'' && bn[1] != '\0' && bn[2] == '\''
                   && bn[3] == '\0'
                   && strchr("UXZW-", toupper((unsigned char)bn[1])) != NULL) {
-            g_unhandled++;
+            DECLINE("std_logic-metavalue");
             fprintf(f, "/*meta %s*/0", bn);
          }
          else {
@@ -750,7 +776,7 @@ static void emit_expr(FILE *f, tree_t e)
                // inlined VERBATIM -> width sensitivity passes through
                emit_ctx_operand(f, tree_value(ref), celem);
             else if (rk == T_CONST_DECL || rk == T_GENERIC_DECL) {
-               g_unhandled++; fprintf(f, "/*ref %s*/0", bn);
+               DECLINE("ref-not-declared"); fprintf(f, "/*ref %s*/0", bn);
             }
             else fputs(nm, f);
          }
@@ -766,7 +792,7 @@ static void emit_expr(FILE *f, tree_t e)
          // char is a bit-like enum lit "'0'"/"'1'"/...; decline 2-state metavalues
          // (X/Z/U/W/-) rather than emit a wrong bit.
          const int n = tree_chars(e);
-         if (n <= 0) { g_unhandled++; fputs("/*str0*/0", f); break; }
+         if (n <= 0) { DECLINE("empty-string-literal"); fputs("/*str0*/0", f); break; }
          fprintf(f, "%d'b", n);
          for (int i = 0; i < n; i++) {
             ident_t rune = tree_ident(tree_char(e, i));
@@ -776,7 +802,7 @@ static void emit_expr(FILE *f, tree_t e)
                            ? ident_char(rune, 1) : '?';
             if (c == '1' || c == 'H') fputc('1', f);
             else if (c == '0' || c == 'L') fputc('0', f);
-            else { g_unhandled++; fputc('0', f); }
+            else { DECLINE("string-char-unsupported"); fputc('0', f); }
          }
       }
       break;
@@ -873,7 +899,7 @@ static void emit_expr(FILE *f, tree_t e)
              && nparams == 2) {
             // the target width is DROPPED (the context resizes) -- so this is
             // width(a), not the requested width: unsafe inside a concatenation.
-            if (celem) g_unhandled++;
+            if (celem) DECLINE("l3d_resize_s-in-concat");
             fputs("$signed(", f);
             emit_expr(f, tree_value(tree_param(e, 0)));
             fputc(')', f);
@@ -893,7 +919,7 @@ static void emit_expr(FILE *f, tree_t e)
                   // Self-determined width is max(width(a), width(mask literal)),
                   // NOT w -- fine in a resizing context, fatal inside a
                   // concatenation, so decline there.
-                  if (celem) g_unhandled++;
+                  if (celem) DECLINE("narrow-shift-mask-in-concat");
                   fputs("(((", f);
                   emit_expr(f, a);
                   fputs(") >> (", f);
@@ -985,7 +1011,7 @@ static void emit_expr(FILE *f, tree_t e)
                 && m > 0 && m <= (INT64_C(1) << 30) && (m & (m - 1)) == 0) {
                // the unsized decimal mask makes this max(width(a), 32) wide,
                // not the k bits the VHDL type has -- unsafe inside a concat.
-               if (celem) g_unhandled++;
+               if (celem) DECLINE("pow2-mod-mask-in-concat");
                fputc('(', f);
                emit_expr(f, tree_value(tree_param(e, 0)));
                fprintf(f, " & %"PRIi64")", m - 1);
@@ -1008,7 +1034,7 @@ static void emit_expr(FILE *f, tree_t e)
             // truncated.  Every other operator in vlog_op is width-preserving
             // (+/- are max(wa,wb) in both; bitwise/shift keep the left width;
             // relationals are 1 bit in both).
-            if (celem && strcmp(op, "*") == 0) g_unhandled++;
+            if (celem && strcmp(op, "*") == 0) DECLINE("multiply-in-concat");
             // ...and the operands are CONTEXT-determined for every one of those
             // width-preserving operators, so a too-WIDE operand still poisons
             // the result: max(L,R) is only right when L and R are.  $signed()
@@ -1121,7 +1147,7 @@ static void emit_expr(FILE *f, tree_t e)
             const bool ident_bad =
                (celem && nw > 0 && emitted_width(a0, 0) != nw);
             if (sgn) {
-               if (ident_bad) g_unhandled++;
+               if (ident_bad) DECLINE("identity-width-in-concat");
                // $signed(x) keeps x's self-determined width -> transparent.
                fputs("$signed(", f);
                emit_ctx_operand(f, a0, celem);
@@ -1135,7 +1161,7 @@ static void emit_expr(FILE *f, tree_t e)
                fputc('}', f);
             }
             else {
-               if (ident_bad) g_unhandled++;
+               if (ident_bad) DECLINE("identity-width-in-concat");
                emit_ctx_operand(f, a0, celem);
             }
          }
@@ -1151,7 +1177,7 @@ static void emit_expr(FILE *f, tree_t e)
          }
          else {
             // rising_edge / unhandled function: surface for inspection
-            g_unhandled++;
+            DECLINE("function-unhandled");
             fprintf(f, "/*fn %s*/", vid(tree_ident(e)));
             if (nparams > 0) emit_expr(f, tree_value(tree_param(e, 0)));
          }
@@ -1271,7 +1297,7 @@ static void emit_expr(FILE *f, tree_t e)
             if (emit_agg_general(f, e)) break;
          }
          // Not faithfully translated — decline rather than silently emit 0.
-         g_unhandled++;
+         DECLINE("aggregate-not-translatable");
          if (getenv("GSM_LOG")) {
             const int nn = tree_assocs(e);
             tree_t a0 = nn > 0 ? tree_assoc(e, 0) : NULL;
@@ -1284,7 +1310,7 @@ static void emit_expr(FILE *f, tree_t e)
       }
       break;
    default:
-      g_unhandled++; fprintf(f, "/*?expr k=%d*/0", tree_kind(e));
+      DECLINE("expression-unhandled"); fprintf(f, "/*?expr k=%d*/0", tree_kind(e));
       break;
    }
 }
@@ -1477,7 +1503,7 @@ static void emit_seq(FILE *f, tree_t s, int ind)
             emit_expr(f, tree_value(s));
          else if (tree_waveforms(s) > 0 && tree_has_value(tree_waveform(s, 0)))
             emit_expr(f, tree_value(tree_waveform(s, 0)));
-         else { g_unhandled++; fputs("0/*null-wave*/", f); }  // disconnect/null waveform — decline
+         else { DECLINE("null-waveform"); fputs("0/*null-wave*/", f); }  // disconnect/null waveform — decline
          fputs(";\n", f);
       }
       break;
@@ -1517,7 +1543,7 @@ static void emit_seq(FILE *f, tree_t s, int ind)
                      ren_decl(idecl) ? ren_suffix(idecl) : "");
          const bool to = (tree_subkind(r) == RANGE_TO);
          if (tree_subkind(r) != RANGE_TO && tree_subkind(r) != RANGE_DOWNTO) {
-            g_unhandled++; tab(f, ind);
+            DECLINE("for-range-subkind"); tab(f, ind);
             fprintf(f, "/*?for-range sk=%d*/\n", tree_subkind(r));
             break;
          }
@@ -1557,7 +1583,7 @@ static void emit_seq(FILE *f, tree_t s, int ind)
                // (tree_has_name -> tree_name), or `others` (neither).
                tree_t c = tree_choice(alt, j);
                if (tree_ranges(c) > 0) {        // Verilog case has no range labels
-                  g_unhandled++; fputs("/*?range-choice*/", f); continue;
+                  DECLINE("range-choice"); fputs("/*?range-choice*/", f); continue;
                }
                if (!tree_has_name(c)) { others = true; continue; }   // others
                if (nemit++) fputs(", ", f);
@@ -1581,7 +1607,7 @@ static void emit_seq(FILE *f, tree_t s, int ind)
       // needs a while->Verilog-`for` peephole (init = preceding sibling assign,
       // increment = last body assign). Until then DECLINE so the module gracefully
       // stays interpreted instead of crashing the whole-subtree synth.
-      g_unhandled++; tab(f, ind); fputs("/*?while-loop*/\n", f);
+      DECLINE("while-loop-nonconstant"); tab(f, ind); fputs("/*?while-loop*/\n", f);
       break;
    case T_LOOP:
       {
@@ -1594,7 +1620,7 @@ static void emit_seq(FILE *f, tree_t s, int ind)
             if (tree_kind(tree_stmt(s, i)) == T_WAIT) { has_wait = true; break; }
          if (has_wait)
             emit_stmt_list(f, s, ind);
-         else { g_unhandled++; tab(f, ind); fputs("/*?loop-no-wait*/\n", f); }
+         else { DECLINE("loop-without-wait"); tab(f, ind); fputs("/*?loop-no-wait*/\n", f); }
       }
       break;
    case T_WAIT:
@@ -1609,10 +1635,10 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          emit_expr(f, tree_value(s));
          fputs(";\n", f);
       }
-      else { g_unhandled++; tab(f, ind); fputs("/*?return*/\n", f); }
+      else { DECLINE("return-not-tail"); tab(f, ind); fputs("/*?return*/\n", f); }
       break;
    default:
-      g_unhandled++; tab(f, ind); fprintf(f, "/*?seq k=%d*/\n", tree_kind(s));
+      DECLINE("sequential-stmt-unhandled"); tab(f, ind); fprintf(f, "/*?seq k=%d*/\n", tree_kind(s));
       break;
    }
 }
@@ -1712,7 +1738,7 @@ static void emit_function(FILE *f, tree_t fn)
          rt = tree_type(tree_value(s));
    }
    if (rt == NULL || (type_is_array(rt) && !type_const_bounds(rt))) {
-      g_unhandled++;
+      DECLINE("function-return-width");
       return;
    }
 
@@ -1720,7 +1746,7 @@ static void emit_function(FILE *f, tree_t fn)
    // has_nontail_return: without this an early return silently loses to the
    // trailing one.
    if (has_nontail_return(fn, true)) {
-      g_unhandled++;
+      DECLINE("function-early-return");
       return;
    }
 
@@ -1782,7 +1808,7 @@ static void emit_process(FILE *f, tree_t p0)
       if (rcond != NULL && !rbefore) {
          // Swapped `if clk elsif rst` form is clk-priority -- not a standard
          // $adff -- so decline rather than emit the wrong arst-priority form.
-         g_unhandled++;
+         DECLINE("reset-clk-priority");
          rcond = NULL;
       }
       fputs("  always @(", f);
@@ -1916,7 +1942,17 @@ static void emit_stmt(FILE *f, tree_t s)
          tree_t ref  = (hier != NULL && tree_kind(hier) == T_HIER)
                        ? tree_ref(hier) : NULL;
          if (ref == NULL || tree_kind(ref) != T_ARCH) {
-            g_unhandled++;
+            // The marker below prints tree_kind(hier), which is ALWAYS T_HIER,
+            // so it cannot say WHICH construct declined -- component
+            // instantiation, for-generate, if-generate, case-generate and a
+            // plain block statement all land here.  The discriminating kind is
+            // the REF's; it goes to the log rather than the marker so that
+            // emission stays byte-identical.
+            if (getenv("GSM_LOG"))
+               fprintf(stderr, "vhdl2vlog: block-ref-not-arch ref_kind=%d (%s)\n",
+                       ref != NULL ? (int)tree_kind(ref) : -1,
+                       hier != NULL ? istr(tree_ident(hier)) : "?");
+            DECLINE("block-ref-not-arch");
             fprintf(f, "  /*?block k=%d*/\n", hier ? tree_kind(hier) : -1);
             break;
          }
@@ -1931,7 +1967,7 @@ static void emit_stmt(FILE *f, tree_t s)
       }
       break;
    default:
-      g_unhandled++; fprintf(f, "  /*?stmt k=%d*/\n", tree_kind(s));
+      DECLINE("concurrent-stmt-unhandled"); fprintf(f, "  /*?stmt k=%d*/\n", tree_kind(s));
       break;
    }
 }
@@ -2379,11 +2415,23 @@ static bool block_types_synth(tree_t block)
                     tree_kind(tree_decl(block, i)));
          return false;
       }
+   // This third loop USED TO BE A BARE `return false` with no GSM_LOG line,
+   // while its two sibling loops above each logged.  That one asymmetry is why
+   // ITC99 b12/b15 and up to 156 regression designs were undiagnosable: the
+   // module is refused HERE, before vhdl2vlog_module writes a single byte, so
+   // the .v is empty, g_unhandled never moves, and nothing says why.
    for (int i = 0; i < tree_stmts(block); i++) {
       tree_t s = tree_stmt(block, i);
       if (tree_kind(s) != T_PROCESS) continue;
       for (int j = 0; j < tree_decls(s); j++)
-         if (!decl_type_synth(tree_decl(s, j))) return false;
+         if (!decl_type_synth(tree_decl(s, j))) {
+            if (getenv("GSM_LOG"))
+               fprintf(stderr, "block_types_synth: process %s decl %s (kind %d) "
+                       "rejected\n", istr(tree_ident(s)),
+                       istr(tree_ident(tree_decl(s, j))),
+                       tree_kind(tree_decl(s, j)));
+            return false;
+         }
    }
    return true;
 }
