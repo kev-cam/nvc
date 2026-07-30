@@ -5094,6 +5094,17 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 // Resolve the gen_statemachine binary without relying on $PATH: honour
 // $GEN_STATEMACHINE, then the in-tree install location, then fall back to PATH.
 // (A standalone board may not have sv2ghdl/yosys on its login PATH.)
+// `timeout` reports 124 when it fires, or 128+SIGKILL (137) if -k had to
+// escalate. system() hands back a wait status, so unwrap it before comparing.
+static bool aj_synth_timed_out(int status)
+{
+   if (status == -1) return false;
+   if (WIFSIGNALED(status)) return WTERMSIG(status) == SIGKILL;
+   if (!WIFEXITED(status)) return false;
+   const int ec = WEXITSTATUS(status);
+   return ec == 124 || ec == 137;
+}
+
 static const char *aj_gen_sm(void)
 {
    const char *g = getenv("GEN_STATEMACHINE");
@@ -5311,7 +5322,29 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       char *slash = strrchr(dir, '/');
       if (slash) *slash = '\0';
       else snprintf(dir, sizeof dir, ".");   // bare filename: sources rel to cwd
-      int off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
+      // WALL-CLOCK CAP ON SYNTH.  gen_statemachine can take superlinear time
+      // on a pathological netlist and there is nothing to stop it: an icache
+      // SRAM chunk (eh2_ifu_ic_mem) was measured spinning for 1 day 13 hours at
+      // 99.9% CPU inside yosys's proc_dlatch pass -- find_mux_feedback recurses
+      // PER BIT through the mux network, and that module carries 654,336 bits of
+      // flattened RAM (18 hoisted copies of a 36,352-bit v_nba_ram_core).  It
+      // never produced its .c, and nothing timed it out, so it burned a core
+      // indefinitely and silently.
+      //
+      // A synth that overruns must DEGRADE TO A DECLINE, which is the outcome
+      // the caller already handles.  Gated on `timeout` actually existing: if
+      // coreutils is absent, fall back to the old unbounded behaviour rather
+      // than making every synth fail.
+      const char *tmo = getenv("NVC_ACCEL_SYNTH_TIMEOUT");
+      const int tmo_s = tmo ? atoi(tmo) : 600;
+      const bool have_timeout = access("/usr/bin/timeout", X_OK) == 0;
+      int off;
+      if (tmo_s > 0 && have_timeout)
+         off = snprintf(cmd, sizeof cmd,
+                        "cd '%s' && /usr/bin/timeout -k 5 %d '%s'",
+                        dir, tmo_s, aj_gen_sm());
+      else
+         off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
       for (int i = 0; i < nsrc; i++)
          off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
       // Re-synthesize with the elaboration's actual generics (width/depth/...).
@@ -5326,8 +5359,13 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top_mod, dutc);
       notef("accel-jit: synth '%s' (top module '%s') from %d source(s)",
             top, top_mod, nsrc);
-      if (system(cmd) != 0 || access(dutc, F_OK) != 0) {
-         notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
+      const int src = system(cmd);
+      if (aj_synth_timed_out(src) && tmo_s > 0 && have_timeout)
+         notef("accel-jit: synth for '%s' exceeded %ds — leaving in nvc "
+               "(raise NVC_ACCEL_SYNTH_TIMEOUT to allow longer)", top, tmo_s);
+      if (src != 0 || access(dutc, F_OK) != 0) {
+         if (!aj_synth_timed_out(src))
+            notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
          return false;
       }
    }
