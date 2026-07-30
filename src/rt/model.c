@@ -1522,6 +1522,7 @@ typedef void (*accel_init_fn)(uint8_t **, int *, int);
 
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 
 // Background compile state
 typedef struct {
@@ -5306,8 +5307,41 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    snprintf(dutc,   sizeof dutc,   "%s/aj_%s_%016llx.c", accel_dir, top,
             (unsigned long long)vhash);
    snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, top);
+
+   // TWO-TIER KEY.  The generated C above is keyed by vhash alone -- it is
+   // derived from the LOGIC and is therefore portable: the same design yields
+   // the same C on every machine, so it is worth keeping (and in principle
+   // committing) rather than recomputing.
+   //
+   // The .so is NOT portable.  It is native code emitted by the local compiler
+   // for the local CPU, so its key must also cover the toolchain and the
+   // machine.  Without that:
+   //   * switching NVC_ACCEL_CC between `cc` (-O0) and `gcc -O3` SILENTLY
+   //     REUSES the old .so, because the compile step below is skipped
+   //     whenever the file merely exists -- which invalidates any measurement
+   //     comparing optimisation levels;
+   //   * a cache directory shared across a heterogeneous farm would load
+   //     machine code built for someone else's ISA.
+   // Both became live hazards when the benchmark harnesses stopped wiping the
+   // cache between runs.
+   uint64_t shash = vhash;
+   { const char *cc = getenv("NVC_ACCEL_CC");
+     if (cc == NULL) cc = "gcc -g -O3";
+     for (const char *p = cc; *p; p++) { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
+     struct utsname un;
+     if (uname(&un) == 0)
+        for (const char *p = un.machine; *p; p++) { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
+#if defined(__x86_64__)
+     // vector width actually used by the emitted code varies with the host
+     __builtin_cpu_init();
+     const unsigned isa = (__builtin_cpu_supports("avx512f") ? 4u : 0u)
+                        | (__builtin_cpu_supports("avx2")    ? 2u : 0u)
+                        | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
+     shash = (shash ^ isa) * 1099511628211ULL;
+#endif
+   }
    snprintf(so,     sizeof so,     "%s/aj_%s_%016llx.so", accel_dir, top,
-            (unsigned long long)vhash);
+            (unsigned long long)shash);
 
    // 2. synthesize the flattened model (gen_statemachine) — but only if this
    //    exact logic has not been synthesized before. The cached synth (keyed by
