@@ -3399,6 +3399,142 @@ static unsigned aj_pending_count(void *pending)
 // clock nexus and nothing else). A proc also sensitive to rst / another clock /
 // driving clk itself (the `clk <= not clk` generator) is filtered out and stays
 // on the normal procq — only an optimisation, never a correctness lever.
+
+// ---- DERIVED-CLOCK QUARANTINE ----------------------------------------------
+// A chunk's group-0 edge detect races the producer of its clock whenever that
+// clock is DERIVED -- computed by comb logic within the same timestep as the
+// root edge (active_clk, free_clk, l1clk...).  The bridge samples `_clk` when
+// the chunk happens to be evaluated, so against a comb-driven clock the edge
+// can be seen a delta late, missed, or double-counted depending on wake order.
+// LATE mode does not help: it protects extra clock GROUPS, and here the
+// derived clock IS group 0.
+//
+// MEASURED on VeeR-EH2 (2026-08-01, the end of an 8-round two-machine
+// bisection): rvdff1__fe1e -- twelve instances of a plain 3-bit async-reset
+// flop -- includes ifu_mem_ctl's bus_mb_beat_count_ff, CLOCKED BY active_clk.
+// Accelerated per-instance, the beat counter never advances: the IFU issues
+// `AR addr=0` EVERY cycle forever (interp walks 0,8,16,24...), the bus wedges,
+// and retirement stops.  In the full 1,359-chunk mix the same race in the
+// commit counters shows as retire counts offset +4 from the first retirement.
+// Each chunk's COMPUTATION is correct throughout (NVC_ACCEL_VERIFY: zero
+// divergences) -- the defect is purely in edge/data ordering at the bridge.
+//
+// THE PREDICATE IS STRUCTURAL, not name-based: walk the clk pin's net through
+// the port chain to its ultimate driver(s); if any driving process is
+// SIGNAL-SENSITIVE, the clock is derived and the chunk declines (stays
+// interpreted).  A primary clock generator (`wait for 5 ns` loop) has no
+// signal sensitivity; a comb producer does.  Signal-sensitivity is established
+// by scanning nexus pending lists for the proc -- O(nexuses) once per install.
+// NVC_ACCEL_ALLOW_DERIVED_CLK=1 overrides for experiments.
+
+// A process is a PRIMARY clock source iff it self-schedules on TIME -- its
+// body contains a timed wait (`wait for ...`).  A comb producer of a derived
+// clock waits on signals only.  Read from the AST rather than runtime wakeup
+// structures: the first attempt scanned nexus pending lists, and this fork's
+// Phase-C slot/trigger rework means those no longer carry sensitivity --
+// every proc scanned as "not sensitive" and the gate never fired.
+static bool aj_tree_has_timed_wait(tree_t t, int depth)
+{
+   if (t == NULL || depth > 24) return false;
+   switch (tree_kind(t)) {
+   case T_WAIT:
+      return tree_has_delay(t);
+   // A clock generator written as a DELAYED SIGNAL ASSIGNMENT self-loop
+   // (`clk <= not clk after 5 ns when run` -- the accelbench testbenches)
+   // has no timed wait; the time source is the waveform delay. Count it.
+   case T_SIGNAL_ASSIGN:
+      {
+         const int nw = tree_waveforms(t);
+         for (int i = 0; i < nw; i++)
+            if (tree_has_delay(tree_waveform(t, i)))
+               return true;
+      }
+      return false;
+   // Only kinds that structurally CARRY a statement list are descended --
+   // tree_stmts on anything else is an object-lookup fatal (measured: the
+   // first version crashed nvc inside the first install).  A timed wait
+   // hidden somewhere more exotic misclassifies that clock as derived, which
+   // errs toward DECLINE -- the safe direction.
+   case T_PROCESS:
+   case T_LOOP:
+   case T_WHILE:
+   case T_FOR:
+      {
+         const int ns = tree_stmts(t);
+         for (int i = 0; i < ns; i++)
+            if (aj_tree_has_timed_wait(tree_stmt(t, i), depth + 1))
+               return true;
+      }
+      return false;
+   // A concurrent conditional assignment (`clk <= not clk after 5 ns when
+   // run else '0'` -- every accelbench testbench) lowers to a process whose
+   // delayed assign sits under an IF arm.  Not descending T_IF classified the
+   // whole suite's clock as derived and the install-guard in accel-gate
+   // caught it: 6/6 designs NO-INSTALL.  T_IF carries conds, not stmts.
+   case T_IF:
+      {
+         const int nc = tree_conds(t);
+         for (int i = 0; i < nc; i++)
+            if (aj_tree_has_timed_wait(tree_cond(t, i), depth + 1))
+               return true;
+      }
+      return false;
+   case T_COND_STMT:
+      {
+         const int ns = tree_stmts(t);
+         for (int i = 0; i < ns; i++)
+            if (aj_tree_has_timed_wait(tree_stmt(t, i), depth + 1))
+               return true;
+      }
+      return false;
+   default:
+      return false;
+   }
+}
+
+static bool aj_proc_signal_sensitive(rt_model_t *m, rt_proc_t *proc)
+{
+   (void)m;
+   return proc->where != NULL && !aj_tree_has_timed_wait(proc->where, 0);
+}
+
+static bool aj_nexus_driver_is_comb(rt_model_t *m, rt_nexus_t *n, int depth)
+{
+   if (n == NULL || depth > 16) return false;
+   for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+      if (getenv("AJ_CLKDBG"))
+         fprintf(stderr, "CLKDBG d=%d tag=%d proc=%s sens=%d fastclk=%d\n",
+                 depth, (int)s->tag,
+                 s->tag == SOURCE_DRIVER && s->u.driver.proc
+                    ? istr(tree_ident(s->u.driver.proc->where)) : "-",
+                 s->tag == SOURCE_DRIVER && s->u.driver.proc
+                    ? aj_proc_signal_sensitive(m, s->u.driver.proc) : -1,
+                 s->tag == SOURCE_DRIVER && s->u.driver.proc
+                    ? s->u.driver.proc->wakeable.fastclk : -1);
+      switch (s->tag) {
+      case SOURCE_DRIVER:
+         if (s->u.driver.proc != NULL
+             && aj_proc_signal_sensitive(m, s->u.driver.proc))
+            return true;
+         break;
+      case SOURCE_PORT:
+         // follow the hierarchy toward the real driver
+         if (aj_nexus_driver_is_comb(m, s->u.port.input, depth + 1))
+            return true;
+         break;
+      default:
+         break;
+      }
+   }
+   return false;
+}
+
+static bool aj_clk_is_derived(rt_model_t *m, rt_signal_t *clksig)
+{
+   if (clksig == NULL || clksig->n_nexus != 1) return false;
+   return aj_nexus_driver_is_comb(m, &clksig->nexus, 0);
+}
+
 static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdata)
 {
    aj_dissolve_fastclk(m);    // rebuilt per install/candidate — full cleanup
@@ -5541,6 +5677,17 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          free(mtext);
       }
    }
+   // Group-0 clock must be PRIMARY.  A derived (comb-driven) clock races its
+   // producer at the bridge -- see aj_clk_is_derived above for the mechanism
+   // and the measured VeeR evidence (stuck ifu beat counter, +4 retire offset).
+   if (have_clk && getenv("NVC_ACCEL_ALLOW_DERIVED_CLK") == NULL
+       && aj_clk_is_derived(m, clk.sig)) {
+      notef("accel-jit: subtree '%s' clk is a DERIVED clock (comb-driven) — "
+            "group-0 edge detect would race its producer; leaving in nvc "
+            "(NVC_ACCEL_ALLOW_DERIVED_CLK=1 overrides)", top);
+      return false;
+   }
+
    if (!have_clk) {
       notef("accel-jit: no clk port found for '%s' — leaving in nvc", top);
       return false;
