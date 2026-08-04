@@ -256,6 +256,8 @@ typedef struct _rt_model {
    aj_chunk_t       **aj_chunks;   // pointer array — chunks have stable address
    unsigned           aj_chunk_count;
    unsigned           aj_chunk_max;
+   uint64_t           aj_snap_now;   // timestep of the last fleet input snapshot
+   unsigned           aj_snap_iter;  // ...and its delta cycle (per-DELTA snapshot)
 } rt_model_t;
 
 // Depth bucket: 0, 1, 2-3, 4-15, 16-63, 64-255, 256-1023, 1024+
@@ -1967,15 +1969,49 @@ typedef struct {
    char         name[64];    // port name (X/Z detection names the offender)
 } aj_bpin_t;
 
+// One bridged input's snapshot slot: where its live bytes come from, where its
+// pre-edge copy lives in the chunk's arena, and which bindtab slot to repoint.
+typedef struct {
+   void   *live;
+   size_t  off;
+   size_t  nb;
+   int     slot;
+} aj_snap_ent_t;
+
 struct _aj_chunk {
    rt_proc_vtable_t vtable;          // FIRST — recover chunk from proc->vtable
    void           (*eval)(void *, void **);  // .so's accel_eval(state, bindtab)
    void           (*reset)(void *);          // this .so's accel_reset(state)
    void            *state;           // per-chunk state (sized by accel_state_size)
    void            *dl;              // dlopen handle
+   bool             merged;          // domain-merged chunk (negedge state flip)
+   uint64_t         ck_flip_now;     // timestep whose fall already flipped (+1)
+   rt_signal_t     *primary_ck;      // bindtab[4] clock's signal (edge arming)
+   void           (*set_clklast)(void *, unsigned char);  // bridge accessor
+   uint64_t         ck_arm_now;      // timestep whose rise this chunk consumed
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
+   // TWO-PHASE EDGE SAMPLING (mechanism 3 of the VeeR divergence).  Immediate
+   // deposits land in signal shared memory at once, so a chunk evaluated later
+   // in the same delta -- or first-woken in a later delta -- marshals another
+   // chunk's POST-edge Q and advances a cycle early (the +4 retired-PC offset;
+   // requires producer AND consumer accelerated, which is why eight bisection
+   // rounds measured every family clean alone and dirty in combination).
+   // Deposit-side remedies alone cannot fix it for LATE-woken chunk
+   // consumers: NBA/two-delta staging publish within the timestep, and a
+   // chunk whose posedge eval runs tens of deltas after the edge (gated-
+   // clock triggers) reads the already-published post-edge value.  The
+   // shipped protocol (SNAP_MODE 4, the FPGA double-bank design in
+   // software): a per-TIMESTEP fleet pass at the first delta boundary
+   // copies every chunk's bridged-input bytes into its arena (the settled
+   // pre-edge world); ONLY the armed posedge eval reads the snapshot via
+   // bindtab repointing; every other eval reads live so Mealy settling and
+   // gated-clock late commits are untouched.  Modes 1-3 are historical
+   // bisection knobs (see aj_snap_mode).
+   uint8_t         *snap;            // arena: pre-edge bytes of bridged inputs
+   aj_snap_ent_t   *snap_map;
+   unsigned         snap_nin;
    bool             defer_pending;
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
@@ -2127,6 +2163,71 @@ static aj_chunk_t *g_aj_cur_chunk[MAX_THREADS];  // chunk running per worker
 // time step compare every bridge output against the settled interpreted value.
 // Turns the accel path into a per-net differential oracle: it reports the exact
 // net + time where the compiled model first diverges from the reference.
+static int g_aj_snap_fleet = 0, g_aj_snap_used = 0;
+
+// NVC_ACCEL_SNAP_MODE: 0 = off (== NVC_ACCEL_NO_SNAP), 1 = per-delta fleet
+// snapshot taken lazily at the first chunk eval of the delta (deposits from
+// interp processes ordered EARLIER in the same delta still contaminate it),
+// 2 = snapshot hoisted to the delta boundary in model_cycle (after driver
+// commits, before any process runs -- airtight against same-delta deposits),
+// 3 = mode 2 + seq-only (inputs whose driver is combinational stay LIVE so
+// blocking-assign comb settle remains visible same-delta; only inputs from
+// clocked/timed drivers are edge-sampled).
+// 4 = DOUBLE-BANK SPLIT (the FPGA two-bank design in software): the fleet
+// snapshot is taken once per TIMESTEP (first delta boundary, before any
+// process runs = the settled PRE-EDGE world), and ONLY the armed posedge
+// eval of a chunk reads it -- comb/settle evals read live.  A late-delta
+// posedge eval (chunk woken by its gated-clock trigger at d29) then samples
+// the same pre-edge D values an early one would, instead of values NBA and
+// the 2-delta stage have already published inside the timestep (measured:
+// first-of-burst retired-PC +4 on eh2_dec).  Modes 1-3 lacked this split:
+// freezing comb evals froze Mealy paths (stuck-at-0), leaving them live
+// left the capture (+4).
+static int aj_snap_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *e = getenv("NVC_ACCEL_SNAP_MODE");
+      mode = e ? atoi(e) : 0;   // PARKED: mode 4 is coherent only for
+                                // single-clock chunks -- an armed eval on a
+                                // multi-clock chunk (eh2_dec) reads primary
+                                // inputs from the pre-edge arena while its
+                                // extra-clock samplers and comb settle read
+                                // live, and the mixed view wedges the machine
+                                // at reset (all-zero TRACE_PKT, 0 retires at
+                                // 400ns).  The coherent form is PRODUCER-side
+                                // per-net banking (NVC_ACCEL_BANK defer/swap)
+                                // -- see task #53.
+      if (getenv("NVC_ACCEL_NO_SNAP") != NULL) mode = 0;
+   }
+   return mode;
+}
+
+static void aj_snap_fleet_take(rt_model_t *m)
+{
+   // Key stamps are now+1: aj_snap_now zero-initializes and 0 is also the
+   // first legal timestep, so a raw `== now` compare would skip the whole of
+   // timestep 0 (same trap ck_arm_now already avoids the same way).
+   if (aj_snap_mode() >= 4) {
+      // per-TIMESTEP: first delta boundary only (the pre-edge world)
+      if (m->aj_snap_now == (uint64_t)m->now + 1)
+         return;
+   }
+   else if (m->aj_snap_now == (uint64_t)m->now + 1
+            && m->aj_snap_iter == m->iteration + 1)
+      return;
+   m->aj_snap_now  = (uint64_t)m->now + 1;
+   m->aj_snap_iter = m->iteration + 1;
+   if (g_aj_snap_fleet++ == 0)
+      notef("accel-snap: two-phase sampling ACTIVE (first fleet pass, "
+            "%u chunks, mode %d)", m->aj_chunk_count, aj_snap_mode());
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      for (unsigned j = 0; j < c->snap_nin; j++)
+         memcpy(c->snap + c->snap_map[j].off,
+                c->snap_map[j].live, c->snap_map[j].nb);
+   }
+}
 static int         g_aj_verify   = 0;       // int (not bool): the bridge reads it via AJB
 static bool        g_aj_verify_skipx = false;  // NVC_ACCEL_VERIFY_X: skip interp-X elems
 static bool        g_aj_vtrack = false;  // NVC_ACCEL_VERIFY_TRACK: verify_flagged means
@@ -2253,7 +2354,44 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    thread->active_obj   = &proc->wakeable;
    thread->active_scope = proc->scope;
    g_aj_cur_chunk[tid]  = chunk;
+   // Primary-clock ARMING first: the mode-4 snapshot decision depends on
+   // whether THIS eval fires the primary posedge (see aj_snap_mode docs).
+   bool armed_rose = false;
+   static int no_arm = -1;
+   if (no_arm < 0) no_arm = getenv("NVC_ACCEL_NO_ARM") != NULL;
+   if (!no_arm && chunk->set_clklast != NULL && chunk->primary_ck != NULL) {
+      rt_nexus_t *cn = &chunk->primary_ck->nexus;
+      armed_rose = cn->last_event == (uint64_t)m->now
+         && (chunk->primary_ck->shared.data[0] & 1)
+         && chunk->ck_arm_now != (uint64_t)m->now + 1;
+      if (armed_rose) chunk->ck_arm_now = (uint64_t)m->now + 1;  // +1: 0 unused
+      (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
+   }
+   // Two-phase edge sampling (see struct _aj_chunk and aj_snap_mode).
+   // Mode 4 (default): armed posedge evals read the per-timestep pre-edge
+   // snapshot, everything else reads live.  Modes 1-3: historical forms
+   // kept as bisection knobs.
+   bool use_snap = false;
+   if (chunk->snap_nin > 0 && aj_snap_mode() > 0) {
+      // engagement telemetry: a run with zero fleet passes never executed this
+      // code at all (dispatch-path bypass) -- the unexecuted-patch trap,
+      // instrumented this time.
+      static nvc_lock_t snap_lock = 0;
+      const bool par = relaxed_load(&g_par_active);
+      if (par) nvc_lock(&snap_lock);
+      aj_snap_fleet_take(m);   // lazy taker: no-op if the boundary hoist ran
+      use_snap = aj_snap_mode() >= 4 ? armed_rose : true;
+      if (use_snap) g_aj_snap_used++;
+      if (par) nvc_unlock(&snap_lock);
+   }
+   if (use_snap)
+      for (unsigned j = 0; j < chunk->snap_nin; j++)
+         chunk->bindtab[chunk->snap_map[j].slot] =
+            chunk->snap + chunk->snap_map[j].off;
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
+   if (use_snap)
+      for (unsigned j = 0; j < chunk->snap_nin; j++)
+         chunk->bindtab[chunk->snap_map[j].slot] = chunk->snap_map[j].live;
    g_aj_cur_chunk[tid]  = save_chunk;
    thread->active_obj   = save_obj;
    thread->active_scope = save_scope;
@@ -2271,6 +2409,11 @@ struct _aj_defer_out {
    unsigned char *shadow;     // staged value (malloc valuesz) — NULL if !defer
    bool           cache_event;
    bool           defer;      // bank-switch this output (vs deposit_signal)
+   bool           negflip;    // merged-chunk reg output: stage at posedge,
+                              // deposit_signal at the domain clock's FALL
+                              // (task #53/#59 -- derivation-free barrier)
+   void          *sigp;       // negflip: the signal to deposit into
+   int            pw;         // negflip: port width (deposit element count)
    bool           dirty;      // shadow staged this cycle, awaiting swap
    bool           verify_flagged;  // NVC_ACCEL_VERIFY: already reported diverged
    bool           off_edge;   // seen changing on a non-posedge delta => Mealy/
@@ -2357,11 +2500,13 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
             for (int b = 0; b < width && b < 64; b++)
                if (ip[(size_t)(width - 1 - b) * esz] & 1) iv |= (uint64_t)1 << b;
          fprintf(stderr, "#AJOUT ord=%d t=%llu d=%u w=%d pe=%d val=0x%llx "
-                 "net=0x%llx chunk=%s\n", ord,
+                 "net=0x%llx chunk=%s sig=%s\n", ord,
                  (unsigned long long)(m ? m->now : 0),
                  m ? m->iteration : 0, width, posedge,
                  (unsigned long long)v, (unsigned long long)iv,
-                 (c != NULL && c->rs_top != NULL) ? c->rs_top : "?");
+                 (c != NULL && c->rs_top != NULL) ? c->rs_top : "?",
+                 (sigp != NULL)
+                    ? istr(tree_ident(((rt_signal_t *)sigp)->where)) : "?");
       }
    }
 
@@ -2443,11 +2588,28 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
       //   anything off-edge      -> immediate (interp active-region comb)
       static int _nba = -1, _st2 = -1;
       if (_nba < 0) {
-         _nba = getenv("NVC_ACCEL_NBA") ? 1 : 0;
+         // DEFAULT ON since the full-VeeR mechanism-3 campaign: routing reg
+         // outputs through the NBA region (and comb-of-edge through the
+         // 2-delta stage) is the correct cross-boundary flop-to-flop
+         // protocol, not an option.  NVC_ACCEL_NBA=0 is the bisection knob.
+         const char *nb = getenv("NVC_ACCEL_NBA");
+         _nba = nb ? atoi(nb) : 1;
          const char *s2 = getenv("NVC_ACCEL_STAGE2");
          _st2 = s2 ? atoi(s2) : _nba;   // default: follow NBA; 0 forces off
       }
       const int pe = posedge & 1, combcls = posedge & 4;
+      // Merged-chunk negedge flip: registered outputs computed at a posedge
+      // eval stage into the shadow; model_cycle publishes them when the
+      // domain clock FALLS.  Off-edge / comb pushes keep their normal paths.
+      if (pe && !combcls && c != NULL && c->merged && ord >= 0
+          && (unsigned)ord < c->defer_count
+          && c->defer_outs[ord].negflip) {
+         aj_defer_out_t *d = &c->defer_outs[ord];
+         memcpy(d->shadow, buf, d->valuesz);
+         d->dirty = true;
+         c->defer_pending = true;
+         return;
+      }
       if (_nba && pe && !combcls)
          sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, true /*nonblock*/);
       else if (_st2 && pe && combcls && c != NULL && ord >= 0
@@ -2736,8 +2898,11 @@ static void aj_reroute(rt_scope_t *scope, aj_chunk_t *chunk)
 // does not receive an edge; it INFERS one by sampling the bound clock bytes at
 // whatever deltas it happens to run:
 //
-//    driving:  posedge = (_clk && t != last_t)          // first eval this
-//                                                       // timestep with clk high
+//    driving:  posedge = (_clk && !aj_cs->clk_last0)    // real value edge;
+//                        // last0 is ARMED per eval by aj_proc_eval from the
+//                        // clock nexus' event state (was `clk && t != last_t`,
+//                        // a level+time proxy that phantom-fired -- history
+//                        // in the emitter comment at the posedge fprintf)
 //    extra ck: rise    = (_n && !aj_cs->ck_last[k])     // vs its LAST sample
 //
 // Both rules are only sound if the chunk is evaluated in the delta where the
@@ -3529,6 +3694,61 @@ static bool aj_nexus_driver_is_comb(rt_model_t *m, rt_nexus_t *n, int depth)
    return false;
 }
 
+// Walk port sources up the hierarchy to the ULTIMATE driving nexus — the one
+// whose driver is a real process, not a port hop.  Two clock pins anywhere in
+// the design that descend from the same generator resolve to the same nexus,
+// which is the merge-group key (task #53/#59: grouping by the LOCAL pin
+// signal fragmented VeeR into ~5-member groups because the clock tree is not
+// port-collapsed across all hierarchy levels).
+static rt_nexus_t *aj_ultimate_driver_nexus(rt_nexus_t *n, int depth)
+{
+   if (n == NULL || depth > 64)
+      return n;
+   for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+      if (s->tag == SOURCE_PORT && s->u.port.input != NULL) {
+         if (getenv("AJ_ROOTDBG"))
+            fprintf(stderr, "ROOTDBG d=%d PORT hop\n", depth);
+         return aj_ultimate_driver_nexus(s->u.port.input, depth + 1);
+      }
+      // See through identity buffers: a clock distributed via
+      // `assign a = b;` is a DRIVER source whose proc body is a single
+      // signal assignment of a plain reference -- resolve b and keep
+      // walking (VeeR's clock tree is built from exactly these, which is
+      // why port-hops alone fragmented the domain into 5/35-member groups).
+      if (s->tag == SOURCE_DRIVER && s->u.driver.proc != NULL) {
+         rt_proc_t *dp = s->u.driver.proc;
+         tree_t w = dp->where;
+         if (getenv("AJ_ROOTDBG"))
+            fprintf(stderr, "ROOTDBG d=%d DRIVER proc=%s kind=%d\n", depth,
+                    istr(tree_ident(w)), (int)tree_kind(w));
+         tree_t asgn = NULL;
+         if (tree_kind(w) == T_CONCURRENT && tree_stmts(w) == 1)
+            asgn = tree_stmt(w, 0);
+         else if (tree_kind(w) == T_SIGNAL_ASSIGN)
+            asgn = w;
+         if (asgn != NULL && tree_kind(asgn) == T_SIGNAL_ASSIGN
+             && tree_waveforms(asgn) == 1) {
+            tree_t wav = tree_waveform(asgn, 0);
+            if (!tree_has_delay(wav)) {          // identity only, not a clkgen
+               tree_t val = tree_value(wav);
+               if (tree_kind(val) == T_REF) {
+                  char lname[64];
+                  aj_lower(lname, istr(tree_ident(val)), sizeof lname);
+                  rt_signal_t *src = aj_find_signal(dp->scope, lname);
+                  if (getenv("AJ_ROOTDBG"))
+                     fprintf(stderr, "ROOTDBG d=%d BUFFER -> %s (%s)\n",
+                             depth, lname, src ? "resolved" : "MISS");
+                  if (src != NULL && src->n_nexus == 1
+                      && &src->nexus != n)
+                     return aj_ultimate_driver_nexus(&src->nexus, depth + 1);
+               }
+            }
+         }
+      }
+   }
+   return n;
+}
+
 static bool aj_clk_is_derived(rt_model_t *m, rt_signal_t *clksig)
 {
    if (clksig == NULL || clksig->n_nexus != 1) return false;
@@ -4088,6 +4308,8 @@ static void aj_respecialize(rt_model_t *m)
          continue;
       }
       c->eval = eval;   // the swap: dispatch now points at specialized code
+      void (*sck)(void *, unsigned char) = dlsym(dl, "accel_set_clklast");
+      if (sck != NULL) c->set_clklast = sck;
       // the specialized .so has its own sm_live_outputs — re-apply the mask
       uint64_t *lom = dlsym(dl, "sm_live_outputs");
       if (lom != NULL) memcpy(lom, c->live_out_mask, sizeof c->live_out_mask);
@@ -4187,6 +4409,12 @@ static void aj_link_handoff(rt_model_t *m)
 // they were created, so a non-installed chunk leaves no active state.
 static void aj_accel_teardown(rt_model_t *m)
 {
+   // engagement telemetry reader: zero fleet passes / snapshot evals on a
+   // run that installed chunks means the sampling code never executed at
+   // all (the unexecuted-patch trap) -- report it where it can be seen.
+   if (getenv("AJ_SNAP_DBG") != NULL && m->aj_chunk_count > 0)
+      notef("accel-snap: %d fleet passes, %d snapshot evals this run",
+            g_aj_snap_fleet, g_aj_snap_used);
    free(m->fastclk_table);
    m->fastclk_table = NULL;
    m->fastclk_count = 0;
@@ -4504,6 +4732,13 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  "%s"
                  " for(int _k=0;_k<%d;_k++) aj_cs->ck_last[_k]=0; }\n\n",
               has_late ? " aj_cs->late_pend = 0;" : "", nck);
+   // Seed-time hook: the t=0 seed evals with clk FORCED low (comb-only settle),
+   // which leaves clk_last0 = 0 via the per-eval update.  For a design whose
+   // clock initialises HIGH there is no rising edge at t=0, so the seed must
+   // sync clk_last0 to the REAL clock level afterwards or the first sample in
+   // the initial high phase reads as a spurious 0->1 edge.
+   fprintf(f, "void accel_set_clklast(void *p, unsigned char v)"
+              "{ ((aj_cs_t *)p)->clk_last0 = v; }\n\n");
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
    chunk->bindtab[0] = (void *)&deposit_signal;
@@ -4512,6 +4747,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    chunk->bindtab[3] = (void *)&aj_out;
    chunk->bindtab[4] = clk->data;
    chunk->bindtab[5] = rst ? rst->data : NULL;
+   chunk->primary_ck = clk != NULL ? clk->sig : NULL;
    // Slots after the per-pin table (array is sized 6+npins+4):
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
    //   [6+npins+1] per-output handoff flags (set by aj_link_handoff post-install)
@@ -4600,6 +4836,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    size_t raw_off = 0;
    static int bin_pin[AJ_MAX_PINS];    // pin index per bridged-input ordinal
    static int bout_pin[AJ_MAX_PINS];   // pin index per output ordinal
+   static void  *snap_live[AJ_MAX_PINS];
+   static size_t snap_nb[AJ_MAX_PINS];
+   static int    snap_slot[AJ_MAX_PINS];
+   int n_snap = 0;
    // inputs: DIRECT IN-PLACE — the packed `in` (chunk-state in_live) persists;
    // each pin memcmp's its nvc logic3d bytes against raw_shadow and is only
    // re-translated on change. Translation detail: each sub-element is `elem`
@@ -4610,9 +4850,23 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    for (int i = 0; i < npins; i++) {
       if (pins[i].is_output) continue;
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
-      if (!spec)
-         chunk->bindtab[6 + bridged_in] = pins[i].data;
       const size_t nb = (size_t)pins[i].width * pins[i].elem;
+      if (!spec) {
+         chunk->bindtab[6 + bridged_in] = pins[i].data;
+         // snapshot slot for the two-phase edge sampling (see struct);
+         // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
+         // must remain visible same-delta), only clocked/timed sources
+         // are edge-sampled
+         bool snap_this = true;
+         if (aj_snap_mode() == 3 && pins[i].sig != NULL)
+            snap_this = !aj_nexus_driver_is_comb(m, &pins[i].sig->nexus, 0);
+         if (snap_this) {
+            snap_live[n_snap] = pins[i].data;
+            snap_nb[n_snap]   = nb;
+            snap_slot[n_snap] = 6 + bridged_in;
+            n_snap++;
+         }
+      }
       bool is_ck = strcmp(pins[i].name, "clk") == 0;
       for (int k = 0; k < nck && !is_ck; k++)
          if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
@@ -4702,6 +4956,25 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    }
    fprintf(f, "  aj_cs->shadow_valid = 1;\n");
    if (!spec) {
+      // materialise the two-phase snapshot arena now every input slot is known
+      chunk->snap_nin = n_snap;
+      if (n_snap > 0) {
+         size_t tot = 0;
+         chunk->snap_map = xcalloc_array(n_snap, sizeof(aj_snap_ent_t));
+         for (int j = 0; j < n_snap; j++) {
+            chunk->snap_map[j].live = snap_live[j];
+            chunk->snap_map[j].off  = tot;
+            chunk->snap_map[j].nb   = snap_nb[j];
+            chunk->snap_map[j].slot = snap_slot[j];
+            tot += snap_nb[j];
+         }
+         chunk->snap = xmalloc(tot);
+         for (int j = 0; j < n_snap; j++)
+            memcpy(chunk->snap + chunk->snap_map[j].off,
+                   chunk->snap_map[j].live, chunk->snap_map[j].nb);
+         if (getenv("AJ_SNAP_DBG"))
+            notef("accel-snap: arena built, %d inputs", n_snap);
+      }
       // bridged-input summary for the handoff link pass (bridge ordinal order)
       chunk->b_in = xcalloc_array(bridged_in > 0 ? bridged_in : 1,
                                   sizeof(aj_bpin_t));
@@ -4721,20 +4994,29 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
    fprintf(f, "  int _clk = CLK[0]&1;\n");
    fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
-   // The bridge now runs on EVERY boundary-input-change delta (the rerouted
-   // combinational processes wake it), not just the clock edge. ADVANCE the
-   // registers once per clock cycle — at the first call with clk high at a NEW
-   // simulation time (the posedge); last_t holds the time we last advanced (a
-   // level edge-detect would need the bridge to also run during clk-low, which a
-   // posedge-optimized clocked process does NOT). COMB outputs re-settle on every
-   // call regardless (below).
-   // Reroute path: time-edge (bridge only runs when a rerouted process wakes it —
-   // reliably at the posedge, not during clk-low). VERIFY path: the harness runs
-   // the bridge EVERY delta (it sees clk-low too), so use a robust value-edge that
-   // never double-fires on a stray clk-high sample (e.g. a clock being stopped).
+   // The bridge runs on EVERY boundary-input-change delta (the rerouted
+   // combinational processes wake it), not just the clock edge.  ADVANCE the
+   // registers once per clock cycle.  BOTH paths now compile the same real
+   // value-edge detect on clk_last0; what differs is who maintains last0:
+   // VERIFY steps the bridge every delta so its own per-eval update sees the
+   // low phase, while the DRIVING path cannot rely on that (the rerouted
+   // proc's rising-edge trigger filters fall wakes) -- there aj_proc_eval
+   // ARMS clk_last0 from the primary clock nexus' event state before each
+   // eval (see the arming block).  COMB outputs re-settle on every call
+   // regardless (below).
    fprintf(f, "  int posedge;\n");
    fprintf(f, "  if(VERIFY) posedge = (_clk && !aj_cs->clk_last0);\n");
-   fprintf(f, "  else { posedge = (_clk && t != last_t); if(posedge) last_t = t; }\n");
+   // Driving mode HAD `(_clk && t != last_t)` -- a level+new-timestep proxy
+   // from before aj_subscribe_clocks existed, when the chunk might never
+   // sample the clock-low phase.  Post-subscription the chunk wakes on every
+   // clock event INCLUDING the fall, so a real edge detect is complete -- and
+   // the proxy is strictly worse: a boundary-input wake in a negedge timestep
+   // that reads the (not-yet-fallen) gated clock high fires a PHANTOM edge.
+   // Measured on full VeeR: eh2_dec double-clocked at burst starts (phantom
+   // at the negedge, then the real posedge) -> retired-PC +4 on the first
+   // retire of every burst.  VERIFY compiled the real edge detect all along,
+   // which is why it stayed clean while the driving run diverged.
+   fprintf(f, "  else { posedge = (_clk && !aj_cs->clk_last0); if(posedge) last_t = t; }\n");
    fprintf(f, "  aj_cs->clk_last0 = _clk;\n");
    // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
    // behaviour (no combinational re-settle on input-change deltas) — wrong for a
@@ -4841,7 +5123,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // semantics for both internal-cone flops (dec ibvalff: pre-edge state)
       // and input-fed flops (mem_ctl ok_prev, lsu bus enables: the input as
       // of the gater's rise). Group 0 still advances at the posedge below.
-      if (has_late)
+      if (has_late) {
          // NOTE: `S` is a macro for aj_cs->S — writing aj_cs->S here would
          // expand into aj_cs->(aj_cs->S). Use the macro.
          // ck_last RESET at arming: the chunk only re-scans when it is
@@ -4866,6 +5148,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                     " if(!_keeplast) for(int _k=0;_k<%d;_k++)"
                     " aj_cs->ck_last[_k]=0; }\n",
                  ((1u << (nck + 1)) - 2u), nck);
+      }
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
       fprintf(f, "  if(!_late && !_coinc){\n");
@@ -5087,6 +5370,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             tgt = NULL;   // layout mismatch across the port hop — fall back
          d->valuesz = (size_t)bufsz;
          d->defer   = (tgt != NULL);
+         // Merged chunks: every REGISTERED output stages at posedge evals and
+         // publishes at the domain clock's fall (the negedge state flip).  No
+         // conservative reader gate needed -- publication goes through
+         // deposit_signal, which handles port propagation and comb-reader
+         // wakeups (the interp-side ICG enables recompute during the low
+         // phase, matching real ICG latch timing).
+         if (chunk->merged && !is_comb && !d->defer) {
+            d->negflip = true;
+            d->sigp    = pins[i].sig;
+            d->pw      = pins[i].width;
+            d->shadow  = xmalloc(bufsz);
+         }
          if (d->defer) {
             d->nexus       = tgt;
             d->eff         = (unsigned char *)tgt->signal->shared.data + tgt->offset;
@@ -5312,6 +5607,143 @@ static int aj_count_instances(rt_scope_t *scope)
    return n;
 }
 
+// ---- NVC_ACCEL_MERGE: one chunk per clock domain (task #53/#59) ------------
+// The collect pass records fully-prepared install candidates instead of
+// installing them; aj_try_merge_install groups them by primary-clock SIGNAL
+// (port collapse makes same-domain pins share one rt_signal_t) and installs
+// each group as ONE merged chunk: a generated wrapper module instantiates
+// every member, chunk-to-chunk nets become flattened INTERNAL wires (the
+// cross-chunk sampling race class disappears structurally), and only the
+// interp-facing rim keeps bridge pins.  gen_statemachine's generated code is
+// already the no-copy two-phase eval within the block: registers are copied
+// to pre-edge locals (phase 1), comb reads the locals, commits write state
+// (phase 2) -- so a single-domain merge needs no cross-block banking at all.
+typedef struct {
+   rt_scope_t *scope;
+   tree_t      ref;
+   char       *top_mod;      // emitted Verilog module name (variant name)
+   char       *vpath;        // emitted subtree .v path
+   aj_pin_t   *pins;
+   int         npins;
+   aj_pin_t    clk, rst;
+   rt_nexus_t *ck_root;      // ultimate driving nexus of clk (the group key)
+   bool        have_rst;
+} aj_mcand_t;
+
+static bool        g_aj_collecting = false;
+static aj_mcand_t *g_aj_cands   = NULL;
+static int         g_aj_ncand   = 0;
+static int         g_aj_candmax = 0;
+
+static void aj_try_merge_install(rt_model_t *m, const char *accel_dir);
+
+// Rewrite an emitted subtree .v with every module name suffixed, so N members
+// of a merge can coexist in one yosys design.  Necessary because the emit
+// path names both the FILE and the MODULES by entity/variant, and same-entity
+// members with different baked generics collide on both (each emit overwrites
+// the file; the per-chunk path never noticed because it synthesizes
+// immediately and keys the .so by CONTENT hash).  Returns the renamed top
+// module in top_out.
+static bool aj_uniquify_modules(const char *src, const char *dst,
+                                const char *suffix, const char *top_in,
+                                char *top_out, size_t top_outsz)
+{
+   char *text = aj_read_file(src);
+   if (text == NULL)
+      return false;
+   // Collect declared module names WITH a content hash of each module's own
+   // text span.  The per-member suffix (_cN) forked every shared primitive
+   // into N copies -- 120 VeeR members each carried a renamed copy of the
+   // same rvdff forest and yosys elaborated the whole thing N times (fused
+   // synths ran for hours).  A content-hash suffix gives identical modules
+   // the SAME name everywhere: yosys's overwrite-on-identical-redefinition
+   // is harmless, and the design graph dedups back to its true size.  Only
+   // same-name modules with DIFFERENT content (baked generics) diverge.
+   char names[256][128];
+   uint64_t nhash[256];
+   const char *nspan_s[256], *nspan_e[256];
+   int nnames = 0;
+   for (const char *p = text; (p = strstr(p, "module ")) != NULL; p += 7) {
+      if (p != text && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+         continue;   // endmodule / $xmodule etc.
+      const char *q = p + 7;
+      while (*q == ' ') q++;
+      int len = 0;
+      while ((isalnum((unsigned char)q[len]) || q[len] == '_') && len < 127)
+         len++;
+      if (len == 0 || nnames == 256) continue;
+      const char *e = strstr(q, "endmodule");
+      uint64_t h = 1469598103934665603ULL;
+      for (const char *t = q; t < (e ? e + 9 : q + len); t++)
+         { h ^= (uint8_t)*t; h *= 1099511628211ULL; }
+      memcpy(names[nnames], q, len);
+      names[nnames][len] = '\0';
+      nhash[nnames] = h;
+      nspan_s[nnames] = q; nspan_e[nnames] = e ? e + 9 : q + len;
+      nnames++;
+   }
+   // TRANSITIVE hash: an identical-text parent instantiating divergent
+   // children must itself diverge (else the overwrite picks one child
+   // binding — the 24-clusters bug one level up).  Mix referenced modules'
+   // hashes into each module's hash until fixpoint (instantiation graphs
+   // are acyclic, so <= nnames passes converge).
+   for (int pass = 0; pass < nnames; pass++) {
+      bool changed = false;
+      for (int i = 0; i < nnames; i++) {
+         uint64_t h = nhash[i];
+         for (int j = 0; j < nnames; j++) {
+            if (j == i) continue;
+            const size_t jl = strlen(names[j]);
+            for (const char *t = nspan_s[i];
+                 (t = strstr(t, names[j])) != NULL && t < nspan_e[i];
+                 t += jl) {
+               const char b = (t > nspan_s[i]) ? t[-1] : ' ';
+               const char a = t[jl];
+               if (!(isalnum((unsigned char)b) || b == '_')
+                   && !(isalnum((unsigned char)a) || a == '_')) {
+                  h = (h ^ nhash[j]) * 1099511628211ULL;
+                  break;   // one mix per referenced module is enough
+               }
+            }
+         }
+         if (h != nhash[i]) { nhash[i] = h; changed = true; }
+      }
+      if (!changed) break;
+   }
+   FILE *f = fopen(dst, "w");
+   if (f == NULL) { free(text); return false; }
+   // stream the text, replacing whole-word occurrences of any collected name
+   const char *p = text;
+   while (*p) {
+      if (isalpha((unsigned char)*p) || *p == '_' || *p == '\\') {
+         const char *w = p;
+         if (*p == '\\') p++;   // escaped identifier: include leader
+         while (isalnum((unsigned char)*p) || *p == '_') p++;
+         const int wl = (int)(p - w) - (w[0] == '\\' ? 1 : 0);
+         const char *wb = w + (w[0] == '\\' ? 1 : 0);
+         int hit = -1;
+         for (int n = 0; n < nnames && hit < 0; n++)
+            if ((int)strlen(names[n]) == wl
+                && strncmp(names[n], wb, wl) == 0)
+               hit = n;
+         fwrite(w, 1, p - w, f);
+         if (hit >= 0)
+            fprintf(f, "_h%08x", (unsigned)(nhash[hit] & 0xffffffffu));
+      }
+      else
+         fputc(*p++, f);
+   }
+   fclose(f);
+   (void)suffix;   // superseded by per-module content-hash suffixes
+   uint64_t th = 0;
+   for (int n = 0; n < nnames; n++)
+      if (strcmp(names[n], top_in) == 0) { th = nhash[n]; break; }
+   free(text);
+   snprintf(top_out, top_outsz, "%s_h%08x", top_in,
+            (unsigned)(th & 0xffffffffu));
+   return true;
+}
+
 static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                                   tree_t ref, const char *accel_dir)
 {
@@ -5419,6 +5851,89 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    snprintf(top_mod, sizeof top_mod, "%s",
             vhdl2vlog_variant_name(tree_ident(ent), scope->where));
 
+   // NVC_ACCEL_MERGE collect pass (task #53/#59), placed BEFORE the synth
+   // step: collect mode must not pay per-candidate synthesis (measured: 6h
+   // on full VeeR reached only 80 of 1,193 candidates).  Build a local pin
+   // view (the normal pin loop runs post-synth because its no-"clk" fallback
+   // scrapes the generated C; here a name heuristic + the AST derived-clock
+   // test suffice), snapshot the emitted .v with uniquified module names,
+   // and record the candidate.  Returning true stops the scan descending.
+   if (g_aj_collecting) {
+      if (nsrc != 1)
+         return false;      // collect handles the single-file FROM_VHDL form
+      static aj_pin_t cpins[AJ_MAX_PINS];
+      int ncp = 0;
+      int clk_i = -1;
+      const int cnports = tree_ports(ent);
+      for (int i = 0; i < cnports && ncp < AJ_MAX_PINS; i++) {
+         tree_t p = tree_port(ent, i);
+         char lname[64];
+         aj_lower(lname, istr(tree_ident(p)), sizeof lname);
+         rt_signal_t *sig = aj_find_signal(scope, lname);
+         if (sig == NULL)
+            continue;
+         aj_pin_t pin = {0};
+         snprintf(pin.name, sizeof pin.name, "%s", lname);
+         pin.elem  = (int)sig->nexus.size;
+         pin.width = pin.elem ? (int)(sig->shared.size / pin.elem) : 1;
+         pin.data  = (uint8_t *)sig->shared.data;
+         pin.sig   = sig;
+         pin.base  = aj_bit_base(tree_type(p));
+         pin.is_output = (tree_subkind(p) == PORT_OUT
+                          || tree_subkind(p) == PORT_BUFFER);
+         if (pin.width < 1 || pin.width > 4096
+             || (pin.elem != 1 && pin.elem != 4)
+             || !aj_marshallable_type(tree_type(p)))
+            return false;   // unmarshallable: leave for the normal scan
+         if (!pin.is_output) {
+            const size_t nl = strlen(lname);
+            if (strcmp(lname, "clk") == 0)
+               clk_i = ncp;   // exact name wins
+            else if (clk_i < 0 && nl >= 3
+                     && strcmp(lname + nl - 3, "clk") == 0
+                     && !aj_clk_is_derived(m, sig))
+               clk_i = ncp;   // first primary *clk-suffixed input
+         }
+         cpins[ncp++] = pin;
+      }
+      if (clk_i < 0)
+         return false;      // no primary clock: not mergeable
+      if (g_aj_ncand == g_aj_candmax) {
+         g_aj_candmax = g_aj_candmax ? g_aj_candmax * 2 : 64;
+         g_aj_cands = xrealloc_array(g_aj_cands, g_aj_candmax,
+                                     sizeof(aj_mcand_t));
+      }
+      aj_mcand_t *c = &g_aj_cands[g_aj_ncand++];
+      c->scope = scope;
+      c->ref   = ref;
+      // Snapshot the emitted .v NOW under a unique path with uniquified
+      // module names: the emit path keys the file AND the modules by
+      // entity/variant name, so same-entity members with different baked
+      // generics overwrite each other and collide in yosys (measured:
+      // merged many_k24 silently became 24 copies of cluster 23).
+      {
+         char sfx[32], upath[600], utop[192];
+         snprintf(sfx, sizeof sfx, "_c%d", g_aj_ncand - 1);
+         snprintf(upath, sizeof upath, "%s/aj_mrg%d_subtree.v", accel_dir,
+                  g_aj_ncand - 1);
+         if (!aj_uniquify_modules(srcs[0], upath, sfx, top_mod,
+                                  utop, sizeof utop)) {
+            g_aj_ncand--;
+            return false;
+         }
+         c->top_mod = xstrdup(utop);
+         c->vpath   = xstrdup(upath);
+      }
+      c->pins  = xmalloc_array(ncp > 0 ? ncp : 1, sizeof(aj_pin_t));
+      memcpy(c->pins, cpins, (ncp > 0 ? ncp : 1) * sizeof(aj_pin_t));
+      c->npins = ncp;
+      c->clk   = cpins[clk_i];
+      c->ck_root = aj_ultimate_driver_nexus(&cpins[clk_i].sig->nexus, 0);
+      memset(&c->rst, 0, sizeof c->rst);
+      c->have_rst = false;
+      return true;
+   }
+
    // Content-hash the synthesis inputs (the emitted/collected Verilog + the top
    // module name) so the synth output is keyed by the LOGIC: a cached synth is
    // reused when the logic is unchanged (in-place update) and gen_statemachine
@@ -5461,6 +5976,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // Both became live hazards when the benchmark harnesses stopped wiping the
    // cache between runs.
    uint64_t shash = vhash;
+   // bridge-format version: bump when the emitted bridge TEXT changes so
+   // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
+   // stale and re-emit+recompile from the cached synth .c.  v2: true
+   // edge-detect posedge + accel_set_clklast.
+   for (const char *p = "bridge-v2"; *p; p++)
+      { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
      for (const char *p = cc; *p; p++) { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
@@ -5754,6 +6275,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    chunk->x_seen_fn  = dlsym(dl, "accel_x_seen");
    chunk->x_info_fn  = dlsym(dl, "accel_x_info");
    chunk->x_clear_fn = dlsym(dl, "accel_x_clear");
+   chunk->set_clklast = dlsym(dl, "accel_set_clklast");
    if (chunk->x_seen_fn != NULL) g_aj_have_xdet = true;
    chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
    // keep the emission inputs for post-link respecialization (re-emit the
@@ -5881,6 +6403,574 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
 }
 
 // Recursively scan scopes for acceleration .so files.
+// The consumer-visible storage of an output pin: follow ONE un-converted
+// output-port hop (the aj_link_handoff pattern) — a producer's local port
+// signal and the net its readers see are different rt_signal_t objects, and
+// even their data differs until the hop is followed (proven on the mini-GALS
+// fixture: chained members matched neither by sig nor by raw data).
+static uint8_t *aj_consumer_data(rt_signal_t *sig)
+{
+   if (sig == NULL)
+      return NULL;
+   if (sig->n_nexus == 1) {
+      rt_nexus_t *n = &sig->nexus;
+      if (n->outputs != NULL) {
+         rt_source_t *o = n->outputs;
+         if (o->chain_output == NULL && o->tag == SOURCE_PORT
+             && o->u.port.conv_func == NULL && o->u.port.output != NULL) {
+            rt_nexus_t *pn = o->u.port.output;
+            return (uint8_t *)pn->signal->shared.data + pn->offset;
+         }
+      }
+   }
+   return (uint8_t *)sig->shared.data;
+}
+
+// Concatenate member snapshot .v files into ONE deduped source: the first
+// definition of each (content-hash-named) module wins, later duplicates are
+// skipped.  yosys hard-ERRORS on re-definition across files even when the
+// text is identical (measured: every v7 fused group died on
+// "Re-definition of module" for shared prims), and identical hashed names
+// are exactly the dedup key.
+static bool aj_concat_dedup(const char **vpaths, int nv, const char *out)
+{
+   FILE *f = fopen(out, "w");
+   if (f == NULL)
+      return false;
+   static char seen[4096][160];
+   int nseen = 0;
+   for (int v = 0; v < nv; v++) {
+      char *text = aj_read_file(vpaths[v]);
+      if (text == NULL) { fclose(f); return false; }
+      const char *p = text;
+      while (*p) {
+         const char *ms = strstr(p, "module ");
+         if (ms == NULL) break;
+         if (ms != text && (isalnum((unsigned char)ms[-1]) || ms[-1] == '_'))
+            { p = ms + 7; continue; }
+         const char *q = ms + 7;
+         while (*q == ' ') q++;
+         int len = 0;
+         while ((isalnum((unsigned char)q[len]) || q[len] == '_') && len < 159)
+            len++;
+         const char *me = strstr(q, "endmodule");
+         const char *span_end = me ? me + 9 : q + len;
+         bool dup = false;
+         for (int s = 0; s < nseen && !dup; s++)
+            if ((int)strlen(seen[s]) == len
+                && strncmp(seen[s], q, len) == 0)
+               dup = true;
+         if (!dup) {
+            if (nseen < 4096) {
+               memcpy(seen[nseen], q, len);
+               seen[nseen][len] = '\0';
+               nseen++;
+            }
+            fwrite(ms, 1, span_end - ms, f);
+            fputc('\n', f);
+         }
+         p = span_end;
+      }
+      free(text);
+   }
+   fclose(f);
+   return true;
+}
+
+// One prepared merge group awaiting (parallel) synthesis + install.
+typedef struct {
+   int       first;             // owning candidate index
+   int      *members;
+   int       nmem, n_internal;
+   aj_pin_t *mp;
+   int       nmp;
+   char      wname[64];
+   char      dutc[600], bridge[600], so[600];
+   char     *cmd;               // synth command (NULL = cached)
+   pid_t     pid;
+   int       rc;
+} aj_mgrp_t;
+
+static aj_mgrp_t *g_mgrps = NULL;
+static int        g_nmgrp = 0, g_mgrpmax = 0;
+
+// Install one merged chunk per clock-domain group (see aj_mcand_t above).
+// Any failure falls back to installing the group's members individually, so
+// NVC_ACCEL_MERGE can never be WORSE than the per-chunk path.  Synthesis of
+// the groups runs NVC_ACCEL_MERGE_JOBS-way parallel (default 8, per user
+// direction): discovery and wrapper emission are cheap and serial, the
+// hours-scale yosys jobs overlap, install is serial again afterwards.
+static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
+{
+   if (g_aj_ncand == 0)
+      return;
+   bool *claimed = xcalloc_array(g_aj_ncand, sizeof(bool));
+   int gid = 0;
+   for (int i = 0; i < g_aj_ncand; i++) {
+      if (claimed[i]) continue;
+      static int members[4096];
+      int nmem = 0;
+      members[nmem++] = i; claimed[i] = true;
+      // Oversized members (multi-MB emitted .v == flattened RAM farms like
+      // eh2_ic_data) stay OUT of merge groups: one such member drags the
+      // whole fused synth into yosys's pathological passes (a v3 group spent
+      // 3h+ in one synth).  They fall through to the singleton path below
+      // and install per-chunk under their own synth timeout.
+      const char *bigenv = getenv("NVC_ACCEL_MERGE_MAX_MEMBER");
+      const long bigcap = bigenv ? atol(bigenv) : 2*1024*1024;
+      struct stat vst;
+      if (stat(g_aj_cands[i].vpath, &vst) == 0 && vst.st_size > bigcap) {
+         aj_mcand_t *c = &g_aj_cands[i];
+         if (getenv("NVC_ACCEL_MERGE_NOFALLBACK") == NULL)
+            accel_install_subtree(m, c->scope, c->ref, accel_dir);
+         else
+            notef("accel-jit: oversized member '%s' stays interpreted "
+                  "(NOFALLBACK)", c->top_mod);
+         continue;
+      }
+      // Group-size cap: one 68-member fused synth ate two 8h VeeR budgets.
+      // Overflow members stay unclaimed and form sibling groups on the same
+      // root in later iterations — several bounded synths instead of one
+      // unbounded one.  NVC_ACCEL_MERGE_MAX_GROUP overrides (default 24).
+      const char *gcenv = getenv("NVC_ACCEL_MERGE_MAX_GROUP");
+      const int gcap = gcenv ? atoi(gcenv) : 24;
+      for (int j = i + 1; j < g_aj_ncand && nmem < gcap && nmem < 4096; j++)
+         if (!claimed[j]
+             && g_aj_cands[j].ck_root == g_aj_cands[i].ck_root
+             && !(stat(g_aj_cands[j].vpath, &vst) == 0
+                  && vst.st_size > bigcap)) {
+            members[nmem++] = j; claimed[j] = true;
+         }
+      if (getenv("NVC_ACCEL_MERGE_DRYRUN") != NULL) {   // grouping inspection
+         rt_nexus_t *r = g_aj_cands[i].ck_root;
+         notef("accel-jit: MERGE dryrun group: %d members, clk pin '%s', "
+               "root sig %s", nmem, g_aj_cands[i].clk.name,
+               (r != NULL && r->signal != NULL)
+                  ? istr(tree_ident(r->signal->where)) : "?");
+         continue;
+      }
+      if (nmem < 2) {   // singleton: normal per-chunk install
+         aj_mcand_t *c = &g_aj_cands[i];
+         if (getenv("NVC_ACCEL_MERGE_NOFALLBACK") == NULL)
+            accel_install_subtree(m, c->scope, c->ref, accel_dir);
+         else
+            notef("accel-jit: singleton '%s' stays interpreted (NOFALLBACK)",
+                  c->top_mod);
+         continue;
+      }
+      const int g = gid++;
+      const bool have_rst = g_aj_cands[i].have_rst;
+      char wname[64], wpath[600];
+      snprintf(wname, sizeof wname, "aj_merged_%d", g);
+      snprintf(wpath, sizeof wpath, "%s/%s.v", accel_dir, wname);
+
+      // ---- merged external pin table + wrapper emission -------------------
+      int tot = 2;
+      for (int k = 0; k < nmem; k++) tot += g_aj_cands[members[k]].npins;
+      aj_pin_t *mp = xmalloc_array(tot, sizeof(aj_pin_t));
+      int nmp = 0;
+      mp[nmp] = g_aj_cands[i].clk;
+      snprintf(mp[nmp].name, sizeof mp[nmp].name, "clk"); nmp++;
+      if (have_rst) {
+         mp[nmp] = g_aj_cands[i].rst;
+         snprintf(mp[nmp].name, sizeof mp[nmp].name, "rst"); nmp++;
+      }
+      char *ports = NULL, *body = NULL;
+      size_t portssz = 0, bodysz = 0;
+      FILE *pf = open_memstream(&ports, &portssz);
+      FILE *bf = open_memstream(&body, &bodysz);
+      fprintf(pf, "input clk");
+      if (have_rst) fprintf(pf, ", input rst");
+      int n_internal = 0;
+      for (int k = 0; k < nmem; k++) {
+         aj_mcand_t *c = &g_aj_cands[members[k]];
+         fprintf(bf, "  %s u%d(", c->top_mod, k);
+         bool first = true;
+         for (int p = 0; p < c->npins; p++) {
+            aj_pin_t *pp = &c->pins[p];
+            // the member's CHOSEN primary-clock pin (any name, e.g.
+            // free_clk) connects to the wrapper's clk; other *clk pins are
+            // ordinary boundary inputs (extra clocks — legal for gsm)
+            if (!pp->is_output && strcmp(pp->name, c->clk.name) == 0
+                && pp->sig == c->clk.sig) {
+               fprintf(bf, "%s.%s(clk)", first ? "" : ", ", pp->name);
+               first = false;
+               continue;
+            }
+            if (!pp->is_output) {
+               // internal? another member's OUTPUT drives the same signal
+               int pj = -1, pq = -1;
+               for (int k2 = 0; k2 < nmem && pj < 0; k2++) {
+                  aj_mcand_t *c2 = &g_aj_cands[members[k2]];
+                  for (int q = 0; q < c2->npins; q++)
+                     // match by shared DATA pointer, not signal identity:
+                     // a port hop joins two different rt_signal_t objects
+                     // over one storage (the aj_link_handoff lesson) — the
+                     // sig-pointer match found 0 internal edges on genuinely
+                     // chained members (proven on the mini-GALS fixture)
+                     if (c2->pins[q].is_output
+                         && aj_consumer_data(c2->pins[q].sig) == pp->data
+                         && c2->pins[q].width == pp->width) {
+                        pj = k2; pq = q; break;
+                     }
+               }
+               if (pj >= 0) {   // flattened internal edge — no bridge crossing
+                  fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
+                          pp->name, pj,
+                          g_aj_cands[members[pj]].pins[pq].name);
+                  first = false;
+                  n_internal++;
+                  continue;
+               }
+            }
+            fprintf(pf, ", %s [%d:0] m%d_%s",
+                    pp->is_output ? "output" : "input",
+                    pp->width - 1, k, pp->name);
+            fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
+                    pp->name, k, pp->name);
+            first = false;
+            mp[nmp] = *pp;
+            snprintf(mp[nmp].name, sizeof mp[nmp].name, "m%d_%s", k, pp->name);
+            nmp++;
+         }
+         fprintf(bf, ");\n");
+      }
+      fclose(pf); fclose(bf);
+      bool ok = true;
+      if (nmp > AJ_MAX_PINS) {   // bridge tables are AJ_MAX_PINS-static
+         notef("accel-jit: MERGE group %d rim too wide (%d pins > %d) — "
+               "falling back to per-chunk installs", g, nmp, AJ_MAX_PINS);
+         ok = false;
+      }
+      FILE *wf = ok ? fopen(wpath, "w") : NULL;
+      ok = ok && wf != NULL;
+      if (ok) {
+         fprintf(wf, "module %s(%s);\n%sendmodule\n", wname, ports, body);
+         fclose(wf);
+      }
+      free(ports); free(body);
+
+      // ---- sources: ONE concatenated+deduped member file + the wrapper ----
+      static const char *srcs[4097];
+      static char allpath[600];
+      int nsrc = 0;
+      if (ok) {
+         const char *vps[4096];
+         int nvp = 0;
+         for (int k = 0; k < nmem; k++) {
+            const char *vp = g_aj_cands[members[k]].vpath;
+            bool dup = false;
+            for (int s = 0; s < nvp; s++)
+               if (strcmp(vps[s], vp) == 0) { dup = true; break; }
+            if (!dup) vps[nvp++] = vp;
+         }
+         snprintf(allpath, sizeof allpath, "%s/%s_all.v", accel_dir, wname);
+         ok = aj_concat_dedup(vps, nvp, allpath);
+         if (ok) {
+            srcs[nsrc++] = allpath;
+            srcs[nsrc++] = wpath;
+         }
+      }
+
+      // ---- two-tier keys (same scheme as the per-chunk path) --------------
+      uint64_t vhash = 1469598103934665603ULL;
+      vhash = (vhash ^ 3u) * 1099511628211ULL;
+      { struct stat gst;
+        if (stat(aj_gen_sm(), &gst) == 0)
+           vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
+      for (const char *p = wname; *p; p++)
+         { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+      for (int s = 0; s < nsrc && ok; s++) {
+         char *vtext = aj_read_file(srcs[s]);
+         if (vtext != NULL) {
+            for (const char *p = vtext; *p; p++)
+               { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+            free(vtext);
+         }
+      }
+      uint64_t shash = vhash;
+      { const char *cc = getenv("NVC_ACCEL_CC");
+        if (cc == NULL) cc = "gcc -g -O3";
+        for (const char *p = cc; *p; p++)
+           { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
+        for (const char *p = "bridge-v2"; *p; p++)
+           { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
+        struct utsname un;
+        if (uname(&un) == 0)
+           for (const char *p = un.machine; *p; p++)
+              { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; } }
+      char dutc[600], bridge[600], so[600];
+      snprintf(dutc, sizeof dutc, "%s/aj_%s_%016llx.c", accel_dir, wname,
+               (unsigned long long)vhash);
+      snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, wname);
+      snprintf(so, sizeof so, "%s/aj_%s_%016llx.so", accel_dir, wname,
+               (unsigned long long)shash);
+
+      // ---- stash for the parallel synth + serial install phases -----------
+      if (ok) {
+         if (g_nmgrp == g_mgrpmax) {
+            g_mgrpmax = g_mgrpmax ? g_mgrpmax * 2 : 16;
+            g_mgrps = xrealloc_array(g_mgrps, g_mgrpmax, sizeof(aj_mgrp_t));
+         }
+         aj_mgrp_t *gr = &g_mgrps[g_nmgrp++];
+         memset(gr, 0, sizeof *gr);
+         gr->first   = i;
+         gr->members = xmalloc_array(nmem, sizeof(int));
+         memcpy(gr->members, members, nmem * sizeof(int));
+         gr->nmem = nmem; gr->n_internal = n_internal;
+         gr->mp = mp; gr->nmp = nmp;
+         snprintf(gr->wname,  sizeof gr->wname,  "%s", wname);
+         snprintf(gr->dutc,   sizeof gr->dutc,   "%s", dutc);
+         snprintf(gr->bridge, sizeof gr->bridge, "%s", bridge);
+         snprintf(gr->so,     sizeof gr->so,     "%s", so);
+         if (getenv("NVC_ACCEL_NO_CACHE") != NULL
+             || access(dutc, F_OK) != 0) {
+            const char *tmo_env = getenv("NVC_ACCEL_SYNTH_TIMEOUT");
+            const int tmo_s = tmo_env ? atoi(tmo_env) : 600;
+            const bool have_timeout = access("/usr/bin/timeout", X_OK) == 0;
+            static char cmd[65536];
+            int off;
+            if (have_timeout && tmo_s > 0)
+               off = snprintf(cmd, sizeof cmd,
+                              "cd '%s' && /usr/bin/timeout -k 5 %d '%s'",
+                              accel_dir, tmo_s, aj_gen_sm());
+            else
+               off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'",
+                              accel_dir, aj_gen_sm());
+            for (int s = 0; s < nsrc; s++)
+               off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[s]);
+            off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'",
+                            wname, dutc);
+            gr->cmd = xstrdup(cmd);
+         }
+         continue;   // synthesis (parallel) + install run after the loop
+      }
+
+      // ---- bridge + compile + install -------------------------------------
+      aj_chunk_t *chunk = NULL;
+      if (ok) {
+         chunk = aj_chunk_new(m);
+         chunk->merged = true;   // enables the negedge state flip
+         chunk->scope  = g_aj_cands[i].scope;
+         chunk->rs_top = xstrdup(wname);
+         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 4,
+                                        sizeof(void *));
+         aj_build_fastclk(m, mp[0].sig, mp[0].data);
+         if (!aj_emit_bridge(bridge, dutc, mp, nmp, &mp[0],
+                             have_rst ? &mp[1] : NULL, m, chunk, false)) {
+            aj_accel_teardown(m);
+            ok = false;
+         }
+      }
+      if (ok && (getenv("NVC_ACCEL_NO_CACHE") != NULL
+                 || access(so, F_OK) != 0)) {
+         const char *cc = getenv("NVC_ACCEL_CC");
+         if (!cc) cc = "gcc -g -O3";
+         const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
+         char cmd[8192];
+         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
+                  cc, smd, so, bridge);
+         if (system(cmd) != 0 || access(so, F_OK) != 0) {
+            notef("accel-jit: MERGE compile failed for '%s'", wname);
+            aj_accel_teardown(m);
+            ok = false;
+         }
+      }
+      else if (ok)
+         notef("accel-jit: reusing cached .so for '%s' (logic unchanged)",
+               wname);
+      if (ok) {
+         void *dl = dlopen(so, RTLD_NOW);
+         void (*eval)(void *, void **) = dl ? dlsym(dl, "accel_eval") : NULL;
+         void (*reset)(void *)         = dl ? dlsym(dl, "accel_reset") : NULL;
+         unsigned long (*ssize)(void)  = dl ? dlsym(dl, "accel_state_size")
+                                            : NULL;
+         if (!eval || !reset || !ssize) {
+            notef("accel-jit: MERGE dlopen/dlsym failed for '%s'", wname);
+            if (dl) dlclose(dl);
+            aj_accel_teardown(m);
+            ok = false;
+         }
+         else {
+            chunk->eval  = eval;
+            chunk->reset = reset;
+            chunk->dl    = dl;
+            chunk->x_seen_fn   = dlsym(dl, "accel_x_seen");
+            chunk->x_info_fn   = dlsym(dl, "accel_x_info");
+            chunk->x_clear_fn  = dlsym(dl, "accel_x_clear");
+            chunk->set_clklast = dlsym(dl, "accel_set_clklast");
+            chunk->state = xcalloc(ssize());
+            chunk->rs_bridge = xstrdup(bridge);
+            chunk->rs_dutc   = xstrdup(dutc);
+            chunk->rs_pins   = xmalloc_array(nmp, sizeof(aj_pin_t));
+            memcpy(chunk->rs_pins, mp, nmp * sizeof(aj_pin_t));
+            chunk->rs_npins  = nmp;
+            chunk->rs_state_size = ssize();
+            g_aj_model = m;
+            chunk->reset(chunk->state);
+            for (int k = 0; k < nmem; k++)
+               aj_reroute(g_aj_cands[members[k]].scope, chunk);
+            if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
+               aj_subscribe_clocks(m, chunk);
+            notef("accel-jit: MERGE ACTIVE — '%s' (%d subtrees fused, %d "
+                  "internal edges) rerouted to one native model "
+                  "(accel installed)", wname, nmem, n_internal);
+         }
+      }
+      if (!ok)   // any failure: this group's members install individually
+         for (int k = 0; k < nmem; k++) {
+            aj_mcand_t *c = &g_aj_cands[members[k]];
+            accel_install_subtree(m, c->scope, c->ref, accel_dir);
+         }
+      free(mp);
+   }
+
+   // ---- phase 2: parallel synthesis (NVC_ACCEL_MERGE_JOBS-way) -----------
+   {
+      const char *jenv = getenv("NVC_ACCEL_MERGE_JOBS");
+      const int jobs = jenv ? atoi(jenv) : 8;
+      int launched = 0, running = 0;
+      while (launched < g_nmgrp || running > 0) {
+         while (running < (jobs > 0 ? jobs : 1) && launched < g_nmgrp) {
+            aj_mgrp_t *gr = &g_mgrps[launched++];
+            if (gr->cmd == NULL) { gr->pid = 0; continue; }
+            notef("accel-jit: MERGE synth '%s' launching (%d members, %d "
+                  "internal edges, %d external pins)", gr->wname, gr->nmem,
+                  gr->n_internal, gr->nmp);
+            pid_t pid = fork();
+            if (pid == 0) {
+               execl("/bin/sh", "sh", "-c", gr->cmd, (char *)NULL);
+               _exit(127);
+            }
+            if (pid < 0) { gr->rc = -1; continue; }
+            gr->pid = pid; running++;
+         }
+         if (running > 0) {
+            int st = 0;
+            pid_t done = waitpid(-1, &st, 0);
+            if (done < 0) break;
+            for (int gi = 0; gi < launched; gi++)
+               if (g_mgrps[gi].pid == done) {
+                  g_mgrps[gi].pid = 0;
+                  g_mgrps[gi].rc  = st;
+                  running--;
+                  notef("accel-jit: MERGE synth '%s' finished (status %d)",
+                        g_mgrps[gi].wname, st);
+                  break;
+               }
+         }
+      }
+   }
+
+   // ---- phase 3: serial bridge + compile + install per group -------------
+   for (int gi = 0; gi < g_nmgrp; gi++) {
+      aj_mgrp_t *gr = &g_mgrps[gi];
+      aj_pin_t *mp = gr->mp;
+      const int nmp = gr->nmp, nmem = gr->nmem;
+      const int *members = gr->members;
+      const bool have_rst = g_aj_cands[gr->first].have_rst;
+      bool ok = true;
+      if (gr->cmd != NULL) {
+         free(gr->cmd);
+         if (access(gr->dutc, F_OK) != 0) {
+            notef("accel-jit: MERGE synth failed for '%s' — falling back to "
+                  "per-chunk installs", gr->wname);
+            ok = false;
+         }
+      }
+      else
+         notef("accel-jit: reusing cached synth for '%s' (logic unchanged)",
+               gr->wname);
+      aj_chunk_t *chunk = NULL;
+      if (ok) {
+         chunk = aj_chunk_new(m);
+         chunk->merged = true;   // enables the negedge state flip
+         chunk->scope  = g_aj_cands[gr->first].scope;
+         chunk->rs_top = xstrdup(gr->wname);
+         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 4,
+                                        sizeof(void *));
+         aj_build_fastclk(m, mp[0].sig, mp[0].data);
+         if (!aj_emit_bridge(gr->bridge, gr->dutc, mp, nmp, &mp[0],
+                             have_rst ? &mp[1] : NULL, m, chunk, false)) {
+            aj_accel_teardown(m);
+            ok = false;
+         }
+      }
+      if (ok && (getenv("NVC_ACCEL_NO_CACHE") != NULL
+                 || access(gr->so, F_OK) != 0)) {
+         const char *cc = getenv("NVC_ACCEL_CC");
+         if (!cc) cc = "gcc -g -O3";
+         const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
+         char cmd[8192];
+         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
+                  cc, smd, gr->so, gr->bridge);
+         if (system(cmd) != 0 || access(gr->so, F_OK) != 0) {
+            notef("accel-jit: MERGE compile failed for '%s'", gr->wname);
+            aj_accel_teardown(m);
+            ok = false;
+         }
+      }
+      else if (ok)
+         notef("accel-jit: reusing cached .so for '%s' (logic unchanged)",
+               gr->wname);
+      if (ok) {
+         void *dl = dlopen(gr->so, RTLD_NOW);
+         void (*eval)(void *, void **) = dl ? dlsym(dl, "accel_eval") : NULL;
+         void (*reset)(void *)         = dl ? dlsym(dl, "accel_reset") : NULL;
+         unsigned long (*ssize)(void)  = dl ? dlsym(dl, "accel_state_size")
+                                            : NULL;
+         if (!eval || !reset || !ssize) {
+            notef("accel-jit: MERGE dlopen/dlsym failed for '%s'", gr->wname);
+            if (dl) dlclose(dl);
+            aj_accel_teardown(m);
+            ok = false;
+         }
+         else {
+            chunk->eval  = eval;
+            chunk->reset = reset;
+            chunk->dl    = dl;
+            chunk->x_seen_fn   = dlsym(dl, "accel_x_seen");
+            chunk->x_info_fn   = dlsym(dl, "accel_x_info");
+            chunk->x_clear_fn  = dlsym(dl, "accel_x_clear");
+            chunk->set_clklast = dlsym(dl, "accel_set_clklast");
+            chunk->state = xcalloc(ssize());
+            chunk->rs_bridge = xstrdup(gr->bridge);
+            chunk->rs_dutc   = xstrdup(gr->dutc);
+            chunk->rs_pins   = xmalloc_array(nmp, sizeof(aj_pin_t));
+            memcpy(chunk->rs_pins, mp, nmp * sizeof(aj_pin_t));
+            chunk->rs_npins  = nmp;
+            chunk->rs_state_size = ssize();
+            g_aj_model = m;
+            chunk->reset(chunk->state);
+            for (int k = 0; k < nmem; k++)
+               aj_reroute(g_aj_cands[members[k]].scope, chunk);
+            if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
+               aj_subscribe_clocks(m, chunk);
+            notef("accel-jit: MERGE ACTIVE — '%s' (%d subtrees fused, %d "
+                  "internal edges) rerouted to one native model "
+                  "(accel installed)", gr->wname, nmem, gr->n_internal);
+         }
+      }
+      if (!ok) {
+         // NVC_ACCEL_MERGE_NOFALLBACK=1: leave failed groups' members
+         // INTERPRETED instead of installing per-chunk — the clean
+         // fused-vs-interp discriminator (a collect-time SKIP makes the
+         // scan descend and re-synthesize hundreds of descendants).
+         if (getenv("NVC_ACCEL_MERGE_NOFALLBACK") != NULL)
+            notef("accel-jit: MERGE group '%s' failed — members stay "
+                  "interpreted (NOFALLBACK)", gr->wname);
+         else
+            for (int k = 0; k < nmem; k++) {
+               aj_mcand_t *c = &g_aj_cands[members[k]];
+               accel_install_subtree(m, c->scope, c->ref, accel_dir);
+            }
+      }
+      free(gr->mp); free(gr->members);
+   }
+   g_nmgrp = 0;
+   free(claimed);
+}
+
 static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
                              const char *accel_dir)
 {
@@ -6092,7 +7182,16 @@ void accel_auto(rt_model_t *m)
    }
    aj_mkdir_p(accel_dir);   // JIT writes aj_*.c/.so here; may not exist yet
 
-   accel_scan_scope(m, root_scope(m), accel_dir);
+   if (getenv("NVC_ACCEL_MERGE") != NULL && getenv("NVC_ACCEL_FROM_VHDL")) {
+      // Task #53/#59: collect candidates, then install one merged chunk per
+      // clock-domain group (falls back to per-chunk on any failure).
+      g_aj_collecting = true;
+      accel_scan_scope(m, root_scope(m), accel_dir);
+      g_aj_collecting = false;
+      aj_try_merge_install(m, accel_dir);
+   }
+   else
+      accel_scan_scope(m, root_scope(m), accel_dir);
 
    // Establish initial combinational output values at t=0. model_reset ran the
    // subtree's procs with their original vtables, but the reroute supersedes
@@ -6120,12 +7219,13 @@ void accel_auto(rt_model_t *m)
       for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
          aj_chunk_t *c = m->aj_chunks[ci];
          if (c->eval == NULL) continue;
-         // Force a comb-only settle: the bridge clocks on (clk && t != last_t)
-         // and last_t is -1 after reset, so a design that initialises clk HIGH
-         // would spuriously clock at t=0. The interpreter only settles comb at
-         // init (rising_edge is false with no transition), so drive clk low for
-         // this one eval and restore it -- the first real edge is unaffected
-         // (its posedge still comes from t != last_t). bindtab[4] is clk->data.
+         // Force a comb-only settle: the bridge edge-detects on clk_last0,
+         // which is 0 after reset, so a design that initialises clk HIGH
+         // would read a spurious 0->1 at its first sample. The interpreter
+         // only settles comb at init (rising_edge is false with no
+         // transition), so drive clk low for this one eval, restore it, and
+         // afterwards sync clk_last0 to the REAL clock level (below) so the
+         // initial level never reads as an edge. bindtab[4] is clk->data.
          uint8_t *clkp = c->bindtab ? (uint8_t *)c->bindtab[4] : NULL;
          const bool force = (clkp != NULL && (clkp[0] & 1));
          const uint8_t saved = force ? clkp[0] : 0;
@@ -6133,6 +7233,11 @@ void accel_auto(rt_model_t *m)
          g_aj_cur_chunk[tid] = c;
          c->eval(c->state, c->bindtab);
          if (force) clkp[0] = saved;
+         if (clkp != NULL && c->dl != NULL) {
+            void (*setck)(void *, unsigned char) =
+               dlsym(c->dl, "accel_set_clklast");
+            if (setck != NULL) setck(c->state, clkp[0] & 1);
+         }
       }
       g_aj_cur_chunk[tid] = save_chunk;
       thread->active_obj   = save_obj;
@@ -10744,6 +11849,43 @@ static void model_cycle(rt_model_t *m)
       deferq_run(m, &m->triggerq);  // Sensitivity list filter
 
    run_callbacks(m, START_OF_PROCESSES);
+
+   // Two-phase edge sampling, hoisted (SNAP_MODE >= 2): fleet snapshot at
+   // the delta boundary -- this delta's driver commits are in, no process
+   // has run -- so a same-delta blocking deposit from an interp process can
+   // no longer contaminate the snapshot (mode 1 takes it lazily at the
+   // first chunk eval, which may follow those deposits).
+   if (m->aj_chunk_count > 0 && aj_snap_mode() >= 2)
+      aj_snap_fleet_take(m);
+
+   // #53 negedge STATE FLIP: merged chunks staged their registered outputs
+   // at posedge evals; publish them in the delta where the domain clock's
+   // FALL commits -- a derivation-free barrier strictly after every gated
+   // rise of the cycle and strictly before the next sample.  This hook
+   // (not a chunk eval) does the flip because fall wakes never reach the
+   // rerouted procs -- their rising-edge triggers filter them (measured).
+   // deposit_signal handles propagation + wakeups for the rim readers.
+   if (m->aj_chunk_count > 0)
+      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+         aj_chunk_t *c = m->aj_chunks[ci];
+         if (!c->merged || !c->defer_pending || c->primary_ck == NULL)
+            continue;
+         rt_nexus_t *cn = &c->primary_ck->nexus;
+         if (!(cn->last_event == (uint64_t)m->now
+               && cn->event_delta == m->iteration
+               && !(c->primary_ck->shared.data[0] & 1)))
+            continue;   // not the fall-commit delta
+         if (c->ck_flip_now == (uint64_t)m->now + 1)
+            continue;   // already flipped this timestep
+         c->ck_flip_now = (uint64_t)m->now + 1;
+         for (unsigned i = 0; i < c->defer_count; i++) {
+            aj_defer_out_t *d = &c->defer_outs[i];
+            if (!d->negflip || !d->dirty) continue;
+            d->dirty = false;
+            deposit_signal(m, (rt_signal_t *)d->sigp, d->shadow, 0, d->pw);
+         }
+         c->defer_pending = false;
+      }
 
    // Probation sim-time bound (P3): a candidate that stops accumulating
    // value-edges (gated clock during halt, slow clock domain, captured
