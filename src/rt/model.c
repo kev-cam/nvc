@@ -2619,13 +2619,19 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          // consumer reproduces in 5s).  sched_deposit nonblock lands in this
          // timestep's NBA region: early-delta consumers still read old,
          // later-delta consumers read new — cascade-equivalent.
+         // BLOCKING (0-delay, next-delta) deposit — NOT nonblock: interp
+         // commits a register at eval-delta+1 and deeper-cascade consumers
+         // (2+ gating levels down) legitimately read it within the same
+         // timestep; a NONBLOCK deposit lands at the NEXT TIMESTEP's delta
+         // 0, one regime late (measured by AJ_EVDBG delta census; gals2
+         // qmon fixture).  0-delay blocking = VHDL `<=` timing exactly.
          // Seed/install context (no active proc): the scheduler is not
          // running — an NBA-scheduled deposit never lands and the outputs
          // stay 'U' (measured: gals2 Y=0).  Deposit immediately there.
          if (model_thread(m)->active_obj == NULL)
             deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
          else
-            sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, true);
+            sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, false);
          return;
       }
       if (_nba && pe && !combcls)
@@ -11102,6 +11108,18 @@ static void notify_event_default(rt_model_t *m, rt_nexus_t *n)
 
 static void notify_event(rt_model_t *m, rt_nexus_t *n)
 {
+   // AJ_EVDBG=<substr>: print signal events (name, time, delta, first value
+   // byte) for names containing <substr> — the delta-census diagnostic that
+   // read the deep-cascade publication bug straight off the event stream.
+   { static const char *_ev = NULL; static int _evi = -1;
+     if (_evi < 0) { _ev = getenv("AJ_EVDBG"); _evi = _ev ? 1 : 0; }
+     if (_evi && n->signal != NULL && n->signal->where != NULL) {
+        const char *nm = istr(tree_ident(n->signal->where));
+        if (strstr(nm, _ev) != NULL)
+           fprintf(stderr, "#EV %s t=%llu d=%u v=%u\n", nm,
+                   (unsigned long long)m->now, m->iteration,
+                   (unsigned)n->signal->shared.data[0]);
+     } }
    n->last_event = m->now;
    n->event_delta = m->iteration;
 
