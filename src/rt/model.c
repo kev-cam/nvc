@@ -2598,16 +2598,34 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          _st2 = s2 ? atoi(s2) : _nba;   // default: follow NBA; 0 forces off
       }
       const int pe = posedge & 1, combcls = posedge & 4;
-      // Merged-chunk negedge flip: registered outputs computed at a posedge
-      // eval stage into the shadow; model_cycle publishes them when the
-      // domain clock FALLS.  Off-edge / comb pushes keep their normal paths.
-      if (pe && !combcls && c != NULL && c->merged && ord >= 0
+      // Merged-chunk negedge flip: registered outputs stage into the shadow
+      // on EVERY eval that pushes them — not only primary-posedge evals.
+      // Extra-clock families (thread-gated registers inside a fused
+      // primary-domain chunk) update on evals where the primary pe bit is
+      // clear; their immediate deposits bypassed the flip and same-timestep
+      // consumers captured post-edge values (measured: EH2 thread 1 ran +8
+      // ahead from its first activation at cyc84 and trapped; gals2 fixture
+      // reproduces in 5s).  All gated rises happen inside the primary high
+      // phase, so publishing at the primary FALL stays correctly ordered
+      // for every family.  Comb pushes keep their live paths.
+      if (!combcls && c != NULL && c->merged && ord >= 0
           && (unsigned)ord < c->defer_count
           && c->defer_outs[ord].negflip) {
-         aj_defer_out_t *d = &c->defer_outs[ord];
-         memcpy(d->shadow, buf, d->valuesz);
-         d->dirty = true;
-         c->defer_pending = true;
+         // NBA-region publication, NOT the fall flip: interp's delta cascade
+         // makes a register commit visible to LATER-delta consumers of the
+         // SAME timestep (deeper gated clocks — dec's l2clk procs), and a
+         // fall-published value arrives one delta regime too late for them
+         // (measured: EH2 thread 1 via interp dec; gals2 deep-cascade
+         // consumer reproduces in 5s).  sched_deposit nonblock lands in this
+         // timestep's NBA region: early-delta consumers still read old,
+         // later-delta consumers read new — cascade-equivalent.
+         // Seed/install context (no active proc): the scheduler is not
+         // running — an NBA-scheduled deposit never lands and the outputs
+         // stay 'U' (measured: gals2 Y=0).  Deposit immediately there.
+         if (model_thread(m)->active_obj == NULL)
+            deposit_signal(m, (rt_signal_t *)sigp, buf, 0, width);
+         else
+            sched_deposit(m, (rt_signal_t *)sigp, buf, 0, width, 0, true);
          return;
       }
       if (_nba && pe && !combcls)
@@ -5149,6 +5167,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                     " aj_cs->ck_last[_k]=0; }\n",
                  ((1u << (nck + 1)) - 2u), nck);
       }
+      // Merged chunks: the ck_last posedge-clear is REQUIRED, not a CK_LATE
+      // option — a fused domain's extra-clock families (thread-gated
+      // registers) otherwise fire ONCE and die: the chunk never samples the
+      // gated clock's fall, ck_last sticks at 1, and every later rise fails
+      // the !ck_last test (measured: gals2 Q2 froze after its first edge;
+      // EH2 thread 1 diverged from first activation).  An ICG-of-clk gated
+      // clock is by construction LOW at the main posedge, so any remembered
+      // high is the previous cycle's — clearing at the posedge re-arms
+      // detection for the fresh rise.
+      if (chunk != NULL && chunk->merged && nck > 0)
+         fprintf(f, "  if(posedge) for(int _k=0;_k<%d;_k++)"
+                    " aj_cs->ck_last[_k]=0;\n", nck);
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
       fprintf(f, "  if(!_late && !_coinc){\n");
@@ -5980,7 +6010,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
    // stale and re-emit+recompile from the cached synth .c.  v2: true
    // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v2"; *p; p++)
+   for (const char *p = "bridge-v3"; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -6693,7 +6723,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v2"; *p; p++)
+        for (const char *p = "bridge-v3"; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
