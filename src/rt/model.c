@@ -11819,6 +11819,7 @@ static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
             : (g_lv_curlv >= g_lv_maxlv + 1 ? g_lv_maxlv + 1
                                             : g_lv_curlv + 1);
          g_lv_ckn++;
+         (void)0;
          return;
       }
    }
@@ -12737,12 +12738,33 @@ static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
    int phases_used = 0, max_rounds = 0;
    for (int phase = 0; phase < 64; phase++) {
       phases_used = phase + 1;
+      static int slots = -1;
+      if (slots < 0) slots = getenv("NVC_SWEEP_NOSLOTS") == NULL;
       for (int round = 0; round < 64; round++) {
          if (round + 1 > max_rounds) max_rounds = round + 1;
          bool any_comb = false;
-         for (int lv = 0; lv <= g_lv_maxlv; lv++) {
+         const int lvtop = slots ? g_lv_maxlv + 1 : g_lv_maxlv;
+         for (int lv = 0; lv <= lvtop; lv++) {
             g_lv_curlv = lv;
             bool any = false;
+            if (slots) {
+               // SLOT MODE: a clocked proc woken by the level lv-1 flush
+               // runs BEFORE comb level lv -- it reads settled state up to
+               // its clock's arrival and pre-update state above it: the
+               // flop samples AS OF ITS CLOCK'S DELTA (interp-equivalent),
+               // fixing the enable-flop one-period lag on late gated
+               // clocks (BUS_HOLD_DATA_BEAT_CNT class) while keeping
+               // glitch suppression for inputs below the slot.
+               for (int i = 0; i < g_lv_ckn; i++) {
+                  if (g_lv_ck[i].p == NULL || g_lv_ck[i].rl > lv) continue;
+                  rt_proc_t *p = g_lv_ck[i].p;
+                  g_lv_ck[i].p = NULL;
+                  const unsigned mark = m->driverq.count;
+                  async_run_process(m, p);
+                  aj_lv_hold_from(m, mark);
+                  any = true;
+               }
+            }
             for (int i = 0; i < g_lv_wvn; i++) {
                if (g_lv_wv[i] == NULL) continue;
                const int pi = aj_lv_idx(g_lv_wv[i]);
