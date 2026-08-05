@@ -691,7 +691,12 @@ rt_model_t *model_new(jit_t *jit, cover_data_t *cover)
    m->fastclk_probe_member = -1;   // 0 would mean "member 0 probing"
 
    const char *fca = getenv("NVC_FAST_CLK_AUTO");
-   if (fca == NULL)
+   if (getenv("NVC_LEVELIZE_SWEEP") != NULL)
+      m->fastclk_auto_at = 0;   // the sweep IS the dispatch: fastclk
+                                // membership strips pending-list
+                                // sensitivity, starving the analyzer's
+                                // graph AND bypassing wave absorption
+   else if (fca == NULL)
       m->fastclk_auto_at = UINT64_C(1000) * UINT64_C(1000000);
    else if (strtoull(fca, NULL, 10) != 0 || *fca == '\0')
       m->fastclk_auto_at = (strtoull(fca, NULL, 10) ?: 1000) * UINT64_C(1000000);
@@ -7157,8 +7162,587 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
 
 // Auto-discover and load acceleration .so files.
 // Naming: ~/.cache/nvc/accel/accel-mod_<entity>-arch_<arch>.so
+// ---- Task #62: STATIC comb levelization -----------------------------------
+// Delta-level glitches are simulation artifacts (user doctrine 2026-08-04):
+// interp comb settle exposes transient values that mid-cascade gated-clock
+// flops legally sample, diverging from fused/silicon-intent semantics
+// (glitch.vhd fixture: 39/40 cycles capture a transient today).  The remedy
+// is a STATIC evaluation order — comb processes topologically leveled at
+// startup, dispatched one-eval-per-settle-wave.  This pass builds the level
+// assignment from RUNTIME structures alone: nexus driver sources give
+// proc->signal, pending lists give signal->proc, so edges need no AST.
+// Analysis + stats first (NVC_LEVELIZE_STATIC=1); the level-ordered sweep
+// dispatch consumes lv_level[] in the next stage.
+// The node universe is rt_wakeable_t*, NOT rt_proc_t*: the fork lowers
+// simple concurrent assignments to W_TRANSFER wakeables whose nexus driver
+// records the OWNING process -- keyed by proc, an s1->s2->s3 transfer chain
+// collapses to one node and the chain depth vanishes (measured: transfers
+// drained one stage per phase while a clocked consumer sampled mid-chain).
+static hash_t   *g_lv_idx  = NULL;   // rt_wakeable_t* -> index+1
+static uint32_t *g_lv_seen = NULL;    // per-node wave stamp (sweep)
+static int       g_lv_maxlv = 0;
+static bool      g_lv_sweep = false;
+static bool      g_lv_inwave = false; // a sweep wave is executing NOW
+static uint32_t  g_lv_wave = 0;
+static rt_wakeable_t **g_lv_wv = NULL; // current wave's collected nodes
+static int       g_lv_wvn = 0, g_lv_wvcap = 0;
+// Wave-born clocked procs run at slot (waking-commit level + 1),
+// interleaved into the level schedule: inputs at lower levels are settled
+// (glitch-free), inputs at higher levels still hold pre-update values --
+// matching interp's delta ordering, where data arriving at a later delta
+// than the clock edge reads OLD.  A post-quiescence drain instead fed
+// same-cycle data to every derived-clock flop (measured: xbtop2 65315 ->
+// 195951 shoot-through).
+typedef struct { rt_proc_t *p; int rl; } lv_ck_t;
+static lv_ck_t  *g_lv_ck = NULL;      // wave-born clocked procs + run slot
+static int       g_lv_ckn = 0, g_lv_ckcap = 0;
+static long      g_lv_late = 0;       // topo-violation canary
+static int       g_lv_curlv = -1;
+// Deposits made by CLOCKED procs during a wave are held here and released
+// into m->driverq at wave end: committing them mid-wave let their comb
+// fanout settle before the drain batch ran, so a gated-clock flop sampled
+// same-timestep data one cycle early (measured: nbaff fixture Q one clock
+// ahead of interp; interp NBA semantics commit flop deposits next delta).
+static deferq_t  g_lv_heldq;
+// TRUE while a deposit-path wakeup_all runs: the deposit stamps its event
+// for iteration+1 (receivers contractually run NEXT delta), so the wave
+// must NOT absorb those wakes into the CURRENT delta -- an absorbed
+// receiver runs one delta before its event exists and its rising_edge
+// reads false (measured: VeeR's deposit-distributed clocks -- e.g.
+// ACTIVE_L2CLK, no SOURCE_DRIVER, events invisible to notify_event --
+// never clocked their kernels under the sweep; bus-sync FFs wedged).
+static bool      g_lv_deposit_wake = false;
+// Deposit-woken procs surfacing mid-wave: contractually NEXT-delta work
+// (their event is stamped iteration+1).  Queued to m->procq they land in
+// the tail drain and run one delta early -- hold here, append to m->procq
+// at wave end (the next dispatch's swap delivers them).
+static deferq_t  g_lv_depq;
+// Port-propagation (driving-heap) updates scheduled by DEPOSITS are
+// next-delta work: stock leaves them for the following boundary's update
+// phase, so the inner port's event lands the SAME delta its deferred
+// receivers run.  The wave's flush drains the driving heap eagerly and
+// committed those ports one delta EARLY -- the receiver's rising_edge
+// read a stale event and never fired (measured: cone_tb, the real
+// rvdff_fpga cell with a deposit-driven clock, q locked at reset value).
+static rt_nexus_t **g_lv_helddrv = NULL;
+static int          g_lv_helddrvn = 0, g_lv_helddrvcap = 0;
+
+static void aj_lv_hold_drv(rt_nexus_t *n)
+{
+   if (g_lv_helddrvn == g_lv_helddrvcap) {
+      g_lv_helddrvcap = g_lv_helddrvcap ? g_lv_helddrvcap * 2 : 64;
+      g_lv_helddrv = xrealloc_array(g_lv_helddrv, g_lv_helddrvcap,
+                                    sizeof(rt_nexus_t *));
+   }
+   g_lv_helddrv[g_lv_helddrvn++] = n;
+}
+
+static int aj_lv_idx(rt_wakeable_t *w)
+{
+   if (g_lv_idx == NULL) return -1;
+   void *v = hash_get(g_lv_idx, w);
+   return v == NULL ? -1 : (int)(uintptr_t)v - 1;
+}
+
+static void aj_lv_wv_push(rt_wakeable_t *w)
+{
+   if (g_lv_wvn == g_lv_wvcap) {
+      g_lv_wvcap = g_lv_wvcap ? g_lv_wvcap * 2 : 1024;
+      g_lv_wv = xrealloc_array(g_lv_wv, g_lv_wvcap, sizeof(rt_wakeable_t *));
+   }
+   g_lv_wv[g_lv_wvn++] = w;
+}
+static rt_wakeable_t **g_lv_wake = NULL;
+static int      *g_lv_level = NULL;
+static int       g_lv_nproc = 0;
+
+// Divert driver-update tasks enqueued by a clocked proc's run into the
+// wave-held queue (released at wave end).
+static void aj_lv_hold_from(rt_model_t *m, unsigned mark)
+{
+   static int nohold = -1, dbg = -1;
+   if (nohold < 0) {
+      nohold = getenv("NVC_SWEEP_NOHOLD") != NULL;
+      dbg = getenv("AJ_HOLDDBG") != NULL;
+   }
+   if (nohold) return;
+   for (unsigned i = mark; i < m->driverq.count; i++) {
+      if (dbg)
+         fprintf(stderr, "#HD hold fn=%p arg=%p t=%llu d=%u\n",
+                 (void *)m->driverq.tasks[i].fn, m->driverq.tasks[i].arg,
+                 (unsigned long long)m->now, m->iteration);
+      deferq_do(&g_lv_heldq, m->driverq.tasks[i].fn, m->driverq.tasks[i].arg);
+   }
+   m->driverq.count = mark;
+}
+
+// AJ_EVDRV=<proc substr>: nexuses whose (port-walked) driver proc name
+// matches are marked at analysis; notify_event traces their every commit.
+// Solves the instance-local leaf-name collision problem (DIN/DOUT/LPM_*).
+static rt_nexus_t *g_lv_evnx[64];
+static int         g_lv_evnxn = 0;
+
+// AJ_EVSENS=<proc substr>: mark nexuses a matching proc is woken BY
+// (direct pending, or via triggers up to 2 levels).  Wait-style procs
+// subscribe only after their first suspension, so this runs again at the
+// first wave past 1 ns.
+static void aj_evsens_scan(rt_model_t *m)
+{
+   const char *es = getenv("AJ_EVSENS");
+   if (es == NULL)
+      return;
+   bool procmatch(rt_wakeable_t *w) {
+      return w != NULL && w->kind == W_PROC
+         && strstr(istr(container_of(w, rt_proc_t, wakeable)->name),
+                   es) != NULL;
+   }
+   bool pendmatch(void *pending, int depth) {
+      if (pointer_tag(pending) == 1) {
+         rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
+         if (procmatch(w)) return true;
+         if (w->kind == W_TRIGGER && depth < 4)
+            return pendmatch(
+               container_of(w, rt_trigger_t, wakeable)->pending, depth + 1);
+         return false;
+      }
+      else if (pending != NULL) {
+         rt_pending_t *pl = untag_pointer(pending, rt_pending_t);
+         for (int i = 0; i < pl->count; i++) {
+            rt_wakeable_t *w = pl->wake[i];
+            if (w == NULL) continue;
+            if (procmatch(w)) return true;
+            if (w->kind == W_TRIGGER && depth < 4
+                && pendmatch(
+                      container_of(w, rt_trigger_t, wakeable)->pending,
+                      depth + 1))
+               return true;
+         }
+      }
+      return false;
+   }
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      if (!pendmatch(n->pending, 0)) continue;
+      bool dup = false;
+      for (int k = 0; k < g_lv_evnxn; k++)
+         if (g_lv_evnx[k] == n) dup = true;
+      if (dup) continue;
+      if (g_lv_evnxn < 64) {
+         g_lv_evnx[g_lv_evnxn++] = n;
+         fprintf(stderr, "#ES nx=%p sig=%s\n", (void *)n,
+                 (n->signal != NULL && n->signal->where != NULL)
+                    ? istr(tree_ident(n->signal->where)) : "?");
+      }
+   }
+   // second pass: a signal can have several nexuses (splits, port views);
+   // the guard's 'event may read a different one than the subscription --
+   // mark every nexus sharing a marked nexus's signal
+   const int base = g_lv_evnxn;
+   for (int k = 0; k < base; k++) {
+      rt_signal_t *sig = g_lv_evnx[k]->signal;
+      if (sig == NULL) continue;
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         if (n->signal != sig) continue;
+         bool dup = false;
+         for (int j = 0; j < g_lv_evnxn; j++)
+            if (g_lv_evnx[j] == n) dup = true;
+         if (dup) continue;
+         if (g_lv_evnxn < 64) {
+            g_lv_evnx[g_lv_evnxn++] = n;
+            fprintf(stderr, "#ES2 nx=%p sig=%s\n", (void *)n,
+                    (sig->where != NULL)
+                       ? istr(tree_ident(sig->where)) : "?");
+         }
+      }
+   }
+}
+
+// Run a leveled node: dispatch by kind (procs and transfers only ever
+// enter the wave arrays).
+static void aj_lv_run(rt_model_t *m, rt_wakeable_t *w)
+{
+   if (w->kind == W_TRANSFER)
+      async_transfer_signal(m, container_of(w, rt_transfer_t, wakeable));
+   else
+      async_run_process(m, container_of(w, rt_proc_t, wakeable));
+}
+
+static void aj_levelize_analyze(rt_model_t *m)
+{
+   if (getenv("NVC_LEVELIZE_STATIC") == NULL
+       && getenv("NVC_LEVELIZE_SWEEP") == NULL)
+      return;
+   // pass 0: map target nexus -> driving W_TRANSFER wakeable.  Transfers
+   // register their OWNING process as the nexus driver, so driver identity
+   // must be corrected to the transfer node or a chain of transfers
+   // collapses into its owner and loses all depth.
+   // aj_pending_foreach filters to W_PROC (its other callers need that);
+   // the graph needs transfers too, so walk unfiltered here.
+   void lv_pending_all(void *pending, void (*cb)(rt_wakeable_t *, void *),
+                       void *ctx) {
+      if (pointer_tag(pending) == 1) {
+         rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
+         if (!w->postponed) cb(w, ctx);
+      }
+      else if (pending != NULL) {
+         rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+         for (int i = 0; i < p->count; i++) {
+            rt_wakeable_t *w = p->wake[i];
+            if (w != NULL && !w->postponed) cb(w, ctx);
+         }
+      }
+   }
+   // AJ_EVSENS=<proc substr>: mark the nexuses a matching proc is woken
+   // BY (direct pending or via triggers, 2 levels) -- traces the actual
+   // clock nets of a wait-on kernel.  Wait-style procs subscribe only
+   // after their first suspension, so aj_evsens_scan also re-runs at the
+   // first wave past 1ns (see aj_sweep_run).
+   aj_evsens_scan(m);
+   hash_t *tmap = hash_new(256);
+   {
+      void tm_cb(rt_wakeable_t *w, void *vc) {
+         if (w->kind != W_TRANSFER) return;
+         rt_transfer_t *t = container_of(w, rt_transfer_t, wakeable);
+         int c = t->count;
+         for (rt_nexus_t *x = t->target; c > 0; x = x->chain) {
+            hash_put(tmap, x, w);
+            c -= x->width;
+         }
+      }
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
+         lv_pending_all(n->pending, tm_cb, NULL);
+   }
+   // pass 1: enumerate nodes (procs + transfers) as drivers or waiters
+   g_lv_idx = hash_new(1024);
+   int cap = 256;
+   g_lv_wake = xmalloc_array(cap, sizeof(rt_wakeable_t *));
+   g_lv_nproc = 0;
+   int nedge_cap = 1024, nedge = 0;
+   int (*edges)[2] = xmalloc_array(nedge_cap, 2 * sizeof(int));
+   #define LV_IDX(w) ({ \
+      void *_v = hash_get(g_lv_idx, (w)); \
+      int _i; \
+      if (_v == NULL) { \
+         if (g_lv_nproc == cap) { \
+            cap *= 2; \
+            g_lv_wake = xrealloc_array(g_lv_wake, cap, sizeof(rt_wakeable_t *)); \
+         } \
+         g_lv_wake[g_lv_nproc] = (w); \
+         hash_put(g_lv_idx, (w), (void *)(uintptr_t)(g_lv_nproc + 1)); \
+         _i = g_lv_nproc++; \
+      } \
+      else _i = (int)(uintptr_t)_v - 1; \
+      _i; })
+   struct lv_ctx { int *idx; int n, cap; };
+   void lv_cb(rt_wakeable_t *w, void *vc) {
+      struct lv_ctx *c = vc;
+      if (w->kind != W_PROC && w->kind != W_TRANSFER) return;
+      if (c->n == c->cap) {
+         c->cap = c->cap ? c->cap * 2 : 64;
+         c->idx = xrealloc_array(c->idx, c->cap, sizeof(int));
+      }
+      c->idx[c->n++] = LV_IDX(w);
+   }
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      // drivers of this nexus; resolve transfer-fed drivers to the
+      // transfer node itself, and see THROUGH port hops -- an instance
+      // output arrives via SOURCE_PORT and a port-blind graph loses every
+      // cross-hierarchy edge (measured: 94,611 edges for 146k procs, 12
+      // levels, 168k topo violations; the rvdffs mux ran before its input
+      // settled and latched a stale 0)
+      rt_wakeable_t *tw = hash_get(tmap, n);
+      int drv[16], ndrv = 0;
+      for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+         if (ndrv >= 16)
+            break;
+         rt_nexus_t *dn = n;
+         rt_source_t *ds = s;
+         if (s->tag == SOURCE_PORT && s->u.port.input != NULL) {
+            // follow the port chain to the ultimate driving nexus
+            rt_nexus_t *in = s->u.port.input;
+            for (int hop = 0; hop < 16 && in != NULL; hop++) {
+               rt_source_t *ps = NULL;
+               for (rt_source_t *t2 = &(in->sources); t2 != NULL;
+                    t2 = t2->chain_input)
+                  if (t2->tag == SOURCE_PORT && t2->u.port.input != NULL)
+                     ps = t2;
+               if (ps == NULL) break;
+               in = ps->u.port.input;
+            }
+            dn = in;
+            ds = NULL;
+            for (rt_source_t *t2 = &(in->sources); t2 != NULL;
+                 t2 = t2->chain_input)
+               if (t2->tag == SOURCE_DRIVER && t2->u.driver.proc != NULL) {
+                  ds = t2;
+                  break;
+               }
+            if (ds == NULL)
+               continue;
+         }
+         else if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+            continue;
+         rt_wakeable_t *dw = &(ds->u.driver.proc->wakeable);
+         rt_wakeable_t *dtw = (dn == n) ? tw : hash_get(tmap, dn);
+         if (dtw != NULL
+             && container_of(dtw, rt_transfer_t, wakeable)->proc
+                == ds->u.driver.proc)
+            dw = dtw;
+         { static const char *ed = NULL; static int edi = -1;
+           if (edi < 0) { ed = getenv("AJ_EVDRV"); edi = ed ? 1 : 0; }
+           if (edi && g_lv_evnxn < 64
+               && strstr(istr(ds->u.driver.proc->name), ed) != NULL) {
+              bool dup = false;
+              for (int k = 0; k < g_lv_evnxn; k++)
+                 if (g_lv_evnx[k] == n) dup = true;
+              if (!dup) {
+                 g_lv_evnx[g_lv_evnxn++] = n;
+                 fprintf(stderr, "#EM nx=%p sig=%s drv=%s\n", (void *)n,
+                         (n->signal != NULL && n->signal->where != NULL)
+                            ? istr(tree_ident(n->signal->where)) : "?",
+                         istr(ds->u.driver.proc->name));
+              }
+           } }
+         drv[ndrv++] = LV_IDX(dw);
+      }
+      if (ndrv == 0) continue;
+      // waiters on this nexus (transfers included)
+      static struct lv_ctx wc = { NULL, 0, 0 };
+      wc.n = 0;
+      lv_pending_all(n->pending, lv_cb, &wc);
+      for (int i = 0; i < ndrv; i++)
+         for (int j = 0; j < wc.n; j++) {
+            if (drv[i] == wc.idx[j]) continue;
+            if (nedge == nedge_cap) {
+               nedge_cap *= 2;
+               edges = xrealloc_array(edges, nedge_cap, 2 * sizeof(int));
+            }
+            edges[nedge][0] = drv[i];
+            edges[nedge][1] = wc.idx[j];
+            nedge++;
+         }
+   }
+   #undef LV_IDX
+   // pass 2: comb classification + Kahn levels over comb->comb edges
+   bool *is_comb = xcalloc_array(g_lv_nproc, sizeof(bool));
+   int ncomb = 0;
+   for (int i = 0; i < g_lv_nproc; i++) {
+      // comb = an undelayed signal transfer, or a signal-sensitive process
+      // with no edge trigger: an edge-triggered process is signal-sensitive
+      // by the predicate but must NOT be leveled -- the sweep absorbed the
+      // glitch fixture's victim flop and ran it mid-settle (the very glitch
+      // the sweep exists to prevent).
+      rt_wakeable_t *w = g_lv_wake[i];
+      if (w->kind == W_TRANSFER)
+         is_comb[i] = getenv("NVC_SWEEP_NOXFER") == NULL
+            && container_of(w, rt_transfer_t, wakeable)->after == 0;
+      else if (w->kind == W_PROC) {
+         rt_proc_t *p = container_of(w, rt_proc_t, wakeable);
+         is_comb[i] = aj_proc_signal_sensitive(m, p) && w->trigger == NULL;
+      }
+      else
+         is_comb[i] = false;
+      if (is_comb[i]) ncomb++;
+   }
+   // CSR adjacency over comb->comb edges: the naive per-pop edge scan is
+   // O(V*E) and VeeR-scale graphs (141k comb nodes, uncapped fanout) never
+   // finish it
+   int *indeg = xcalloc_array(g_lv_nproc, sizeof(int));
+   int *outdeg = xcalloc_array(g_lv_nproc, sizeof(int));
+   int ncedge = 0;
+   for (int e = 0; e < nedge; e++)
+      if (is_comb[edges[e][0]] && is_comb[edges[e][1]]) {
+         indeg[edges[e][1]]++;
+         outdeg[edges[e][0]]++;
+         ncedge++;
+      }
+   int *off = xmalloc_array(g_lv_nproc + 1, sizeof(int));
+   off[0] = 0;
+   for (int i = 0; i < g_lv_nproc; i++) off[i + 1] = off[i] + outdeg[i];
+   int *adj = xmalloc_array(ncedge > 0 ? ncedge : 1, sizeof(int));
+   int *fill = xcalloc_array(g_lv_nproc, sizeof(int));
+   for (int e = 0; e < nedge; e++)
+      if (is_comb[edges[e][0]] && is_comb[edges[e][1]]) {
+         const int u = edges[e][0];
+         adj[off[u] + fill[u]++] = edges[e][1];
+      }
+   g_lv_level = xmalloc_array(g_lv_nproc, sizeof(int));
+   for (int i = 0; i < g_lv_nproc; i++) g_lv_level[i] = -1;
+   int *queue = xmalloc_array(g_lv_nproc, sizeof(int));
+   int qh = 0, qt = 0, done = 0, maxlv = 0;
+   for (int i = 0; i < g_lv_nproc; i++)
+      if (is_comb[i] && indeg[i] == 0) { g_lv_level[i] = 0; queue[qt++] = i; }
+   while (qh < qt) {
+      int u = queue[qh++]; done++;
+      for (int k = off[u]; k < off[u + 1]; k++) {
+         int v = adj[k];
+         if (g_lv_level[v] < g_lv_level[u] + 1) {
+            g_lv_level[v] = g_lv_level[u] + 1;
+            if (g_lv_level[v] > maxlv) maxlv = g_lv_level[v];
+         }
+         if (--indeg[v] == 0) queue[qt++] = v;
+      }
+   }
+   free(outdeg); free(off); free(adj); free(fill);
+   const int in_cycle = ncomb - done;
+   // Comb procs caught in cycles (ICG latch feedback, vhdl2vlog loops) get
+   // level 0: they iterate to fixpoint WITHIN the comb rounds via
+   // re-absorption.  Leaving them unleveled sent them to the clocked
+   // drain, where a gate computed with a stale latch output and the latch
+   // updated after -- the sweep MANUFACTURED a clock glitch (measured:
+   // VeeR IFU busclk extra transition, wrong final value, four bus-sync
+   // flops dead, no retires).
+   for (int i = 0; i < g_lv_nproc; i++)
+      if (is_comb[i] && g_lv_level[i] < 0)
+         g_lv_level[i] = 0;
+   notef("levelize: %d procs (%d comb), %d edges, %d levels, "
+         "%d comb procs in cycles (delta fallback)",
+         g_lv_nproc, ncomb, nedge, maxlv + 1, in_cycle);
+   const char *drvfind = getenv("AJ_DRVFIND");
+   if (drvfind != NULL) {
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         if (n->signal == NULL || n->signal->where == NULL) continue;
+         const char *nm = istr(tree_ident(n->signal->where));
+         if (strstr(nm, drvfind) == NULL) continue;
+         rt_wakeable_t *tw = hash_get(tmap, n);
+         for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+            if (s->tag == SOURCE_PORT && s->u.port.input != NULL) {
+               // follow port hops to the ultimate driving nexus
+               rt_nexus_t *in = s->u.port.input;
+               for (int hop = 0; hop < 16 && in != NULL; hop++) {
+                  rt_source_t *ps = NULL;
+                  for (rt_source_t *t2 = &(in->sources); t2 != NULL;
+                       t2 = t2->chain_input)
+                     if (t2->tag == SOURCE_PORT && t2->u.port.input != NULL)
+                        ps = t2;
+                  if (ps == NULL) break;
+                  in = ps->u.port.input;
+               }
+               for (rt_source_t *t2 = &(in->sources); t2 != NULL;
+                    t2 = t2->chain_input) {
+                  if (t2->tag != SOURCE_DRIVER || t2->u.driver.proc == NULL)
+                     continue;
+                  rt_wakeable_t *dw = &(t2->u.driver.proc->wakeable);
+                  rt_wakeable_t *itw = hash_get(tmap, in);
+                  if (itw != NULL
+                      && container_of(itw, rt_transfer_t, wakeable)->proc
+                         == t2->u.driver.proc)
+                     dw = itw;
+                  const int di = aj_lv_idx(dw);
+                  fprintf(stderr, "#DF sig=%s nx=%p in=%p VIA-PORT drv=%s "
+                          "kind=%d node=%d lv=%d\n",
+                          nm, (void *)n, (void *)in,
+                          istr(t2->u.driver.proc->name), (int)dw->kind,
+                          di, (di >= 0 && g_lv_level != NULL)
+                                 ? g_lv_level[di] : -2);
+               }
+               continue;
+            }
+            if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+               continue;
+            rt_wakeable_t *dw = &(s->u.driver.proc->wakeable);
+            if (tw != NULL
+                && container_of(tw, rt_transfer_t, wakeable)->proc
+                   == s->u.driver.proc)
+               dw = tw;
+            const int di = aj_lv_idx(dw);
+            fprintf(stderr, "#DF sig=%s nx=%p drv=%s kind=%d node=%d "
+                    "lv=%d\n",
+                    nm, (void *)n, istr(s->u.driver.proc->name),
+                    (int)dw->kind, di,
+                    (di >= 0 && g_lv_level != NULL) ? g_lv_level[di] : -2);
+         }
+      }
+   }
+   const char *sensfind = getenv("AJ_SENSFIND");
+   if (sensfind != NULL) {
+      void sf_cb(rt_wakeable_t *w, void *vc) {
+         rt_nexus_t *n = vc;
+         const char *sig = (n->signal != NULL && n->signal->where != NULL)
+            ? istr(tree_ident(n->signal->where)) : "?";
+         if (w->kind == W_TRIGGER) {
+            // trigger-mediated subscription: report procs hanging off the
+            // trigger's own pending list, tagged with the HOST nexus
+            rt_trigger_t *t = container_of(w, rt_trigger_t, wakeable);
+            void *p = t->pending;
+            if (pointer_tag(p) == 1) {
+               rt_wakeable_t *pw = untag_pointer(p, rt_wakeable_t);
+               if (pw->kind == W_PROC) {
+                  const char *pn =
+                     istr(container_of(pw, rt_proc_t, wakeable)->name);
+                  if (strstr(pn, sensfind) != NULL)
+                     fprintf(stderr, "#SF proc=%s VIA-TRIGGER kind=%d "
+                             "sig=%s\n", pn, (int)t->kind, sig);
+               }
+            }
+            else if (p != NULL) {
+               rt_pending_t *pl = untag_pointer(p, rt_pending_t);
+               for (int i = 0; i < pl->count; i++) {
+                  if (pl->wake[i] == NULL || pl->wake[i]->kind != W_PROC)
+                     continue;
+                  const char *pn = istr(
+                     container_of(pl->wake[i], rt_proc_t, wakeable)->name);
+                  if (strstr(pn, sensfind) != NULL)
+                     fprintf(stderr, "#SF proc=%s VIA-TRIGGER kind=%d "
+                             "sig=%s\n", pn, (int)t->kind, sig);
+               }
+            }
+            return;
+         }
+         const char *pn = NULL;
+         if (w->kind == W_PROC)
+            pn = istr(container_of(w, rt_proc_t, wakeable)->name);
+         else if (w->kind == W_TRANSFER)
+            pn = "(xfer)";
+         else
+            return;
+         if (strstr(pn, sensfind) == NULL) return;
+         fprintf(stderr, "#SF proc=%s kind=%d sig=%s\n", pn, (int)w->kind,
+                 sig);
+      }
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
+         lv_pending_all(n->pending, sf_cb, n);
+   }
+   const char *lvfind = getenv("AJ_LVFIND");
+   if (lvfind != NULL) {
+      for (int i = 0; i < g_lv_nproc; i++) {
+         if (g_lv_wake[i]->kind != W_PROC) continue;
+         rt_proc_t *p = container_of(g_lv_wake[i], rt_proc_t, wakeable);
+         if (strstr(istr(p->name), lvfind) == NULL) continue;
+         fprintf(stderr, "#LF node=%d comb=%d lv=%d trig=%d name=%s\n",
+                 i, (int)is_comb[i], g_lv_level[i],
+                 g_lv_wake[i]->trigger != NULL, istr(p->name));
+      }
+   }
+   if (getenv("AJ_SWEEPDBG") != NULL && g_lv_nproc <= 64) {
+      for (int i = 0; i < g_lv_nproc; i++)
+         fprintf(stderr, "#LV node=%d kind=%d comb=%d lv=%d name=%s\n",
+                 i, (int)g_lv_wake[i]->kind, (int)is_comb[i], g_lv_level[i],
+                 g_lv_wake[i]->kind == W_PROC
+                    ? istr(container_of(g_lv_wake[i], rt_proc_t,
+                                        wakeable)->name)
+                    : "-");
+      for (int e = 0; e < nedge; e++)
+         fprintf(stderr, "#LE %d -> %d\n", edges[e][0], edges[e][1]);
+   }
+   g_lv_maxlv = maxlv;
+   g_lv_seen  = xcalloc_array(g_lv_nproc, sizeof(uint32_t));
+   g_lv_sweep = getenv("NVC_LEVELIZE_SWEEP") != NULL;
+   if (g_lv_sweep)
+      notef("levelize: SWEEP dispatch ACTIVE (%d levels)", maxlv + 1);
+   free(indeg); free(queue); free(is_comb); free(edges);
+   hash_free(tmap);
+}
+
+// Engage the levelized sweep without the accel install path (plain-interp
+// runs under NVC_LEVELIZE_SWEEP)
+void accel_levelize(rt_model_t *m)
+{
+   aj_levelize_analyze(m);
+}
+
 void accel_auto(rt_model_t *m)
 {
+   aj_levelize_analyze(m);
    g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
    g_aj_verify_skipx = getenv("NVC_ACCEL_VERIFY_X") != NULL;
    g_aj_vtrack = getenv("NVC_ACCEL_VERIFY_TRACK") != NULL;
@@ -8233,7 +8817,11 @@ static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
    const size_t valuesz = n->size * n->width;
 
    if (!cmp_bytes(eff, value, valuesz)) {
-      copy2(last, eff, value, valuesz);
+      if (g_lv_inwave && n->last_event == m->now
+          && n->event_delta == m->iteration)
+         memcpy(eff, value, valuesz);   // see put_effective_impl
+      else
+         copy2(last, eff, value, valuesz);
 
       // Arm readers: one OR per process, no list walk, no hash
       lazy_nexus_readers_t *nr = ihash_get(g_lazy_nmap, (uintptr_t)n);
@@ -10676,6 +11264,19 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
       rt_signal_t *signal = n->signal;
       rt_source_t *d0 = &(signal->nexus.sources);
 
+      { static const char *dd = NULL; static int ddi = -1;
+        if (ddi < 0) { dd = getenv("AJ_DRVDBG"); ddi = dd ? 1 : 0; }
+        if (ddi && signal->where != NULL
+            && strstr(istr(tree_ident(signal->where)), dd) != NULL)
+           fprintf(stderr, "#DV %s t=%llu d=%u fq=%d sq=%d eq=%d v=%u wv=%u\n",
+                   istr(tree_ident(signal->where)),
+                   (unsigned long long)m->now, m->iteration,
+                   (int)d->fastqueued, (int)d0->sigqueued,
+                   (int)!cmp_bytes(value, value_ptr(n, &w->value),
+                                   n->width * n->size),
+                   (unsigned)((const unsigned char *)value)[0],
+                   (unsigned)((const unsigned char *)
+                              value_ptr(n, &w->value))[0]); }
       if (d->fastqueued) {
          assert(m->next_is_delta);
          if (unlikely(m->fastclk_probe_member >= 0)
@@ -10812,6 +11413,23 @@ static void async_run_process(rt_model_t *m, void *arg)
    if (unlikely(proc->wakeable.fastclk) && m->fastclk_npending > 0)
       m->fastclk_npending--;    // self-suspended member resumed
 
+   { static const char *pd = NULL; static int pdi = -1;
+     if (pdi < 0) { pd = getenv("AJ_PROCDBG"); pdi = pd ? 1 : 0; }
+     if (pdi && strstr(istr(proc->name), pd) != NULL) {
+        fprintf(stderr, "#PR %s t=%llu d=%u\n", istr(proc->name),
+                (unsigned long long)m->now, m->iteration);
+        for (int _k = 0; _k < g_lv_evnxn; _k++) {
+           rt_nexus_t *nx = g_lv_evnx[_k];
+           const unsigned char *eb = nexus_effective(nx);
+           const unsigned char *lb = nexus_last_value(nx);
+           fprintf(stderr, "#PS   %s ev_t=%lld ev_d=%u val=%u last=%u\n",
+                   (nx->signal != NULL && nx->signal->where != NULL)
+                      ? istr(tree_ident(nx->signal->where)) : "?",
+                   (long long)nx->last_event, nx->event_delta,
+                   (unsigned)eb[0], (unsigned)lb[0]);
+        }
+     } }
+
    run_process(m, proc);
 }
 
@@ -10835,7 +11453,13 @@ static bool heap_delete_proc_cb(uint64_t key, void *value, void *search)
 
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t)
 {
-   if (t->epoch == m->trigger_epoch)
+   // No memoisation inside a sweep wave: one flush batches commits that
+   // interp separated into deltas, so a trigger evaluated on an early
+   // commit caches FALSE and the real clock edge later in the SAME batch
+   // is swallowed (measured: VeeR TB responders never fired).  Wave
+   // triggers are clock-edge waits woken once per wave, so fresh
+   // evaluation cannot double-fire them.
+   if (!g_lv_inwave && t->epoch == m->trigger_epoch)
       return t->result.integer != 0;   // Cached
 
    switch (t->kind) {
@@ -11073,9 +11697,31 @@ static void wakeable_set_kind(rt_wakeable_t *w, wakeable_kind_t k)
 
 static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
 {
-   if (obj->fastclk && m->fastclk_on) {
+   { static const char *wd = NULL; static int wdi = -1;
+     if (wdi < 0) { wd = getenv("AJ_WAKEDBG"); wdi = wd ? 1 : 0; }
+     if (wdi && obj->kind == W_PROC) {
+        rt_proc_t *p = container_of(obj, rt_proc_t, wakeable);
+        extern rt_nexus_t *g_aj_notify_nexus;
+        if (strstr(istr(p->name), wd) != NULL)
+           fprintf(stderr, "#WU %s pending=%d inwave=%d t=%llu d=%u via=%s\n",
+                   istr(p->name), (int)obj->pending, (int)g_lv_inwave,
+                   (unsigned long long)m->now, m->iteration,
+                   (g_aj_notify_nexus != NULL
+                    && g_aj_notify_nexus->signal != NULL
+                    && g_aj_notify_nexus->signal->where != NULL)
+                      ? istr(tree_ident(g_aj_notify_nexus->signal->where))
+                      : "(none)");
+     } }
+   if (obj->fastclk && m->fastclk_on && !g_lv_inwave) {
       // Clk-only process: never queued. Latch that the clock fanout fired this
       // delta; the posedge table runs it directly at the proc-dispatch site.
+      // NOT inside a sweep wave: a gated clock is comb and commits MID-WAVE,
+      // after this delta's dispatch site already ran -- the latched hit
+      // dispatched one delta late, where sync_event_cache had cleared the
+      // edge flags and every member body-filtered to a no-op (measured:
+      // VeeR bus_intf domain dead, ARVALID stuck at init X, zero retires).
+      // In-wave the member takes the normal path into the wave's clocked
+      // drain: same delta, flags valid, settled data.
       m->fastclk_hit = true;
       return;
    }
@@ -11083,6 +11729,101 @@ static void wakeup_one(rt_model_t *m, rt_wakeable_t *obj)
    if (obj->pending)
       return;   // Already scheduled
 
+   // #62 sweep: a leveled comb proc woken while a wave is executing joins
+   // the CURRENT wave at its level instead of running inline -- the inline
+   // path replays the delta cascade (transients included) and defeats the
+   // level ordering (measured: NZ=39 persisted with queue-side-only sweep).
+   if (g_lv_inwave && g_lv_deposit_wake) {
+      // Deposit contract: receivers run NEXT delta, where the stamped
+      // event (iteration+1) is current.  Procs: hold to wave end.
+      // Triggers: force the queued (non-blocking) path so evaluation
+      // happens at the next boundary, not inline before the event exists.
+      if (obj->kind == W_PROC) {
+         if (obj->pending)
+            return;
+         rt_proc_t *p = container_of(obj, rt_proc_t, wakeable);
+         obj->pending = true;
+         deferq_do(&g_lv_depq, async_run_process, p);
+         { static int dbg = -1;
+           if (dbg < 0) dbg = getenv("AJ_SWEEPDBG") != NULL;
+           if (dbg)
+              fprintf(stderr, "#DW %s t=%llu d=%u\n", istr(p->name),
+                      (unsigned long long)m->now, m->iteration); }
+         return;
+      }
+      if (obj->kind == W_TRANSFER) {
+         if (obj->pending)
+            return;
+         rt_transfer_t *t = container_of(obj, rt_transfer_t, wakeable);
+         obj->pending = true;
+         deferq_do(&g_lv_depq, async_transfer_signal, t);
+         return;
+      }
+      if (obj->kind == W_TRIGGER) {
+         const bool save = m->blocking_update;
+         m->blocking_update = false;
+         obj->vtable->wake(m, obj);
+         m->blocking_update = save;
+         return;
+      }
+   }
+   if (g_lv_inwave && !g_lv_deposit_wake
+       && (obj->kind == W_PROC || obj->kind == W_TRANSFER)) {
+      static int nocomb = -1;
+      if (nocomb < 0) nocomb = getenv("NVC_SWEEP_NOCOMB") != NULL;
+      if (nocomb)
+         goto sweep_normal_wake;
+      const int pi = aj_lv_idx(obj);
+      { static int dbg = -1;
+        if (dbg < 0) dbg = getenv("AJ_SWEEPDBG") != NULL;
+        if (dbg)
+           fprintf(stderr, "#WK inwave kind=%d node=%s pi=%d lv=%d curlv=%d\n",
+                   (int)obj->kind,
+                   obj->kind == W_PROC
+                      ? istr(container_of(obj, rt_proc_t, wakeable)->name)
+                      : "(xfer)",
+                   pi, pi >= 0 ? g_lv_level[pi] : -2, g_lv_curlv); }
+      if (pi >= 0 && g_lv_level[pi] >= 0) {
+         // absorb unconditionally: reaching here means !pending, so the
+         // node is not queued -- a re-wake after running means its inputs
+         // changed and it MUST re-run at its level next round (one-eval-
+         // per-wave froze a stale transient in signal memory: NZ=39).
+         obj->pending = true;
+         aj_lv_wv_push(obj);
+         if (g_lv_level[pi] <= g_lv_curlv)
+            g_lv_late++;   // joined at/below the pass cursor: next round
+         return;
+      }
+      // UNLEVELED (clocked) procs must not run inline mid-wave either --
+      // the fork's blocking-update path executed the glitch fixture's
+      // victim between a transient deposit and its settle (measured: the
+      // two GL hashes bracket vict's sample).  Schedule at the slot after
+      // the waking commit's level.  Unleveled transfers (delayed
+      // assignments, or nodes unseen by the analyzer) take the normal
+      // queue -- they only schedule waveforms.
+      static int inlineck = -1;
+      if (inlineck < 0) inlineck = getenv("NVC_SWEEP_INLINE_CK") != NULL
+         || getenv("NVC_SWEEP_COMBONLY") != NULL;
+      if (obj->kind == W_PROC && !inlineck) {
+         rt_proc_t *p = container_of(obj, rt_proc_t, wakeable);
+         obj->pending = true;
+         if (g_lv_ckn == g_lv_ckcap) {
+            g_lv_ckcap = g_lv_ckcap ? g_lv_ckcap * 2 : 256;
+            g_lv_ck = xrealloc_array(g_lv_ck, g_lv_ckcap, sizeof(lv_ck_t));
+         }
+         g_lv_ck[g_lv_ckn].p  = p;
+         // clamp to the last slot (maxlv+1): a wake during that slot's own
+         // flush must land in a reachable slot or it is silently dropped
+         // with pending stuck true
+         g_lv_ck[g_lv_ckn].rl = g_lv_curlv < 0 ? 0
+            : (g_lv_curlv >= g_lv_maxlv + 1 ? g_lv_maxlv + 1
+                                            : g_lv_curlv + 1);
+         g_lv_ckn++;
+         return;
+      }
+   }
+
+sweep_normal_wake:
    obj->vtable->wake(m, obj);
 }
 
@@ -11111,14 +11852,46 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    // AJ_EVDBG=<substr>: print signal events (name, time, delta, first value
    // byte) for names containing <substr> — the delta-census diagnostic that
    // read the deep-cascade publication bug straight off the event stream.
+   for (int _k = 0; _k < g_lv_evnxn; _k++) {
+      if (g_lv_evnx[_k] != n) continue;
+      const unsigned char *db = n->signal != NULL
+         ? n->signal->shared.data : NULL;
+      fprintf(stderr, "#NX %p sig=%s t=%llu d=%u v=%u\n", (void *)n,
+              (n->signal != NULL && n->signal->where != NULL)
+                 ? istr(tree_ident(n->signal->where)) : "?",
+              (unsigned long long)m->now, m->iteration,
+              db != NULL ? (unsigned)db[0] : 999);
+      break;
+   }
+   { static const char *_nx = NULL; static int _nxi = -1;
+     if (_nxi < 0) { _nx = getenv("AJ_EVNX"); _nxi = _nx ? 1 : 0; }
+     if (_nxi) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%p", (void *)n);
+        if (strstr(_nx, buf) != NULL) {
+           const unsigned char *db = n->signal != NULL
+              ? n->signal->shared.data : NULL;
+           fprintf(stderr, "#NX %p sig=%s t=%llu d=%u v=%u\n", (void *)n,
+                   (n->signal != NULL && n->signal->where != NULL)
+                      ? istr(tree_ident(n->signal->where)) : "?",
+                   (unsigned long long)m->now, m->iteration,
+                   db != NULL ? (unsigned)db[0] : 999);
+        }
+     } }
    { static const char *_ev = NULL; static int _evi = -1;
      if (_evi < 0) { _ev = getenv("AJ_EVDBG"); _evi = _ev ? 1 : 0; }
      if (_evi && n->signal != NULL && n->signal->where != NULL) {
         const char *nm = istr(tree_ident(n->signal->where));
-        if (strstr(nm, _ev) != NULL)
-           fprintf(stderr, "#EV %s t=%llu d=%u v=%u\n", nm,
-                   (unsigned long long)m->now, m->iteration,
-                   (unsigned)n->signal->shared.data[0]);
+        if (strstr(nm, _ev) != NULL) {
+           uint64_t h = 1469598103934665603ULL;
+           const unsigned char *db = n->signal->shared.data;
+           for (size_t i = 0; i < n->signal->shared.size; i++)
+              { h ^= db[i]; h *= 1099511628211ULL; }
+           extern int g_aj_phase;
+           fprintf(stderr, "#EV %s nx=%p t=%llu d=%u v=%u h=%08x ph=%d\n",
+                   nm, (void *)n, (unsigned long long)m->now, m->iteration,
+                   (unsigned)db[0], (unsigned)(h & 0xffffffffu), g_aj_phase);
+        }
      } }
    n->last_event = m->now;
    n->event_delta = m->iteration;
@@ -11126,8 +11899,16 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    if (n->flags & NET_F_CACHE_EVENT)
       n->signal->shared.flags |= SIG_F_EVENT_FLAG;
 
+   extern rt_nexus_t *g_aj_notify_nexus;
+   g_aj_notify_nexus = n;
    n->vtable->notify(m, n);
+   g_aj_notify_nexus = NULL;
 }
+rt_nexus_t *g_aj_notify_nexus = NULL;
+// Engine phase at notify time (diagnostic): 1=boundary driverq,
+// 2=boundary driving heap, 3=boundary effective heap, 4=wave flush,
+// 5=process phase (proc/deposit inline), 0=other
+int g_aj_phase = 0;
 
 static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
@@ -11139,7 +11920,16 @@ static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value)
    const size_t valuesz = n->size * n->width;
 
    if (!cmp_bytes(eff, value, valuesz)) {
-      copy2(last, eff, value, valuesz);
+      // Single-update-per-delta invariant for 'last_value: a sweep wave can
+      // re-update a net within one delta (stale round then corrected run);
+      // shifting last_value to the transient shatters edge detection
+      // downstream (a clock reads 1->1 across its own edge).  Keep the
+      // delta-entry value.
+      if (g_lv_inwave && n->last_event == m->now
+          && n->event_delta == m->iteration)
+         memcpy(eff, value, valuesz);
+      else
+         copy2(last, eff, value, valuesz);
       notify_event(m, n);
    }
 }
@@ -11263,6 +12053,16 @@ static void update_driving(rt_model_t *m, rt_nexus_t *n, bool safe)
       // separately or there was an event on this signal
       const bool update_outputs = !!(n->flags & NET_F_EFFECTIVE)
          || (n->event_delta == m->iteration && n->last_event == m->now);
+
+      for (int _k = 0; _k < g_lv_evnxn; _k++) {
+         if (g_lv_evnx[_k] != n) continue;
+         fprintf(stderr, "#UO %s t=%llu d=%u gate=%d nouts=%d\n",
+                 (n->signal != NULL && n->signal->where != NULL)
+                    ? istr(tree_ident(n->signal->where)) : "?",
+                 (unsigned long long)m->now, m->iteration,
+                 (int)update_outputs, n->outputs != NULL);
+         break;
+      }
 
       if (update_outputs) {
          for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
@@ -11521,11 +12321,22 @@ static void sync_event_cache(rt_model_t *m)
       const bool event = s->nexus.last_event == m->now
          && s->nexus.event_delta == m->iteration;
 
+      // A deposit stamps its event for iteration+1 and sets the cached
+      // flag for its receivers, which run NEXT delta.  The wave's
+      // per-flush sync runs BEFORE that delta arrives and must not
+      // destroy the flag (measured: every deposit-driven CLOCK lost its
+      // edge to the first flush after the deposit -- cone_tb / the VeeR
+      // ACTIVE_L2CLK kernels body-filtered forever).  Stock never hits
+      // this: sync runs only at boundaries, after iteration advances.
+      const bool pending_next = g_lv_inwave
+         && s->nexus.last_event == m->now
+         && s->nexus.event_delta == m->iteration + 1;
+
       TRACE("sync event flag %d for %s", event, istr(tree_ident(s->where)));
 
       if (event)
          assert(s->shared.flags & SIG_F_EVENT_FLAG);   // Set by notify_event
-      else
+      else if (!pending_next)
          s->shared.flags &= ~SIG_F_EVENT_FLAG;
    }
 }
@@ -11792,6 +12603,287 @@ static inline void run_procq(rt_model_t *m, deferq_t *dq)
       deferq_run(m, dq);
 }
 
+// ---- Task #62 stage 2: level-ordered comb sweep dispatch -------------------
+// When NVC_LEVELIZE_SWEEP=1, comb processes woken in a delta run in STATIC
+// LEVEL order with driver updates flushed between levels (immediate
+// visibility down the order) and at most one eval per wave.  The comb settle
+// collapses into the delta it started in, transients are never externally
+// observable, and clocked processes (which keep the normal path and wake in
+// the following delta) sample fully settled values — the glitch-free
+// semantics the user's doctrine calls for.  Non-comb / unleveled tasks run
+// FIFO exactly as before.
+static void aj_sweep_flush(rt_model_t *m)
+{
+   extern int g_aj_phase;
+   const int save_phase = g_aj_phase;
+   g_aj_phase = 4;
+   // to QUIESCENCE: procs run inline from the notify path during heap
+   // processing schedule fresh driver updates — a single pass strands them
+   // one delta per hop (measured: 1-2 leveled procs absorbed per wave).
+   while (m->driverq.count > 0 || heap_size(m->driving_heap) > 0
+          || heap_size(m->effective_heap) > 0) {
+      if (m->driverq.count > 0) {
+         swap_deferq(&m->next_driverq, &m->driverq);
+         deferq_run(m, &m->next_driverq);
+      }
+      while (heap_size(m->driving_heap) > 0)
+         update_driving(m, heap_extract_min(m->driving_heap), true);
+      while (heap_size(m->effective_heap) > 0)
+         update_effective(m, heap_extract_min(m->effective_heap));
+   }
+   g_aj_phase = save_phase;
+   sync_event_cache(m);
+   // Each flush is a virtual delta for trigger memoisation: run_trigger
+   // memoises per trigger_epoch, which normally bumps once per delta.  A
+   // wave spans many former deltas under ONE epoch, so a trigger evaluated
+   // early (edge not yet committed) memoised FALSE and the real edge later
+   // in the wave was swallowed (measured: VeeR TB ifu_resp/lsu_rd_resp
+   // never fired -- AXI read-response channel dead, zero retires).
+   m->trigger_epoch++;
+}
+
+static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
+{
+   // t=0 settles via the classic delta machinery: the initial X-resolve of
+   // comb feedback loops is evaluation-order-dependent, and the sweep's
+   // phase-ordered fixpoint reaches a DIFFERENT (reset-dead) X state on
+   // VeeR.  Glitch-freedom is a steady-state property; X-init order is
+   // simulator-defined either way.
+   { static int rescanned0 = 0;
+     if (!rescanned0 && m->now >= UINT64_C(1000000)) {
+        rescanned0 = 1;
+        aj_evsens_scan(m);
+     } }
+   // AJ_NETDUMP=<substr>: per-delta dump of every matching nexus's raw
+   // state -- value, event stamps -- disambiguated by pointer.  Finds the
+   // stuck inner-port nexus among leaf-name collisions.
+   { static const char *nd = NULL; static int ndi = -1;
+     if (ndi < 0) { nd = getenv("AJ_NETDUMP"); ndi = nd ? 1 : 0; }
+     if (ndi) {
+        for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+           if (n->signal == NULL || n->signal->where == NULL) continue;
+           const char *nm = istr(tree_ident(n->signal->where));
+           if (strstr(nm, nd) == NULL) continue;
+           const unsigned char *eb = nexus_effective(n);
+           fprintf(stderr, "#ND %s nx=%p t=%llu d=%u val=%u ev_t=%lld "
+                   "ev_d=%u\n", nm, (void *)n,
+                   (unsigned long long)m->now, m->iteration,
+                   (unsigned)eb[0], (long long)n->last_event,
+                   n->event_delta);
+        }
+     } }
+   static int pure = -1, combonly = -1;
+   if (pure < 0) {
+      pure = getenv("NVC_SWEEP_PURE") != NULL;
+      combonly = getenv("NVC_SWEEP_COMBONLY") != NULL;
+   }
+   if (!g_lv_sweep || g_lv_level == NULL || m->now == 0 || pure) {
+      run_procq(m, dq);
+      return;
+   }
+   { static int rescanned = 0;
+     if (!rescanned && m->now >= UINT64_C(1000000)) {
+        rescanned = 1;
+        aj_evsens_scan(m);
+     } }
+   g_lv_wave++;
+   g_lv_wvn = 0;
+   g_lv_inwave = true;
+   g_lv_curlv = -1;
+   // pass 0: run unleveled tasks FIFO, collect leveled comb nodes.  Both
+   // procs and transfers embed the wakeable as their first member, so the
+   // task arg doubles as the node key.
+   for (unsigned i = 0; i < dq->count; i++) {
+      defer_task_t *t = &dq->tasks[i];
+      rt_wakeable_t *w = NULL;
+      if (t->fn == async_run_process)
+         w = &((rt_proc_t *)t->arg)->wakeable;
+      else if (t->fn == async_transfer_signal)
+         w = &((rt_transfer_t *)t->arg)->wakeable;
+      const int pi = (w != NULL) ? aj_lv_idx(w) : -1;
+      if (pi < 0 || g_lv_level[pi] < 0) {
+         const bool clocked = (t->fn == async_run_process);
+         const unsigned mark = clocked ? m->driverq.count : 0;
+         (*t->fn)(m, t->arg);
+         if (clocked)
+            aj_lv_hold_from(m, mark);
+         continue;
+      }
+      aj_lv_wv_push(w);
+   }
+   dq->count = 0;
+   // commit pass-0 deposits BEFORE the level passes: without this the
+   // unleveled tasks' commits ride the lv0 flush, their comb fanout joins
+   // mid-round (one round late at <= curlv) and a deep consumer samples a
+   // stale chain (measured: gl ran at lv3 with s1..s3 3 stages behind,
+   // vict captured the transient in round 0)
+   aj_sweep_flush(m);
+   // level passes: run, flush, absorb newly woken deeper comb procs
+   // Outer loop: level passes, then SAME-DELTA dispatch of clocked procs
+   // woken by mid-wave commits.  Classically a consumer runs in the delta
+   // its clock's event was stamped; wave-born wakes queued to the next
+   // delta found their edge flags cleared by sync_event_cache and gated
+   // flops never fired (measured: gals family Y=0, dead domains).  Their
+   // runs may wake further leveled combs (absorbed) or clocked procs
+   // (drained next round) -- iterate until quiescent.
+   // STRICT PHASES: (1) settle ALL combs to quiescence -- repeat the level
+   // passes while absorption adds work (a proc absorbed at/below the pass
+   // cursor runs in the next iteration); only then (2) run clocked procs
+   // woken by the settled commits, in this same delta; their deposits may
+   // start a new comb wave -- repeat.  Interleaving the phases let a
+   // consumer sample a mid-settle transient (measured: NZ regressed to 39
+   // when the drain ran between comb rounds).
+   const unsigned procq_start = m->procq.count;
+   int phases_used = 0, max_rounds = 0;
+   for (int phase = 0; phase < 64; phase++) {
+      phases_used = phase + 1;
+      for (int round = 0; round < 64; round++) {
+         if (round + 1 > max_rounds) max_rounds = round + 1;
+         bool any_comb = false;
+         for (int lv = 0; lv <= g_lv_maxlv; lv++) {
+            g_lv_curlv = lv;
+            bool any = false;
+            for (int i = 0; i < g_lv_wvn; i++) {
+               if (g_lv_wv[i] == NULL) continue;
+               const int pi = aj_lv_idx(g_lv_wv[i]);
+               if (g_lv_level[pi] != lv) continue;
+               rt_wakeable_t *w = g_lv_wv[i];
+               g_lv_wv[i] = NULL;
+               aj_lv_run(m, w);
+               any = true;
+            }
+            if (any) {
+               aj_sweep_flush(m);
+               any_comb = true;
+            }
+         }
+         g_lv_curlv = -1;
+         if (!any_comb)
+            break;
+      }
+      // Synchronous-abstraction drain: comb is settled and NO clocked proc
+      // has run this phase, so every flop woken during settling reads the
+      // settled pre-update state; flops woken by THESE updates (ripple)
+      // drain in the next phase and correctly read post-update state.
+      const bool have_tail = !combonly && m->procq.count > procq_start;
+      if (!have_tail && (combonly || g_lv_ckn == 0))
+         break;   // quiescent (COMBONLY: wave-born queue work defers to
+                  // the next delta exactly as stock run_procq would)
+      if (have_tail) {
+         const unsigned n = m->procq.count - procq_start;
+         static defer_task_t *tail = NULL;
+         static unsigned tailcap = 0;
+         if (n > tailcap) {
+            tailcap = n * 2;
+            tail = xrealloc_array(tail, tailcap, sizeof(defer_task_t));
+         }
+         memcpy(tail, m->procq.tasks + procq_start, n * sizeof(defer_task_t));
+         m->procq.count = procq_start;
+         for (unsigned i = 0; i < n; i++)
+            (*tail[i].fn)(m, tail[i].arg);
+      }
+      // Snapshot the batch BEFORE resetting the array: drain-run procs
+      // absorb new wakes inline (blocking commits -> hook), and appending
+      // into a zeroed g_lv_ckn overwrites slots this loop is still
+      // iterating -- the overwritten proc is lost with pending stuck true,
+      // permanently dead (measured: VeeR dbg/bus flops never ran after
+      // their first mid-drain wake; whole domains X-locked).
+      {
+         static lv_ck_t *batch = NULL;
+         static int batchcap = 0;
+         const int nck = g_lv_ckn;
+         if (nck > batchcap) {
+            batchcap = nck * 2;
+            batch = xrealloc_array(batch, batchcap, sizeof(lv_ck_t));
+         }
+         memcpy(batch, g_lv_ck, nck * sizeof(lv_ck_t));
+         g_lv_ckn = 0;
+         for (int i = 0; i < nck; i++) {
+            if (batch[i].p == NULL) continue;
+            const unsigned mark = m->driverq.count;
+            async_run_process(m, batch[i].p);
+            aj_lv_hold_from(m, mark);
+         }
+      }
+      aj_sweep_flush(m);
+   }
+   // Overflow safety: if the round/phase caps were hit, wave entries may
+   // remain unrun with pending stuck true -- dropping them kills their
+   // procs PERMANENTLY (measured: VeeR retired NOTHING).  Drain leftovers
+   // FIFO to a fixpoint; order degrades to delta semantics, correctness
+   // survives.
+   for (int guard = 0; guard < 1000; guard++) {
+      bool anyleft = false;
+      for (int i = 0; i < g_lv_wvn; i++) {
+         if (g_lv_wv[i] == NULL) continue;
+         rt_wakeable_t *w = g_lv_wv[i];
+         g_lv_wv[i] = NULL;
+         aj_lv_run(m, w);
+         anyleft = true;
+      }
+      for (int i = 0; i < g_lv_ckn; i++) {
+         if (g_lv_ck[i].p == NULL) continue;
+         rt_proc_t *p = g_lv_ck[i].p;
+         g_lv_ck[i].p = NULL;
+         const unsigned mark = m->driverq.count;
+         async_run_process(m, p);
+         aj_lv_hold_from(m, mark);
+         anyleft = true;
+      }
+      g_lv_ckn = 0;
+      if (!anyleft)
+         break;
+      { static int dbg = -1;
+        if (dbg < 0) dbg = getenv("AJ_SWEEPDBG") != NULL;
+        if (dbg)
+           fprintf(stderr, "#OV wave=%u leftover drain pass %d\n",
+                   g_lv_wave, guard); }
+      aj_sweep_flush(m);
+   }
+   { static int dbg = -1; if (dbg < 0) dbg = getenv("AJ_SWEEPDBG") != NULL;
+     if (dbg && (phases_used >= 64 || max_rounds >= 64 || g_lv_wave <= 8))
+        fprintf(stderr, "#WV wave=%u t=%llu d=%u phases=%d rounds=%d%s\n",
+                g_lv_wave, (unsigned long long)m->now, m->iteration,
+                phases_used, max_rounds,
+                (phases_used >= 64 || max_rounds >= 64) ? " CAP-HIT" : ""); }
+   if (g_lv_helddrvn > 0) {
+      for (int i = 0; i < g_lv_helddrvn; i++)
+         defer_driving_update(m, g_lv_helddrv[i]);
+      g_lv_helddrvn = 0;
+      m->next_is_delta = true;
+   }
+   if (g_lv_depq.count > 0) {
+      for (unsigned i = 0; i < g_lv_depq.count; i++)
+         deferq_do(&m->procq, g_lv_depq.tasks[i].fn, g_lv_depq.tasks[i].arg);
+      g_lv_depq.count = 0;
+      m->next_is_delta = true;
+   }
+   { static int dbg = -1;
+     if (dbg < 0) dbg = getenv("AJ_HOLDDBG") != NULL;
+     if (dbg && g_lv_heldq.count > 0)
+        fprintf(stderr, "#HD release %u tasks t=%llu d=%u\n",
+                g_lv_heldq.count, (unsigned long long)m->now, m->iteration); }
+   if (g_lv_heldq.count > 0) {
+      // release clocked-proc deposits: the next delta's update phase
+      // commits them (interp NBA timing), and their comb fanout settles in
+      // that delta's wave
+      for (unsigned i = 0; i < g_lv_heldq.count; i++)
+         deferq_do(&m->driverq, g_lv_heldq.tasks[i].fn,
+                   g_lv_heldq.tasks[i].arg);
+      g_lv_heldq.count = 0;
+      m->next_is_delta = true;
+   }
+   g_lv_inwave = false;
+   g_lv_curlv = -1;
+   { static int dbg = -1; if (dbg < 0) dbg = getenv("AJ_SWEEPDBG") != NULL;
+     if (dbg && g_lv_late > 0) {
+        static long last = 0;
+        if (g_lv_late != last)
+           fprintf(stderr, "#SW topo violations: %ld\n", g_lv_late);
+        last = g_lv_late;
+     } }
+}
+
 static void model_cycle(rt_model_t *m)
 {
    // Simulation cycle is described in LRM 93 section 12.6.4
@@ -11859,20 +12951,24 @@ static void model_cycle(rt_model_t *m)
       }
    }
 
+   { extern int g_aj_phase; g_aj_phase = 1; }
    if (m->driverq.count > 0) {
       swap_deferq(&m->next_driverq, &m->driverq);
       deferq_run(m, &m->next_driverq);
    }
 
+   { extern int g_aj_phase; g_aj_phase = 2; }
    while (heap_size(m->driving_heap) > 0) {
       rt_nexus_t *n = heap_extract_min(m->driving_heap);
       update_driving(m, n, true);
    }
 
+   { extern int g_aj_phase; g_aj_phase = 3; }
    while (heap_size(m->effective_heap) > 0) {
       rt_nexus_t *n = heap_extract_min(m->effective_heap);
       update_effective(m, n);
    }
+   { extern int g_aj_phase; g_aj_phase = 5; }
 
    sync_event_cache(m);
 
@@ -12236,7 +13332,7 @@ fastclk_done:;
       const unsigned depth = m->next_procq.count;
       const int b = prof_bucket(depth);
       const uint64_t t0 = get_timestamp_ns();
-      run_procq(m, &m->next_procq);
+      aj_sweep_run(m, &m->next_procq);
       const uint64_t dt = get_timestamp_ns() - t0;
       m->prof_deltas++;
       m->prof_activations += depth;
@@ -12245,7 +13341,7 @@ fastclk_done:;
       m->prof_depth_ns[b] += dt;
    }
    else
-      run_procq(m, &m->next_procq);
+      aj_sweep_run(m, &m->next_procq);
 
    run_callbacks(m, END_OF_PROCESSES);
 
@@ -12530,7 +13626,9 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
             if (n->flags & NET_F_CACHE_EVENT)
                n->signal->shared.flags |= SIG_F_EVENT_FLAG;
             m->next_is_delta = true;
+            g_lv_deposit_wake = true;
             wakeup_all(m, &(n->pending));
+            g_lv_deposit_wake = false;
          }
       }
 
@@ -12670,20 +13768,31 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
          else
             assert(!(n->flags & NET_F_CACHE_EVENT));
 
+         g_lv_deposit_wake = wake_next;
          wakeup_all(m, &(n->pending));
+         g_lv_deposit_wake = false;
 
          for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
+            rt_nexus_t *pn = NULL;
             switch (o->tag) {
             case SOURCE_PORT:
-               defer_driving_update(m, o->u.port.output);
+               pn = o->u.port.output;
                break;
             case SOURCE_IMPLICIT:
                // Reverse implicit: receiver deposit propagates to parent
-               defer_driving_update(m, o->u.pseudo.nexus);
+               pn = o->u.pseudo.nexus;
                break;
             default:
                should_not_reach_here();
             }
+            // In a sweep wave, hold the port propagation to wave end: the
+            // wave's flush would drain the driving heap eagerly and commit
+            // the port one delta early, desynchronising its event from
+            // the deposit's deferred receivers (see g_lv_helddrv).
+            if (g_lv_inwave && wake_next)
+               aj_lv_hold_drv(pn);
+            else
+               defer_driving_update(m, pn);
             m->next_is_delta = true;
          }
       }

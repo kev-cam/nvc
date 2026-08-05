@@ -1215,6 +1215,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (use_accel)
       accel_auto(state->model);
+   else if (getenv("NVC_LEVELIZE_SWEEP") != NULL
+            || getenv("NVC_LEVELIZE_STATIC") != NULL)
+      accel_levelize(state->model);
 
    if (lazy_eval)
       lazy_eval_install(state->model);

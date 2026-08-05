@@ -90,6 +90,7 @@ void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt);
 void proc_reset_vtable(rt_proc_t *proc);
 bool accel_load(rt_model_t *m, const char *so_path);
 void accel_auto(rt_model_t *m);
+void accel_levelize(rt_model_t *m);
 int accel_demote(rt_model_t *m, const char *tok);
 void lazy_eval_install(rt_model_t *m);
 
