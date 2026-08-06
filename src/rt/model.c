@@ -13554,8 +13554,17 @@ static void model_cycle(rt_model_t *m)
          ++xcons_steps;
          if (xcons_at > 0 && xcons_steps == xcons_at) {
             xcons_at = 0;   // one-shot
+            // TOPO-ORDERED settle: re-run X-net driver procs in LEVELIZE
+            // order so each re-evaluates AFTER its inputs settled. The flat
+            // (unordered) variant re-computed X from not-yet-settled inputs
+            // and X-marked 68k previously-certain nets; topo order is what
+            // makes re-evaluation sound. Requires the sweep's level table.
+            extern hash_t *g_lv_idx;
+            extern int *g_lv_level;
             hash_t *woken = hash_new(1024);
-            int nwake = 0;
+            typedef struct { int lvl; rt_proc_t *p; } xset_t;
+            xset_t *set = NULL;
+            int nset = 0, capset = 0;
             for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
                if (n->signal == NULL) continue;
                const unsigned char *db = nexus_effective(n);
@@ -13570,14 +13579,31 @@ static void model_cycle(rt_model_t *m)
                   rt_proc_t *p = s->u.driver.proc;
                   if (hash_get(woken, p) != NULL) continue;
                   hash_put(woken, p, p);
-                  deltaq_insert_proc(m, 0, p);
-                  nwake++;
+                  int lvl = 0;
+                  if (g_lv_idx != NULL && g_lv_level != NULL) {
+                     void *v = hash_get(g_lv_idx, &(p->wakeable));
+                     if (v != NULL)
+                        lvl = g_lv_level[(int)(uintptr_t)v - 1];
+                  }
+                  if (nset == capset) {
+                     capset = capset ? capset * 2 : 1024;
+                     set = xrealloc_array(set, capset, sizeof(xset_t));
+                  }
+                  set[nset++] = (xset_t){ lvl, p };
                }
             }
             hash_free(woken);
-            if (nwake > 0)
-               notef("accel-jit: X-consistency sweep re-ran %d proc(s)",
-                     nwake);
+            // insertion-stable level sort (qsort fine)
+            int xcmp(const void *a, const void *b) {
+               return ((const xset_t *)a)->lvl - ((const xset_t *)b)->lvl;
+            }
+            qsort(set, nset, sizeof(xset_t), xcmp);
+            for (int i2 = 0; i2 < nset; i2++)
+               run_process(m, set[i2].p);
+            free(set);
+            if (nset > 0)
+               notef("accel-jit: topo-ordered X settle re-ran %d proc(s)",
+                     nset);
          }
       }
    }
