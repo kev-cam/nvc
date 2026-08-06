@@ -218,6 +218,7 @@ typedef struct _rt_source {
    unsigned        sigqueued : 1;
    unsigned        pseudoqueued : 1;
    unsigned        was_active : 1;
+   unsigned        aj_rerouted : 1;   // owning proc rerouted into accel chunk
    union {
       rt_port_t   port;
       rt_driver_t driver;

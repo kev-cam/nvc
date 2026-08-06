@@ -2675,6 +2675,15 @@ static void aj_poke(int ord, const void *packed, unsigned nbytes)
       if (e->ord != ord) continue;
       memcpy(e->stage, packed, nbytes < e->nbytes ? nbytes : e->nbytes);
       e->dirty = true;
+      { static int dbg = -2;
+        if (dbg == -2) { const char *v = getenv("AJ_POKEDBG");
+                         dbg = v ? atoi(v) : -1; }
+        if (dbg >= 0 && ord == dbg) {
+           extern rt_model_t *__model_for_dbg;
+           const unsigned char *pb = packed;
+           fprintf(stderr, "#PK ord=%d stage t=? bytes=%02x%02x%02x%02x\n",
+                   ord, pb[0], pb[1], pb[2], pb[3]);
+        } }
       atomic_store(&g_aj_hoff_pending, true);
    }
 }
@@ -2694,6 +2703,16 @@ static void aj_apply_pokes(rt_model_t *m)
          if (!e->dirty) continue;
          e->dirty = false;
          memcpy(e->dst, e->stage, e->nbytes);
+         { static int dbg = -2;
+           if (dbg == -2) { const char *v = getenv("AJ_POKEDBG");
+                            dbg = v ? atoi(v) : -1; }
+           if (dbg >= 0 && e->ord == dbg) {
+              const unsigned char *pb = e->stage;
+              fprintf(stderr, "#PA ord=%d apply t=%llu d=%u "
+                      "bytes=%02x%02x%02x%02x\n", e->ord,
+                      (unsigned long long)m->now, m->iteration,
+                      pb[0], pb[1], pb[2], pb[3]);
+           } }
          *e->ext_chg = 1;
          if (!e->wake->wakeable.pending)
             deltaq_insert_proc(m, 0, e->wake);
@@ -3282,6 +3301,22 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
          restored++;
       }
       // else: something else (reset_process) already replaced it — leave it
+   }
+
+   // Reconnect any drivers aj_quench_rerouted_drivers disconnected for this
+   // chunk's procs: the resumed procs drive their nets again from the
+   // written-back state.
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+         if (s->tag != SOURCE_DRIVER || !s->aj_rerouted)
+            continue;
+         for (unsigned i = 0; i < chunk->rr_count; i++)
+            if (s->u.driver.proc == chunk->rr_saved[i].proc) {
+               s->aj_rerouted = 0;
+               s->disconnected = 0;
+               break;
+            }
+      }
    }
 
    const uint64_t t_vt = get_timestamp_ns();
@@ -4432,6 +4467,61 @@ static void aj_link_handoff(rt_model_t *m)
 
    if (nlink > 0 && getenv("NVC_ACCEL_NO_RESPEC") == NULL)
       aj_respecialize(m);
+}
+
+// Disconnect the drivers of every rerouted proc. After aj_reroute the proc
+// never runs again, but its driver SOURCES survive with whatever waveform was
+// current at install -- typically the init 'U'/'X' transaction still queued
+// for t=0. Two failure paths follow: the queued transaction applies at t=0
+// delta 1 and clobbers the chunk's seed deposit, and every later resolution
+// on the nexus folds the stale driver value in (l3d RESOLVE_LUT ORs the
+// uncertainty plane, so the VALUE stays right while the X mark spreads --
+// the VeeR fused cyc90 illegal-instruction trap came from exactly this via
+// dbg_halt_req). The chunk owns these nets now: mark the sources so update
+// paths consume without applying, and set the VHDL disconnect flag so
+// resolution ignores them. aj_chunk_demote reconnects on writeback.
+static void aj_quench_rerouted_drivers(rt_model_t *m)
+{
+   static bool done = false;
+   if (done || m->aj_chunk_count == 0 || g_aj_verify
+       || getenv("NVC_ACCEL_NO_QUENCH") != NULL)
+      return;
+   done = true;
+
+   const bool dbg = getenv("NVC_ACCEL_QUENCH_DBG") != NULL;
+   int nquench = 0, nlive = 0;
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+         if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+            continue;
+         rt_proc_t *p = s->u.driver.proc;
+         if (aj_chunk_of_proc(m, p) == NULL)
+            continue;
+         // A rerouted proc is not necessarily dead: the fast-clk table (and
+         // the levelize sweep) dispatch proc BODIES directly, bypassing the
+         // chunk vtable — clock gaters distribute their gated clock exactly
+         // this way. Only quench drivers of procs nothing dispatches.
+         if (p->wakeable.fastclk) {
+            nlive++;
+            if (dbg)
+               notef("accel-jit: quench SKIP live fastclk driver %s -> %s",
+                     istr(p->name),
+                     n->signal != NULL && n->signal->where != NULL
+                        ? istr(tree_ident(n->signal->where)) : "?");
+            continue;
+         }
+         s->aj_rerouted = 1;
+         s->disconnected = 1;
+         nquench++;
+         if (dbg && nquench <= 40)
+            notef("accel-jit: quench %s -> %s", istr(p->name),
+                  n->signal != NULL && n->signal->where != NULL
+                     ? istr(tree_ident(n->signal->where)) : "?");
+      }
+   }
+   if (nquench > 0 || nlive > 0)
+      notef("accel-jit: disconnected %d driver(s) of rerouted procs "
+            "(%d live fastclk skipped)", nquench, nlive);
 }
 
 // Undo aj_build_fastclk + the partially-built chunk when an install fails after
@@ -11889,9 +11979,11 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
            for (size_t i = 0; i < n->signal->shared.size; i++)
               { h ^= db[i]; h *= 1099511628211ULL; }
            extern int g_aj_phase;
-           fprintf(stderr, "#EV %s nx=%p t=%llu d=%u v=%u h=%08x ph=%d\n",
+           fprintf(stderr, "#EV %s nx=%p t=%llu d=%u v=%u h=%08x ph=%d sc=%s\n",
                    nm, (void *)n, (unsigned long long)m->now, m->iteration,
-                   (unsigned)db[0], (unsigned)(h & 0xffffffffu), g_aj_phase);
+                   (unsigned)db[0], (unsigned)(h & 0xffffffffu), g_aj_phase,
+                   n->signal->parent != NULL
+                      ? istr(n->signal->parent->name) : "?");
         }
      } }
    n->last_event = m->now;
@@ -12092,6 +12184,28 @@ static void update_driver(rt_model_t *m, rt_nexus_t *n, rt_source_t *source)
    waveform_t *w_now  = &(source->u.driver.waveforms);
    waveform_t *w_next = w_now->next;
 
+   if (unlikely(source->aj_rerouted)) {
+      // Proc rerouted into an accel chunk: swallow the transactions queued
+      // at install (typically the init 'U'/'X') so they cannot clobber the
+      // chunk's deposits — see aj_quench_rerouted_drivers. A transaction
+      // arriving AFTER init proves something still dispatches the proc body
+      // directly (fast-clk table, levelize sweep): reconnect and apply.
+      if (m->now > 0) {
+         source->aj_rerouted = 0;
+         source->disconnected = 0;
+      }
+      else {
+         if (w_next != NULL
+             && (w_next->when == m->now || w_next->when == -m->now)) {
+            if (w_next->when == m->now)
+               free_value(n, w_now->value);
+            *w_now = *w_next;
+            free_waveform(m, w_next);
+         }
+         return;
+      }
+   }
+
    if (likely(w_next != NULL && w_next->when == m->now)) {
       free_value(n, w_now->value);
       *w_now = *w_next;
@@ -12116,6 +12230,17 @@ static void update_driver(rt_model_t *m, rt_nexus_t *n, rt_source_t *source)
 static void fast_update_driver(rt_model_t *m, rt_nexus_t *nexus)
 {
    rt_source_t *src = &(nexus->sources);
+
+   if (unlikely(src->aj_rerouted)) {
+      if (m->now > 0) {   // post-init activity: proc is live — reconnect
+         src->aj_rerouted = 0;
+         src->disconnected = 0;
+      }
+      else {
+         src->fastqueued = 0;   // see aj_quench_rerouted_drivers
+         return;
+      }
+   }
 
    if (likely(nexus->flags & NET_F_FAST_DRIVER)) {
       // Preconditions for fast driver updates
@@ -13498,8 +13623,10 @@ void model_run(rt_model_t *m, uint64_t stop_time)
       if (nt != NULL) { const int v = atoi(nt); if (v > 0) g_fork_tests = v; }
    }
 
-   if (m->aj_chunk_count > 0)
+   if (m->aj_chunk_count > 0) {
       aj_link_handoff(m);   // wire packed chunk-to-chunk edges (NVC_ACCEL_HANDOFF)
+      aj_quench_rerouted_drivers(m);
+   }
 
    run_callbacks(m, START_OF_SIMULATION);
 
