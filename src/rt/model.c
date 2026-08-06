@@ -13531,10 +13531,28 @@ static void model_cycle(rt_model_t *m)
          const char *e = getenv("NVC_ACCEL_XCONS");
          xcons_at = e ? atoi(e) : 0;
       }
-      if (xcons_at > 0 && m->aj_chunk_count > 0
-          && m->now != xcons_last) {
+      // Settle-window force-event: for the first K timesteps, chunk
+      // publications EVENT even when byte-equal, matching the interp
+      // driver timeline (interp procs re-drive at reset captures and those
+      // events wake settle cascades; a byte-equal deposit silently skips
+      // them and downstream combs keep stale X — the event-hole class).
+      // After the window, change-gating resumes (steady-state suppression
+      // is the correct optimization).
+      { extern bool g_aj_forceev;
+        static int few_at = -2;
+        if (few_at == -2) {
+           // DEFAULT OFF: measured neutral on VeeR (the missing settle
+           // events are interp-proc re-runs, not deposits — a deposit-side
+           // force-event cannot recreate them). Knob kept for experiments.
+           const char *fe = getenv("NVC_ACCEL_FORCEEV");
+           few_at = fe ? atoi(fe) : 0;
+        }
+        g_aj_forceev = m->aj_chunk_count > 0 && few_at > 0
+           && xcons_steps < few_at; }
+      if (m->aj_chunk_count > 0 && m->now != xcons_last) {
          xcons_last = m->now;
-         if (++xcons_steps == xcons_at) {
+         ++xcons_steps;
+         if (xcons_at > 0 && xcons_steps == xcons_at) {
             xcons_at = 0;   // one-shot
             hash_t *woken = hash_new(1024);
             int nwake = 0;
@@ -14312,6 +14330,8 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
    }
 }
 
+bool g_aj_forceev = false;   // settle-window: byte-equal deposits still event
+
 static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
                                 const void *values, int offset, size_t count,
                                 bool wake_next)
@@ -14357,7 +14377,7 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
          continue;
       }
 
-      if (!cmp_bytes(eff, vptr, valuesz)) {
+      if (!cmp_bytes(eff, vptr, valuesz) || g_aj_forceev) {
          copy2(last, eff, vptr, valuesz);
          m->trigger_epoch++;
 
