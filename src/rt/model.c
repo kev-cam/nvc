@@ -1949,6 +1949,7 @@ typedef struct {
                                // a deposited byte is base|valuebit
    uint8_t      *data;         // shared.data (read inputs)
    rt_signal_t  *sig;          // signal (force outputs via force_signal)
+   bool          icg;          // gated-clock output (gater-cell member)
 } aj_pin_t;
 
 // NVC_ACCEL_HANDOFF: one packed chunk-to-chunk edge. When a chunk output's
@@ -1993,6 +1994,7 @@ struct _aj_chunk {
    void            *state;           // per-chunk state (sized by accel_state_size)
    void            *dl;              // dlopen handle
    bool             merged;          // domain-merged chunk (negedge state flip)
+   bool             gater;           // clock-gate cell chunk: ICG latch rules
    uint64_t         ck_flip_now;     // timestep whose fall already flipped (+1)
    rt_signal_t     *primary_ck;      // bindtab[4] clock's signal (edge arming)
    void           (*set_clklast)(void *, unsigned char);  // bridge accessor
@@ -2433,6 +2435,12 @@ struct _aj_defer_out {
    bool           negflip;    // merged-chunk reg output: stage at posedge,
                               // deposit_signal at the domain clock's FALL
                               // (task #53/#59 -- derivation-free barrier)
+   bool           icg;        // gated-clock output (pin *l1clk): once
+                              // published high, HOLD through the clk-high
+                              // phase -- a live-computed enable drop would
+                              // emit a runt pulse the real ICG latch
+                              // suppresses (missed 35ns reset captures)
+   uint8_t        icg_last;   // last published value bit
    void          *sigp;       // negflip: the signal to deposit into
    int            pw;         // negflip: port width (deposit element count)
    bool           dirty;      // shadow staged this cycle, awaiting swap
@@ -2587,6 +2595,30 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          copy_value_ptr(od->nx, &od->src->u.driver.waveforms.value,
                         (const uint8_t *)buf + od->off);
       }
+
+   // ICG latch rule: a gated-clock output that has published HIGH must not
+   // publish LOW while the chunk's source clock is still high -- the real
+   // gater latches its enable during the low phase, so an enable change in
+   // the high phase cannot truncate the pulse. The chunk computes l1clk
+   // live; suppress the runt fall (the low-phase eval publishes it).
+   if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
+       && c->defer_outs[ord].icg && width == 1) {
+      aj_defer_out_t *ig = &c->defer_outs[ord];
+      const unsigned nb = ((const uint8_t *)buf)[0] & 1;
+      const uint8_t clkhi = c->bindtab != NULL && c->bindtab[4] != NULL
+         ? (((const uint8_t *)c->bindtab[4])[0] & 1) : 0;
+      if (nb == 0 && ig->icg_last == 1 && clkhi)
+         return;   // hold high through the high phase
+      ig->icg_last = (uint8_t)nb;
+      // Clocks are WAVEFORMS, not registered state: never route them through
+      // the negflip/NBA staging (a staged fall flushes an instant late and
+      // the rim sees rise-then-fall compressed into one instant -- interp
+      // gater latches downstream open early and emit runt gated clocks).
+      // Publish immediately, fan to alias extras, done.
+      for (int k = 0; k < aj_npub; k++)
+         deposit_signal(m, aj_pub[k], buf, 0, width);
+      return;
+   }
 
    if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
        && c->defer_outs[ord].defer) {
@@ -5715,6 +5747,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          if (tgt != NULL && (size_t)tgt->size * tgt->width != (size_t)bufsz)
             tgt = NULL;   // layout mismatch across the port hop — fall back
          d->valuesz = (size_t)bufsz;
+         d->icg     = pins[i].icg
+                      || strstr(pins[i].name, "l1clk") != NULL;
          d->defer   = (tgt != NULL);
          // Merged chunks: every REGISTERED output stages at posedge evals and
          // publishes at the domain clock's fall (the negedge state flip).  No
@@ -5868,6 +5902,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    }
    if (!spec) {
       chunk->defer_count = ord;
+      { int nicg = 0;
+        for (int i2 = 0; i2 < ord; i2++)
+           if (chunk->defer_outs[i2].icg) nicg++;
+        if (nicg > 0)
+           notef("accel-jit: '%s': %d gated-clock (ICG) output(s)",
+                 chunk->rs_top != NULL ? chunk->rs_top : "?", nicg); }
       // bridged-output summary for the handoff link pass (output ordinal order)
       chunk->b_out = xcalloc_array(ord > 0 ? ord : 1, sizeof(aj_bpin_t));
       chunk->n_bout = ord;
@@ -6924,6 +6964,36 @@ typedef struct {
 static aj_mgrp_t *g_mgrps = NULL;
 static int        g_nmgrp = 0, g_mgrpmax = 0;
 
+
+// Scan a subtree .v for clkhdr cell instances and collect their OUTPUT net
+// names (last connection of the single-line instantiation). These nets are
+// gated clocks: their exported boundary pins need the ICG latch rule in
+// aj_out (a live-computed enable drop otherwise emits a runt pulse that the
+// real gater latch suppresses -- missed reset captures downstream).
+static int aj_scan_gater_nets(const char *vpath, char names[][64], int max)
+{
+   FILE *vf = fopen(vpath, "r");
+   if (vf == NULL) return 0;
+   char line[4096];
+   int n = 0;
+   while (n < max && fgets(line, sizeof line, vf) != NULL) {
+      if (strstr(line, "clkhdr") == NULL) continue;
+      char *close = strstr(line, ");");
+      if (close == NULL) continue;
+      char *e = close;
+      while (e > line && (e[-1] == ' ')) e--;
+      char *s = e;
+      while (s > line && (isalnum((unsigned char)s[-1]) || s[-1] == '_')) s--;
+      if (e - s > 0 && e - s < 64) {
+         memcpy(names[n], s, e - s);
+         names[n][e - s] = '\0';
+         n++;
+      }
+   }
+   fclose(vf);
+   return n;
+}
+
 // Install one merged chunk per clock-domain group (see aj_mcand_t above).
 // Any failure falls back to installing the group's members individually, so
 // NVC_ACCEL_MERGE can never be WORSE than the per-chunk path.  Synthesis of
@@ -7014,6 +7084,9 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       int n_internal = 0;
       for (int k = 0; k < nmem; k++) {
          aj_mcand_t *c = &g_aj_cands[members[k]];
+         static char gater_nets[128][64];
+         const int ngat = c->vpath != NULL
+            ? aj_scan_gater_nets(c->vpath, gater_nets, 128) : 0;
          // NVC_ACCEL_MERGE_MAP=1: member ordinal -> design instance, the only
          // record tying a bundle's mK pins back to the covered instance (the
          // bridge names members m0..mN only) — required to census a specific
@@ -7071,6 +7144,15 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             first = false;
             mp[nmp] = *pp;
             snprintf(mp[nmp].name, sizeof mp[nmp].name, "m%d_%s", k, pp->name);
+            if (pp->is_output && c->top_mod != NULL
+                && strstr(c->top_mod, "clkhdr") != NULL)
+               mp[nmp].icg = true;
+            if (pp->is_output && !mp[nmp].icg)
+               for (int gi = 0; gi < ngat; gi++)
+                  if (strcmp(gater_nets[gi], pp->name) == 0) {
+                     mp[nmp].icg = true;
+                     break;
+                  }
             nmp++;
          }
          fprintf(bf, ");\n");
@@ -13421,6 +13503,64 @@ static void model_cycle(rt_model_t *m)
             break;
          else if (heap_min_key(m->eventq_heap) > m->now)
             break;
+      }
+   }
+
+   // ONE-SHOT X-CONSISTENCY RE-EVALUATION (accel event-hole closure).
+   // Accel publications certain-ize rim bytes on their own timeline; an
+   // interp comb that evaluated while an input was still X never sees the
+   // X->certain EVENT the all-interp run would have produced, so its stale
+   // X output recirculates (VeeR: the IFC island missed its 35ns settle and
+   // the X reached CSR-address case-dispatch). After a few timesteps -- the
+   // reset window has stamped real values everywhere -- re-run the driver
+   // procs of every net still carrying X: they recompute from live certain
+   // inputs. Spurious wakeups are legal VHDL (edge guards no-op), so no
+   // proc classification is needed. NVC_ACCEL_XCONS=<timesteps> tunes the
+   // trigger (default 8; 0 disables).
+   {
+      static int xcons_at = -2;
+      static int xcons_steps = 0;
+      static uint64_t xcons_last = UINT64_C(0xffffffffffffffff);
+      if (xcons_at == -2) {
+         // DEFAULT OFF: measured on VeeR, the spurious re-runs X-marked
+         // 68k previously-certain nets — l3d outputs recomputed while ANY
+         // input is legitimately X (uninitialized BP arrays) go X, where
+         // the stale-but-certain original evaluation was the right answer.
+         // The certainty plane is TIMING-SENSITIVE; blanket re-evaluation
+         // violates it. Keep as an experimental knob only.
+         const char *e = getenv("NVC_ACCEL_XCONS");
+         xcons_at = e ? atoi(e) : 0;
+      }
+      if (xcons_at > 0 && m->aj_chunk_count > 0
+          && m->now != xcons_last) {
+         xcons_last = m->now;
+         if (++xcons_steps == xcons_at) {
+            xcons_at = 0;   // one-shot
+            hash_t *woken = hash_new(1024);
+            int nwake = 0;
+            for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+               if (n->signal == NULL) continue;
+               const unsigned char *db = nexus_effective(n);
+               bool isx = false;
+               for (int e2 = 0; e2 < n->width && !isx; e2++)
+                  if (db[(size_t)e2 * n->size] & 4) isx = true;
+               if (!isx) continue;
+               for (rt_source_t *s = &(n->sources); s != NULL;
+                    s = s->chain_input) {
+                  if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+                     continue;
+                  rt_proc_t *p = s->u.driver.proc;
+                  if (hash_get(woken, p) != NULL) continue;
+                  hash_put(woken, p, p);
+                  deltaq_insert_proc(m, 0, p);
+                  nwake++;
+               }
+            }
+            hash_free(woken);
+            if (nwake > 0)
+               notef("accel-jit: X-consistency sweep re-ran %d proc(s)",
+                     nwake);
+         }
       }
    }
 
