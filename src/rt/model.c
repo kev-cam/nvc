@@ -1997,6 +1997,9 @@ struct _aj_chunk {
    bool             gater;           // clock-gate cell chunk: ICG latch rules
    uint64_t         ck_flip_now;     // timestep whose fall already flipped (+1)
    rt_signal_t     *primary_ck;      // bindtab[4] clock's signal (edge arming)
+   const uint8_t   *rst_data;        // NVC_ACCEL_RST_HOLD: reset pin live bytes
+   bool             rst_low;         //   active-low (pin name ends _l/_n/_b)
+   bool             rst_released;    //   sticky: deassert seen, pass-through
    void           (*set_clklast)(void *, unsigned char);  // bridge accessor
    uint64_t         ck_arm_now;      // timestep whose rise this chunk consumed
    rt_scope_t      *scope;           // installed subtree root
@@ -2320,6 +2323,10 @@ static bool aj_verify_diff(const unsigned char *ip, const unsigned char *ap,
    return false;
 }
 
+static inline int aj_rst_hold(void);
+static void aj_rst_release(rt_model_t *m, aj_chunk_t *c);
+static void aj_lower(char *dst, const char *src, size_t n);
+
 static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
 {
    // Recover this proc's chunk from its vtable (first field), establish the
@@ -2411,6 +2418,19 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       for (unsigned j = 0; j < chunk->snap_nin; j++)
          chunk->bindtab[chunk->snap_map[j].slot] =
             chunk->snap + chunk->snap_map[j].off;
+   // NVC_ACCEL_RST_HOLD release trigger: outputs byte-stable since the seed
+   // never re-poke aj_out, so the reset assertion must ALSO be checked at
+   // eval entry or their latches would never flush (the bridge change-gates
+   // on o_prev).  This is the flush that lands AT the interp settle edge:
+   // chunk evals fire on clock edges, so the first eval with reset driven-
+   // asserted IS the edge where interp's sync resets clear.  Reads LIVE
+   // reset bytes (not the snapshot).
+   if (aj_rst_hold() && !chunk->rst_released && chunk->rst_data != NULL
+       && m->now > 0) {
+      const unsigned rb = chunk->rst_data[0];
+      if ((rb & 2) && (chunk->rst_low ? !(rb & 1) : (rb & 1)))
+         aj_rst_release(m, chunk);
+   }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
    if (use_snap)
       for (unsigned j = 0; j < chunk->snap_nin; j++)
@@ -2447,6 +2467,10 @@ struct _aj_defer_out {
    bool           verify_flagged;  // NVC_ACCEL_VERIFY: already reported diverged
    bool           off_edge;   // seen changing on a non-posedge delta => Mealy/
                               // combinational => never route through NBA region
+   unsigned char *rh_latch;   // NVC_ACCEL_RST_HOLD: bytes latched during reset
+   void          *rh_sigp;    //   publication target for the release flush
+   int            rh_width;   //   deposit element count for the flush
+   bool           rh_have;    //   latch holds bytes awaiting the release
 };
 
 // NVC_ACCEL_VERIFY report: compact logic3d-bytes -> value hex (bit0 of each
@@ -2481,6 +2505,83 @@ static void aj_verify_report(void *sigp, const unsigned char *interp,
 // output table (g_aj_cur_chunk, set by aj_proc_eval). A deferred output is
 // copied into its shadow (the swap publishes it later); a non-deferred output
 // falls back to the immediate deposit, exactly as before.
+static inline int aj_rst_hold(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("NVC_ACCEL_RST_HOLD");
+      v = e ? atoi(e) : 0;
+   }
+   return v;
+}
+
+// RST_HOLD release anchor: the chunk's own rst input rim is usually DEAD
+// (its glue proc was rerouted with the subtree), frozen at init bytes — a
+// release condition read there fires spuriously (measured: driven-0 at 5ns
+// read as an active-low assertion).  Anchor instead on the LIVE root of the
+// reset network: the shallowest signal under the model root whose leaf name
+// is an rst-family match — the TB drives that one directly.
+static rt_signal_t *aj_rst_root_find(rt_scope_t *s, const char *base,
+                                     bool low, int depth)
+{
+   for (int si = 0; si < s->signals.count; si++) {
+      rt_signal_t *sig = s->signals.items[si];
+      if (sig->where == NULL) continue;
+      char nm[32];
+      aj_lower(nm, istr(tree_ident(sig->where)), sizeof nm);
+      const char *n = nm;
+      if (n[0] == 's' && n[1] == '_') n += 2;   // tb s_ prefix
+      size_t nl = strlen(n);
+      if (low && nl > 2 && n[nl - 2] == '_'
+          && (n[nl - 1] == 'l' || n[nl - 1] == 'n' || n[nl - 1] == 'b'))
+         nl -= 2;
+      if (nl == strlen(base) && strncmp(n, base, nl) == 0)
+         return sig;
+   }
+   if (depth <= 0) return NULL;
+   for (int ci = 0; ci < s->children.count; ci++) {
+      rt_signal_t *hit = aj_rst_root_find(s->children.items[ci], base, low,
+                                          depth - 1);
+      if (hit != NULL) return hit;
+   }
+   return NULL;
+}
+
+// NVC_ACCEL_RST_HOLD release: flush every publication latched during the
+// reset window (the RST_HOLD branch in aj_out) and switch the chunk to
+// sticky pass-through.  Immediate deposits: the flush IS the interp
+// mass-settle instant — the X->certain byte changes are real events that
+// wake the readers, and intra-instant delta order is immaterial (the
+// reference's own settle lands at d=4 and its d=3 readers heal from the
+// wake the same way).
+static void aj_rst_release(rt_model_t *m, aj_chunk_t *c)
+{
+   c->rst_released = true;
+   int nfl = 0;
+   for (unsigned ord = 0; ord < c->defer_count; ord++)
+      nfl += c->defer_outs[ord].rh_have ? 1 : 0;
+   notef("accel-jit: RST_HOLD release (%d latched) at %"PRIi64, nfl,
+         model_now(m, NULL));
+   for (unsigned ord = 0; ord < c->defer_count; ord++) {
+      aj_defer_out_t *d = &c->defer_outs[ord];
+      if (!d->rh_have || d->rh_sigp == NULL)
+         continue;
+      d->rh_have = false;
+      if (c->out_drv_n != NULL)
+         for (int k = 0; k < c->out_drv_n[ord]; k++) {
+            struct aj_odrv *od = &c->out_drv[ord][k];
+            copy_value_ptr(od->nx, &od->src->u.driver.waveforms.value,
+                           d->rh_latch + od->off);
+         }
+      deposit_signal(m, (rt_signal_t *)d->rh_sigp, d->rh_latch, 0,
+                     d->rh_width);
+      if (c->out_extra_n != NULL)
+         for (int k = 0; k < c->out_extra_n[ord]; k++)
+            deposit_signal(m, c->out_extra[ord][k], d->rh_latch, 0,
+                           d->rh_width);
+   }
+}
+
 static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
 {
    rt_model_t *m = g_aj_model;
@@ -2583,6 +2684,46 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
        && c->out_extra_n != NULL)
       for (int k = 0; k < c->out_extra_n[ord]; k++)
          aj_pub[aj_npub++] = c->out_extra[ord][k];
+
+   // NVC_ACCEL_RST_HOLD: hold publications while the chunk's reset input is
+   // asserted.  Measured on fused VeeR: the interp reference keeps the rim
+   // plane X through the reset window and mass-settles X->certain at the
+   // first post-reset edge (20,333 rim events at t=35ns d=4 in the ref, all
+   // absent from the fused run because chunk seeds certain-ized the same
+   // nets at t=0 d=3 — values identical, wake EVENTS gone; comb islands
+   // that wake on the settle recirculate captured X instead: the cyc86-89
+   // event-hole).  Latch here, flush at the first post-deassert eval — the
+   // X->certain byte change then lands at the interp settle instant as a
+   // real event.  Gated-clock (icg) outputs are exempt: clocks must toggle
+   // during reset.
+   // Release condition: the first instant reset is DRIVEN and ASSERTED —
+   // that is when the interp flops CLEAR (sync $adff at the first edge
+   // under assertion; measured: VeeR S_RST_L is high 0-30ns, asserts low at
+   // 30ns, the interp mass-settle is the 35ns edge).  Driven matters: the
+   // t=0 seed runs while the pin still holds undriven init bytes, which
+   // must read as hold, not as an active-low assertion.
+   if (aj_rst_hold() && c != NULL && !c->rst_released && c->rst_data != NULL
+       && ord >= 0 && (unsigned)ord < c->defer_count) {
+      // now>0: at t=0 the rst rim still holds its INIT bytes (driven-0)
+      // until the tb value propagates through glue — indistinguishable from
+      // an active-low assertion (measured: all 14 chunks released at 0ms+1).
+      const unsigned rb = c->rst_data[0];
+      if (m->now == 0
+          || !((rb & 2) && (c->rst_low ? !(rb & 1) : (rb & 1)))) {
+         aj_defer_out_t *d = &c->defer_outs[ord];
+         if (!d->icg) {
+            if (d->rh_latch == NULL)
+               d->rh_latch = xmalloc(d->valuesz);
+            memcpy(d->rh_latch, buf, d->valuesz);
+            d->rh_sigp  = sigp;
+            d->rh_width = width;
+            d->rh_have  = true;
+            return;
+         }
+      }
+      else
+         aj_rst_release(m, c);   // reset now active: flush, then pass through
+   }
 
    // Refresh the original (rerouted) procs' drivers on this output: port
    // propagation and resolution read DRIVING values, not the deposited
@@ -4782,8 +4923,10 @@ static void aj_accel_teardown(rt_model_t *m)
    if (m->aj_chunk_count > 0) {
       aj_chunk_t *c = m->aj_chunks[--m->aj_chunk_count];
       if (c->defer_outs != NULL) {
-         for (unsigned i = 0; i < c->defer_count; i++)
+         for (unsigned i = 0; i < c->defer_count; i++) {
             free(c->defer_outs[i].shadow);
+            free(c->defer_outs[i].rh_latch);
+         }
          free(c->defer_outs);
       }
       free(c->bindtab);
@@ -5214,6 +5357,57 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          for (int k = 0; k < chunk->n_ck_sigs; k++)
             if (chunk->ck_sigs[k] == pins[i].sig) { dup0 = true; break; }
          if (!dup0) chunk->ck_sigs[chunk->n_ck_sigs++] = pins[i].sig;
+      }
+      // NVC_ACCEL_RST_HOLD: remember the reset input's live bytes.  Matched
+      // on the pin's BASE name (merged member prefix m<N>_ stripped);
+      // trailing _l/_n/_b means active-low.  Reset SEMANTICS still come
+      // from the netlist ($adff / D-mux) — this pin only gates WHEN
+      // publications become visible (see the RST_HOLD branch in aj_out).
+      if (!spec && chunk->rst_data == NULL && pins[i].data != NULL) {
+         const char *bn = pins[i].name;
+         if (bn[0] == 'm') {
+            const char *us = bn + 1;
+            while (*us >= '0' && *us <= '9') us++;
+            if (us > bn + 1 && *us == '_') bn = us + 1;
+         }
+         char base[32];
+         const size_t bl = strlen(bn);
+         if (bl < sizeof base) {
+            memcpy(base, bn, bl + 1);
+            bool low = false;
+            if (bl > 2 && base[bl - 2] == '_' && (base[bl - 1] == 'l'
+                || base[bl - 1] == 'n' || base[bl - 1] == 'b')) {
+               low = true;
+               base[bl - 2] = '\0';
+            }
+            const size_t xl = strlen(base);
+            const char *tail = xl >= 3 ? base + xl - 3 : base;
+            // tail "rst" only at a word boundary: core_rst matches, the
+            // JTAG trst does NOT (it is not the functional reset and is
+            // typically static — anchoring on it would hold forever).
+            const bool tail_rst = strcmp(tail, "rst") == 0
+               && (xl == 3 || base[xl - 4] == '_');
+            if (strcmp(base, "rst") == 0 || strcmp(base, "reset") == 0
+                || strcmp(base, "resetn") == 0 || tail_rst
+                || (xl >= 5 && strcmp(base + xl - 5, "reset") == 0)) {
+               chunk->rst_low = low || strcmp(base, "resetn") == 0;
+               // the pin's own rim is usually dead (rerouted glue) — anchor
+               // the release read on the live root of the reset network
+               rt_signal_t *rr = aj_rst_root_find(m->root, base,
+                                                  chunk->rst_low, 3);
+               if (rr == NULL)
+                  rr = aj_rst_root_find(m->root, "rst", chunk->rst_low, 3);
+               if (rr == NULL)
+                  rr = aj_rst_root_find(m->root, "reset", chunk->rst_low, 3);
+               chunk->rst_data = rr != NULL
+                  ? (const uint8_t *)rr->shared.data : pins[i].data;
+               if (aj_rst_hold())
+                  notef("accel-jit: RST_HOLD arm pin '%s' (%s) anchor=%s",
+                        pins[i].name, chunk->rst_low ? "low" : "high",
+                        rr != NULL && rr->where != NULL
+                           ? istr(tree_ident(rr->where)) : "(pin rim)");
+            }
+         }
       }
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       const size_t nb = (size_t)pins[i].width * pins[i].elem;
