@@ -3355,6 +3355,18 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
                                 const void *values, int offset, size_t count,
                                 bool wake_next);
 
+uint64_t g_aj_dep_nx = 0, g_aj_dep_noop = 0, g_aj_dep_w1 = 0,
+         g_aj_dep_chg = 0;
+__attribute__((destructor))
+static void aj_dep_stats_dump(void)
+{
+   if (g_aj_dep_nx > 0 && getenv("NVC_DEP_STATS") != NULL)
+      fprintf(stderr, "#DEPSTATS nx=%"PRIu64" changed=%"PRIu64
+              " noop=%"PRIu64" w1=%"PRIu64"\n",
+              g_aj_dep_nx, g_aj_dep_chg, g_aj_dep_nx - g_aj_dep_chg,
+              g_aj_dep_w1);
+}
+
 typedef struct {
    char         name[512];
    rt_signal_t *sig;
@@ -14931,7 +14943,22 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
          continue;
       }
 
+      // NVC_DEP_STATS census (VeeR interp, 3000ns): 77.3M nexus visits,
+      // 93.1% byte-equal no-ops.  A compare-first reorder was measured
+      // NEUTRAL (the no-op cost IS the compare; scaffolding is noise) —
+      // the deposit VOLUME is the target, and that fix belongs at codegen
+      // (shadow-gated deposit calls), not here.
+      { static int _ds = -1;
+        if (_ds < 0) _ds = getenv("NVC_DEP_STATS") != NULL;
+        if (_ds) {
+           extern uint64_t g_aj_dep_nx, g_aj_dep_w1;
+           g_aj_dep_nx++;
+           if (valuesz == 1) g_aj_dep_w1++;
+        } }
       if (!cmp_bytes(eff, vptr, valuesz) || g_aj_forceev) {
+         { static int _ds = -1;
+           if (_ds < 0) _ds = getenv("NVC_DEP_STATS") != NULL;
+           if (_ds) { extern uint64_t g_aj_dep_chg; g_aj_dep_chg++; } }
          copy2(last, eff, vptr, valuesz);
          m->trigger_epoch++;
 
