@@ -6840,6 +6840,30 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                top0, nseen);
          return false;
       }
+      // Oversized emissions DESCEND instead of admitting the whole subtree:
+      // a multi-MB .v (flattened RAM farm — eh2_ic_data class) was doomed
+      // either way (merge-excluded; singleton synth hangs; interpreted
+      // under NOFALLBACK) and, worse, admitting it here CONSUMED its
+      // interior — re-admitting ic_mem/ic_data dissolved the ICM/DCCM
+      // flop-bundle groups (14 groups/295 members -> 6/88) and LOST speed
+      // (16.5 -> 13.4 cyc/s).  Returning false makes accel_scan_scope
+      // recurse into the children, so the tractable interior becomes
+      // candidates piecewise.  OPT-IN (NVC_ACCEL_DESCEND_BIG=1): with the
+      // descend on, coverage jumps 14 groups/295 members -> 34/701 on
+      // VeeR (5 descents) but the retire stream diverges (28 retires
+      // diff=24 vs the window — deterministic), so a correctness bisect
+      // of the newly admitted interior chunk classes must land before
+      // this can default on.
+      if (getenv("NVC_ACCEL_DESCEND_BIG") != NULL) {
+         const char *bigenv = getenv("NVC_ACCEL_MERGE_MAX_MEMBER");
+         const long bigcap = bigenv ? atol(bigenv) : 2*1024*1024;
+         struct stat vst;
+         if (stat(vpath, &vst) == 0 && vst.st_size > bigcap) {
+            notef("accel-jit: subtree '%s' emission oversized (%ld bytes) — "
+                  "descending into children", top0, (long)vst.st_size);
+            return false;
+         }
+      }
       notef("accel-jit: emitted subtree '%s' -> %d modules -> %s",
             top0, nseen, vpath);
       snprintf(srcs[0], sizeof srcs[0], "%s", vpath);
