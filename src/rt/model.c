@@ -3033,7 +3033,22 @@ static void aj_lower(char *dst, const char *src, size_t n)
 }
 
 // Find a port signal by (lowercased) name in this scope or its parent.
+static uint64_t g_aj_hf_ns = 0, g_aj_hf_calls = 0;   // T0 startup audit
+static uint64_t g_aj_fs_ns = 0, g_aj_fs_calls = 0;
+
+static rt_signal_t *aj_find_signal_inner(rt_scope_t *scope,
+                                         const char *lname);
+
 static rt_signal_t *aj_find_signal(rt_scope_t *scope, const char *lname)
+{
+   const uint64_t t0 = get_timestamp_ns();
+   rt_signal_t *r = aj_find_signal_inner(scope, lname);
+   g_aj_fs_ns += get_timestamp_ns() - t0;
+   g_aj_fs_calls++;
+   return r;
+}
+
+static rt_signal_t *aj_find_signal_inner(rt_scope_t *scope, const char *lname)
 {
    for (rt_scope_t *s = scope; s != NULL; s = s->parent) {
       for (int i = 0; i < s->signals.count; i++) {
@@ -4747,6 +4762,10 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
    done = true;
 
    const bool dbg = getenv("NVC_ACCEL_QUENCH_DBG") != NULL;
+   notef("accel-jit: T0 audit: has_field %"PRIu64" calls %.1fs, "
+         "find_signal %"PRIu64" calls %.1fs",
+         g_aj_hf_calls, g_aj_hf_ns / 1e9,
+         g_aj_fs_calls, g_aj_fs_ns / 1e9);
    int nquench = 0, nlive = 0, nsync = 0;
 
    // Map bound output signal -> (chunk index << 16 | ord+1) so drivers on
@@ -5243,12 +5262,17 @@ static char *aj_read_file(const char *path)
 
 static bool aj_model_has_field(const char *dutc_text, const char *name)
 {
+   const uint64_t t0 = get_timestamp_ns();
    char n1[80], n2[96], n3[96];
    snprintf(n1, sizeof n1, "uint64_t _%s;", name);
    snprintf(n2, sizeof n2, "unsigned __int128 _%s;", name);
    snprintf(n3, sizeof n3, "uint32_t _%s[", name);   // wide limb array
-   return strstr(dutc_text, n1) != NULL || strstr(dutc_text, n2) != NULL
+   const bool hit = strstr(dutc_text, n1) != NULL
+       || strstr(dutc_text, n2) != NULL
        || strstr(dutc_text, n3) != NULL;
+   g_aj_hf_ns += get_timestamp_ns() - t0;
+   g_aj_hf_calls++;
+   return hit;
 }
 
 // Emit the address-baked bridge .c around the generated model.
@@ -6629,25 +6653,38 @@ static bool aj_uniquify_modules(const char *src, const char *dst,
    // binding — the 24-clusters bug one level up).  Mix referenced modules'
    // hashes into each module's hash until fixpoint (instantiation graphs
    // are acyclic, so <= nnames passes converge).
+   // The reference structure is PASS-INVARIANT (the text never changes) —
+   // precompute it once and iterate the hash folding over bitmaps.  The
+   // old form re-ran the strstr search over every module span on EVERY
+   // fixpoint pass: measured 71% of fused VeeR warm startup (~190s) inside
+   // one libc string kernel.  Fold order and in-place (Gauss-Seidel)
+   // updates are preserved exactly, so the resulting hashes — and the
+   // downstream synth/.so cache keys — are bit-identical.
+   static uint64_t refs[256][4];
+   memset(refs, 0, sizeof refs);
+   for (int i = 0; i < nnames; i++)
+      for (int j = 0; j < nnames; j++) {
+         if (j == i) continue;
+         const size_t jl = strlen(names[j]);
+         for (const char *t = nspan_s[i];
+              (t = strstr(t, names[j])) != NULL && t < nspan_e[i];
+              t += jl) {
+            const char b = (t > nspan_s[i]) ? t[-1] : ' ';
+            const char a = t[jl];
+            if (!(isalnum((unsigned char)b) || b == '_')
+                && !(isalnum((unsigned char)a) || a == '_')) {
+               refs[i][j >> 6] |= (uint64_t)1 << (j & 63);
+               break;   // one mix per referenced module is enough
+            }
+         }
+      }
    for (int pass = 0; pass < nnames; pass++) {
       bool changed = false;
       for (int i = 0; i < nnames; i++) {
          uint64_t h = nhash[i];
-         for (int j = 0; j < nnames; j++) {
-            if (j == i) continue;
-            const size_t jl = strlen(names[j]);
-            for (const char *t = nspan_s[i];
-                 (t = strstr(t, names[j])) != NULL && t < nspan_e[i];
-                 t += jl) {
-               const char b = (t > nspan_s[i]) ? t[-1] : ' ';
-               const char a = t[jl];
-               if (!(isalnum((unsigned char)b) || b == '_')
-                   && !(isalnum((unsigned char)a) || a == '_')) {
-                  h = (h ^ nhash[j]) * 1099511628211ULL;
-                  break;   // one mix per referenced module is enough
-               }
-            }
-         }
+         for (int j = 0; j < nnames; j++)
+            if (j != i && (refs[i][j >> 6] & ((uint64_t)1 << (j & 63))))
+               h = (h ^ nhash[j]) * 1099511628211ULL;
          if (h != nhash[i]) { nhash[i] = h; changed = true; }
       }
       if (!changed) break;
