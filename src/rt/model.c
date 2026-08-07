@@ -6102,6 +6102,19 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
         if (nicg > 0)
            notef("accel-jit: '%s': %d gated-clock (ICG) output(s)",
                  chunk->rs_top != NULL ? chunk->rs_top : "?", nicg); }
+      // #66 sibling-rim census: how many outputs carry same-scope same-name
+      // sibling deposit targets (the duplicated-rim glue class — the proven
+      // event-hole participant).  Bounds the coverage cost of declining
+      // such members from reroute at admission time.
+      { int nsib = 0, nx = 0;
+        if (chunk->out_extra_n != NULL)
+           for (int i2 = 0; i2 < ord; i2++)
+              if (chunk->out_extra_n[i2] > 0)
+                 { nsib++; nx += chunk->out_extra_n[i2]; }
+        if (nsib > 0)
+           notef("accel-jit: SIBRIM '%s': %d/%d output(s) have %d sibling "
+                 "rim(s)", chunk->rs_top != NULL ? chunk->rs_top : "?",
+                 nsib, ord, nx); }
       // bridged-output summary for the handoff link pass (output ordinal order)
       chunk->b_out = xcalloc_array(ord > 0 ? ord : 1, sizeof(aj_bpin_t));
       chunk->n_bout = ord;
