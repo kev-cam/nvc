@@ -6437,15 +6437,81 @@ static void lower_deposit(lower_unit_t *lu, tree_t stmt)
 
       vcode_reg_t count_reg = lower_array_total_len(lu, type, nets);
       vcode_reg_t data_reg = lower_array_data(value_reg);
-      emit_deposit(lower_array_data(nets), count_reg, data_reg);
+      vcode_reg_t nets_reg = lower_array_data(nets);
+
+      // Deposit gate: measured on VeeR interp, 93.1% of deposit-nexus
+      // visits carry bytes already equal to the effective value (77.3M
+      // visits in 3000ns; deposit+cmp ~15-20% of steady sim).  The
+      // runtime performs the same equality test only AFTER the JIT exit,
+      // split_nexus and per-nexus scaffolding — so compare inline against
+      // the resolved bytes and branch around the deposit entirely when
+      // nothing changes.  Byte-equal deposits are event-free no-ops in
+      // deposit_signal_impl, so skipping the call is observationally
+      // identical (forced nets: an equal-value deposit is LOST either
+      // way).  The NVC_ACCEL_FORCEEV diagnostic knob (force events on
+      // byte-equal deposits; measured neutral, default off) is bypassed
+      // by this gate.
+      vcode_type_t voffset = vtype_offset();
+      vcode_reg_t res_reg = emit_resolved(nets_reg, count_reg);
+
+      vcode_var_t i_var = lower_temp_var(lu, "depgate_i", voffset, voffset);
+      emit_store(emit_const(voffset, 0), i_var);
+
+      vcode_block_t head_bb = emit_block();
+      vcode_block_t body_bb = emit_block();
+      vcode_block_t next_bb = emit_block();
+      vcode_block_t diff_bb = emit_block();
+      vcode_block_t skip_bb = emit_block();
+      emit_jump(head_bb);
+
+      vcode_select_block(head_bb);
+      vcode_reg_t i_reg = emit_load(i_var);
+      vcode_reg_t done_reg = emit_cmp(VCODE_CMP_EQ, i_reg, count_reg);
+      emit_cond(done_reg, skip_bb, body_bb);
+
+      vcode_select_block(body_bb);
+      vcode_reg_t cur_reg = emit_load_indirect(emit_array_ref(res_reg, i_reg));
+      vcode_reg_t new_reg = emit_load_indirect(emit_array_ref(data_reg, i_reg));
+      vcode_reg_t neq_reg = emit_cmp(VCODE_CMP_NEQ, cur_reg, new_reg);
+      emit_cond(neq_reg, diff_bb, next_bb);
+
+      vcode_select_block(next_bb);
+      emit_store(emit_add(i_reg, emit_const(voffset, 1)), i_var);
+      emit_jump(head_bb);
+
+      vcode_select_block(diff_bb);
+      emit_deposit(nets_reg, count_reg, data_reg);
+      emit_jump(skip_bb);
+
+      vcode_select_block(skip_bb);
    }
    else if (type_is_record(type)) {
       vcode_reg_t locus = lower_debug_locus(value);
       lower_for_each_field_2(lu, type, value_type, nets, value_reg, locus,
                              lower_deposit_field_cb, NULL);
    }
-   else
-      emit_deposit(nets, emit_const(vtype_offset(), 1), value_reg);
+   else {
+      // Scalar deposit gate: the 77M VeeR deposit visits are per-wire
+      // scalar := writes (1 lane x 4-byte l3d elem), 93.1% byte-equal
+      // no-ops — the array-path gate above never sees them.  One inline
+      // load+compare skips the JIT exit and the whole runtime path when
+      // the value is unchanged (same observational-equivalence argument
+      // as the array gate).
+      vcode_reg_t one_reg = emit_const(vtype_offset(), 1);
+      vcode_reg_t res_ptr = emit_resolved(nets, one_reg);
+      vcode_reg_t cur_reg = emit_load_indirect(res_ptr);
+      vcode_reg_t neq_reg = emit_cmp(VCODE_CMP_NEQ, cur_reg, value_reg);
+
+      vcode_block_t dep_bb  = emit_block();
+      vcode_block_t skip_bb = emit_block();
+      emit_cond(neq_reg, dep_bb, skip_bb);
+
+      vcode_select_block(dep_bb);
+      emit_deposit(nets, one_reg, value_reg);
+      emit_jump(skip_bb);
+
+      vcode_select_block(skip_bb);
+   }
 }
 
 static void lower_release_field_cb(lower_unit_t *lu, tree_t field,
