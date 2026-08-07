@@ -4762,6 +4762,142 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
                      (void *)(((uintptr_t)ci << 16) | (ord + 1)));
    }
 
+   // NVC_ACCEL_STARVE_CENSUS: enumerate nexuses that have NO driver source
+   // at all, at least one interp reader pending, and live under a rerouted
+   // member scope — the STARVED INTERNALIZED RIM class (#66): the member
+   // proc that would drive them was rerouted before its first execution,
+   // so no source was ever created; the rim holds init bytes forever and
+   // its X mark poisons every interp reader cone (measured: the IFU/EXU
+   // island behind the missing cyc86-89 postsync pause).
+   if (getenv("NVC_ACCEL_STARVE_CENSUS") != NULL) {
+      hash_t *mscope = hash_new(4096);   // rerouted member scopes
+      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+         aj_chunk_t *c = m->aj_chunks[ci];
+         for (unsigned r = 0; r < c->rr_count; r++)
+            if (c->rr_saved[r].proc->scope != NULL)
+               hash_put(mscope, c->rr_saved[r].proc->scope, (void *)1);
+      }
+      hash_t *bysc = hash_new(1024);     // scope -> count (as uintptr)
+      int nstarve = 0, nsamp = 0;
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         if (n->signal == NULL || n->signal->parent == NULL) continue;
+         // Walk port hops to the ULTIMATE driving nexus (sv2vhdl rims are
+         // port-connected copies of the primitive's dout): liveness is
+         // judged there, not at the rim.
+         rt_nexus_t *un = n;
+         for (int hop = 0; hop < 16; hop++) {
+            rt_source_t *ps = NULL;
+            for (rt_source_t *s = &(un->sources); s != NULL;
+                 s = s->chain_input)
+               if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                  ps = s;
+            if (ps == NULL) break;
+            un = ps->u.port.input;
+         }
+         bool live = false;
+         for (rt_source_t *s = &(un->sources); s != NULL && !live;
+              s = s->chain_input)
+            if (s->tag == SOURCE_DRIVER && !s->disconnected
+                && !s->aj_rerouted)
+               live = true;
+         if (live) continue;
+         rt_scope_t *ps = n->signal->parent;
+         bool member = false;
+         for (rt_scope_t *w = ps; w != NULL && !member; w = w->parent)
+            if (hash_get(mscope, w) != NULL) member = true;
+         if (!member) continue;
+         int ninterp = 0;
+         void *pd = n->pending;
+         if (pointer_tag(pd) == 1) {
+            rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+            if (w->kind == W_PROC) ninterp = 1;
+         }
+         else if (pd != NULL) {
+            rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+            for (int i = 0; i < pl->count; i++)
+               if (pl->wake[i] != NULL && pl->wake[i]->kind == W_PROC)
+                  ninterp++;
+         }
+         if (ninterp == 0) continue;
+         nstarve++;
+         hash_put(bysc, ps,
+                  (void *)((uintptr_t)hash_get(bysc, ps) + 1));
+         if (nsamp < 30 && n->signal->where != NULL) {
+            nsamp++;
+            notef("accel-jit: STARVED %s.%s readers=%d",
+                  istr(ps->name), istr(tree_ident(n->signal->where)),
+                  ninterp);
+         }
+      }
+      // NVC_ACCEL_STARVE_NET=<substr>: full source/pending dump for
+      // matching signals — classifier ground truth
+      { const char *sn = getenv("NVC_ACCEL_STARVE_NET");
+        if (sn != NULL)
+           for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+              if (n->signal == NULL || n->signal->where == NULL) continue;
+              char ln[64];
+              aj_lower(ln, istr(tree_ident(n->signal->where)), sizeof ln);
+              if (strstr(ln, sn) == NULL) continue;
+              // walk to the ultimate driving nexus, dump ITS sources
+              rt_nexus_t *un = n;
+              for (int hop = 0; hop < 16; hop++) {
+                 rt_source_t *ps = NULL;
+                 for (rt_source_t *s = &(un->sources); s != NULL;
+                      s = s->chain_input)
+                    if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                       ps = s;
+                 if (ps == NULL) break;
+                 un = ps->u.port.input;
+              }
+              hash_t *rrm = hash_new(32768);
+              for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+                 aj_chunk_t *c = m->aj_chunks[ci];
+                 for (unsigned r = 0; r < c->rr_count; r++)
+                    hash_put(rrm, c->rr_saved[r].proc, (void *)1);
+              }
+              int nsrc = 0;
+              for (rt_source_t *s = &(un->sources); s != NULL;
+                   s = s->chain_input, nsrc++) {
+                 rt_proc_t *dp = s->tag == SOURCE_DRIVER
+                    ? s->u.driver.proc : NULL;
+                 notef("accel-jit: SNET %s ULT sc=%s src%d tag=%d disc=%u "
+                       "rr=%u proc=%s pscope=%s inrr=%d fastclk=%d "
+                       "vt_chunk=%d", ln,
+                       un->signal != NULL && un->signal->parent != NULL
+                          ? istr(un->signal->parent->name) : "?",
+                       nsrc, (int)s->tag, (unsigned)s->disconnected,
+                       (unsigned)s->aj_rerouted,
+                       dp != NULL ? istr(dp->name) : "-",
+                       dp != NULL && dp->scope != NULL
+                          ? istr(dp->scope->name) : "-",
+                       dp != NULL ? (hash_get(rrm, dp) != NULL) : -1,
+                       dp != NULL ? (int)dp->wakeable.fastclk : -1,
+                       dp != NULL
+                          ? (aj_chunk_of_proc(m, dp) != NULL) : -1);
+              }
+              hash_free(rrm);
+              int npend = 0;
+              void *pd = n->pending;
+              if (pointer_tag(pd) == 1) npend = 1;
+              else if (pd != NULL) {
+                 rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+                 npend = pl->count;
+              }
+              notef("accel-jit: SNET %s: %d source(s), %d pending", ln,
+                    nsrc, npend);
+           } }
+      notef("accel-jit: STARVE census: %d driverless member-scope "
+            "nexus(es) with interp readers", nstarve);
+      const void *sk; void *sv;
+      for (hash_iter_t it = HASH_BEGIN;
+           hash_iter(bysc, &it, &sk, &sv); )
+         if ((uintptr_t)sv >= 8)
+            notef("accel-jit: STARVE scope %s: %d",
+                  istr(((rt_scope_t *)sk)->name), (int)(uintptr_t)sv);
+      hash_free(bysc);
+      hash_free(mscope);
+   }
+
    // RESTORE PASS: a rerouted proc whose driven nets have live interp
    // readers but NO chunk publication is rim GLUE the boundary missed
    // (readable/plain copies, fanout assigns, stall derivations). The chunk
@@ -4771,49 +4907,106 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
    // interp vtable back: they re-derive the net from published inputs.
    // Only procs driving NO published net qualify (no double-drive risk).
    {
+      // Reroute membership by rr_saved, not vtable identity (direct-entry
+      // rewrapping repoints vtables later; rr_saved is the ground truth).
+      hash_t *rrmap = hash_new(32768);
+      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+         aj_chunk_t *c = m->aj_chunks[ci];
+         for (unsigned r = 0; r < c->rr_count; r++)
+            hash_put(rrmap, c->rr_saved[r].proc, c);
+      }
+      // Readers sit on the port-chain HEAD (the sv2vhdl rim copy the interp
+      // procs actually read); the rerouted driver sits on the chain TAIL
+      // (the primitive's dout).  Correlating them same-nexus never fires —
+      // measured: a_ff_e2 rim with 5-8 interp readers, driver a_e2_ff:_p0
+      // rerouted two port hops down, restore count 0, rim X-marked forever
+      // (the starved-rim island behind the missing cyc86-89 pause).  Walk
+      // each read rim to its ultimate driving nexus and attribute the
+      // readers THERE.
+      // Complete publication map: every bridged output signal of every
+      // chunk (b_out), NOT just the negflip sigp subset in bmap — with the
+      // subset, published standalone-chunk outputs classified as
+      // unpublished and their rerouted drivers were restored into
+      // double-drives (measured: 4/6 accelbench PERINST mismatches).
+      hash_t *pubmap = hash_new(4096);
+      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+         aj_chunk_t *c = m->aj_chunks[ci];
+         for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++)
+            if (c->b_out[bo].sig != NULL)
+               hash_put(pubmap, c->b_out[bo].sig, (void *)1);
+      }
       hash_t *pflag = hash_new(4096);   // proc -> 1=unpub-with-reader 2=pub
       for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
-         for (rt_source_t *s = &(n->sources); s != NULL; s = s->chain_input) {
+         bool irdr = false;
+         void *pd = n->pending;
+         if (pointer_tag(pd) == 1) {
+            rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+            if (w->kind == W_PROC && hash_get(rrmap,
+                   container_of(w, rt_proc_t, wakeable)) == NULL)
+               irdr = true;
+         }
+         else if (pd != NULL) {
+            rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+            for (int i = 0; i < pl->count && !irdr; i++) {
+               rt_wakeable_t *w = pl->wake[i];
+               if (w != NULL && w->kind == W_PROC && hash_get(rrmap,
+                      container_of(w, rt_proc_t, wakeable)) == NULL)
+                  irdr = true;
+            }
+         }
+         const bool pub = n->signal != NULL
+            && (hash_get(bmap, n->signal) != NULL
+                || hash_get(pubmap, n->signal) != NULL);
+         if (!irdr && !pub)
+            continue;
+         rt_nexus_t *un = n;
+         for (int hop = 0; hop < 16; hop++) {
+            rt_source_t *ps = NULL;
+            for (rt_source_t *s = &(un->sources); s != NULL;
+                 s = s->chain_input)
+               if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                  ps = s;
+            if (ps == NULL) break;
+            un = ps->u.port.input;
+         }
+         for (rt_source_t *s = &(un->sources); s != NULL;
+              s = s->chain_input) {
             if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
                continue;
             rt_proc_t *p = s->u.driver.proc;
-            if (aj_chunk_of_proc(m, p) == NULL)
+            if (hash_get(rrmap, p) == NULL)
                continue;
             uintptr_t fl = (uintptr_t)hash_get(pflag, p);
-            if (n->signal != NULL && hash_get(bmap, n->signal) != NULL)
-               fl |= 2;
-            else {
-               bool irdr = false;
-               void *pd = n->pending;
-               if (pointer_tag(pd) == 1) {
-                  rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
-                  if (w->kind == W_PROC && aj_chunk_of_proc(m,
-                         container_of(w, rt_proc_t, wakeable)) == NULL)
-                     irdr = true;
-               }
-               else if (pd != NULL) {
-                  rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
-                  for (int i = 0; i < pl->count && !irdr; i++) {
-                     rt_wakeable_t *w = pl->wake[i];
-                     if (w != NULL && w->kind == W_PROC && aj_chunk_of_proc(m,
-                            container_of(w, rt_proc_t, wakeable)) == NULL)
-                        irdr = true;
-                  }
-               }
-               if (irdr) fl |= 1;
-            }
+            if (pub) fl |= 2;
+            if (irdr) fl |= 1;
             hash_put(pflag, p, (void *)fl);
          }
       }
-      int nrestore = 0;
+      hash_free(rrmap);
+      hash_free(pubmap);
+      int nrestore = 0, nvt = 0;
+      { int fd[4] = {0,0,0,0}; unsigned nrr = 0;
+        for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+           aj_chunk_t *c = m->aj_chunks[ci];
+           nrr += c->rr_count;
+           for (unsigned r = 0; r < c->rr_count; r++) {
+              uintptr_t fl = (uintptr_t)hash_get(pflag, c->rr_saved[r].proc);
+              if (fl < 4) fd[fl]++;
+           }
+        }
+        if (dbg)
+           notef("accel-jit: restore-pass: %u rr — none=%d unpub+rdr=%d "
+                 "pub=%d pub+rdr=%d", nrr, fd[0], fd[1], fd[2], fd[3]); }
       for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
          aj_chunk_t *c = m->aj_chunks[ci];
          for (unsigned r = 0; r < c->rr_count; r++) {
             rt_proc_t *p = c->rr_saved[r].proc;
             if ((uintptr_t)hash_get(pflag, p) != 1)
                continue;   // qualifies only: unpublished-with-reader, no pub
-            if (p->vtable != &c->vtable)
+            if (p->vtable != &c->vtable) {
+               nvt++;
                continue;
+            }
             proc_set_vtable(p, c->rr_saved[r].vt);
             deltaq_insert_proc(m, 0, p);   // catch up on missed events
             nrestore++;
@@ -4822,9 +5015,100 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
          }
       }
       hash_free(pflag);
-      if (nrestore > 0)
-         notef("accel-jit: restored %d rim-glue proc(s) to the interpreter",
-               nrestore);
+      if (nrestore > 0 || nvt > 0)
+         notef("accel-jit: restored %d rim-glue proc(s) to the interpreter"
+               " (%d skipped: foreign vtable)", nrestore, nvt);
+
+      // SAME-ULTIMATE-NEXUS PUBLICATION FANOUT (#66): a flop's single dout
+      // feeds several port-connected rims; the chunk publishes ONE of them
+      // (its bridged output) while a sibling rim with its own interp
+      // readers starves at init-X forever (per-proc restore cannot help:
+      // 278 procs classify pub+rdr — restoring would double-drive the
+      // published rim).  Register every reader-bearing rim that port-walks
+      // to the SAME ultimate nexus as a published output as an out_extra
+      // deposit target of that ord, and back-fill it once from the
+      // published rim's current bytes so quiescent outputs do not leave it
+      // at init until their first change.
+      {
+         hash_t *umap = hash_new(4096);   // ultimate nexus -> (ci<<16|ord+1)
+         for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+            aj_chunk_t *c = m->aj_chunks[ci];
+            for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++) {
+               if (c->b_out[bo].sig == NULL) continue;
+               rt_nexus_t *un = &c->b_out[bo].sig->nexus;
+               for (int hop = 0; hop < 16; hop++) {
+                  rt_source_t *ps = NULL;
+                  for (rt_source_t *s = &(un->sources); s != NULL;
+                       s = s->chain_input)
+                     if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                        ps = s;
+                  if (ps == NULL) break;
+                  un = ps->u.port.input;
+               }
+               if (hash_get(umap, un) == NULL)
+                  hash_put(umap, un,
+                           (void *)(((uintptr_t)ci << 16) | (bo + 1)));
+            }
+         }
+         int nfan = 0, nfull = 0;
+         for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+            if (n->signal == NULL) continue;
+            bool irdr = false;
+            void *pd = n->pending;
+            if (pointer_tag(pd) == 1) {
+               rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+               irdr = w->kind == W_PROC;
+            }
+            else if (pd != NULL) {
+               rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+               for (int i = 0; i < pl->count && !irdr; i++)
+                  irdr = pl->wake[i] != NULL
+                     && pl->wake[i]->kind == W_PROC;
+            }
+            if (!irdr) continue;
+            rt_nexus_t *un = n;
+            for (int hop = 0; hop < 16; hop++) {
+               rt_source_t *ps = NULL;
+               for (rt_source_t *s = &(un->sources); s != NULL;
+                    s = s->chain_input)
+                  if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                     ps = s;
+               if (ps == NULL) break;
+               un = ps->u.port.input;
+            }
+            void *uv = hash_get(umap, un);
+            if (uv == NULL) continue;
+            const unsigned ci  = (unsigned)((uintptr_t)uv >> 16);
+            const unsigned ord = (unsigned)((uintptr_t)uv & 0xffff) - 1;
+            aj_chunk_t *oc = m->aj_chunks[ci];
+            rt_signal_t *pub = oc->b_out[ord].sig;
+            rt_signal_t *sib = n->signal;
+            if (sib == pub || sib->shared.size != pub->shared.size)
+               continue;
+            if (ord >= oc->defer_count) continue;
+            if (oc->out_extra == NULL) {
+               oc->out_extra   = xcalloc_array(oc->defer_count,
+                                               sizeof(*oc->out_extra));
+               oc->out_extra_n = xcalloc_array(oc->defer_count, 1);
+            }
+            bool dup = false;
+            for (int k = 0; k < oc->out_extra_n[ord] && !dup; k++)
+               dup = oc->out_extra[ord][k] == sib;
+            if (dup) continue;
+            if (oc->out_extra_n[ord] >= 6) { nfull++; continue; }
+            oc->out_extra[ord][oc->out_extra_n[ord]++] = sib;
+            // back-fill from the published rim's current effective bytes
+            deposit_signal(m, sib,
+                           nexus_effective(&pub->nexus), 0,
+                           oc->b_out[ord].width);
+            nfan++;
+         }
+         hash_free(umap);
+         if (nfan > 0 || nfull > 0)
+            notef("accel-jit: %d same-net sibling rim(s) added to the "
+                  "publication fanout (%d dropped: extra table full)",
+                  nfan, nfull);
+      }
    }
 
    for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
