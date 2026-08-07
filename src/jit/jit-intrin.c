@@ -2688,14 +2688,31 @@ static void l3d_addsub(jit_scalar_t *args, tlab_t *tlab, int sub)
    }
 
    int32_t *r = __tlab_alloc(tlab, (size_t)W * sizeof(int32_t), 8);
-   int carry = sub;   // subtract: start carry at 1 for a + ~b + 1
-   for (int s = 0; s < W; s++) {   // s = significance, 0 = LSB
-      const int abit = (s < la) ? (a[la - 1 - s] & 1) : 0;
-      int bbit = (s < lb) ? (b[lb - 1 - s] & 1) : 0;
-      if (sub) bbit ^= 1;
-      const int sum = abit + bbit + carry;
-      r[W - 1 - s] = 2 + (sum & 1);   // 2=L3D_0, 3=L3D_1 (driven, certain)
-      carry = sum >> 1;
+   if (W <= 64) {
+      // Pack the value bits into one machine word and add ONCE: the
+      // bit-serial ripple below cost ~8 ops per bit and l3d_addsub was
+      // 6.8% of VeeR interp sim time.  Semantics are identical for every
+      // input: both forms read only bit 0 of each lane (value plane) and
+      // emit driven-certain bits (2|bit).
+      uint64_t av = 0, bv = 0;
+      for (int s = 0; s < la; s++)
+         av |= (uint64_t)(a[la - 1 - s] & 1) << s;
+      for (int s = 0; s < lb; s++)
+         bv |= (uint64_t)(b[lb - 1 - s] & 1) << s;
+      const uint64_t sv = sub ? av - bv : av + bv;
+      for (int s = 0; s < W; s++)
+         r[W - 1 - s] = 2 + (int32_t)((sv >> s) & 1);
+   }
+   else {
+      int carry = sub;   // subtract: start carry at 1 for a + ~b + 1
+      for (int s = 0; s < W; s++) {   // s = significance, 0 = LSB
+         const int abit = (s < la) ? (a[la - 1 - s] & 1) : 0;
+         int bbit = (s < lb) ? (b[lb - 1 - s] & 1) : 0;
+         if (sub) bbit ^= 1;
+         const int sum = abit + bbit + carry;
+         r[W - 1 - s] = 2 + (sum & 1);   // 2=L3D_0, 3=L3D_1 (driven, certain)
+         carry = sum >> 1;
+      }
    }
 
    args[0].pointer = r;
