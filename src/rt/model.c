@@ -8060,6 +8060,27 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
 static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
                              const char *accel_dir)
 {
+   // NVC_ACCEL_EXCLUDE=<substr,...>: TRUE PRUNE — no acceleration AND no
+   // descent below a matching scope path.  Distinct from NVC_ACCEL_SKIP,
+   // which declines a subtree but lets the walk recurse into its children:
+   // under DESCEND_BIG that made SKIP change chunk GRANULARITY instead of
+   // excluding logic (bisect configs regrouped 34->40->56 installs and the
+   // divergence signature shifted each time — unusable for isolation).
+   { static const char *ex = NULL; static int exi = -1;
+     if (exi < 0) { ex = getenv("NVC_ACCEL_EXCLUDE"); exi = ex ? 1 : 0; }
+     if (exi && scope->name != NULL) {
+        char sn[512];
+        snprintf(sn, sizeof sn, "%s", istr(scope->name));
+        for (char *p = sn; *p; p++) *p = tolower((unsigned char)*p);
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s", ex);
+        for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+           if (t[0] != '\0' && strstr(sn, t) != NULL) {
+              notef("accel-jit: scope %s EXCLUDED (no accel, no descent)",
+                    istr(scope->name));
+              return;
+           }
+     } }
    // JIT subtree path: work down from the top, accelerate the first
    // synthesizable subtree that compiles, and don't recurse into it.
    if (getenv("NVC_ACCEL_JIT") != NULL) {
