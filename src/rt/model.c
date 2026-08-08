@@ -5117,6 +5117,15 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
             if (sib == pub || sib->shared.size != pub->shared.size)
                continue;
             if (ord >= oc->defer_count) continue;
+            // Clock-class outputs are EXEMPT: they publish through the
+            // dedicated icg immediate path with runt-hold semantics, and
+            // fanning their siblings here delivers rise+fall compressed
+            // into one instant on the sibling nets (measured on the
+            // DESCEND config: LSU_C1_DC*_CLK / BUS_IBUF_C1_CLK siblings
+            // pulsed rise@845+fall@845 while the primary held correctly —
+            // downstream flops missed edges and stalls arrived late).
+            if (oc->defer_outs[ord].icg)
+               continue;
             if (oc->out_extra == NULL) {
                oc->out_extra   = xcalloc_array(oc->defer_count,
                                                sizeof(*oc->out_extra));
