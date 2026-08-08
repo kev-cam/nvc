@@ -9153,8 +9153,54 @@ void accel_levelize(rt_model_t *m)
    aj_levelize_analyze(m);
 }
 
+// NVC_COLLAPSE_CENSUS: sizing data for elaboration-level port aliasing
+// (task #59 / the SMP double-bank directive).  A "pure rim" nexus — exactly
+// one source and it is a conversion-free SOURCE_PORT — is storage that
+// port-collapse would eliminate entirely (its bytes become an alias of the
+// driving side; no SOURCE_PORT edge, no update walk, no rim deposit).  The
+// census reports how much of the design that class covers, deciding
+// whether the alias mechanism is worth building for this code base.
+static void aj_collapse_census_scope(rt_scope_t *s, long ctr[8])
+{
+   for (int i = 0; i < s->signals.count; i++) {
+      rt_signal_t *sig = s->signals.items[i];
+      rt_nexus_t *n = &sig->nexus;
+      for (unsigned k = 0; k < sig->n_nexus; k++, n = n->chain) {
+         ctr[0]++;                                   // nexuses
+         ctr[1] += n->width * n->size;               // bytes
+         if (n->n_sources == 1 && n->sources.tag == SOURCE_PORT) {
+            if (n->sources.u.port.conv_func == NULL) {
+               ctr[2]++;                             // pure rims
+               ctr[3] += n->width * n->size;
+               if (sig->resolution == NULL) {
+                  ctr[4]++;                          // unresolved pure rims
+                  ctr[5] += n->width * n->size;
+               }
+            }
+            else
+               ctr[6]++;                             // conversion rims
+         }
+         else if (n->n_sources == 0)
+            ctr[7]++;                                // undriven
+      }
+   }
+   for (int i = 0; i < s->children.count; i++)
+      aj_collapse_census_scope(s->children.items[i], ctr);
+}
+
 void accel_auto(rt_model_t *m)
 {
+   if (getenv("NVC_COLLAPSE_CENSUS") != NULL) {
+      long ctr[8] = {0};
+      aj_collapse_census_scope(root_scope(m), ctr);
+      notef("collapse-census: nexuses=%ld bytes=%ld pure_rims=%ld (%.1f%%) "
+            "rim_bytes=%ld (%.1f%%) unresolved_rims=%ld urim_bytes=%ld "
+            "conv_rims=%ld undriven=%ld",
+            ctr[0], ctr[1], ctr[2],
+            ctr[0] ? 100.0 * ctr[2] / ctr[0] : 0.0,
+            ctr[3], ctr[1] ? 100.0 * ctr[3] / ctr[1] : 0.0,
+            ctr[4], ctr[5], ctr[6], ctr[7]);
+   }
    aj_levelize_analyze(m);
    g_aj_verify = getenv("NVC_ACCEL_VERIFY") != NULL;
    g_aj_verify_skipx = getenv("NVC_ACCEL_VERIFY_X") != NULL;
