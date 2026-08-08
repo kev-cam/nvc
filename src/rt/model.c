@@ -2216,16 +2216,22 @@ static int aj_snap_mode(void)
    static int mode = -1;
    if (mode < 0) {
       const char *e = getenv("NVC_ACCEL_SNAP_MODE");
-      mode = e ? atoi(e) : 0;   // PARKED: mode 4 is coherent only for
-                                // single-clock chunks -- an armed eval on a
-                                // multi-clock chunk (eh2_dec) reads primary
-                                // inputs from the pre-edge arena while its
-                                // extra-clock samplers and comb settle read
-                                // live, and the mixed view wedges the machine
-                                // at reset (all-zero TRACE_PKT, 0 retires at
-                                // 400ns).  The coherent form is PRODUCER-side
-                                // per-net banking (NVC_ACCEL_BANK defer/swap)
-                                // -- see task #53.
+      mode = e ? atoi(e) : 0;   // Default OFF, but the original park reason
+                                // is CURED: the historical wedge (armed eval
+                                // reads primary inputs pre-edge while extra-
+                                // clock samplers read live -- the mixed view
+                                // zeroed TRACE_PKT at reset) is resolved by
+                                // excluding clock pins from snap_map (clocks
+                                // live, data pre-edge -- the coherent flop
+                                // view).  Measured 2026-08-08: SNAP_MODE=4
+                                // fixes the DESCEND 1100ns bus-phase race
+                                // (27/nt0, was 28/nt11; standing full ladder
+                                // + hello clean) BUT descend diverges at
+                                // 3000ns depth (205 retires vs 125) -- a
+                                // second late-manifesting defect, open.  Not
+                                // default until that is mechanized.  The
+                                // producer-side per-net banking (#53) remains
+                                // the structural alternative.
       if (getenv("NVC_ACCEL_NO_SNAP") != NULL) mode = 0;
    }
    return mode;
@@ -2489,6 +2495,17 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
               g_aj_ev_armed[ci]++;
         }
      } }
+   // NVC_ACCEL_ARMTRACE=<substr of rs_top>: per-eval arming/snapshot
+   // engagement trace (model.c side of EVTRACE — the bridge cannot see
+   // armed_rose/use_snap).
+   { static const char *_at = (const char *)-1;
+     if (_at == (const char *)-1) _at = getenv("NVC_ACCEL_ARMTRACE");
+     if (_at != NULL && chunk->rs_top != NULL
+         && strstr(chunk->rs_top, _at) != NULL)
+        fprintf(stderr, "[arm %s] t=%"PRIi64"+%u armed=%d extra=%d snap=%d "
+                "snapnow=%"PRIu64"\n", chunk->rs_top, m->now, m->iteration,
+                (int)armed_rose, (int)extra_rose, (int)use_snap,
+                m->aj_snap_now); }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
    if (use_snap)
       for (unsigned j = 0; j < chunk->snap_nin; j++)
@@ -5487,6 +5504,14 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          }
       }
    }
+   // SM_GROUP0_REGS: how many registers the MAIN clock group actually
+   // clocks (-1 when the model predates the marker).  0 with extras means
+   // the wrapper clk pin is a DEAD net — see the dead-primary redirect
+   // after clock subscription below.
+   long g0regs = -1;
+   { const char *g0p = strstr(dut_text, "#define SM_GROUP0_REGS ");
+     if (g0p != NULL)
+        g0regs = atol(g0p + strlen("#define SM_GROUP0_REGS ")); }
 
    // Per-BIT vector clocks: gen_statemachine names a group on bit N of a
    // vector clock wire "<wire>__b<N>" (EH2's active_thread_l2clk[1:0] — one
@@ -6020,6 +6045,39 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          snprintf(chunk->b_in[bi].name, sizeof chunk->b_in[bi].name,
                   "%s", pp->name);
       }
+      // DEAD-PRIMARY REDIRECT (SM_GROUP0_REGS, see gen_statemachine): the
+      // model's main clock group has NO registers but extra clock groups
+      // exist — the wrapper clk pin is a dead net (FPGA-shape members whose
+      // flops run on rawclk extras), so every phase keyed on primary_ck
+      // (edge arming, pre-edge snapshot, negflip staged-output publication)
+      // never fires: outputs fall into mixed immediate/late publication
+      // (measured on merged_31: dout_readable +5ns late, rsp-valid Q one
+      // full cycle early — the descend nt11 bus-phase shift).  Re-key
+      // primary_ck to a LIVE subscribed clock: prefer an underived ck_sig,
+      // else the first non-primary one.  bindtab[4] keeps the wrapper-clk
+      // bytes — the empty group 0 makes the netlist clklast inert.
+      if (g0regs == 0 && nck > 0 && chunk->primary_ck != NULL) {
+         rt_signal_t *live = NULL;
+         for (int k = 0; k < chunk->n_ck_sigs && live == NULL; k++) {
+            rt_signal_t *cs = chunk->ck_sigs[k];
+            if (cs != NULL && cs != chunk->primary_ck
+                && !aj_clk_is_derived(m, cs))
+               live = cs;
+         }
+         for (int k = 0; k < chunk->n_ck_sigs && live == NULL; k++)
+            if (chunk->ck_sigs[k] != NULL
+                && chunk->ck_sigs[k] != chunk->primary_ck)
+               live = chunk->ck_sigs[k];
+         if (live != NULL) {
+            notef("accel-jit: group-0 empty (%d extra clock group(s)) — "
+                  "primary re-keyed %s -> %s", nck,
+                  chunk->primary_ck->where != NULL
+                     ? istr(tree_ident(chunk->primary_ck->where)) : "?",
+                  live->where != NULL
+                     ? istr(tree_ident(live->where)) : "?");
+            chunk->primary_ck = live;
+         }
+      }
    }
    fprintf(f, "  return _chg;\n}\n\n");
    fprintf(f, "void accel_eval(void *p, void **AJB){\n  aj_cs_t *aj_cs = p;\n");
@@ -6321,6 +6379,42 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // fixpoint nvc's interpreted delta loop reaches. No lookahead needed: outputs
    // are deposited THIS delta (below) and propagate immediately via wakeup.
    fprintf(f, "  if(!_fused) sm_comb(&S,&in,&o);\n");
+   // NVC_ACCEL_EVTRACE=<substr of scope tag>: UNCONDITIONAL per-eval trace
+   // (t, delta, pe/mask/chg/fused + every narrow *din* input and *dout*
+   // output).  CK_TRACE is count-limited from t=0 and INDUMP/SMDUMP are
+   // gated on `posedge` — which a dead-primary chunk NEVER raises — so none
+   // of them can watch a same-instant capture mid-run.  This one can.
+   fprintf(f, "  { static int _evt=-2; if(_evt==-2){ const char *e="
+              "getenv(\"NVC_ACCEL_EVTRACE\");"
+              " _evt=(e && strstr(\"%s\", e))?1:0; }\n",
+           istr(chunk->scope->name));
+   if (nck > 0)   // posedge_mask/_chg/_fused exist only in multi-clock bridges
+      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %s] t=%%lld+%%u pe=%%d"
+                 " mask=0x%%x chg=%%d fused=%%d\","
+                 " t, d, posedge, posedge_mask, _chg, _fused);\n",
+              istr(chunk->scope->name));
+   else
+      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %s] t=%%lld+%%u"
+                 " pe=%%d\", t, d, posedge);\n",
+              istr(chunk->scope->name));
+   { int nf = 0;
+     for (int i = 0; i < npins && nf < 16; i++) {
+        if (pins[i].width > 64 || !aj_model_has_field(dut_text, pins[i].name))
+           continue;
+        if (!pins[i].is_output && strstr(pins[i].name, "din") != NULL) {
+           fprintf(f, "    fprintf(stderr,\" %s=%%llx\","
+                      "(unsigned long long)in._%s);\n",
+                   pins[i].name, pins[i].name);
+           nf++;
+        }
+        else if (pins[i].is_output && strstr(pins[i].name, "dout") != NULL) {
+           fprintf(f, "    fprintf(stderr,\" %s=%%llx\","
+                      "(unsigned long long)o._%s);\n",
+                   pins[i].name, pins[i].name);
+           nf++;
+        }
+     } }
+   fprintf(f, "    fprintf(stderr,\"\\n\"); } }\n");
    // NVC_ACCEL_SMDUMP: dump the accel model's ALL internal nets (registers +
    // combinational) once per cycle at the posedge, in the REAL sim — accurate
    // multi-clock + real stimulus. Trace where a divergence enters a cone that
@@ -7181,7 +7275,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
    // stale and re-emit+recompile from the cached synth .c.  v2: true
    // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v3"; *p; p++)
+   for (const char *p = "bridge-v4"; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -7989,7 +8083,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v3"; *p; p++)
+        for (const char *p = "bridge-v4"; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
