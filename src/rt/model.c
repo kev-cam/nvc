@@ -7872,12 +7872,19 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                   "(NOFALLBACK)", c->top_mod);
          continue;
       }
-      // Group-size cap: one 68-member fused synth ate two 8h VeeR budgets.
-      // Overflow members stay unclaimed and form sibling groups on the same
-      // root in later iterations — several bounded synths instead of one
-      // unbounded one.  NVC_ACCEL_MERGE_MAX_GROUP overrides (default 24).
+      // Group-size cap: one 68-member fused synth once ate two 8h VeeR
+      // budgets — but that predates the synth wall-clock (an overrunning
+      // synth now degrades to a decline), so the cap is a shaping knob, not
+      // a safety valve.  Overflow members stay unclaimed and form sibling
+      // groups on the same root in later iterations — several bounded
+      // synths instead of one unbounded one.  Default RAISED 24 -> 96 on
+      // the measured VeeR ladder (2026-08-08, all full-ladder clean incl
+      // hello cycles=2519): cap 24 = 14 groups / 16.5 cyc/s marginal;
+      // cap 48 = 8 groups / 23.5; cap 96 = 6 groups / 32.4 — fewer, bigger
+      // fused chunks cut the residual interp machinery tax (the measured
+      // dominant cost).  NVC_ACCEL_MERGE_MAX_GROUP overrides.
       const char *gcenv = getenv("NVC_ACCEL_MERGE_MAX_GROUP");
-      const int gcap = gcenv ? atoi(gcenv) : 24;
+      const int gcap = gcenv ? atoi(gcenv) : 96;
       for (int j = i + 1; j < g_aj_ncand && nmem < gcap && nmem < 4096; j++)
          if (!claimed[j]
              && g_aj_cands[j].ck_root == g_aj_cands[i].ck_root
