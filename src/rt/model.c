@@ -2431,6 +2431,19 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       if ((rb & 2) && (chunk->rst_low ? !(rb & 1) : (rb & 1)))
          aj_rst_release(m, chunk);
    }
+   { static int _ec = -1;
+     if (_ec < 0) _ec = getenv("NVC_ACCEL_EVAL_STATS") != NULL;
+     if (_ec && chunk->primary_ck != NULL) {
+        extern uint64_t g_aj_ev_rise[64], g_aj_ev_fall[64];
+        unsigned ci = 0;
+        for (; ci < m->aj_chunk_count && m->aj_chunks[ci] != chunk; ci++);
+        if (ci < 64) {
+           if (chunk->primary_ck->shared.data[0] & 1)
+              g_aj_ev_rise[ci]++;
+           else
+              g_aj_ev_fall[ci]++;
+        }
+     } }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
    if (use_snap)
       for (unsigned j = 0; j < chunk->snap_nin; j++)
@@ -3357,6 +3370,16 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
 
 uint64_t g_aj_dep_nx = 0, g_aj_dep_noop = 0, g_aj_dep_w1 = 0,
          g_aj_dep_chg = 0;
+uint64_t g_aj_ev_rise[64], g_aj_ev_fall[64];
+__attribute__((destructor))
+static void aj_eval_stats_dump(void)
+{
+   if (getenv("NVC_ACCEL_EVAL_STATS") == NULL) return;
+   for (int i = 0; i < 64; i++)
+      if (g_aj_ev_rise[i] + g_aj_ev_fall[i] > 0)
+         fprintf(stderr, "#EVSTATS chunk%d rise=%"PRIu64" fall=%"PRIu64"\n",
+                 i, g_aj_ev_rise[i], g_aj_ev_fall[i]);
+}
 __attribute__((destructor))
 static void aj_dep_stats_dump(void)
 {
