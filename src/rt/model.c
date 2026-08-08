@@ -2002,6 +2002,8 @@ struct _aj_chunk {
    bool             rst_released;    //   sticky: deassert seen, pass-through
    void           (*set_clklast)(void *, unsigned char);  // bridge accessor
    uint64_t         ck_arm_now;      // timestep whose rise this chunk consumed
+   uint64_t         ck_xarm_now;     // timestep whose EXTRA-clock rise engaged
+                                     // the pre-edge snapshot (once per instant)
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
@@ -2397,6 +2399,31 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       if (armed_rose) chunk->ck_arm_now = (uint64_t)m->now + 1;  // +1: 0 unused
       (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
    }
+   // EXTRA-clock rise: engage the mode-4 pre-edge snapshot even when the
+   // PRIMARY did not rise.  A chunk can be clocked entirely by non-primary
+   // pins (measured: merged_31 — FPGA-shape members whose `clk` pin carries
+   // a never-rising gated net while the flops clock on rawclk extras); its
+   // extra-clock families fire inside the bridge from live clock bytes, so
+   // without this the data inputs are read LIVE post-edge and every flop
+   // captures ONE CYCLE EARLY (bus_last_data_beat 10ns ahead).  Primary
+   // set_clklast semantics stay untouched: no primary edge is manufactured.
+   bool extra_rose = false;
+   if (!no_arm && chunk->primary_ck != NULL) {
+      for (int k = 0; k < chunk->n_ck_sigs && !extra_rose; k++) {
+         rt_signal_t *cs = chunk->ck_sigs[k];
+         if (cs == NULL || cs == chunk->primary_ck)
+            continue;
+         if (cs->nexus.last_event == (uint64_t)m->now
+             && (cs->shared.data[0] & 1))
+            extra_rose = true;
+      }
+      if (extra_rose) {
+         if (chunk->ck_xarm_now == (uint64_t)m->now + 1)
+            extra_rose = false;   // once per instant (same trap as ck_arm_now)
+         else
+            chunk->ck_xarm_now = (uint64_t)m->now + 1;
+      }
+   }
    // Two-phase edge sampling (see struct _aj_chunk and aj_snap_mode).
    // Mode 4 (default): armed posedge evals read the per-timestep pre-edge
    // snapshot, everything else reads live.  Modes 1-3: historical forms
@@ -2410,7 +2437,7 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       const bool par = relaxed_load(&g_par_active);
       if (par) nvc_lock(&snap_lock);
       aj_snap_fleet_take(m);   // lazy taker: no-op if the boundary hoist ran
-      use_snap = aj_snap_mode() >= 4 ? armed_rose : true;
+      use_snap = aj_snap_mode() >= 4 ? (armed_rose || extra_rose) : true;
       if (use_snap) g_aj_snap_used++;
       if (par) nvc_unlock(&snap_lock);
    }
@@ -2435,13 +2462,31 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
      if (_ec < 0) _ec = getenv("NVC_ACCEL_EVAL_STATS") != NULL;
      if (_ec && chunk->primary_ck != NULL) {
         extern uint64_t g_aj_ev_rise[64], g_aj_ev_fall[64];
+        extern uint64_t g_aj_ev_rise_bt[64], g_aj_ev_armed[64];
+        extern char g_aj_ev_name[64][48], g_aj_ev_ck[64][48];
         unsigned ci = 0;
         for (; ci < m->aj_chunk_count && m->aj_chunks[ci] != chunk; ci++);
         if (ci < 64) {
+           if (g_aj_ev_name[ci][0] == '\0') {
+              snprintf(g_aj_ev_name[ci], sizeof g_aj_ev_name[ci], "%s",
+                       chunk->rs_top != NULL ? chunk->rs_top : "?");
+              snprintf(g_aj_ev_ck[ci], sizeof g_aj_ev_ck[ci], "%s",
+                       chunk->primary_ck->where != NULL
+                          ? istr(tree_ident(chunk->primary_ck->where)) : "?");
+           }
            if (chunk->primary_ck->shared.data[0] & 1)
               g_aj_ev_rise[ci]++;
            else
               g_aj_ev_fall[ci]++;
+           // Cross-check byte source: bindtab[4] is what the BRIDGE reads as
+           // the primary clock.  rise==0 while rise_bt>0 means primary_ck's
+           // signal bytes are NOT the bytes driving the netlist (pointer /
+           // rim mismatch) — exactly the arming failure being hunted.
+           const uint8_t *bt = (const uint8_t *)chunk->bindtab[4];
+           if (bt != NULL && (bt[0] & 1))
+              g_aj_ev_rise_bt[ci]++;
+           if (armed_rose || extra_rose)
+              g_aj_ev_armed[ci]++;
         }
      } }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
@@ -3371,14 +3416,18 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
 uint64_t g_aj_dep_nx = 0, g_aj_dep_noop = 0, g_aj_dep_w1 = 0,
          g_aj_dep_chg = 0;
 uint64_t g_aj_ev_rise[64], g_aj_ev_fall[64];
+uint64_t g_aj_ev_rise_bt[64], g_aj_ev_armed[64];
+char g_aj_ev_name[64][48], g_aj_ev_ck[64][48];
 __attribute__((destructor))
 static void aj_eval_stats_dump(void)
 {
    if (getenv("NVC_ACCEL_EVAL_STATS") == NULL) return;
    for (int i = 0; i < 64; i++)
       if (g_aj_ev_rise[i] + g_aj_ev_fall[i] > 0)
-         fprintf(stderr, "#EVSTATS chunk%d rise=%"PRIu64" fall=%"PRIu64"\n",
-                 i, g_aj_ev_rise[i], g_aj_ev_fall[i]);
+         fprintf(stderr, "#EVSTATS chunk%d rise=%"PRIu64" fall=%"PRIu64
+                 " rise_bt=%"PRIu64" armed=%"PRIu64" name=%s primary=%s\n",
+                 i, g_aj_ev_rise[i], g_aj_ev_fall[i], g_aj_ev_rise_bt[i],
+                 g_aj_ev_armed[i], g_aj_ev_name[i], g_aj_ev_ck[i]);
 }
 __attribute__((destructor))
 static void aj_dep_stats_dump(void)
@@ -4121,6 +4170,28 @@ static rt_nexus_t *aj_ultimate_driver_nexus(rt_nexus_t *n, int depth)
    return n;
 }
 
+// Diagnostic (MERGE_DRYRUN member dump): is this clock signal produced
+// inside `cand` (some driver proc's scope is cand or a descendant)?  A
+// self-produced-primary theory of the DESCEND BUSCLK freeze was tested
+// and REFUTED with this predicate (the BUSCLK group was 7 pure consumers;
+// the real cause was a POISONED synth-cache entry — see aj_stage_source).
+// Kept for grouping inspection: a group whose primary really were one of
+// its own outputs would be worth seeing in the dryrun listing.
+static bool aj_clk_self_produced(rt_signal_t *clksig, rt_scope_t *cand)
+{
+   if (clksig == NULL || cand == NULL || clksig->n_nexus != 1)
+      return false;
+   for (rt_source_t *s = &(clksig->nexus.sources); s != NULL;
+        s = s->chain_input) {
+      if (s->tag != SOURCE_DRIVER || s->u.driver.proc == NULL)
+         continue;
+      for (rt_scope_t *w = s->u.driver.proc->scope; w != NULL; w = w->parent)
+         if (w == cand)
+            return true;
+   }
+   return false;
+}
+
 static bool aj_clk_is_derived(rt_model_t *m, rt_signal_t *clksig)
 {
    if (clksig == NULL || clksig->n_nexus != 1) return false;
@@ -4636,6 +4707,11 @@ static void aj_respecialize(rt_model_t *m)
       // spec bakes _coinc as a constant — a mode flip must miss the cache
       h = (h ^ (getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 5u : 9u))
          * 1099511628211ull;
+      // Fold the model identity in: two CONFIGS can share top name and flag
+      // vectors while binding different logic (rs_dutc is content-keyed), and
+      // an unkeyed spec name would cache one config's spec under the other's.
+      for (const char *p = c->rs_dutc ? c->rs_dutc : ""; *p; p++)
+         h = (h ^ (uint8_t)*p) * 1099511628211ull;
 
       char dir[512];
       snprintf(dir, sizeof dir, "%s", c->rs_bridge);
@@ -4643,7 +4719,8 @@ static void aj_respecialize(rt_model_t *m)
       if (slash != NULL) *slash = '\0';
       else snprintf(dir, sizeof dir, ".");
       char specc[600], specso[600];
-      snprintf(specc,  sizeof specc,  "%s/aj_%s_bridge_spec.c", dir, c->rs_top);
+      snprintf(specc,  sizeof specc,  "%s/aj_%s_spec_%016llx_bridge.c", dir,
+               c->rs_top, (unsigned long long)h);
       snprintf(specso, sizeof specso, "%s/aj_%s_spec_%016llx.so", dir, c->rs_top,
                (unsigned long long)h);
 
@@ -4657,8 +4734,10 @@ static void aj_respecialize(rt_model_t *m)
          if (cc == NULL) cc = "gcc -g -O3";
          const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
          char cmd[2048];
-         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
-                  cc, smd, specso, specc);
+         snprintf(cmd, sizeof cmd,
+                  "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
+                  cc, smd, specso, (int)getpid(), specc, specso, (int)getpid(),
+                  specso);
          if (system(cmd) != 0 || access(specso, F_OK) != 0) {
             warnf("accel-jit: respec compile failed for '%s' — keeping generic",
                   c->rs_top);
@@ -5297,6 +5376,45 @@ static char *aj_read_file(const char *path)
    return buf;
 }
 
+// Anti-poisoning staging for the synth cache.  The cache was poisoned by a
+// two-process race: one run content-hashed its just-emitted wrapper .v, a
+// concurrent run with a DIFFERENT config rewrote the same shared-named file
+// before gen_statemachine read it, and the OTHER config's netlist was cached
+// under this config's key — permanently, because every later run recomputes
+// the same key and trusts the cached file (measured: merged_30 lost its
+// entire active_clk register family, lsu_bus_clk_en_q read as constant 0 and
+// LSU BUSCLK froze from cyc70 in the DESCEND config only).  The fix is to
+// hand gen_statemachine a KEY-NAMED PRIVATE COPY of the exact bytes that
+// went into the hash: same key => same bytes by construction, so whatever
+// other processes do to the shared-named emissions cannot cross configs.
+static void aj_staged_path(char *out, size_t outsz, const char *accel_dir,
+                           const char *keyname, uint64_t vhash, int idx)
+{
+   snprintf(out, outsz, "%s/ajk_%s_%016llx_s%d.v", accel_dir, keyname,
+            (unsigned long long)vhash, idx);
+}
+
+static bool aj_stage_source(const char *accel_dir, const char *keyname,
+                            uint64_t vhash, int idx, const char *text)
+{
+   char path[600];
+   aj_staged_path(path, sizeof path, accel_dir, keyname, vhash, idx);
+   const size_t n = strlen(text);
+   struct stat st;
+   if (stat(path, &st) == 0 && (size_t)st.st_size == n)
+      return true;   // key-named => content-determined; size guards truncation
+   char tmp[640];
+   snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+   FILE *f = fopen(tmp, "wb");
+   if (f == NULL) return false;
+   const bool wok = fwrite(text, 1, n, f) == n;
+   if (fclose(f) != 0 || !wok || rename(tmp, path) != 0) {
+      unlink(tmp);
+      return false;
+   }
+   return true;
+}
+
 // gen_statemachine declares each scalar/vector port as "uint64_t _<name>;" for
 // <=64 bits, or as a limb array "uint32_t _<name>[N];" for a >64-bit port (the
 // scalable wide path). Match either spelling — a wide port that fails this check
@@ -5763,14 +5881,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       }
       if (!aj_model_has_field(dut_text, pins[i].name)) continue;
       const size_t nb = (size_t)pins[i].width * pins[i].elem;
+      bool is_ck = strcmp(pins[i].name, "clk") == 0;
+      for (int k = 0; k < nck && !is_ck; k++)
+         if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       if (!spec) {
          chunk->bindtab[6 + bridged_in] = pins[i].data;
          // snapshot slot for the two-phase edge sampling (see struct);
          // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
          // must remain visible same-delta), only clocked/timed sources
-         // are edge-sampled
-         bool snap_this = true;
-         if (aj_snap_mode() == 3 && pins[i].sig != NULL)
+         // are edge-sampled.  CLOCK pins are NEVER snapshotted: the
+         // bridge's extra-clock edge-detects must see the live post-rise
+         // byte or a snapshot-engaged eval could not fire them at all
+         // (measured on merged_31: FPGA-shape members whose `clk` pin is a
+         // dead gated net and whose real clocking is rawclk extras).
+         bool snap_this = !is_ck;
+         if (snap_this && aj_snap_mode() == 3 && pins[i].sig != NULL)
             snap_this = !aj_nexus_driver_is_comb(m, &pins[i].sig->nexus, 0);
          if (snap_this) {
             snap_live[n_snap] = pins[i].data;
@@ -5779,9 +5904,6 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             n_snap++;
          }
       }
-      bool is_ck = strcmp(pins[i].name, "clk") == 0;
-      for (int k = 0; k < nck && !is_ck; k++)
-         if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       // Record every clock INPUT signal for aj_subscribe_clocks (below). This
       // is the only place that knows which pins are clocks: `clk` by name and
       // the rest from the model's sm_extra_clocks[] table.
@@ -7012,18 +7134,31 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
      if (stat(aj_gen_sm(), &gst) == 0)
         vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+   char **vtexts = xcalloc_array(nsrc, sizeof(char *));
    for (int i = 0; i < nsrc; i++) {
       char *vtext = aj_read_file(srcs[i]);
       if (vtext != NULL) {
          for (const char *p = vtext; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
-         free(vtext);
+         vtexts[i] = vtext;   // staged below once the full key is known
       }
    }
+   // Stage the HASHED bytes under the key so gen_statemachine reads exactly
+   // what was hashed (see aj_stage_source).  A failed stage falls back to
+   // the shared-named source: correct in the single-process case.
+   bool staged = true;
+   for (int i = 0; i < nsrc; i++) {
+      if (vtexts[i] == NULL
+          || !aj_stage_source(accel_dir, top, vhash, i, vtexts[i]))
+         staged = false;
+      free(vtexts[i]);
+   }
+   free(vtexts);
 
    char dutc[600], bridge[600], so[600];
    snprintf(dutc,   sizeof dutc,   "%s/aj_%s_%016llx.c", accel_dir, top,
             (unsigned long long)vhash);
-   snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, top);
+   snprintf(bridge, sizeof bridge, "%s/aj_%s_%016llx_bridge.c", accel_dir, top,
+            (unsigned long long)vhash);
 
    // TWO-TIER KEY.  The generated C above is keyed by vhash alone -- it is
    // derived from the LOGIC and is therefore portable: the same design yields
@@ -7102,8 +7237,14 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                         dir, tmo_s, aj_gen_sm());
       else
          off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
-      for (int i = 0; i < nsrc; i++)
-         off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[i]);
+      for (int i = 0; i < nsrc; i++) {
+         char sp[600];
+         if (staged)
+            aj_staged_path(sp, sizeof sp, accel_dir, top, vhash, i);
+         else
+            snprintf(sp, sizeof sp, "%s", srcs[i]);
+         off += snprintf(cmd + off, sizeof cmd - off, " '%s'", sp);
+      }
       // Re-synthesize with the elaboration's actual generics (width/depth/...).
       // The vhdl2vlog path emits already-elaborated modules (generics baked in),
       // so passing them would chparam a non-existent defparam and error.
@@ -7113,7 +7254,18 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
          notef("accel-jit: params %s", params);
       }
-      off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'", top_mod, dutc);
+      // Write-then-rename: a concurrent same-key synth must never leave a
+      // half-written dutc for another process (or a crash) to cache.  The
+      // _nvc.c byproduct (named by gen_statemachine from the output stem) is
+      // renamed alongside; its absence must not fail the synth.
+      char dutcbase[600];
+      snprintf(dutcbase, sizeof dutcbase, "%.*s", (int)strlen(dutc) - 2, dutc);
+      off += snprintf(cmd + off, sizeof cmd - off,
+                      " %s '%s_g%d.c' && mv -f '%s_g%d.c' '%s'"
+                      " && { mv -f '%s_g%d_nvc.c' '%s_nvc.c' 2>/dev/null"
+                      " || true; }",
+                      top_mod, dutcbase, (int)getpid(), dutcbase,
+                      (int)getpid(), dutc, dutcbase, (int)getpid(), dutcbase);
       notef("accel-jit: synth '%s' (top module '%s') from %d source(s)",
             top, top_mod, nsrc);
       const int src = system(cmd);
@@ -7310,7 +7462,9 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // NVC_ACCEL_SMDUMP: compile in sm_dump_comb (all internal nets) for the
       // real-sim internal-net probe (see aj_emit_bridge). Clear the cache to toggle.
       const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
-      snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'", cc, smd, so, bridge);
+      snprintf(cmd, sizeof cmd,
+               "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
+               cc, smd, so, (int)getpid(), bridge, so, (int)getpid(), so);
       if (system(cmd) != 0 || access(so, F_OK) != 0) {
          notef("accel-jit: compile failed for '%s'", top);
          aj_accel_teardown(m);
@@ -7643,6 +7797,19 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                "root sig %s", nmem, g_aj_cands[i].clk.name,
                (r != NULL && r->signal != NULL)
                   ? istr(tree_ident(r->signal->where)) : "?");
+         for (int k = 0; k < nmem; k++) {
+            aj_mcand_t *c = &g_aj_cands[members[k]];
+            int prodk = -1;
+            for (int k2 = 0; k2 < nmem && prodk < 0; k2++)
+               if (aj_clk_self_produced(c->clk.sig,
+                                        g_aj_cands[members[k2]].scope))
+                  prodk = k2;
+            notef("accel-jit:   m%d %s clk=%s sig=%s%s%d", k,
+                  c->scope != NULL ? istr(c->scope->name) : "?", c->clk.name,
+                  c->clk.sig != NULL
+                     ? istr(tree_ident(c->clk.sig->where)) : "?",
+                  prodk >= 0 ? " PRODUCED-BY-m" : " external", prodk);
+         }
          continue;
       }
       if (nmem < 2) {   // singleton: normal per-chunk install
@@ -7798,13 +7965,24 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
            vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
       for (const char *p = wname; *p; p++)
          { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+      char *mtexts[2] = { NULL, NULL };
       for (int s = 0; s < nsrc && ok; s++) {
          char *vtext = aj_read_file(srcs[s]);
          if (vtext != NULL) {
             for (const char *p = vtext; *p; p++)
                { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
-            free(vtext);
+            if (s < 2) mtexts[s] = vtext; else free(vtext);
          }
+      }
+      // Stage the HASHED bytes under the key (see aj_stage_source): what the
+      // key says is what gen_statemachine gets, even if a concurrent run with
+      // a different config rewrites the shared-named wrapper .v files.
+      bool mstaged = ok && nsrc <= 2;
+      for (int s = 0; s < nsrc && s < 2; s++) {
+         if (mtexts[s] == NULL
+             || !aj_stage_source(accel_dir, wname, vhash, s, mtexts[s]))
+            mstaged = false;
+         free(mtexts[s]);
       }
       uint64_t shash = vhash;
       { const char *cc = getenv("NVC_ACCEL_CC");
@@ -7820,7 +7998,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       char dutc[600], bridge[600], so[600];
       snprintf(dutc, sizeof dutc, "%s/aj_%s_%016llx.c", accel_dir, wname,
                (unsigned long long)vhash);
-      snprintf(bridge, sizeof bridge, "%s/aj_%s_bridge.c", accel_dir, wname);
+      snprintf(bridge, sizeof bridge, "%s/aj_%s_%016llx_bridge.c", accel_dir,
+               wname, (unsigned long long)vhash);
       snprintf(so, sizeof so, "%s/aj_%s_%016llx.so", accel_dir, wname,
                (unsigned long long)shash);
 
@@ -7855,10 +8034,25 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             else
                off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'",
                               accel_dir, aj_gen_sm());
-            for (int s = 0; s < nsrc; s++)
-               off += snprintf(cmd + off, sizeof cmd - off, " '%s'", srcs[s]);
-            off += snprintf(cmd + off, sizeof cmd - off, " %s '%s'",
-                            wname, dutc);
+            for (int s = 0; s < nsrc; s++) {
+               char sp[600];
+               if (mstaged)
+                  aj_staged_path(sp, sizeof sp, accel_dir, wname, vhash, s);
+               else
+                  snprintf(sp, sizeof sp, "%s", srcs[s]);
+               off += snprintf(cmd + off, sizeof cmd - off, " '%s'", sp);
+            }
+            // Write-then-rename (same rationale as the per-chunk path).
+            char dutcbase[600];
+            snprintf(dutcbase, sizeof dutcbase, "%.*s",
+                     (int)strlen(dutc) - 2, dutc);
+            off += snprintf(cmd + off, sizeof cmd - off,
+                            " %s '%s_g%d.c' && mv -f '%s_g%d.c' '%s'"
+                            " && { mv -f '%s_g%d_nvc.c' '%s_nvc.c' 2>/dev/null"
+                            " || true; }",
+                            wname, dutcbase, (int)getpid(), dutcbase,
+                            (int)getpid(), dutc, dutcbase, (int)getpid(),
+                            dutcbase);
             gr->cmd = xstrdup(cmd);
          }
          continue;   // synthesis (parallel) + install run after the loop
@@ -7886,8 +8080,9 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          if (!cc) cc = "gcc -g -O3";
          const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
          char cmd[8192];
-         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
-                  cc, smd, so, bridge);
+         snprintf(cmd, sizeof cmd,
+                  "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
+                  cc, smd, so, (int)getpid(), bridge, so, (int)getpid(), so);
          if (system(cmd) != 0 || access(so, F_OK) != 0) {
             notef("accel-jit: MERGE compile failed for '%s'", wname);
             aj_accel_teardown(m);
@@ -8020,8 +8215,10 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          if (!cc) cc = "gcc -g -O3";
          const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
          char cmd[8192];
-         snprintf(cmd, sizeof cmd, "%s %s -shared -fPIC -o '%s' '%s'",
-                  cc, smd, gr->so, gr->bridge);
+         snprintf(cmd, sizeof cmd,
+                  "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
+                  cc, smd, gr->so, (int)getpid(), gr->bridge, gr->so,
+                  (int)getpid(), gr->so);
          if (system(cmd) != 0 || access(gr->so, F_OK) != 0) {
             notef("accel-jit: MERGE compile failed for '%s'", gr->wname);
             aj_accel_teardown(m);
