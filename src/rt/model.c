@@ -13485,6 +13485,17 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
       }
    assert(orig != NULL);
    (*orig->deposit)(m, n, value);
+   // I2 write-through: mirror the committed plane-0 bytes into value
+   // bank B (plane 3).  Reads stay on plane 0 (JIT-compiled procs read
+   // shared+8 directly), so behavior is identical; the mirror proves the
+   // extra plane's allocation and write path.  I2.5 flips reads to the
+   // bank pair via the JIT sel lowering and drops this mirror.
+   {
+      rt_signal_t *sig = n->signal;
+      const size_t valuesz = (size_t)n->size * n->width;
+      memcpy(sig->shared.data + n->offset + 3 * sig->shared.size,
+             sig->shared.data + n->offset, valuesz);
+   }
    if (g_banked_st.count == g_banked_st.max) {
       g_banked_st.max = g_banked_st.max ? g_banked_st.max * 2 : 256;
       g_banked_st.items = xrealloc_array(g_banked_st.items, g_banked_st.max,
@@ -16014,7 +16025,15 @@ sig_shared_t *x_init_signal(int64_t count, uint32_t size, jit_scalar_t value,
               " sub-elements which is greater than the maximum supported %d",
               istr(tree_ident(where)), count, INT32_MAX);
 
-   const size_t datasz = MAX(3 * count * size, 8);
+   // NVC_BANKED I2: a fourth plane (value bank B) behind the env — the
+   // double-banked substrate.  Eligibility is unknown this early (sources
+   // register later), so every signal gets the plane; +33% signal bytes.
+   // Cached here because x_init_signal runs during elaboration, before
+   // accel_banked_init resolves g_banked.
+   static int banked_planes = 0;
+   if (banked_planes == 0)
+      banked_planes = getenv("NVC_BANKED") != NULL ? 4 : 3;
+   const size_t datasz = MAX((size_t)banked_planes * count * size, 8);
    rt_signal_t *s = static_alloc(m, sizeof(rt_signal_t) + datasz);
    setup_signal(m, s, where, count, size, flags, offset);
 
