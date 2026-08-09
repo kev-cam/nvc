@@ -9221,6 +9221,31 @@ static void aj_collapse_census_scope(rt_scope_t *s, long ctr[8])
 // unresolved, single-source nexuses currently on the default vtable (the
 // fast single-driver/memo1/lazy classes keep their specializations; the
 // banked class will absorb them in I2 once the second plane is real).
+// Banked eligibility also requires that NOTHING consumes the nexus's value
+// during the update phase, because staged deposits only land at the flip:
+// transfer processes (async_transfer_signal — the `q <= r` identity-assign
+// optimization — reads its SOURCE mid-phase; measured: gals's qa1/qa2/qb1
+// never updated and the fixture wedged at Y=0) and implicit signals (the
+// implicitq drains before the flip site).  Both register their wakeables
+// during initialization, before accel_banked_init runs, so an install-time
+// pending walk sees them.
+static bool aj_banked_pending_ok(void *pending)
+{
+   if (pointer_tag(pending) == 1) {
+      rt_wakeable_t *w = untag_pointer(pending, rt_wakeable_t);
+      return w->kind != W_TRANSFER && w->kind != W_IMPLICIT;
+   }
+   else if (pending != NULL) {
+      rt_pending_t *p = untag_pointer(pending, rt_pending_t);
+      for (int i = 0; i < p->count; i++) {
+         rt_wakeable_t *w = p->wake[i];
+         if (w == NULL) continue;
+         if (w->kind == W_TRANSFER || w->kind == W_IMPLICIT) return false;
+      }
+   }
+   return true;
+}
+
 static void aj_banked_install_scope(rt_scope_t *s)
 {
    for (int i = 0; i < s->signals.count; i++) {
@@ -9228,6 +9253,15 @@ static void aj_banked_install_scope(rt_scope_t *s)
       rt_nexus_t *n = &sig->nexus;
       for (unsigned k = 0; k < sig->n_nexus; k++, n = n->chain) {
          if (n->n_sources != 1 || n->sources.tag != SOURCE_DRIVER)
+            continue;
+         // Port fan-out is an update-phase consumer too: the outputs
+         // list schedules SOURCE_PORT propagation from the source's
+         // notify into heaps that drain BEFORE the flip (measured: gals
+         // qa1 — the child q feeding its port never propagated).  Only
+         // leaf nets (no port outputs) are banked-eligible.
+         if (n->outputs != NULL)
+            continue;
+         if (!aj_banked_pending_ok(n->pending))
             continue;
          int ci = 0;
          for (; ci < g_banked_st.nclasses; ci++)
@@ -9262,8 +9296,8 @@ void accel_banked_init(rt_model_t *m)
       g_banked = getenv("NVC_BANKED") != NULL ? 1 : 0;
    if (g_banked == 1) {
       aj_banked_install_scope(root_scope(m));
-      notef("banked: I1 scaffolding ACTIVE — %ld nexus(es) on the banked "
-            "vtable (behavior-identical; touched-list + flip cadence only)",
+      notef("banked: copy-at-flip ACTIVE — %ld leaf nexus(es) staged "
+            "(deposits land at the delta-boundary flip)",
             g_banked_st.installs);
    }
 }
@@ -13456,6 +13490,17 @@ static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
    TRACE("update %s effective value %s", trace_nexus(n), fmt_nexus(n, value));
 
+   // Base-run counterpart of the NVC_BANKED_DBG stage trace: with banking
+   // OFF, print the same "#BD"-format line at the deposit itself so the
+   // two runs' sequences diff directly (I2.6 gals-wedge debugging).
+   { static int dbg = -1;
+     if (dbg < 0) { const char *e = getenv("NVC_BANKED_DBG");
+                    dbg = e != NULL ? atoi(e) : 0; }
+     if (dbg > 0) { dbg--;
+        fprintf(stderr, "#BD put %s t=%"PRIi64"+%u v=%02x\n",
+                n->signal->where ? istr(tree_ident(n->signal->where)) : "?",
+                m->now, m->iteration, ((const uint8_t *)value)[0]); } }
+
    unsigned char *eff = nexus_effective(n);
    unsigned char *last = nexus_last_value(n);
 
@@ -13487,17 +13532,31 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
          break;
       }
    assert(orig != NULL);
-   (*orig->deposit)(m, n, value);
-   // I2 write-through: mirror the committed plane-0 bytes into value
-   // bank B (plane 3).  Reads stay on plane 0 (JIT-compiled procs read
-   // shared+8 directly), so behavior is identical; the mirror proves the
-   // extra plane's allocation and write path.  I2.5 flips reads to the
-   // bank pair via the JIT sel lowering and drops this mirror.
+   (void)orig;
+   // I2.6 COPY-AT-FLIP: STAGE the value into bank B only — plane 0 (what
+   // every reader sees) is untouched until the delta-boundary flip, so
+   // during the update phase no reader-visible byte of a banked net
+   // changes.  The flip replays the ORIGINAL deposit with the staged
+   // bytes, reusing its change-compare / last_value / notify exactly —
+   // semantics-preserving by construction, and duplicate touches
+   // self-dedup because the replayed cmp short-circuits.  (The sel-read
+   // JIT form was priced at 34% and rejected — reads keep today's
+   // zero-cost plane-0 form; the copy volume is touched-only, ~1 memcpy
+   // per deposit.)  This is the writer-isolation property I3's
+   // concurrent staging needs: bank-B writes are race-free per nexus by
+   // the single-driver eligibility.
    {
       rt_signal_t *sig = n->signal;
       const size_t valuesz = (size_t)n->size * n->width;
       memcpy(sig->shared.data + n->offset + 3 * sig->shared.size,
-             sig->shared.data + n->offset, valuesz);
+             value, valuesz);
+      static int dbg = -1;
+      if (dbg < 0) { const char *e = getenv("NVC_BANKED_DBG");
+                     dbg = e ? atoi(e) : 0; }
+      if (dbg > 0) { dbg--;
+         fprintf(stderr, "#BD stage %s t=%"PRIi64"+%u v=%02x\n",
+                 sig->where ? istr(tree_ident(sig->where)) : "?",
+                 m->now, m->iteration, ((const uint8_t *)value)[0]); }
    }
    if (g_banked_st.count == g_banked_st.max) {
       g_banked_st.max = g_banked_st.max ? g_banked_st.max * 2 : 256;
@@ -13508,12 +13567,32 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
    g_banked_st.deposits++;
 }
 
-// Delta-boundary flip: I2 will toggle the bank select and run wakes from
-// the touched list here; I1 only records the cadence and drains.
-static void banked_flip(void)
+// Delta-boundary flip: replay the ORIGINAL deposit for every touched
+// nexus with its staged bank-B bytes — the batched, reader-isolated form
+// of what the un-banked path did interleaved during the update phase.
+// Runs at the delta boundary after driver commits and before processes
+// (the same visibility point: update-phase machinery reads driver
+// waveforms, never plane-0 effective — audited).  Duplicates in the list
+// replay the same staged value; the deposit's change-compare makes the
+// repeats free.
+static void banked_flip(rt_model_t *m)
 {
    if (g_banked_st.count > (size_t)g_banked_st.maxtouched)
       g_banked_st.maxtouched = (long)g_banked_st.count;
+   for (size_t i = 0; i < g_banked_st.count; i++) {
+      rt_nexus_t *n = g_banked_st.items[i];
+      const rt_nexus_vtable_t *orig = NULL;
+      for (int c = 0; c < g_banked_st.nclasses; c++)
+         if (&g_banked_st.patched[c] == n->vtable) {
+            orig = g_banked_st.orig[c];
+            break;
+         }
+      if (orig == NULL)
+         continue;   // vtable replaced since staging (lazy/fastclk install)
+      rt_signal_t *sig = n->signal;
+      (*orig->deposit)(m, n,
+                       sig->shared.data + n->offset + 3 * sig->shared.size);
+   }
    g_banked_st.count = 0;
    g_banked_st.flips++;
 }
@@ -14734,6 +14813,15 @@ static void model_cycle(rt_model_t *m)
       dump_signals(m, m->root);
 #endif
 
+   // NVC_BANKED copy-at-flip: replay staged bank-B deposits BEFORE the
+   // trigger epoch bump and sensitivity drain — the wakes these deposits
+   // notify must feed THIS delta's process filtering exactly as the
+   // un-banked interleaved deposits did (placing the flip after the
+   // triggerq drain made every wake one delta late and wedged the GALS
+   // handshake fixture at Y=0).
+   if (unlikely(g_banked == 1))
+      banked_flip(m);
+
    // The epoch bump must stay unconditional: run_trigger memoises on it
    // from the run_process filter and the inline blocking_update wake path,
    // both outside this drain
@@ -14750,11 +14838,6 @@ static void model_cycle(rt_model_t *m)
    // first chunk eval, which may follow those deposits).
    if (m->aj_chunk_count > 0 && aj_snap_mode() >= 2)
       aj_snap_fleet_take(m);
-
-   // NVC_BANKED I1: the delta-boundary flip cadence (bank-select toggle +
-   // touched-list wake drain in I2; bookkeeping only in I1).
-   if (unlikely(g_banked == 1))
-      banked_flip();
 
    // #53 negedge STATE FLIP: merged chunks staged their registered outputs
    // at posedge evals; publish them in the delta where the domain clock's
