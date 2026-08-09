@@ -1179,8 +1179,10 @@ static void aj_fastclk_evict(rt_model_t *m, rt_wakeable_t *w, const char *why)
       return;
    w->fastclk = 0;
    w->fastclk_ee = 0;
-   if (w->pending && m->fastclk_npending > 0)
-      m->fastclk_npending--;    // was counted as a self-suspended member
+   if (w->fastclk_counted) {
+      w->fastclk_counted = 0;   // was counted as a self-suspended member
+      atomic_add(&m->fastclk_npending, -1);
+   }
    if (m->fused_block != NULL)
       m->fastclk_evict_defer = true;
    static unsigned ecount = 0;
@@ -1201,8 +1203,15 @@ static inline void set_pending(rt_model_t *m, rt_wakeable_t *wake)
       // so the fused block falls back to the checking loop. Queueing from
       // OUTSIDE its own activation (eventq timed wake, force/release
       // depositor requeue) evicts: the table would double-run it.
-      if (get_active_wakeable() == wake)
-         m->fastclk_npending++;
+      if (get_active_wakeable() == wake) {
+         // Atomic + exact pairing via fastclk_counted: this runs on evproc
+         // WORKERS (NBA-form members self-queue every activation through
+         // x_sched_process), and a plain ++ raced the parallel decrements
+         // in async_run_process — counter drift double-ran or skipped
+         // fused-block members (the PP>=3 retire divergence).
+         wake->fastclk_counted = 1;
+         atomic_add(&m->fastclk_npending, 1);
+      }
       else
          aj_fastclk_evict(m, wake, "queued outside the table");
    }
@@ -13016,8 +13025,10 @@ static void async_run_process(rt_model_t *m, void *arg)
    assert(proc->wakeable.pending);
    proc->wakeable.pending = false;
 
-   if (unlikely(proc->wakeable.fastclk) && m->fastclk_npending > 0)
-      m->fastclk_npending--;    // self-suspended member resumed
+   if (unlikely(proc->wakeable.fastclk_counted)) {
+      proc->wakeable.fastclk_counted = 0;   // self-suspended member resumed
+      atomic_add(&m->fastclk_npending, -1);
+   }
 
    { static const char *pd = NULL; static int pdi = -1;
      if (pdi < 0) { pd = getenv("AJ_PROCDBG"); pdi = pd ? 1 : 0; }
@@ -15048,8 +15059,10 @@ static void model_cycle(rt_model_t *m)
             for (unsigned i = 0; i < m->fastclk_count; i++) {
                rt_wakeable_t *w = &(m->fastclk_table[i]->wakeable);
                if (m->fastclk_comb[i] || !w->fastclk) {
-                  if (w->fastclk && w->pending && m->fastclk_npending > 0)
-                     m->fastclk_npending--;
+                  if (w->fastclk && w->fastclk_counted) {
+                     w->fastclk_counted = 0;
+                     atomic_add(&m->fastclk_npending, -1);
+                  }
                   w->fastclk = 0;   // evict (or already evicted via hooks)
                   w->fastclk_ee = 0;
                }

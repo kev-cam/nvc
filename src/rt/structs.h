@@ -63,6 +63,9 @@ typedef struct {
    unsigned        fastclk_ee : 1; // wide table: EVERY-EVENT member (also pends
                                    // on a registered companion, e.g. async rst);
                                    // cleared everywhere fastclk is cleared
+   unsigned        fastclk_counted : 1; // this pend incremented fastclk_npending
+                                   // (exact pairing so the atomic decrement at
+                                   // resume/evict can never under/overshoot)
    unsigned        fused_cone : 1; // comb_fused_* block: force/release re-runs it
    unsigned        dep_recorded : 1; // cone's depositor map entries complete
    unsigned        wait_state : 2; // 0=first activation, 1=static (entries
