@@ -548,17 +548,20 @@ static const char *fmt_jit_value(jit_scalar_t value, bool scalar, uint32_t len)
 
 static model_thread_t *model_thread(rt_model_t *m)
 {
-#if RT_MULTITHREADED
+   // Always per-thread, even with RT_MULTITHREADED off: the parallel
+   // process scheduler (evproc) runs proc eval on worker threads, and the
+   // wrappers stash active_obj/tlab here expecting a per-thread slot.
+   // Slot-0 aliasing made every worker share one active_obj — sole-writer
+   // safe with a single worker (PP=2) but a clobber race at PP>=3 (the
+   // x_sched_event NULL-wakeable SEGV).  The array is MAX_THREADS-sized
+   // and the struct 64-aligned already; serial pays one thread_id() TLS
+   // read per call.
    const int my_id = thread_id();
 
    if (unlikely(m->threads[my_id] == NULL))
       return (m->threads[my_id] = xcalloc(sizeof(model_thread_t)));
 
    return m->threads[my_id];
-#else
-   assert(thread_id() == 0);
-   return m->threads[0];
-#endif
 }
 
 __attribute__((cold, noinline))
@@ -575,6 +578,11 @@ static void deferq_grow(deferq_t *dq)
 // single global schedule lock taken only around the queue/heap appends.
 static int        g_par_active = 0;
 static nvc_lock_t g_sched_lock = 0;
+// NVC_DIRECT_SCHED: workers run sched_driver's fast path directly for the
+// FAST_DRIVER whole-signal class instead of pipelining records to thread 0.
+// Resolved once in evproc_ensure_started (before any parallel dispatch).
+static int        g_direct_sched = 0;
+static long       g_direct_cnt[MAX_THREADS];
 // Count of nexus splits (clone_nexus). For synthesizable RTL the access
 // pattern is static, so all splits happen in the first cycle(s); the parallel
 // dispatch waits until this stops changing (structure frozen) before running
@@ -599,6 +607,31 @@ static inline void deferq_do(deferq_t *dq, defer_fn_t fn, void *arg)
    }
    else
       deferq_append(dq, fn, arg);
+}
+
+// Pending-list arming from a worker during parallel eval must serialize:
+// two procs waiting on the same nexus mutate one pending list (tag flips,
+// realloc).  Same pattern as deferq_do — free when serial.
+static void sched_event_par(rt_model_t *m, void **pending, rt_wakeable_t *obj)
+{
+   if (unlikely(relaxed_load(&g_par_active))) {
+      nvc_lock(&g_sched_lock);
+      sched_event(m, pending, obj);
+      nvc_unlock(&g_sched_lock);
+   }
+   else
+      sched_event(m, pending, obj);
+}
+
+static void clear_event_par(rt_model_t *m, void **pending, rt_wakeable_t *obj)
+{
+   if (unlikely(relaxed_load(&g_par_active))) {
+      nvc_lock(&g_sched_lock);
+      clear_event(m, pending, obj);
+      nvc_unlock(&g_sched_lock);
+   }
+   else
+      clear_event(m, pending, obj);
 }
 
 static void deferq_scan(deferq_t *dq, scan_fn_t fn, void *arg)
@@ -9615,7 +9648,7 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
          // (recorded in cur_set) so no wakeup is lost — never re-run the
          // process (body side effects must execute exactly once).
          for (unsigned i = 0; i < proc->wait_count; i++)
-            clear_event(m, &(proc->wait_set[i]->pending), obj);
+            clear_event_par(m, &(proc->wait_set[i]->pending), obj);
          free(proc->wait_set);
          proc->wait_set = NULL;
          proc->wait_count = proc->wait_cap = 0;
@@ -9627,7 +9660,7 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
             aj_fastclk_evict(m, obj, "wait-set change");
          direct_eval_uninstall(proc);   // demoted: back to the generic path
          for (unsigned i = 0; i < proc->cur_count; i++)
-            sched_event(m, &(proc->cur_set[i]->pending), obj);
+            sched_event_par(m, &(proc->cur_set[i]->pending), obj);
       }
       proc->cur_sig = 0;
       proc->cur_count = 0;
@@ -13604,6 +13637,11 @@ static void banked_stats_dump(void)
       fprintf(stderr, "#BANKED installs=%ld deposits=%ld flips=%ld "
               "maxtouched=%ld\n", g_banked_st.installs, g_banked_st.deposits,
               g_banked_st.flips, g_banked_st.maxtouched);
+   long direct = 0;
+   for (int i = 0; i < MAX_THREADS; i++)
+      direct += g_direct_cnt[i];
+   if (direct > 0)
+      fprintf(stderr, "#DIRECT sched=%ld\n", direct);
 }
 
 static void enqueue_effective(rt_model_t *m, rt_nexus_t *n)
@@ -14233,6 +14271,12 @@ static void evproc_ensure_started(rt_model_t *m)
       if (mv > 0) g_evproc_min = (unsigned)mv;
    }
    notef("NVC_PARALLEL_PROCS=%d, parallel-delta gate=%u procs", nt, g_evproc_min);
+
+   if (getenv("NVC_DIRECT_SCHED") != NULL) {
+      g_direct_sched = 1;
+      notef("NVC_DIRECT_SCHED: worker-direct sched_driver for the "
+            "FAST_DRIVER whole-signal class");
+   }
 
    g_evproc.nthreads = nt;
    g_evproc.model    = m;
@@ -15937,7 +15981,7 @@ static void arm_trigger(rt_model_t *m, rt_trigger_t *t, rt_wakeable_t *obj)
          int32_t offset = t->args[1].integer;
 
          rt_nexus_t *n = split_nexus(m, s, offset, 1);
-         sched_event(m, &(n->pending), obj);
+         sched_event_par(m, &(n->pending), obj);
       }
       break;
    case FUNC_TRIGGER:
@@ -15949,7 +15993,7 @@ static void arm_trigger(rt_model_t *m, rt_trigger_t *t, rt_wakeable_t *obj)
             rt_signal_t *s = container_of(ss, rt_signal_t, shared);
 
             rt_nexus_t *n = split_nexus(m, s, offset, 1);
-            sched_event(m, &(n->pending), obj);
+            sched_event_par(m, &(n->pending), obj);
          }
       }
       break;
@@ -15962,7 +16006,7 @@ static void arm_trigger(rt_model_t *m, rt_trigger_t *t, rt_wakeable_t *obj)
 
          rt_nexus_t *n = split_nexus(m, s, offset, count);
          for (; count > 0; n = n->chain) {
-            sched_event(m, &(n->pending), obj);
+            sched_event_par(m, &(n->pending), obj);
 
             count -= n->width;
             assert(count >= 0);
@@ -16215,6 +16259,26 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject)
 {
    if (unlikely(relaxed_load(&g_par_active))) {
+      // Worker-direct (NVC_DIRECT_SCHED): for the FAST_DRIVER whole-signal
+      // single-nexus class, run sched_driver's fast path ON THE WORKER
+      // instead of capturing a pipe record.  Safe because per-nexus driver
+      // state (waveform, active marks) is single-writer under the
+      // single-driver invariant, the nexus tree is frozen during parallel
+      // eval, and the driverq append inside sched_driver already takes
+      // g_sched_lock under g_par_active.  This keeps every fast-path side
+      // effect (same-value dedup, w->value/when freshness, active_delta,
+      // next_is_delta) that pipe replay provides, while moving the dedup
+      // and value copy off the serial propagate phase.
+      if (g_direct_sched) {
+         rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+         if (after == 0 && s->n_nexus == 1 && s->nexus.width == 1
+             && (s->nexus.flags & NET_F_FAST_DRIVER)) {
+            sched_driver(get_model(), &s->nexus, 0, reject, &scalar,
+                         get_active_proc());
+            g_direct_cnt[thread_id()]++;
+            return;
+         }
+      }
       // Worker eval: defer the driver write to thread 0 via the pipe.
       const int tid = thread_id();
       prop_rec_t *r = prop_reserve(tid);
@@ -16250,6 +16314,16 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
 
    if (unlikely(relaxed_load(&g_par_active))) {
+      // Worker-direct: see x_sched_waveform_s.  sched_driver's fast path
+      // copies the (transient) value immediately, so no capture needed.
+      if (g_direct_sched && after == 0 && s->n_nexus == 1 && offset == 0
+          && count == (int32_t)s->nexus.width
+          && (s->nexus.flags & NET_F_FAST_DRIVER)) {
+         sched_driver(get_model(), &s->nexus, 0, reject, values,
+                      get_active_proc());
+         g_direct_cnt[thread_id()]++;
+         return;
+      }
       // Worker eval: defer the driver write to thread 0 via the pipe. Copy the
       // value (transient on the worker); wide values go to a heap buffer the
       // applier frees.
@@ -16569,7 +16643,7 @@ void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count)
          }
          p->cur_set[p->cur_count++] = n;
          if (obj->wait_state == 0) {
-            sched_event(m, &(n->pending), obj);
+            sched_event_par(m, &(n->pending), obj);
             if (p->wait_count == p->wait_cap) {
                p->wait_cap = p->wait_cap ? p->wait_cap * 2 : 16;
                p->wait_set = xrealloc_array(p->wait_set, p->wait_cap,
@@ -16584,7 +16658,7 @@ void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count)
    }
 
    for (; count > 0; n = n->chain) {
-      sched_event(m, &(n->pending), obj);
+      sched_event_par(m, &(n->pending), obj);
 
       count -= n->width;
       assert(count >= 0);
@@ -16610,7 +16684,7 @@ void x_clear_event(sig_shared_t *ss, uint32_t offset, int32_t count)
 
    rt_nexus_t *n = split_nexus(m, s, offset, count);
    for (; count > 0; n = n->chain) {
-      clear_event(m, &(n->pending), &(proc->wakeable));
+      clear_event_par(m, &(n->pending), &(proc->wakeable));
 
       count -= n->width;
       assert(count >= 0);
@@ -16627,7 +16701,7 @@ void x_enable_trigger(rt_trigger_t *trigger)
    if (trigger->pending == NULL)
       arm_trigger(m, trigger, &(trigger->wakeable));
 
-   sched_event(m, &(trigger->pending), obj);
+   sched_event_par(m, &(trigger->pending), obj);
 }
 
 void x_disable_trigger(rt_trigger_t *trigger)
@@ -16637,7 +16711,7 @@ void x_disable_trigger(rt_trigger_t *trigger)
    rt_wakeable_t *obj = get_active_wakeable();
    rt_model_t *m = get_model();
 
-   clear_event(m, &(trigger->pending), obj);
+   clear_event_par(m, &(trigger->pending), obj);
 }
 
 void x_enter_state(int32_t state, bool strong)
