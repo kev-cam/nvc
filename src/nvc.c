@@ -1213,6 +1213,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    model_reset(state->model);
 
+   accel_banked_init(state->model);   // NVC_BANKED (no-op unless env set)
+
    if (use_accel)
       accel_auto(state->model);
    else if (getenv("NVC_LEVELIZE_SWEEP") != NULL

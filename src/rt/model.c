@@ -323,6 +323,32 @@ static void calculate_driving_single(rt_model_t *m, rt_nexus_t *n);
 static void calculate_driving_memo1(rt_model_t *m, rt_nexus_t *n);
 static const rt_nexus_vtable_t nexus_single_driver_vtable;
 static const rt_nexus_vtable_t nexus_memo1_vtable;
+
+// NVC_BANKED=1 — increment I1 SCAFFOLDING for the double-banked SMP
+// substrate (see the smp-double-banked directive / design_banked_smp.md).
+// I1 changes NO behavior: the banked vtable's deposit performs exactly the
+// default deposit, then appends the nexus to a per-delta touched list that
+// the delta-boundary flip hook drains (a no-op drain for now).  What I1
+// proves: the per-nexus vtable install for the banked class, the deposit
+// chokepoint interception, and the flip cadence — the plumbing that I2's
+// real second plane + eval/commit overlap will inhabit.
+// Eligibility is ANY single-SOURCE_DRIVER nexus regardless of resolution
+// (per the resolver-omission directive: resolution of one input is the
+// identity in regular digital logic) and regardless of which specialized
+// vtable it sits on — so the interception is a PATCHED COPY of the
+// nexus's current vtable with .deposit chained through banked_deposit
+// (the fastclk_guard pattern), preserving every class's update_driving.
+static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value);
+#define BANKED_MAX_CLASSES 8
+static int g_banked = -1;   // NVC_BANKED, resolved in accel_banked_init
+static struct {
+   rt_nexus_t **items;
+   size_t       count, max;
+   long         installs, deposits, flips, maxtouched;
+   int          nclasses;
+   const rt_nexus_vtable_t *orig[BANKED_MAX_CLASSES];
+   rt_nexus_vtable_t        patched[BANKED_MAX_CLASSES];
+} g_banked_st;
 static void update_implicit_signal(rt_model_t *m, rt_implicit_t *imp);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
@@ -9188,6 +9214,57 @@ static void aj_collapse_census_scope(rt_scope_t *s, long ctr[8])
       aj_collapse_census_scope(s->children.items[i], ctr);
 }
 
+// NVC_BANKED I1: install the banked vtable on the eligible class — driven,
+// unresolved, single-source nexuses currently on the default vtable (the
+// fast single-driver/memo1/lazy classes keep their specializations; the
+// banked class will absorb them in I2 once the second plane is real).
+static void aj_banked_install_scope(rt_scope_t *s)
+{
+   for (int i = 0; i < s->signals.count; i++) {
+      rt_signal_t *sig = s->signals.items[i];
+      rt_nexus_t *n = &sig->nexus;
+      for (unsigned k = 0; k < sig->n_nexus; k++, n = n->chain) {
+         if (n->n_sources != 1 || n->sources.tag != SOURCE_DRIVER)
+            continue;
+         int ci = 0;
+         for (; ci < g_banked_st.nclasses; ci++)
+            if (g_banked_st.orig[ci] == n->vtable)
+               break;
+         if (ci == g_banked_st.nclasses) {
+            // new original class: skip anything already patched, cap classes
+            bool already = false;
+            for (int p = 0; p < g_banked_st.nclasses && !already; p++)
+               already = (&g_banked_st.patched[p] == n->vtable);
+            if (already || g_banked_st.nclasses == BANKED_MAX_CLASSES)
+               continue;
+            g_banked_st.orig[ci] = n->vtable;
+            g_banked_st.patched[ci] = *n->vtable;
+            g_banked_st.patched[ci].deposit = banked_deposit;
+            g_banked_st.nclasses++;
+         }
+         n->vtable = &g_banked_st.patched[ci];
+         g_banked_st.installs++;
+      }
+   }
+   for (int i = 0; i < s->children.count; i++)
+      aj_banked_install_scope(s->children.items[i]);
+}
+
+// Always-run entry (plain interp included): nvc.c calls this after
+// model_reset regardless of --accel, so the banked class installs on every
+// serially-passing workload (the directive's exploration corpus).
+void accel_banked_init(rt_model_t *m)
+{
+   if (g_banked < 0)
+      g_banked = getenv("NVC_BANKED") != NULL ? 1 : 0;
+   if (g_banked == 1) {
+      aj_banked_install_scope(root_scope(m));
+      notef("banked: I1 scaffolding ACTIVE — %ld nexus(es) on the banked "
+            "vtable (behavior-identical; touched-list + flip cadence only)",
+            g_banked_st.installs);
+   }
+}
+
 void accel_auto(rt_model_t *m)
 {
    if (getenv("NVC_COLLAPSE_CENSUS") != NULL) {
@@ -13396,6 +13473,46 @@ static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value)
    }
 }
 
+// NVC_BANKED I1: exactly the class's original deposit, plus the
+// touched-list append.  Serial-only.
+static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
+{
+   const rt_nexus_vtable_t *orig = NULL;
+   for (int i = 0; i < g_banked_st.nclasses; i++)
+      if (&g_banked_st.patched[i] == n->vtable) {
+         orig = g_banked_st.orig[i];
+         break;
+      }
+   assert(orig != NULL);
+   (*orig->deposit)(m, n, value);
+   if (g_banked_st.count == g_banked_st.max) {
+      g_banked_st.max = g_banked_st.max ? g_banked_st.max * 2 : 256;
+      g_banked_st.items = xrealloc_array(g_banked_st.items, g_banked_st.max,
+                                         sizeof(rt_nexus_t *));
+   }
+   g_banked_st.items[g_banked_st.count++] = n;
+   g_banked_st.deposits++;
+}
+
+// Delta-boundary flip: I2 will toggle the bank select and run wakes from
+// the touched list here; I1 only records the cadence and drains.
+static void banked_flip(void)
+{
+   if (g_banked_st.count > (size_t)g_banked_st.maxtouched)
+      g_banked_st.maxtouched = (long)g_banked_st.count;
+   g_banked_st.count = 0;
+   g_banked_st.flips++;
+}
+
+__attribute__((destructor))
+static void banked_stats_dump(void)
+{
+   if (g_banked == 1)
+      fprintf(stderr, "#BANKED installs=%ld deposits=%ld flips=%ld "
+              "maxtouched=%ld\n", g_banked_st.installs, g_banked_st.deposits,
+              g_banked_st.flips, g_banked_st.maxtouched);
+}
+
 static void enqueue_effective(rt_model_t *m, rt_nexus_t *n)
 {
    if (n->flags & NET_F_PENDING)
@@ -14619,6 +14736,11 @@ static void model_cycle(rt_model_t *m)
    // first chunk eval, which may follow those deposits).
    if (m->aj_chunk_count > 0 && aj_snap_mode() >= 2)
       aj_snap_fleet_take(m);
+
+   // NVC_BANKED I1: the delta-boundary flip cadence (bank-select toggle +
+   // touched-list wake drain in I2; bookkeeping only in I1).
+   if (unlikely(g_banked == 1))
+      banked_flip();
 
    // #53 negedge STATE FLIP: merged chunks staged their registered outputs
    // at posedge evals; publish them in the delta where the domain clock's
