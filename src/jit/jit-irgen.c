@@ -3433,6 +3433,32 @@ static void irgen_op_resolved(jit_irgen_t *g, mir_value_t n)
    jit_value_t data_ptr = irgen_alloc_temp(g);
    irgen_lea(g, data_ptr, jit_addr_from_value(shared, 8));
 
+   // NVC_BANKED_READS: the double-bank read form — value plane selected by
+   // the global bank index (data + 8 + sel*3*size reaches value bank B at
+   // plane 3 when sel==1; see the NVC_BANKED substrate in rt/model.c).
+   // With sel pinned at 0 this is the PRICING build: identical behavior,
+   // and the marginal cost of the extra load-sel/load-size/mul/add per
+   // signal read is measurable directly.  Startup-env-picked so the
+   // default lowering stays byte-identical to today's.
+   static int banked_reads = -1;
+   if (banked_reads < 0)
+      banked_reads = getenv("NVC_BANKED_READS") != NULL ? 1 : 0;
+   if (banked_reads) {
+      extern int32_t nvc_banked_sel;
+      jit_value_t sel = irgen_alloc_temp(g);
+      j_load(g, JIT_SZ_32, sel, jit_addr_from_value(
+                jit_value_from_int64((int64_t)(intptr_t)&nvc_banked_sel), 0));
+      jit_value_t szv = irgen_alloc_temp(g);
+      j_load(g, JIT_SZ_32, szv, jit_addr_from_value(shared, 0));
+      jit_value_t t1 = irgen_alloc_temp(g);
+      j_mul(g, t1, sel, szv);
+      jit_value_t t2 = irgen_alloc_temp(g);
+      j_mul(g, t2, t1, jit_value_from_int64(3));
+      jit_value_t np = irgen_alloc_temp(g);
+      j_add(g, np, data_ptr, t2);
+      data_ptr = np;
+   }
+
    mir_type_t type = mir_get_pointer(g->mu, mir_get_type(g->mu, n));
 
    const int scale = irgen_size_bytes(g, type);

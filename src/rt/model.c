@@ -340,6 +340,9 @@ static const rt_nexus_vtable_t nexus_memo1_vtable;
 // (the fastclk_guard pattern), preserving every class's update_driving.
 static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value);
 #define BANKED_MAX_CLASSES 8
+// Global bank-select index read by JIT code emitted under NVC_BANKED_READS
+// (jit-irgen.c irgen_op_resolved).  Stays 0 until the flip goes live.
+int32_t nvc_banked_sel = 0;
 static int g_banked = -1;   // NVC_BANKED, resolved in accel_banked_init
 static struct {
    rt_nexus_t **items;
