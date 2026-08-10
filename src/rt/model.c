@@ -130,6 +130,11 @@ typedef struct _rt_model {
    rt_watch_t        *watches;
    deferq_t           procq;
    deferq_t           next_procq;
+   // #67 E/U phase pipeline (NVC_TWO_PHASE): E-side next-delta procq bank
+   // (merged into procq at the boundary) and the E-owned deferred-wake
+   // bank (inline eval-phase wakes replay single-threaded at the boundary).
+   deferq_t           procq_e;
+   deferq_t           ewakeq;
    deferq_t           driverq;
    deferq_t           next_driverq;
    deferq_t           postponedq;
@@ -583,6 +588,12 @@ static nvc_lock_t g_sched_lock = 0;
 // Resolved once in evproc_ensure_started (before any parallel dispatch).
 static int        g_direct_sched = 0;
 static long       g_direct_cnt[MAX_THREADS];
+// #67 NVC_TWO_PHASE: g_two_phase = env armed; g_two_phase_eval = inside the
+// EVAL window (E context) — inline wake publication defers to the boundary
+// replay and next-delta procq appends go to the E bank.  Both 0 by default:
+// the serial path is untouched.
+static int        g_two_phase = -1;
+static int        g_two_phase_eval = 0;
 // Count of nexus splits (clone_nexus). For synthesizable RTL the access
 // pattern is static, so all splits happen in the first cycle(s); the parallel
 // dispatch waits until this stops changing (structure frozen) before running
@@ -632,6 +643,20 @@ static void clear_event_par(rt_model_t *m, void **pending, rt_wakeable_t *obj)
    }
    else
       clear_event(m, pending, obj);
+}
+
+// #67 boundary replay of eval-phase-deferred wakes (single-threaded).
+static void async_replay_wake_all(rt_model_t *m, void *arg)
+{
+   wakeup_all(m, (void **)arg);
+}
+
+static void async_replay_wake_trigger(rt_model_t *m, void *arg)
+{
+   rt_wakeable_t *obj = arg;
+   rt_trigger_t *t = container_of(obj, rt_trigger_t, wakeable);
+   if (run_trigger(m, t))
+      wakeup_all(m, &(t->pending));
 }
 
 static void deferq_scan(deferq_t *dq, scan_fn_t fn, void *arg)
@@ -949,6 +974,8 @@ void model_free(rt_model_t *m)
    free(m->inactiveq.tasks);
    free(m->next_inactiveq.tasks);
    free(m->nonblockq.tasks);
+   free(m->procq_e.tasks);
+   free(m->ewakeq.tasks);
    free(m->driverq.tasks);
    free(m->next_driverq.tasks);
 
@@ -1222,7 +1249,8 @@ static void deltaq_insert_proc(rt_model_t *m, uint64_t delta, rt_proc_t *proc)
 {
    if (delta == 0) {
       set_pending(m, &proc->wakeable);
-      deferq_do(&m->procq, async_run_process, proc);
+      deferq_do(unlikely(g_two_phase_eval) ? &m->procq_e : &m->procq,
+                async_run_process, proc);
       m->next_is_delta = true;
    }
    else {
@@ -2613,6 +2641,12 @@ struct _aj_defer_out {
    bool           verify_flagged;  // NVC_ACCEL_VERIFY: already reported diverged
    bool           off_edge;   // seen changing on a non-posedge delta => Mealy/
                               // combinational => never route through NBA region
+   bool           must_e;     // #67 E/U pipeline: this ordinal's publication is
+                              // load-bearing same-delta (ICG clock / Mealy /
+                              // comb class) and must execute on the EVAL thread;
+                              // only !must_e ordinals (defer-bank, NBA-region,
+                              // stage2 = registered classes) may become records
+                              // for the update thread (audit verdict D).
    unsigned char *rh_latch;   // NVC_ACCEL_RST_HOLD: bytes latched during reset
    void          *rh_sigp;    //   publication target for the release flush
    int            rh_width;   //   deposit element count for the flush
@@ -6604,6 +6638,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             d->shadow      = xmalloc(bufsz);
             deferred++;
          }
+         // #67: registered classes (defer-bank / negflip / NBA-eligible
+         // non-comb) are deferrable to the update thread; ICG clocks and
+         // Mealy/comb outputs are load-bearing same-delta and pinned to E.
+         // (off_edge is runtime-learned Mealy — the U thread must ALSO
+         // re-check it, since an ordinal can demote after install.)
+         d->must_e = d->icg || is_comb;
          chunk->bindtab[6 + ni + ord] = pins[i].sig;
       }
       if (!no_force) {
@@ -13197,7 +13237,8 @@ static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
    if (obj->postponed)
       deferq_do(&m->postponedq, fn, arg);
    else {
-      deferq_do(&m->procq, fn, arg);
+      deferq_do(unlikely(g_two_phase_eval) ? &m->procq_e : &m->procq,
+                fn, arg);
       m->next_is_delta |= m->blocking_update;
    }
 
@@ -13269,6 +13310,11 @@ static void wake_trigger(rt_model_t *m, rt_wakeable_t *obj)
       deferq_do(&m->triggerq, async_run_trigger, t);
       set_pending(m, obj);
    }
+   else if (unlikely(g_two_phase_eval))
+      // Defer the RUN too: the trigger memoises per epoch — evaluate it in
+      // the boundary window where deposits have settled (replay is before
+      // the epoch increments).
+      deferq_do(&m->ewakeq, async_replay_wake_trigger, obj);
    else if (run_trigger(m, t))
       wakeup_all(m, &(t->pending));
 }
@@ -14103,6 +14149,56 @@ static void swap_deferq(deferq_t *a, deferq_t *b)
 }
 
 // ---------------------------------------------------------------------------
+// NVC_TWO_PHASE core pinning (user directive 2026-08-09): the two phase
+// threads (E=eval, U=update) run on DIFFERENT PHYSICAL cores so each
+// phase's working set stays resident in its own private L1/L2.  SMT
+// siblings share those caches, so siblings are rejected via
+// /sys/.../topology/core_id.  NVC_PHASE_PIN=a,b overrides.
+static bool aj_read_core_id(int cpu, int *core)
+{
+   char path[128];
+   snprintf(path, sizeof path,
+            "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+   FILE *f = fopen(path, "r");
+   if (f == NULL) return false;
+   const bool ok = fscanf(f, "%d", core) == 1;
+   fclose(f);
+   return ok;
+}
+
+static bool aj_pick_phase_cores(int *e_cpu, int *u_cpu)
+{
+   const char *pin = getenv("NVC_PHASE_PIN");
+   if (pin != NULL && sscanf(pin, "%d,%d", e_cpu, u_cpu) == 2)
+      return true;
+   const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+   int c0;
+   if (ncpu < 2 || !aj_read_core_id(0, &c0)) {
+      *e_cpu = 0; *u_cpu = (ncpu > 2) ? 2 : 1;   // topology-blind fallback
+      return ncpu >= 2;
+   }
+   *e_cpu = 0;
+   for (int cpu = 1; cpu < ncpu; cpu++) {
+      int ci;
+      if (aj_read_core_id(cpu, &ci) && ci != c0) {
+         *u_cpu = cpu;
+         return true;
+      }
+   }
+   *u_cpu = 1;   // all cpus report one core (VM): still separate cpus
+   return true;
+}
+
+static void aj_pin_thread(int cpu)
+{
+   cpu_set_t set;
+   CPU_ZERO(&set);
+   CPU_SET(cpu, &set);
+   if (pthread_setaffinity_np(pthread_self(), sizeof set, &set) != 0)
+      warnf("phase-pin: could not pin to cpu%d", cpu);
+}
+
+// ---------------------------------------------------------------------------
 // Stage-1c parallel process dispatch — eval on workers, propagate on thread 0.
 //
 // At a wide delta, thread 0 partitions the woken-process table into per-worker
@@ -14635,7 +14731,8 @@ static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
    }
    if (g_lv_depq.count > 0) {
       for (unsigned i = 0; i < g_lv_depq.count; i++)
-         deferq_do(&m->procq, g_lv_depq.tasks[i].fn, g_lv_depq.tasks[i].arg);
+         deferq_do(unlikely(g_two_phase_eval) ? &m->procq_e : &m->procq,
+                   g_lv_depq.tasks[i].fn, g_lv_depq.tasks[i].arg);
       g_lv_depq.count = 0;
       m->next_is_delta = true;
    }
@@ -15220,8 +15317,25 @@ fastclk_done:;
       deferq_shuffle(&m->procq);
 
    // Run all non-postponed processes and event callbacks
+   // #67 boundary merge: E-bank next-delta appends join the shared bank
+   // before the swap (single-threaded here).
+   if (unlikely(m->procq_e.count > 0)) {
+      for (int i = 0; i < m->procq_e.count; i++)
+         deferq_append(&m->procq, m->procq_e.tasks[i].fn,
+                       m->procq_e.tasks[i].arg);
+      m->procq_e.count = 0;
+   }
    swap_deferq(&m->next_procq, &m->procq);
    evproc_ensure_started(m);
+   // #67 eval window: under NVC_TWO_PHASE the inline wake publications and
+   // E-side procq appends divert to the E banks for the duration of the
+   // process evaluations, then replay/merge single-threaded — the
+   // structurally-two-phase form the U thread will inherit.  Env off:
+   // g_two_phase_eval stays 0 and every path is byte-identical to today.
+   if (unlikely(g_two_phase < 0))
+      g_two_phase = getenv("NVC_TWO_PHASE") != NULL;
+   if (unlikely(g_two_phase))
+      g_two_phase_eval = 1;
    if (unlikely(m->prof_enabled)) {
       const unsigned depth = m->next_procq.count;
       const int b = prof_bucket(depth);
@@ -15236,6 +15350,11 @@ fastclk_done:;
    }
    else
       aj_sweep_run(m, &m->next_procq);
+
+   if (unlikely(g_two_phase)) {
+      g_two_phase_eval = 0;
+      deferq_run(m, &m->ewakeq);   // boundary replay of deferred wakes
+   }
 
    run_callbacks(m, END_OF_PROCESSES);
 
@@ -15522,9 +15641,14 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
             if (n->flags & NET_F_CACHE_EVENT)
                n->signal->shared.flags |= SIG_F_EVENT_FLAG;
             m->next_is_delta = true;
-            g_lv_deposit_wake = true;
-            wakeup_all(m, &(n->pending));
-            g_lv_deposit_wake = false;
+            if (unlikely(g_two_phase_eval))
+               deferq_do(&m->ewakeq, async_replay_wake_all,
+                         (void *)&(n->pending));
+            else {
+               g_lv_deposit_wake = true;
+               wakeup_all(m, &(n->pending));
+               g_lv_deposit_wake = false;
+            }
          }
       }
 
@@ -15681,9 +15805,13 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
          else
             assert(!(n->flags & NET_F_CACHE_EVENT));
 
-         g_lv_deposit_wake = wake_next;
-         wakeup_all(m, &(n->pending));
-         g_lv_deposit_wake = false;
+         if (unlikely(g_two_phase_eval))
+            deferq_do(&m->ewakeq, async_replay_wake_all, (void *)&(n->pending));
+         else {
+            g_lv_deposit_wake = wake_next;
+            wakeup_all(m, &(n->pending));
+            g_lv_deposit_wake = false;
+         }
 
          for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
             rt_nexus_t *pn = NULL;
@@ -16566,7 +16694,8 @@ void x_transfer_signal(sig_shared_t *target_ss, uint32_t toffset,
 
       if (!t->wakeable.pending) {
          // Schedule initial update immediately
-         deferq_do(&m->procq, async_transfer_signal, t);
+         deferq_do(unlikely(g_two_phase_eval) ? &m->procq_e : &m->procq,
+                   async_transfer_signal, t);
          t->wakeable.pending = true;
       }
 
