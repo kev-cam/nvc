@@ -369,6 +369,7 @@ static void procq_do(rt_model_t *m, rt_wakeable_t *obj, defer_fn_t fn,
                      void *arg);
 static void part_final_report(rt_model_t *m);
 static void evproc_shutdown(void);
+static void u_thread_shutdown(void);
 static void async_update_property(rt_model_t *m, void *arg);
 static void async_update_driver(rt_model_t *m, void *arg);
 static void async_fast_driver(rt_model_t *m, void *arg);
@@ -594,6 +595,31 @@ static long       g_direct_cnt[MAX_THREADS];
 // the serial path is untouched.
 static int        g_two_phase = -1;
 static int        g_two_phase_eval = 0;
+// Capture gate for x_sched_waveform's record branch — set alongside
+// g_par_active by evproc_dispatch, and independently by TWO_PHASE=3.
+// Split so NVC_FORCE_PAR can measure the g_par_active deopt (JIT
+// inline-drive decline + deferq locks) without arming the capture.
+static int        g_capture = 0;
+static int        g_two_phase_run = 0;   // 0 off, 1 single-thread form, 2 U-phase, 3 overlap
+static struct {
+   bool           started;
+   nvc_thread_t  *thread;
+   int            e_cpu, u_cpu;
+   rt_model_t    *model;
+   int            req __attribute__((aligned(64)));
+   int            done __attribute__((aligned(64)));
+   int            stop;
+   // TP3 overlap: E streams driver-write records into its prop pipe during
+   // eval; U chases them with `consumed`, applying sched_driver per record
+   // (U-owned bookkeeping).  stream: 0 idle, 1 streaming, 2 drain request
+   // (E finished eval; U acks by storing 0 once consumed == count).  The
+   // pipe is PREALLOCATED (no realloc under the reader); x86-TSO gives the
+   // record-fill -> count-increment ordering the chase relies on.
+   int            stream __attribute__((aligned(64)));
+   uint32_t       consumed;
+   int            e_tid;
+} g_uthr;
+
 // Count of nexus splits (clone_nexus). For synthesizable RTL the access
 // pattern is static, so all splits happen in the first cycle(s); the parallel
 // dispatch waits until this stops changing (structure frozen) before running
@@ -911,6 +937,7 @@ void model_free(rt_model_t *m)
 {
    part_final_report(m);
 
+   u_thread_shutdown();
    evproc_shutdown();
 
    if (unlikely(m->prof_enabled))
@@ -14270,6 +14297,19 @@ static inline prop_rec_t *prop_reserve(int tid)
 {
    prop_pipe_t *p = g_evproc.pipes[tid];
    if (unlikely(p->count == p->max)) {
+      if (unlikely(g_two_phase_run == 3)) {
+         // TP3 streams from this pipe: the array must NOT move under the
+         // reader.  Overflow (should not happen at 128k records/delta):
+         // wait for U to drain, then fall back to serial-inline for the
+         // rest of the delta.
+         notef("TP3: prop pipe overflow (%u) — captureless fallback",
+               p->count);
+         atomic_store(&g_uthr.stream, 2);
+         while (atomic_load(&g_uthr.stream) != 0)
+            spin_wait();
+         atomic_store(&g_capture, 0);
+         return NULL;   // caller takes the serial path
+      }
       p->max = p->max ? p->max * 2 : 1024;
       p->recs = xrealloc_array(p->recs, p->max, sizeof(prop_rec_t));
    }
@@ -14411,6 +14451,7 @@ static void evproc_dispatch(rt_model_t *m, deferq_t *dq)
    const uint64_t e = ++g_evproc.epoch;
    atomic_store(&g_evproc.remaining, nw);
    atomic_store(&g_par_active, 1);
+   atomic_store(&g_capture, 1);
 
    for (int t = 1; t < g_evproc.nthreads; t++) {
       evproc_mb_t *mb = &g_evproc.mb[t];
@@ -14431,6 +14472,7 @@ static void evproc_dispatch(rt_model_t *m, deferq_t *dq)
    // (no scheduling locks needed) and apply every deferred driver update —
    // the sole site where split_nexus / sched_driver run.
    atomic_store(&g_par_active, 0);
+   atomic_store(&g_capture, 0);
    for (int t = 1; t < g_evproc.nthreads; t++)
       prop_drain(m, g_evproc.pipes[g_evproc.mb[t].tid]);
 
@@ -14762,6 +14804,126 @@ static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
      } }
 }
 
+// #67: the extracted UPDATE phase of the simulation cycle (driver
+// maturation, driving/effective heaps, implicit signals, banked flip,
+// trigger filtering).  Runs inline by default; under NVC_TWO_PHASE=2 it
+// runs on the dedicated U thread pinned to a different physical core.
+static void update_phase(rt_model_t *m)
+{
+   { extern int g_aj_phase; g_aj_phase = 1; }
+   if (m->driverq.count > 0) {
+      swap_deferq(&m->next_driverq, &m->driverq);
+      deferq_run(m, &m->next_driverq);
+   }
+
+   { extern int g_aj_phase; g_aj_phase = 2; }
+   while (heap_size(m->driving_heap) > 0) {
+      rt_nexus_t *n = heap_extract_min(m->driving_heap);
+      update_driving(m, n, true);
+   }
+
+   { extern int g_aj_phase; g_aj_phase = 3; }
+   while (heap_size(m->effective_heap) > 0) {
+      rt_nexus_t *n = heap_extract_min(m->effective_heap);
+      update_effective(m, n);
+   }
+   { extern int g_aj_phase; g_aj_phase = 5; }
+
+   sync_event_cache(m);
+
+   m->blocking_update = true;
+
+   // Update implicit signals
+   if (m->implicitq.count > 0)
+      deferq_run(m, &m->implicitq);
+
+   assert(model_thread(m)->tlab->alloc == 0);
+
+#if TRACE_SIGNALS > 0
+   if (__trace_on)
+      dump_signals(m, m->root);
+#endif
+
+   // NVC_BANKED copy-at-flip: replay staged bank-B deposits BEFORE the
+   // trigger epoch bump and sensitivity drain — the wakes these deposits
+   // notify must feed THIS delta's process filtering exactly as the
+   // un-banked interleaved deposits did (placing the flip after the
+   // triggerq drain made every wake one delta late and wedged the GALS
+   // handshake fixture at Y=0).
+   if (unlikely(g_banked == 1))
+      banked_flip(m);
+
+   // The epoch bump must stay unconditional: run_trigger memoises on it
+   // from the run_process filter and the inline blocking_update wake path,
+   // both outside this drain
+   m->trigger_epoch++;
+   if (m->triggerq.count > 0)
+      deferq_run(m, &m->triggerq);  // Sensitivity list filter
+}
+
+
+static void *u_thread_main(void *arg)
+{
+   rt_model_t *m = arg;
+   __model = m;
+   model_thread(m)->tlab = tlab_acquire(m->mspace);
+   aj_pin_thread(g_uthr.u_cpu);
+   int seen = 0;
+   for (;;) {
+      const int st = atomic_load(&g_uthr.stream);
+      if (st != 0) {
+         prop_pipe_t *p = g_evproc.pipes[g_uthr.e_tid];
+         const uint32_t cnt = relaxed_load(&p->count);
+         while (g_uthr.consumed < cnt)
+            prop_apply(m, &p->recs[g_uthr.consumed++]);
+         if (st == 2 && g_uthr.consumed == relaxed_load(&p->count)) {
+            p->count = 0;
+            g_uthr.consumed = 0;
+            atomic_store(&g_uthr.stream, 0);   // drained: E may proceed
+         }
+         continue;
+      }
+      int r;
+      if ((r = atomic_load(&g_uthr.req)) == seen) {
+         if (relaxed_load(&g_uthr.stop))
+            break;
+         spin_wait();
+         continue;
+      }
+      seen = r;
+      update_phase(m);
+      atomic_store(&g_uthr.done, r);
+   }
+   return NULL;
+}
+
+static void u_thread_shutdown(void)
+{
+   if (!g_uthr.started)
+      return;
+   relaxed_store(&g_uthr.stop, 1);
+   thread_join(g_uthr.thread);
+   g_uthr.started = false;
+}
+
+static void u_phase_handoff(rt_model_t *m)
+{
+   if (unlikely(!g_uthr.started)) {
+      g_uthr.started = true;
+      g_uthr.model = m;
+      if (!aj_pick_phase_cores(&g_uthr.e_cpu, &g_uthr.u_cpu))
+         { g_uthr.e_cpu = 0; g_uthr.u_cpu = 1; }
+      aj_pin_thread(g_uthr.e_cpu);
+      g_uthr.thread = thread_create(u_thread_main, m, "uphase");
+      notef("NVC_TWO_PHASE=2: update phase on cpu%d, eval on cpu%d",
+            g_uthr.u_cpu, g_uthr.e_cpu);
+   }
+   const int r = g_uthr.req + 1;
+   atomic_store(&g_uthr.req, r);
+   while (atomic_load(&g_uthr.done) != r)
+      spin_wait();
+}
+
 static void model_cycle(rt_model_t *m)
 {
    // Simulation cycle is described in LRM 93 section 12.6.4
@@ -14931,55 +15093,15 @@ static void model_cycle(rt_model_t *m)
       }
    }
 
-   { extern int g_aj_phase; g_aj_phase = 1; }
-   if (m->driverq.count > 0) {
-      swap_deferq(&m->next_driverq, &m->driverq);
-      deferq_run(m, &m->next_driverq);
-   }
-
-   { extern int g_aj_phase; g_aj_phase = 2; }
-   while (heap_size(m->driving_heap) > 0) {
-      rt_nexus_t *n = heap_extract_min(m->driving_heap);
-      update_driving(m, n, true);
-   }
-
-   { extern int g_aj_phase; g_aj_phase = 3; }
-   while (heap_size(m->effective_heap) > 0) {
-      rt_nexus_t *n = heap_extract_min(m->effective_heap);
-      update_effective(m, n);
-   }
-   { extern int g_aj_phase; g_aj_phase = 5; }
-
-   sync_event_cache(m);
-
-   m->blocking_update = true;
-
-   // Update implicit signals
-   if (m->implicitq.count > 0)
-      deferq_run(m, &m->implicitq);
-
-   assert(model_thread(m)->tlab->alloc == 0);
-
-#if TRACE_SIGNALS > 0
-   if (__trace_on)
-      dump_signals(m, m->root);
-#endif
-
-   // NVC_BANKED copy-at-flip: replay staged bank-B deposits BEFORE the
-   // trigger epoch bump and sensitivity drain — the wakes these deposits
-   // notify must feed THIS delta's process filtering exactly as the
-   // un-banked interleaved deposits did (placing the flip after the
-   // triggerq drain made every wake one delta late and wedged the GALS
-   // handshake fixture at Y=0).
-   if (unlikely(g_banked == 1))
-      banked_flip(m);
-
-   // The epoch bump must stay unconditional: run_trigger memoises on it
-   // from the run_process filter and the inline blocking_update wake path,
-   // both outside this drain
-   m->trigger_epoch++;
-   if (m->triggerq.count > 0)
-      deferq_run(m, &m->triggerq);  // Sensitivity list filter
+   // #67 NVC_TWO_PHASE=2: the whole update phase runs on the pinned U
+   // thread (cache partition: driver/waveform/pending/heap structures live
+   // in U's core-private cache; eval state stays in E's).  Handshake is a
+   // request/ack epoch pair; the phases stay strictly ordered — this first
+   // increment measures the cache split alone, no concurrency.
+   if (unlikely(g_two_phase_run >= 2))
+      u_phase_handoff(m);
+   else
+      update_phase(m);
 
    run_callbacks(m, START_OF_PROCESSES);
 
@@ -15332,10 +15454,34 @@ fastclk_done:;
    // process evaluations, then replay/merge single-threaded — the
    // structurally-two-phase form the U thread will inherit.  Env off:
    // g_two_phase_eval stays 0 and every path is byte-identical to today.
-   if (unlikely(g_two_phase < 0))
-      g_two_phase = getenv("NVC_TWO_PHASE") != NULL;
+   if (unlikely(g_two_phase < 0)) {
+      const char *tp = getenv("NVC_TWO_PHASE");
+      g_two_phase = tp != NULL;
+      g_two_phase_run = tp != NULL ? atoi(tp) : 0;
+      if (getenv("NVC_FORCE_PAR") != NULL)   // deopt-cost probe: JIT
+         atomic_store(&g_par_active, 1);     // inline-drive declines +
+   }                                          // deferq locks, no capture
    if (unlikely(g_two_phase))
       g_two_phase_eval = 1;
+   if (unlikely(g_two_phase_run == 3)) {
+      // TP3 overlap: ensure the U thread + a preallocated E pipe exist,
+      // then arm the capture — driver writes stream to U during eval.
+      if (!g_uthr.started)
+         u_phase_handoff(m);   // creates + pins the U thread (idle req)
+      const int etid = thread_id();
+      if (g_evproc.pipes[etid] == NULL) {
+         prop_pipe_t *p = xcalloc(sizeof(prop_pipe_t));
+         p->max  = 131072;   // fixed: no realloc under the streaming reader
+         p->recs = xmalloc_array(p->max, sizeof(prop_rec_t));
+         g_evproc.pipes[etid] = p;
+         g_uthr.e_tid = etid;
+      }
+      g_uthr.consumed = 0;
+      g_evproc.pipes[etid]->count = 0;
+      atomic_store(&g_par_active, 1);
+      atomic_store(&g_capture, 1);
+      atomic_store(&g_uthr.stream, 1);
+   }
    if (unlikely(m->prof_enabled)) {
       const unsigned depth = m->next_procq.count;
       const int b = prof_bucket(depth);
@@ -15352,6 +15498,13 @@ fastclk_done:;
       aj_sweep_run(m, &m->next_procq);
 
    if (unlikely(g_two_phase)) {
+      if (g_two_phase_run == 3) {
+         atomic_store(&g_uthr.stream, 2);        // drain request
+         while (atomic_load(&g_uthr.stream) != 0)
+            spin_wait();                          // U quiesced
+         atomic_store(&g_capture, 0);
+         atomic_store(&g_par_active, 0);
+      }
       g_two_phase_eval = 0;
       deferq_run(m, &m->ewakeq);   // boundary replay of deferred wakes
    }
@@ -16399,7 +16552,7 @@ void x_sched_inactive(void)
 void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject)
 {
-   if (unlikely(relaxed_load(&g_par_active))) {
+   if (unlikely(relaxed_load(&g_capture))) {
       // Worker-direct (NVC_DIRECT_SCHED): for the FAST_DRIVER whole-signal
       // single-nexus class, run sched_driver's fast path ON THE WORKER
       // instead of capturing a pipe record.  Safe because per-nexus driver
@@ -16423,11 +16576,13 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
       // Worker eval: defer the driver write to thread 0 via the pipe.
       const int tid = thread_id();
       prop_rec_t *r = prop_reserve(tid);
-      r->ss = ss; r->offset = offset; r->count = 1;
-      r->after = after; r->reject = reject; r->proc = get_active_proc();
-      r->scalar = true; r->sval = scalar; r->heapval = NULL;
-      prop_commit(tid);
-      return;
+      if (r != NULL) {   // NULL: TP3 overflow fallback — serial path below
+         r->ss = ss; r->offset = offset; r->count = 1;
+         r->after = after; r->reject = reject; r->proc = get_active_proc();
+         r->scalar = true; r->sval = scalar; r->heapval = NULL;
+         prop_commit(tid);
+         return;
+      }
    }
 
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
@@ -16454,7 +16609,7 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
 
-   if (unlikely(relaxed_load(&g_par_active))) {
+   if (unlikely(relaxed_load(&g_capture))) {
       // Worker-direct: see x_sched_waveform_s.  sched_driver's fast path
       // copies the (transient) value immediately, so no capture needed.
       if (g_direct_sched && after == 0 && s->n_nexus == 1 && offset == 0
@@ -16471,19 +16626,21 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
       const int tid = thread_id();
       const uint32_t nbytes = count * s->nexus.size;
       prop_rec_t *r = prop_reserve(tid);
-      r->ss = ss; r->offset = offset; r->count = count;
-      r->after = after; r->reject = reject; r->proc = get_active_proc();
-      r->scalar = false; r->nbytes = nbytes;
-      if (likely(nbytes <= PROP_VALSZ)) {
-         r->heapval = NULL;
-         memcpy(r->value, values, nbytes);
+      if (r != NULL) {   // NULL: TP3 overflow fallback — serial path below
+         r->ss = ss; r->offset = offset; r->count = count;
+         r->after = after; r->reject = reject; r->proc = get_active_proc();
+         r->scalar = false; r->nbytes = nbytes;
+         if (likely(nbytes <= PROP_VALSZ)) {
+            r->heapval = NULL;
+            memcpy(r->value, values, nbytes);
+         }
+         else {
+            r->heapval = xmalloc(nbytes);
+            memcpy(r->heapval, values, nbytes);
+         }
+         prop_commit(tid);
+         return;
       }
-      else {
-         r->heapval = xmalloc(nbytes);
-         memcpy(r->heapval, values, nbytes);
-      }
-      prop_commit(tid);
-      return;
    }
 
    RT_LOCK(s->lock);
@@ -17163,7 +17320,14 @@ void *x_driving_value(sig_shared_t *ss, uint32_t offset, int32_t count)
                  "for %s", istr(proc->name), istr(tree_ident(s->where)));
 
       const uint8_t *driving;
-      if (n->flags & NET_F_FAST_DRIVER)
+      // #67 TP3 overlap (audit rule 8): while U owns waveform bookkeeping,
+      // an unresolved single-source nexus's driving value equals its
+      // effective value (no resolution, no other source) — read plane 0,
+      // which E owns, instead of the waveform U may be writing.
+      if ((n->flags & NET_F_FAST_DRIVER)
+          || (unlikely(g_two_phase_eval) && g_two_phase_run == 3
+              && n->n_sources == 1
+              && n->signal->resolution == NULL))
          driving = nexus_effective(n);
       else
          driving = value_ptr(n, &(src->u.driver.waveforms.value));
