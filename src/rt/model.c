@@ -352,6 +352,12 @@ static int g_banked = -1;   // NVC_BANKED, resolved in accel_banked_init
 static struct {
    rt_nexus_t **items;
    size_t       count, max;
+   // Under the E/U pipeline banked_deposit runs on BOTH threads (E: must_e
+   // chunk publications; U: streamed interp writes) — a shared touched list
+   // corrupts under growth (TSAN: xrealloc + memcpy races).  The U thread
+   // appends to its own list; the flip (single-threaded) drains both.
+   rt_nexus_t **items_u;
+   size_t       count_u, max_u;
    long         installs, deposits, flips, maxtouched;
    int          nclasses;
    const rt_nexus_vtable_t *orig[BANKED_MAX_CLASSES];
@@ -13675,12 +13681,23 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
                  sig->where ? istr(tree_ident(sig->where)) : "?",
                  m->now, m->iteration, ((const uint8_t *)value)[0]); }
    }
-   if (g_banked_st.count == g_banked_st.max) {
-      g_banked_st.max = g_banked_st.max ? g_banked_st.max * 2 : 256;
-      g_banked_st.items = xrealloc_array(g_banked_st.items, g_banked_st.max,
-                                         sizeof(rt_nexus_t *));
+   if (unlikely(g_uthr.started) && thread_id() != 0) {
+      if (g_banked_st.count_u == g_banked_st.max_u) {
+         g_banked_st.max_u = g_banked_st.max_u ? g_banked_st.max_u * 2 : 256;
+         g_banked_st.items_u = xrealloc_array(g_banked_st.items_u,
+                                              g_banked_st.max_u,
+                                              sizeof(rt_nexus_t *));
+      }
+      g_banked_st.items_u[g_banked_st.count_u++] = n;
    }
-   g_banked_st.items[g_banked_st.count++] = n;
+   else {
+      if (g_banked_st.count == g_banked_st.max) {
+         g_banked_st.max = g_banked_st.max ? g_banked_st.max * 2 : 256;
+         g_banked_st.items = xrealloc_array(g_banked_st.items, g_banked_st.max,
+                                            sizeof(rt_nexus_t *));
+      }
+      g_banked_st.items[g_banked_st.count++] = n;
+   }
    g_banked_st.deposits++;
 }
 
@@ -13692,12 +13709,25 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
 // waveforms, never plane-0 effective — audited).  Duplicates in the list
 // replay the same staged value; the deposit's change-compare makes the
 // repeats free.
+static void banked_flip_one(rt_model_t *m, rt_nexus_t *n);
+
 static void banked_flip(rt_model_t *m)
 {
-   if (g_banked_st.count > (size_t)g_banked_st.maxtouched)
-      g_banked_st.maxtouched = (long)g_banked_st.count;
-   for (size_t i = 0; i < g_banked_st.count; i++) {
-      rt_nexus_t *n = g_banked_st.items[i];
+   const size_t total = g_banked_st.count + g_banked_st.count_u;
+   if (total > (size_t)g_banked_st.maxtouched)
+      g_banked_st.maxtouched = (long)total;
+   for (size_t i = 0; i < g_banked_st.count; i++)
+      banked_flip_one(m, g_banked_st.items[i]);
+   for (size_t i = 0; i < g_banked_st.count_u; i++)
+      banked_flip_one(m, g_banked_st.items_u[i]);
+   g_banked_st.count = 0;
+   g_banked_st.count_u = 0;
+   g_banked_st.flips++;
+}
+
+static void banked_flip_one(rt_model_t *m, rt_nexus_t *n)
+{
+   {
       const rt_nexus_vtable_t *orig = NULL;
       for (int c = 0; c < g_banked_st.nclasses; c++)
          if (&g_banked_st.patched[c] == n->vtable) {
@@ -13705,13 +13735,11 @@ static void banked_flip(rt_model_t *m)
             break;
          }
       if (orig == NULL)
-         continue;   // vtable replaced since staging (lazy/fastclk install)
+         return;   // vtable replaced since staging (lazy/fastclk install)
       rt_signal_t *sig = n->signal;
       (*orig->deposit)(m, n,
                        sig->shared.data + n->offset + 3 * sig->shared.size);
    }
-   g_banked_st.count = 0;
-   g_banked_st.flips++;
 }
 
 __attribute__((destructor))
@@ -14318,7 +14346,12 @@ static inline prop_rec_t *prop_reserve(int tid)
 
 static inline void prop_commit(int tid)
 {
-   g_evproc.pipes[tid]->count++;
+   prop_pipe_t *p = g_evproc.pipes[tid];
+   // RELEASE: the record-field stores must not be compiler-reordered past
+   // the count publication — the TP3 streaming consumer chases count
+   // concurrently (x86-TSO covers the CPU ordering; this covers gcc).
+   // Found by TSAN as the nondeterministic half-filled-record apply.
+   __atomic_store_n(&p->count, p->count + 1, __ATOMIC_RELEASE);
 }
 
 // Thread 0: apply one record — the sole site where split_nexus/sched_driver run.
@@ -14873,7 +14906,7 @@ static void *u_thread_main(void *arg)
       const int st = atomic_load(&g_uthr.stream);
       if (st != 0) {
          prop_pipe_t *p = g_evproc.pipes[g_uthr.e_tid];
-         const uint32_t cnt = relaxed_load(&p->count);
+         const uint32_t cnt = __atomic_load_n(&p->count, __ATOMIC_ACQUIRE);
          while (g_uthr.consumed < cnt)
             prop_apply(m, &p->recs[g_uthr.consumed++]);
          if (st == 2 && g_uthr.consumed == relaxed_load(&p->count)) {
