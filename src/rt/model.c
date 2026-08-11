@@ -260,6 +260,11 @@ typedef struct _rt_model {
    // chunk can be live. Replaces the old single global g_aj_eval.
    aj_chunk_t       **aj_chunks;   // pointer array — chunks have stable address
    unsigned           aj_chunk_count;
+   // delta-ordered capture (NVC_ACCEL_CAPTURE_DELTA): chunks whose armed
+   // capture was deferred this timestep, re-woken from the delta boundary
+   // once iteration reaches the target (or the timestep would end)
+   aj_chunk_t       **aj_capq;
+   int                aj_capq_count, aj_capq_max;
    unsigned           aj_chunk_max;
    uint64_t           aj_snap_now;   // timestep of the last fleet input snapshot
    unsigned           aj_snap_iter;  // ...and its delta cycle (per-DELTA snapshot)
@@ -2184,6 +2189,8 @@ struct _aj_chunk {
    uint64_t         recap_now;       // now+1 stamp (0 = none this instant)
    unsigned long    recap_size;      // replayable prefix (accel_recap_size);
                                      // 0 = unprobed, ULONG_MAX = absent
+   uint64_t         cap_pending;     // delta-ordered capture: now+1 stamp
+                                     // while this chunk waits on aj_capq
    bool             defer_pending;
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
@@ -2587,11 +2594,27 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
      if (_cd == -2) { const char *e = getenv("NVC_ACCEL_CAPTURE_DELTA");
                       _cd = e ? atoi(e) : -1; }
      if (_cd >= 0 && (armed_rose || extra_rose)
-         && m->iteration < (unsigned)_cd && save_obj != NULL) {
+         && m->iteration < (unsigned)_cd
+         && chunk->cap_pending != (uint64_t)-1) {   // drain force: capture now
+        // v1: engagement must not depend on the dispatch path (v0's
+        // save_obj guard silently skipped fastclk-TABLE evals — mixed
+        // deferred/undeferred population, boot death).  Un-stamp the arm
+        // (the arm sequence replays at the capture wake: clk last_event
+        // and byte still hold within the timestep) and queue the CHUNK on
+        // the model-side capq; the delta-boundary drain re-wakes its
+        // representative proc once iteration reaches the target or the
+        // timestep would otherwise end.
         if (armed_rose) chunk->ck_arm_now = 0;
         if (extra_rose) chunk->ck_xarm_now = 0;
-        rt_proc_t *self = container_of(save_obj, rt_proc_t, wakeable);
-        deltaq_insert_proc(m, 0, self);
+        if (chunk->cap_pending != (uint64_t)m->now + 1) {
+           chunk->cap_pending = (uint64_t)m->now + 1;
+           if (m->aj_capq_count == m->aj_capq_max) {
+              m->aj_capq_max = m->aj_capq_max ? m->aj_capq_max * 2 : 32;
+              m->aj_capq = xrealloc_array(m->aj_capq, m->aj_capq_max,
+                                          sizeof(aj_chunk_t *));
+           }
+           m->aj_capq[m->aj_capq_count++] = chunk;
+        }
         g_aj_cur_chunk[tid]  = save_chunk;
         thread->active_obj   = save_obj;
         thread->active_scope = save_scope;
@@ -2670,9 +2693,15 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
      if (_at != NULL && chunk->rs_top != NULL
          && strstr(chunk->rs_top, _at) != NULL)
         fprintf(stderr, "[arm %s] t=%"PRIi64"+%u armed=%d extra=%d snap=%d "
-                "snapnow=%"PRIu64"\n", chunk->rs_top, m->now, m->iteration,
+                "snapnow=%"PRIu64" lev=%"PRIu64" byte=%u arm_now=%"PRIu64"\n",
+                chunk->rs_top, m->now, m->iteration,
                 (int)armed_rose, (int)extra_rose, (int)use_snap,
-                m->aj_snap_now); }
+                m->aj_snap_now,
+                chunk->primary_ck != NULL
+                   ? (uint64_t)chunk->primary_ck->nexus.last_event : 0,
+                chunk->primary_ck != NULL
+                   ? (unsigned)chunk->primary_ck->shared.data[0] : 0,
+                chunk->ck_arm_now); }
    { static int _rc = -1;
      if (_rc < 0) _rc = getenv("NVC_ACCEL_RECAP") != NULL;
      if (_rc && chunk->recap_size == 0 && chunk->dl != NULL) {
@@ -15886,6 +15915,41 @@ fastclk_done:;
       }
       g_two_phase_eval = 0;
       deferq_run(m, &m->ewakeq);   // boundary replay of deferred wakes
+   }
+
+   // Delta-ordered capture drain: re-wake deferred chunks once the next
+   // delta reaches the target — or right away when the timestep would
+   // otherwise end (each drain adds a delta, so the quiet-timestep case
+   // self-extends and terminates at the target; captures land at
+   // min(target, natural-end+1)).
+   if (m->aj_capq_count > 0) {
+      static int _cdk = -2;
+      if (_cdk == -2) { const char *e = getenv("NVC_ACCEL_CAPTURE_DELTA");
+                        _cdk = e ? atoi(e) : -1; }
+      if (getenv("AJ_CAPDBG") != NULL)
+         fprintf(stderr, "#CAPQ t=%"PRIi64"+%u count=%d nid=%d pend=%d\n",
+                 m->now, m->iteration, m->aj_capq_count,
+                 (int)m->next_is_delta,
+                 m->aj_capq_count > 0 && m->aj_capq[0]->rr_count > 0
+                    ? (int)m->aj_capq[0]->rr_saved[0].proc->wakeable.pending
+                    : -1);
+      if (m->iteration + 1 >= (unsigned)_cdk || !m->next_is_delta) {
+         // direct boundary call: the capture runs HERE, after every proc of
+         // this delta — clear the dedup claim the deferring eval left so
+         // the call is not silently dropped, then evaluate.  Publications
+         // schedule normally (active_obj is set inside aj_proc_eval).
+         const int n = m->aj_capq_count;
+         m->aj_capq_count = 0;   // captures may re-defer only via new arms
+         for (int ci = 0; ci < n; ci++) {
+            aj_chunk_t *c = m->aj_capq[ci];
+            if (c->rr_count == 0 || c->rr_saved[0].proc == NULL)
+               continue;
+            c->last_eval_now = 0;
+            c->cap_pending   = (uint64_t)-1;   // force: no re-defer
+            aj_proc_eval(m, c->rr_saved[0].proc);
+            c->cap_pending   = 0;
+         }
+      }
    }
 
    run_callbacks(m, END_OF_PROCESSES);
