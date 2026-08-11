@@ -4357,6 +4357,35 @@ static rt_nexus_t *aj_ultimate_driver_nexus(rt_nexus_t *n, int depth)
                }
             }
          }
+         // NVC_ACCEL_CKREKEY: see through LATCH-BASED clock gates.  VeeR's
+         // sv2v output clocks whole subsystems (ARF/INSTBUFF/ALN/every BHT
+         // bank — 1,162 of 1,182 dryrun groups) through LPM latch nets:
+         // the driver proc is the latch process inside an lpm_* entity, so
+         // resolution stopped here and each consumer became an unmergeable
+         // 1-member group that stays interpreted.  Resolve THROUGH the
+         // gating entity's own clock input (same name heuristics as the
+         // candidate scan) so the family keys to the true root; the gated
+         // clock still drives the wrapper's members via their clk pins
+         // (grouping KEY only — bindtab wiring unchanged).
+         { static int _rk = -1;
+           if (_rk < 0) _rk = getenv("NVC_ACCEL_CKREKEY") != NULL;
+           if (_rk && asgn == NULL && dp->scope != NULL) {
+              rt_signal_t *gck = aj_find_signal(dp->scope, "clk");
+              if (gck == NULL) {
+                 for (int gi = 0; gi < dp->scope->signals.count
+                         && gck == NULL; gi++) {
+                    rt_signal_t *sg = dp->scope->signals.items[gi];
+                    if (sg->where == NULL) continue;
+                    char nm[64];
+                    aj_lower(nm, istr(tree_ident(sg->where)), sizeof nm);
+                    const size_t nl = strlen(nm);
+                    if (nl >= 3 && strcmp(nm + nl - 3, "clk") == 0)
+                       gck = sg;
+                 }
+              }
+              if (gck != NULL && gck->n_nexus == 1 && &gck->nexus != n)
+                 return aj_ultimate_driver_nexus(&gck->nexus, depth + 1);
+           } }
       }
    }
    return n;
@@ -8389,7 +8418,14 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             // free_clk) connects to the wrapper's clk; other *clk pins are
             // ordinary boundary inputs (extra clocks — legal for gsm)
             if (!pp->is_output && strcmp(pp->name, c->clk.name) == 0
-                && pp->sig == c->clk.sig) {
+                && pp->sig == c->clk.sig
+                && pp->sig == g_aj_cands[i].clk.sig) {
+               // only members clocked by the SEED'S OWN signal bind to the
+               // wrapper clk; under NVC_ACCEL_CKREKEY a member grouped via
+               // a latch-gated clock keeps its gated net as an ordinary
+               // boundary input (an EXTRA clock — the sm_clock_late/extra
+               // machinery) instead of being silently re-clocked by the
+               // seed's signal (measured: re-clocking killed the machine).
                fprintf(bf, "%s.%s(clk)", first ? "" : ", ", pp->name);
                first = false;
                continue;
