@@ -2182,6 +2182,8 @@ struct _aj_chunk {
    // the chunk arming at +3).
    uint8_t         *recap;           // pre-capture state copy (lazily sized)
    uint64_t         recap_now;       // now+1 stamp (0 = none this instant)
+   unsigned long    recap_size;      // replayable prefix (accel_recap_size);
+                                     // 0 = unprobed, ULONG_MAX = absent
    bool             defer_pending;
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
@@ -2650,19 +2652,27 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
                 m->aj_snap_now); }
    { static int _rc = -1;
      if (_rc < 0) _rc = getenv("NVC_ACCEL_RECAP") != NULL;
-     if (_rc && chunk->rs_state_size > 0) {
+     if (_rc && chunk->recap_size == 0 && chunk->dl != NULL) {
+        // probe once: the replayable-prefix size (register block S +
+        // edge-detects, everything BEFORE the change baselines and
+        // publication gates).  Old .so's lack the symbol -> RECAP inert.
+        unsigned long (*rsz)(void) = dlsym(chunk->dl, "accel_recap_size");
+        chunk->recap_size = rsz != NULL ? rsz() : ULONG_MAX;
+     }
+     if (_rc && chunk->recap_size > 0 && chunk->recap_size != ULONG_MAX) {
         if (armed_rose || extra_rose) {
            if (chunk->recap == NULL)
-              chunk->recap = xmalloc(chunk->rs_state_size);
-           memcpy(chunk->recap, chunk->state, chunk->rs_state_size);
+              chunk->recap = xmalloc(chunk->recap_size);
+           memcpy(chunk->recap, chunk->state, chunk->recap_size);
            chunk->recap_now = (uint64_t)m->now + 1;
         }
         else if (chunk->recap != NULL
                  && chunk->recap_now == (uint64_t)m->now + 1) {
-           // replay: restore the pre-capture state (incl clklast) so the
+           // replay: restore ONLY the register/edge-detect prefix so the
            // bridge's edge-detect refires and the capture re-runs against
-           // the current (later-delta) input world
-           memcpy(chunk->state, chunk->recap, chunk->rs_state_size);
+           // the current (later-delta) input world; change baselines and
+           // publication gates stay live (v1's fatal flaw)
+           memcpy(chunk->state, chunk->recap, chunk->recap_size);
         }
      } }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
@@ -5793,6 +5803,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                          " unsigned char late_pend;" : "",
               raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
+   // NVC_ACCEL_RECAP contract: the replayable PREFIX of aj_cs_t = register
+   // block S + edge-detect fields (last_t/clk_last0/ck_last[/snapS...]) —
+   // everything BEFORE in_live.  Rolling back only this prefix restores the
+   // capture state AND re-arms the edge-detects while leaving the change
+   // baselines (in_live/raw_shadow) and publication gates (o_prev) intact —
+   // v1's full-state rollback reverted those and broke publication gating.
+   fprintf(f, "unsigned long accel_recap_size(void){"
+              " return (unsigned long)((char*)&((aj_cs_t*)0)->in_live"
+              " - (char*)0); }\n");
 
    // DEMOTE WRITEBACK TABLES (aj_chunk_demote). Scrape the state_t struct
    // out of the generated model text (the established cross-file contract:
@@ -7526,7 +7545,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
    // stale and re-emit+recompile from the cached synth .c.  v2: true
    // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v4"; *p; p++)
+   for (const char *p = "bridge-v5"; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -8499,7 +8518,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v4"; *p; p++)
+        for (const char *p = "bridge-v5"; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
