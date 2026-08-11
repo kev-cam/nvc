@@ -2574,6 +2574,29 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
             chunk->ck_xarm_now = (uint64_t)m->now + 1;
       }
    }
+   // DELTA-ORDERED CAPTURE v0 (NVC_ACCEL_CAPTURE_DELTA=k, user directive):
+   // the interp delta cascade IS the correct ordering — rim producers
+   // (interp packing flops, gated commits) land at deep deltas (measured:
+   // wb_pkt at +11) AFTER the chunk's natural armed eval (~+3), so the
+   // lumped capture must be PLACED after them.  Defer the armed capture by
+   // un-stamping the arm (the whole arm sequence replays at the next wake —
+   // clk last_event/byte still hold within the timestep) and self-queueing
+   // for the next delta, until iteration >= k.  v0 = one global k to prove
+   // the mechanism; per-chunk values come from the interp delta census.
+   { static int _cd = -2;
+     if (_cd == -2) { const char *e = getenv("NVC_ACCEL_CAPTURE_DELTA");
+                      _cd = e ? atoi(e) : -1; }
+     if (_cd >= 0 && (armed_rose || extra_rose)
+         && m->iteration < (unsigned)_cd && save_obj != NULL) {
+        if (armed_rose) chunk->ck_arm_now = 0;
+        if (extra_rose) chunk->ck_xarm_now = 0;
+        rt_proc_t *self = container_of(save_obj, rt_proc_t, wakeable);
+        deltaq_insert_proc(m, 0, self);
+        g_aj_cur_chunk[tid]  = save_chunk;
+        thread->active_obj   = save_obj;
+        thread->active_scope = save_scope;
+        return;
+     } }
    // Two-phase edge sampling (see struct _aj_chunk and aj_snap_mode).
    // Mode 4 (default): armed posedge evals read the per-timestep pre-edge
    // snapshot, everything else reads live.  Modes 1-3: historical forms
