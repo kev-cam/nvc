@@ -944,9 +944,13 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
    free(scope);
 }
 
+static void aj_census_dump(rt_model_t *m);
+
 void model_free(rt_model_t *m)
 {
    part_final_report(m);
+
+   aj_census_dump(m);
 
    u_thread_shutdown();
    evproc_shutdown();
@@ -2191,6 +2195,9 @@ struct _aj_chunk {
                                      // 0 = unprobed, ULONG_MAX = absent
    uint64_t         cap_pending;     // delta-ordered capture: now+1 stamp
                                      // while this chunk waits on aj_capq
+   unsigned         cap_maxdelta;    // census: max arming/extra-wake delta
+   int              cap_delta;       // per-chunk capture depth (census file;
+                                     // -1 = unset, fall back to global k)
    bool             defer_pending;
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
@@ -2486,6 +2493,66 @@ static inline int aj_rst_hold(void);
 static void aj_rst_release(rt_model_t *m, aj_chunk_t *c);
 static void aj_lower(char *dst, const char *src, size_t n);
 
+// Delta-ordered capture CENSUS dump (NVC_ACCEL_CLOCK_CENSUS=<file>):
+// per-chunk max arming/extra-wake delta observed over the run — the
+// chunk's clock-edge depth in the delta cascade.  Called from the
+// END_OF_SIMULATION paths and model_free; idempotent.
+static void aj_census_dump(rt_model_t *m)
+{
+   static bool dumped = false;
+   const char *cf = getenv("NVC_ACCEL_CLOCK_CENSUS");
+   if (dumped || cf == NULL || m == NULL || m->aj_chunk_count == 0)
+      return;
+   FILE *f = fopen(cf, "w");
+   if (f == NULL)
+      return;
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      if (c->rs_top != NULL)
+         fprintf(f, "%s %u\n", c->rs_top, c->cap_maxdelta);
+   }
+   fclose(f);
+   dumped = true;
+   notef("accel-jit: clock census -> %s (%u chunks)", cf, m->aj_chunk_count);
+}
+
+// Delta-ordered capture census lookup (NVC_ACCEL_CAPTURE_CENSUS=<file>,
+// lines "<chunk-top> <depth>" from a calibration run's
+// NVC_ACCEL_CLOCK_CENSUS dump).  Returns the per-chunk capture depth,
+// or -1 when the file is absent or the chunk is not listed.
+static int aj_census_lookup(const char *top)
+{
+   static char (*names)[96] = NULL;
+   static int  *depths = NULL;
+   static int   n = -1;
+   if (n < 0) {
+      n = 0;
+      const char *cf = getenv("NVC_ACCEL_CAPTURE_CENSUS");
+      FILE *f = cf != NULL ? fopen(cf, "r") : NULL;
+      if (f != NULL) {
+         int max = 64;
+         names  = xmalloc_array(max, sizeof *names);
+         depths = xmalloc_array(max, sizeof(int));
+         char nm[96]; int d;
+         while (fscanf(f, "%95s %d", nm, &d) == 2) {
+            if (n == max) {
+               max *= 2;
+               names  = xrealloc_array(names, max, sizeof *names);
+               depths = xrealloc_array(depths, max, sizeof(int));
+            }
+            snprintf(names[n], sizeof names[n], "%s", nm);
+            depths[n++] = d;
+         }
+         fclose(f);
+      }
+   }
+   if (top != NULL)
+      for (int i = 0; i < n; i++)
+         if (strcmp(names[i], top) == 0)
+            return depths[i] > 0 ? depths[i] : -1;
+   return -1;
+}
+
 static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
 {
    // Recover this proc's chunk from its vtable (first field), establish the
@@ -2593,8 +2660,18 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    { static int _cd = -2;
      if (_cd == -2) { const char *e = getenv("NVC_ACCEL_CAPTURE_DELTA");
                       _cd = e ? atoi(e) : -1; }
-     if (_cd >= 0 && (armed_rose || extra_rose)
-         && m->iteration < (unsigned)_cd
+     if (armed_rose || extra_rose) {
+        // census recording: the chunk's arming depth in the delta cascade
+        if (m->iteration > chunk->cap_maxdelta)
+           chunk->cap_maxdelta = m->iteration;
+        // per-chunk capture depth from the census file (lazy one-time
+        // lookup; 0 = unprobed, -1 = absent-from-census -> global k)
+        if (chunk->cap_delta == 0)
+           chunk->cap_delta = aj_census_lookup(chunk->rs_top);
+     }
+     const int _k = (chunk->cap_delta > 0) ? chunk->cap_delta : _cd;
+     if (_k >= 0 && (armed_rose || extra_rose)
+         && m->iteration < (unsigned)_k
          && chunk->cap_pending != (uint64_t)-1) {   // drain force: capture now
         // v1: engagement must not depend on the dispatch path (v0's
         // save_obj guard silently skipped fastclk-TABLE evals — mixed
@@ -8469,9 +8546,11 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             // the member's CHOSEN primary-clock pin (any name, e.g.
             // free_clk) connects to the wrapper's clk; other *clk pins are
             // ordinary boundary inputs (extra clocks — legal for gsm)
+            static int _rkon = -1;
+            if (_rkon < 0) _rkon = getenv("NVC_ACCEL_CKREKEY") != NULL;
             if (!pp->is_output && strcmp(pp->name, c->clk.name) == 0
                 && pp->sig == c->clk.sig
-                && pp->sig == g_aj_cands[i].clk.sig) {
+                && (!_rkon || pp->sig == g_aj_cands[i].clk.sig)) {
                // only members clocked by the SEED'S OWN signal bind to the
                // wrapper clk; under NVC_ACCEL_CKREKEY a member grouped via
                // a latch-gated clock keeps its gated net as an ordinary
@@ -16123,6 +16202,7 @@ void model_run(rt_model_t *m, uint64_t stop_time)
       jit_run_region_leave(m->jit, thread, oldstate);
    }
 
+   aj_census_dump(m);
    run_callbacks(m, END_OF_SIMULATION);
 
    if (m->liveness)
@@ -16153,6 +16233,7 @@ void model_run_fini(rt_model_t *m)
 {
    MODEL_ENTRY(m);
 
+   aj_census_dump(m);
    run_callbacks(m, END_OF_SIMULATION);
 
    if (m->liveness)
