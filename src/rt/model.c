@@ -6998,6 +6998,14 @@ typedef struct {
    aj_pin_t    clk, rst;
    rt_nexus_t *ck_root;      // ultimate driving nexus of clk (the group key)
    bool        have_rst;
+   // NVC_ACCEL_MERGE_GLUE: comb-only subtree (no primary clock) recorded as
+   // connective tissue.  Never seeds or joins a group by clock; admitted into
+   // a group only by the backward-cone fixpoint in aj_try_merge_install when
+   // one of its outputs feeds a group member's input.  Un-admitted glue stays
+   // interpreted (it is never claimed).  This is the mech-3 root fix: without
+   // the glue, member<->member cascades cross the interp rim and the merged
+   // chunk's registers capture stale sibling values at the armed eval.
+   bool        is_glue;
 } aj_mcand_t;
 
 static bool        g_aj_collecting = false;
@@ -7296,8 +7304,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          char lname[64];
          aj_lower(lname, istr(tree_ident(p)), sizeof lname);
          rt_signal_t *sig = aj_find_signal(scope, lname);
-         if (sig == NULL)
+         if (sig == NULL) {
+            if (getenv("NVC_ACCEL_COLLECT_DBG") != NULL)
+               notef("accel-jit: collect '%s' %s: port %s NOT FOUND",
+                     top0, istr(scope->name), lname);
             continue;
+         }
          aj_pin_t pin = {0};
          snprintf(pin.name, sizeof pin.name, "%s", lname);
          pin.elem  = (int)sig->nexus.size;
@@ -7309,8 +7321,13 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                           || tree_subkind(p) == PORT_BUFFER);
          if (pin.width < 1 || pin.width > 4096
              || (pin.elem != 1 && pin.elem != 4)
-             || !aj_marshallable_type(tree_type(p)))
+             || !aj_marshallable_type(tree_type(p))) {
+            if (getenv("NVC_ACCEL_COLLECT_DBG") != NULL)
+               notef("accel-jit: collect bail '%s' pin %s w=%d elem=%d "
+                     "marsh=%d", top0, lname, pin.width, pin.elem,
+                     (int)aj_marshallable_type(tree_type(p)));
             return false;   // unmarshallable: leave for the normal scan
+         }
          if (!pin.is_output) {
             const size_t nl = strlen(lname);
             if (strcmp(lname, "clk") == 0)
@@ -7322,14 +7339,68 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          }
          cpins[ncp++] = pin;
       }
-      if (clk_i < 0)
-         return false;      // no primary clock: not mergeable
+      if (clk_i < 0) {
+         // No primary clock: not mergeable as a member.  Under
+         // NVC_ACCEL_MERGE_GLUE, record comb-only subtrees (sv_and/sv_or
+         // interconnect glue) as glue candidates so the group builder can
+         // internalize member->glue->member cascades (mech-3 root fix).
+         // Either way the subtree is NOT collected as a member: return
+         // false so it stays interpreted unless a group admits it.
+         static int glue_on = -1;
+         if (glue_on < 0)
+            glue_on = getenv("NVC_ACCEL_MERGE_GLUE") != NULL;
+         bool has_out = false;
+         for (int p = 0; p < ncp; p++) has_out |= cpins[p].is_output;
+         if (glue_on && ncp > 0 && has_out) {
+            if (g_aj_ncand == g_aj_candmax) {
+               g_aj_candmax = g_aj_candmax ? g_aj_candmax * 2 : 64;
+               g_aj_cands = xrealloc_array(g_aj_cands, g_aj_candmax,
+                                           sizeof(aj_mcand_t));
+            }
+            aj_mcand_t *gc = &g_aj_cands[g_aj_ncand++];
+            memset(gc, 0, sizeof(aj_mcand_t));
+            gc->scope = scope;
+            gc->ref   = ref;
+            char sfx[32], upath[600], utop[192];
+            snprintf(sfx, sizeof sfx, "_g%d", g_aj_ncand - 1);
+            snprintf(upath, sizeof upath, "%s/aj_glu%d_subtree.v", accel_dir,
+                     g_aj_ncand - 1);
+            if (!aj_uniquify_modules(srcs[0], upath, sfx, top_mod,
+                                     utop, sizeof utop)) {
+               g_aj_ncand--;
+               return false;
+            }
+            // NO EDGE-TRIGGERED STATE: comb glue may legitimately emit as
+            // `always @(*)` (reduction loops), but a no-clock subtree with
+            // posedge/negedge sensitivity holds state and must never be
+            // synthesized as comb inside the fused netlist.
+            {
+               char *vtext = aj_read_file(upath);
+               const bool has_edge = vtext != NULL
+                  && (strstr(vtext, "posedge") != NULL
+                      || strstr(vtext, "negedge") != NULL);
+               free(vtext);
+               if (has_edge) {
+                  g_aj_ncand--;
+                  return false;
+               }
+            }
+            gc->top_mod = xstrdup(utop);
+            gc->vpath   = xstrdup(upath);
+            gc->pins  = xmalloc_array(ncp, sizeof(aj_pin_t));
+            memcpy(gc->pins, cpins, ncp * sizeof(aj_pin_t));
+            gc->npins = ncp;
+            gc->is_glue = true;
+         }
+         return false;
+      }
       if (g_aj_ncand == g_aj_candmax) {
          g_aj_candmax = g_aj_candmax ? g_aj_candmax * 2 : 64;
          g_aj_cands = xrealloc_array(g_aj_cands, g_aj_candmax,
                                      sizeof(aj_mcand_t));
       }
       aj_mcand_t *c = &g_aj_cands[g_aj_ncand++];
+      memset(c, 0, sizeof(aj_mcand_t));
       c->scope = scope;
       c->ref   = ref;
       // Snapshot the emitted .v NOW under a unique path with uniquified
@@ -7992,10 +8063,22 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
 {
    if (g_aj_ncand == 0)
       return;
+   if (getenv("NVC_ACCEL_COLLECT_DBG") != NULL) {
+      int ng = 0;
+      for (int i = 0; i < g_aj_ncand; i++) ng += g_aj_cands[i].is_glue;
+      notef("accel-jit: collect census: %d candidates (%d glue)",
+            g_aj_ncand, ng);
+      for (int i = 0; i < g_aj_ncand; i++)
+         notef("accel-jit:   cand %d %s%s scope=%s", i,
+               g_aj_cands[i].top_mod,
+               g_aj_cands[i].is_glue ? " GLUE" : "",
+               g_aj_cands[i].scope != NULL
+                  ? istr(g_aj_cands[i].scope->name) : "?");
+   }
    bool *claimed = xcalloc_array(g_aj_ncand, sizeof(bool));
    int gid = 0;
    for (int i = 0; i < g_aj_ncand; i++) {
-      if (claimed[i]) continue;
+      if (claimed[i] || g_aj_cands[i].is_glue) continue;
       static int members[4096];
       int nmem = 0;
       members[nmem++] = i; claimed[i] = true;
@@ -8030,12 +8113,138 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       const char *gcenv = getenv("NVC_ACCEL_MERGE_MAX_GROUP");
       const int gcap = gcenv ? atoi(gcenv) : 96;
       for (int j = i + 1; j < g_aj_ncand && nmem < gcap && nmem < 4096; j++)
-         if (!claimed[j]
+         if (!claimed[j] && !g_aj_cands[j].is_glue
              && g_aj_cands[j].ck_root == g_aj_cands[i].ck_root
              && !(stat(g_aj_cands[j].vpath, &vst) == 0
                   && vst.st_size > bigcap)) {
             members[nmem++] = j; claimed[j] = true;
          }
+      // NVC_ACCEL_MERGE_GLUE: pull the comb glue cone FEEDING member inputs
+      // into the group (backward fixpoint) so member->glue->member cascades
+      // become internal wires of the fused netlist instead of interp rim
+      // round-trips — the mech-3 root fix (a merged chunk's registers
+      // capture ONCE per timestep at the armed eval; a cascade crossing the
+      // rim arrives a publication-regime late and the capture reads stale
+      // sibling values).  A glue candidate is admitted when one of its
+      // OUTPUTS shares storage with a non-clk INPUT pin of the current set;
+      // admitted glue's own inputs extend the cone on later iterations.
+      // Unclaimed glue is never installed (stays interpreted).
+      if (nmem >= 2) {
+         static int glue_cap = -2;
+         if (glue_cap == -2) {
+            const char *ge = getenv("NVC_ACCEL_MERGE_GLUE");
+            const char *gm = getenv("NVC_ACCEL_MERGE_GLUE_MAX");
+            glue_cap = (ge != NULL && atoi(ge) != 0) ? (gm ? atoi(gm) : 2048)
+                                                     : -1;
+         }
+         int nglue = 0;
+         bool grew = glue_cap > 0;
+         while (grew && nglue < glue_cap && nmem < 4096) {
+            grew = false;
+            for (int j = 0; j < g_aj_ncand && nglue < glue_cap
+                    && nmem < 4096; j++) {
+               if (claimed[j] || !g_aj_cands[j].is_glue) continue;
+               aj_mcand_t *gc = &g_aj_cands[j];
+               // NVC_ACCEL_MERGE_GLUE_SKIP=<substr,...>: leave matching glue
+               // interpreted (bisection knob for the admission population).
+               { static const char *gs = (const char *)-1;
+                 if (gs == (const char *)-1)
+                    gs = getenv("NVC_ACCEL_MERGE_GLUE_SKIP");
+                 if (gs != NULL && gc->scope != NULL) {
+                    char sn[512], buf[256];
+                    snprintf(sn, sizeof sn, "%s", istr(gc->scope->name));
+                    snprintf(buf, sizeof buf, "%s", gs);
+                    bool hit = false;
+                    for (char *t = strtok(buf, ","); t != NULL && !hit;
+                         t = strtok(NULL, ","))
+                       hit = t[0] != '\0' && strstr(sn, t) != NULL;
+                    if (hit) continue;
+                 } }
+               // CLOCK PURITY: never admit glue that produces a clock-class
+               // net.  Clock-tree gates (and/or inside the l1clk/l2clk
+               // fabrics) re-timed through chunk publication (+2-delta
+               // stage2 vs interp's same-delta cascade) skew every interp
+               // gated-clock consumer downstream — measured: admitting them
+               // killed the machine outright (0 retires by 1100ns).
+               bool clocky = false;
+               for (int p = 0; p < gc->npins && !clocky; p++) {
+                  if (!gc->pins[p].is_output) continue;
+                  rt_signal_t *os = gc->pins[p].sig;
+                  if (os == NULL) continue;
+                  // follow the single port hop to the OUTER net (the port
+                  // signal's own ident is just the formal name, e.g. "o")
+                  rt_signal_t *outer = os;
+                  if (os->n_nexus == 1 && os->nexus.outputs != NULL) {
+                     rt_source_t *o2 = os->nexus.outputs;
+                     if (o2->chain_output == NULL && o2->tag == SOURCE_PORT
+                         && o2->u.port.conv_func == NULL
+                         && o2->u.port.output != NULL
+                         && o2->u.port.output->signal != NULL)
+                        outer = o2->u.port.output->signal;
+                  }
+                  if (outer->where != NULL) {
+                     char onm[128];
+                     aj_lower(onm, istr(tree_ident(outer->where)), sizeof onm);
+                     if (strstr(onm, "clk") != NULL
+                         || strstr(onm, "clock") != NULL)
+                        clocky = true;
+                  }
+               }
+               if (clocky) continue;
+               bool feeds = false;
+               for (int p = 0; p < gc->npins && !feeds; p++) {
+                  if (!gc->pins[p].is_output) continue;
+                  const uint8_t *od = aj_consumer_data(gc->pins[p].sig);
+                  for (int k = 0; k < nmem && !feeds; k++) {
+                     aj_mcand_t *mc = &g_aj_cands[members[k]];
+                     // Never admit glue that feeds a CLOCK HEADER member:
+                     // internalizing an ICG's enable re-times the gated
+                     // clock the header produces for INTERP consumers (the
+                     // enable's rim hop was part of the measured-correct
+                     // clock distribution timing).
+                     if (mc->top_mod != NULL
+                         && strstr(mc->top_mod, "clkhdr") != NULL)
+                        continue;
+                     for (int q = 0; q < mc->npins; q++) {
+                        aj_pin_t *ip = &mc->pins[q];
+                        if (ip->is_output) continue;
+                        if (!mc->is_glue
+                            && strcmp(ip->name, mc->clk.name) == 0
+                            && ip->sig == mc->clk.sig)
+                           continue;   // never glue into a clock pin
+                        if (od == ip->data
+                            && gc->pins[p].width == ip->width) {
+                           feeds = true;
+                           break;
+                        }
+                     }
+                  }
+               }
+               if (feeds) {
+                  members[nmem++] = j;
+                  claimed[j] = true;
+                  nglue++;
+                  grew = true;
+                  if (getenv("NVC_ACCEL_COLLECT_DBG") != NULL)
+                     notef("accel-jit: glue ADMIT %s (%s) into group root %s",
+                           gc->scope != NULL ? istr(gc->scope->name) : "?",
+                           gc->top_mod,
+                           g_aj_cands[i].ck_root != NULL
+                              && g_aj_cands[i].ck_root->signal != NULL
+                              ? istr(tree_ident(
+                                   g_aj_cands[i].ck_root->signal->where))
+                              : "?");
+               }
+            }
+         }
+         if (nglue > 0)
+            notef("accel-jit: MERGE group (root %s) admitted %d glue "
+                  "subtree(s), %d members total (NVC_ACCEL_MERGE_GLUE)",
+                  g_aj_cands[i].ck_root != NULL
+                     && g_aj_cands[i].ck_root->signal != NULL
+                     ? istr(tree_ident(g_aj_cands[i].ck_root->signal->where))
+                     : "?", nglue, nmem);
+      }
       if (getenv("NVC_ACCEL_MERGE_DRYRUN") != NULL) {   // grouping inspection
          rt_nexus_t *r = g_aj_cands[i].ck_root;
          notef("accel-jit: MERGE dryrun group: %d members, clk pin '%s', "
@@ -8090,6 +8299,18 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       fprintf(pf, "input clk");
       if (have_rst) fprintf(pf, ", input rst");
       int n_internal = 0;
+      // Glue outputs are chunk-INTERNAL wires, never wrapper ports: the
+      // interp glue proc stays alive (not rerouted) so every interp-visible
+      // net keeps its interp driver/timing/X-epoch semantics; the chunk
+      // computes its OWN copy purely for member-cascade correctness.
+      for (int k = 0; k < nmem; k++) {
+         aj_mcand_t *c = &g_aj_cands[members[k]];
+         if (!c->is_glue) continue;
+         for (int p = 0; p < c->npins; p++)
+            if (c->pins[p].is_output)
+               fprintf(bf, "  wire [%d:0] m%d_%s;\n",
+                       c->pins[p].width - 1, k, c->pins[p].name);
+      }
       for (int k = 0; k < nmem; k++) {
          aj_mcand_t *c = &g_aj_cands[members[k]];
          static char gater_nets[128][64];
@@ -8143,6 +8364,14 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                   n_internal++;
                   continue;
                }
+            }
+            if (c->is_glue && pp->is_output) {
+               // internal wire only (declared in the pre-pass above): no
+               // wrapper port, no bridge pin, no publication
+               fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
+                       pp->name, k, pp->name);
+               first = false;
+               continue;
             }
             fprintf(pf, ", %s [%d:0] m%d_%s",
                     pp->is_output ? "output" : "input",
@@ -8367,7 +8596,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             g_aj_model = m;
             chunk->reset(chunk->state);
             for (int k = 0; k < nmem; k++)
-               aj_reroute(g_aj_cands[members[k]].scope, chunk);
+               if (!g_aj_cands[members[k]].is_glue)   // glue procs stay live
+                  aj_reroute(g_aj_cands[members[k]].scope, chunk);
             if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
                aj_subscribe_clocks(m, chunk);
             notef("accel-jit: MERGE ACTIVE — '%s' (%d subtrees fused, %d "
@@ -8378,6 +8608,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       if (!ok)   // any failure: this group's members install individually
          for (int k = 0; k < nmem; k++) {
             aj_mcand_t *c = &g_aj_cands[members[k]];
+            if (c->is_glue) continue;   // glue never installs standalone
             accel_install_subtree(m, c->scope, c->ref, accel_dir);
          }
       free(mp);
@@ -8503,7 +8734,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             g_aj_model = m;
             chunk->reset(chunk->state);
             for (int k = 0; k < nmem; k++)
-               aj_reroute(g_aj_cands[members[k]].scope, chunk);
+               if (!g_aj_cands[members[k]].is_glue)   // glue procs stay live
+                  aj_reroute(g_aj_cands[members[k]].scope, chunk);
             if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
                aj_subscribe_clocks(m, chunk);
             notef("accel-jit: MERGE ACTIVE — '%s' (%d subtrees fused, %d "
