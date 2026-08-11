@@ -2172,6 +2172,16 @@ struct _aj_chunk {
    uint8_t         *snap;            // arena: pre-edge bytes of bridged inputs
    aj_snap_ent_t   *snap_map;
    unsigned         snap_nin;
+   // NVC_ACCEL_RECAP checkpoint-and-replay capture: state snapshot taken
+   // BEFORE each armed eval; a later same-timestep input wake rolls the
+   // state back (incl the bridge's clklast) and re-runs the capture with
+   // the now-settled inputs.  Repeated wakes converge to interp's delta
+   // fixpoint — the interp-relative contract for lumped captures without
+   // any input snapshot (mech-3: interp packing flops commit at deep
+   // deltas AFTER the chunk's early armed eval, e.g. wb_pkt at +11 vs
+   // the chunk arming at +3).
+   uint8_t         *recap;           // pre-capture state copy (lazily sized)
+   uint64_t         recap_now;       // now+1 stamp (0 = none this instant)
    bool             defer_pending;
    void           **bindtab;         // per-run address table (the .so's AJB -> here)
    uint8_t          in_sel, out_sel; // decoupled bank-select registers (later)
@@ -2638,6 +2648,23 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
                 "snapnow=%"PRIu64"\n", chunk->rs_top, m->now, m->iteration,
                 (int)armed_rose, (int)extra_rose, (int)use_snap,
                 m->aj_snap_now); }
+   { static int _rc = -1;
+     if (_rc < 0) _rc = getenv("NVC_ACCEL_RECAP") != NULL;
+     if (_rc && chunk->rs_state_size > 0) {
+        if (armed_rose || extra_rose) {
+           if (chunk->recap == NULL)
+              chunk->recap = xmalloc(chunk->rs_state_size);
+           memcpy(chunk->recap, chunk->state, chunk->rs_state_size);
+           chunk->recap_now = (uint64_t)m->now + 1;
+        }
+        else if (chunk->recap != NULL
+                 && chunk->recap_now == (uint64_t)m->now + 1) {
+           // replay: restore the pre-capture state (incl clklast) so the
+           // bridge's edge-detect refires and the capture re-runs against
+           // the current (later-delta) input world
+           memcpy(chunk->state, chunk->recap, chunk->rs_state_size);
+        }
+     } }
    if (chunk->eval) chunk->eval(chunk->state, chunk->bindtab);
    if (use_snap)
       for (unsigned j = 0; j < chunk->snap_nin; j++)
