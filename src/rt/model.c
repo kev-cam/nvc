@@ -6058,7 +6058,16 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          // (measured on merged_31: FPGA-shape members whose `clk` pin is a
          // dead gated net and whose real clocking is rawclk extras).
          bool snap_this = !is_ck;
-         if (snap_this && aj_snap_mode() == 3 && pins[i].sig != NULL)
+         // Modes 3 and 5 snapshot ONLY registered-producer pins.  Mode 5 =
+         // mode-4 timing (per-timestep boundary fleet take, armed-eval-only
+         // engagement) + this per-pin selection: interp REGISTERED flops
+         // commit at edge-delta+1, so a chunk's late armed eval live-reads
+         // their POST-edge values (the mech-3 one-cycle-early class — e.g.
+         // the LPM wb_pkt packing flop feeding TLU); comb-driven pins keep
+         // live reads (same-delta settle visibility — snapshotting them was
+         // mode 4's overreach and its 3000ns depth defect).
+         if (snap_this && (aj_snap_mode() == 3 || aj_snap_mode() == 5)
+             && pins[i].sig != NULL)
             snap_this = !aj_nexus_driver_is_comb(m, &pins[i].sig->nexus, 0);
          if (snap_this) {
             snap_live[n_snap] = pins[i].data;
