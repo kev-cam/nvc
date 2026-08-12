@@ -2141,7 +2141,8 @@ struct _aj_chunk {
    const uint8_t   *rst_data;        // NVC_ACCEL_RST_HOLD: reset pin live bytes
    bool             rst_low;         //   active-low (pin name ends _l/_n/_b)
    bool             rst_released;    //   sticky: deassert seen, pass-through
-   void           (*set_clklast)(void *, unsigned char);  // bridge accessor
+   void           (*set_clklast)(void *, unsigned char);
+   void           (*force_arm_fn)(void *);   // CK_LATE dead-primary arming  // bridge accessor
    uint64_t         ck_arm_now;      // timestep whose rise this chunk consumed
    uint64_t         ck_xarm_now;     // timestep whose EXTRA-clock rise engaged
                                      // the pre-edge snapshot (once per instant)
@@ -2622,6 +2623,13 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
          && chunk->ck_arm_now != (uint64_t)m->now + 1;
       if (armed_rose) chunk->ck_arm_now = (uint64_t)m->now + 1;  // +1: 0 unused
       (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
+      // CK_LATE + dead/re-keyed primary: the bridge's raw-byte posedge
+      // never fires for these, so snapS/late_pend would never arm — poke
+      // the bridge's force_arm from the model-side (re-keyed) arming.
+      { static int _lt2 = -1;
+        if (_lt2 < 0) _lt2 = getenv("NVC_ACCEL_CK_LATE") != NULL;
+        if (_lt2 && armed_rose && chunk->force_arm_fn != NULL)
+           chunk->force_arm_fn(chunk->state); }
    }
    // EXTRA-clock rise: engage the mode-4 pre-edge snapshot even when the
    // PRIMARY did not rise.  A chunk can be clocked entirely by non-primary
@@ -5111,6 +5119,8 @@ static void aj_respecialize(rt_model_t *m)
       c->eval = eval;   // the swap: dispatch now points at specialized code
       void (*sck)(void *, unsigned char) = dlsym(dl, "accel_set_clklast");
       if (sck != NULL) c->set_clklast = sck;
+      void (*ffa)(void *) = dlsym(dl, "accel_force_arm");
+      if (ffa != NULL) c->force_arm_fn = ffa;
       // the specialized .so has its own sm_live_outputs — re-apply the mask
       uint64_t *lom = dlsym(dl, "sm_live_outputs");
       if (lom != NULL) memcpy(lom, c->live_out_mask, sizeof c->live_out_mask);
@@ -5958,7 +5968,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  " unsigned char x_seen; unsigned short x_pin; unsigned x_hits;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck,
               has_late ? " state_t snapS; inputs_t snapIn;"
-                         " unsigned char late_pend;" : "",
+                         // 32-bit: descend wrappers carry up to 30 extra
+                         // families — the original unsigned char silently
+                         // dropped families 8+ (the LATE at-scale death)
+                         " unsigned late_pend; unsigned char force_arm;" : "",
               raw_total);
    fprintf(f, "unsigned long accel_state_size(void){ return sizeof(aj_cs_t); }\n");
    // NVC_ACCEL_RECAP contract: the replayable PREFIX of aj_cs_t = register
@@ -6072,6 +6085,13 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // the initial high phase reads as a spurious 0->1 edge.
    fprintf(f, "void accel_set_clklast(void *p, unsigned char v)"
               "{ ((aj_cs_t *)p)->clk_last0 = v; }\n\n");
+   // LATE arming for dead/re-keyed primaries: the bridge's own `posedge`
+   // is an edge detect on the RAW bindtab clk bytes, which a dead primary
+   // (FPGA-shape BUSCLK class) never raises — the model-side re-keyed
+   // arming pokes this flag so snapS/late_pend still arm under CK_LATE.
+   if (has_late)
+      fprintf(f, "void accel_force_arm(void *p)"
+                 "{ ((aj_cs_t *)p)->force_arm = 1; }\n\n");
 
    // Fill the scalar table slots (the per-pin slots are filled in the loops).
    chunk->bindtab[0] = (void *)&deposit_signal;
@@ -6585,7 +6605,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          // per-group ICG-of-clk auto-detect is the general landing).
          fprintf(f, "  static int _keeplast=-1; if(_keeplast<0)"
                     " _keeplast=getenv(\"NVC_ACCEL_CK_KEEPLAST\")?1:0;\n");
-         fprintf(f, "  if(_late && posedge){ aj_cs->snapS = S;"
+         fprintf(f, "  if(_late && (posedge || aj_cs->force_arm)){"
+                    " aj_cs->force_arm = 0;"
+                    " aj_cs->snapS = S;"
                     " aj_cs->snapIn = in;"
                     " aj_cs->late_pend = %uu;"
                     " if(!_keeplast) for(int _k=0;_k<%d;_k++)"
@@ -7703,7 +7725,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
    // stale and re-emit+recompile from the cached synth .c.  v2: true
    // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v5"; *p; p++)
+   for (const char *p = "bridge-v7"; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -8018,6 +8040,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    chunk->x_info_fn  = dlsym(dl, "accel_x_info");
    chunk->x_clear_fn = dlsym(dl, "accel_x_clear");
    chunk->set_clklast = dlsym(dl, "accel_set_clklast");
+   chunk->force_arm_fn = dlsym(dl, "accel_force_arm");
    if (chunk->x_seen_fn != NULL) g_aj_have_xdet = true;
    chunk->state = xcalloc(ssize());   // per-chunk state (identical .so's don't share)
    // keep the emission inputs for post-link respecialization (re-emit the
@@ -8685,7 +8708,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v5"; *p; p++)
+        for (const char *p = "bridge-v7"; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
@@ -8808,6 +8831,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             chunk->x_info_fn   = dlsym(dl, "accel_x_info");
             chunk->x_clear_fn  = dlsym(dl, "accel_x_clear");
             chunk->set_clklast = dlsym(dl, "accel_set_clklast");
+   chunk->force_arm_fn = dlsym(dl, "accel_force_arm");
             chunk->state = xcalloc(ssize());
             chunk->rs_bridge = xstrdup(bridge);
             chunk->rs_dutc   = xstrdup(dutc);
@@ -8946,6 +8970,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             chunk->x_info_fn   = dlsym(dl, "accel_x_info");
             chunk->x_clear_fn  = dlsym(dl, "accel_x_clear");
             chunk->set_clklast = dlsym(dl, "accel_set_clklast");
+   chunk->force_arm_fn = dlsym(dl, "accel_force_arm");
             chunk->state = xcalloc(ssize());
             chunk->rs_bridge = xstrdup(gr->bridge);
             chunk->rs_dutc   = xstrdup(gr->dutc);
