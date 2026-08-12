@@ -6282,6 +6282,42 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          // (measured on merged_31: FPGA-shape members whose `clk` pin is a
          // dead gated net and whose real clocking is rawclk extras).
          bool snap_this = !is_ck;
+         // NVC_ACCEL_SNAP_PINS=<file>: explicit per-pin snapshot assignment
+         // (user directive: random-bisect which INPUT is troublesome for
+         // the mixed accel/interp boundary).  Lines "<chunk-top> <pin>";
+         // listed pins snapshot (mode-4 timing), unlisted stay live; clock
+         // pins never snapshot regardless.  Read per install — runtime-only
+         // (the snap map is built here from dut_text, not baked in the .so).
+         { static char (*spn)[160] = NULL; static int spn_n = -1;
+           if (spn_n < 0) {
+              spn_n = 0;
+              const char *pf = getenv("NVC_ACCEL_SNAP_PINS");
+              FILE *sf = pf != NULL ? fopen(pf, "r") : NULL;
+              if (sf != NULL) {
+                 int mx = 64;
+                 spn = xmalloc_array(mx, sizeof *spn);
+                 char cn[96], pn[64];
+                 while (fscanf(sf, "%95s %63s", cn, pn) == 2) {
+                    if (spn_n == mx) {
+                       mx *= 2;
+                       spn = xrealloc_array(spn, mx, sizeof *spn);
+                    }
+                    snprintf(spn[spn_n++], sizeof spn[0], "%s %s", cn, pn);
+                 }
+                 fclose(sf);
+              }
+              else if (pf != NULL)
+                 spn_n = -2;   // file named but unreadable: filter DISABLED
+           }
+           if (spn_n > 0 && snap_this && chunk->rs_top != NULL) {
+              char key[160];
+              snprintf(key, sizeof key, "%s %s", chunk->rs_top, pins[i].name);
+              bool listed = false;
+              for (int si = 0; si < spn_n && !listed; si++)
+                 listed = strcmp(spn[si], key) == 0;
+              snap_this = listed;
+           }
+         }
          // Modes 3 and 5 snapshot ONLY registered-producer pins.  Mode 5 =
          // mode-4 timing (per-timestep boundary fleet take, armed-eval-only
          // engagement) + this per-pin selection: interp REGISTERED flops
@@ -6388,6 +6424,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    if (!spec) {
       // materialise the two-phase snapshot arena now every input slot is known
       chunk->snap_nin = n_snap;
+      if (getenv("NVC_ACCEL_SNAP_PINS") != NULL)
+         notef("accel-jit: snap-pins filter: '%s' snap_nin=%d",
+               chunk->rs_top != NULL ? chunk->rs_top : "?", n_snap);
       if (n_snap > 0) {
          size_t tot = 0;
          chunk->snap_map = xcalloc_array(n_snap, sizeof(aj_snap_ent_t));
@@ -7423,6 +7462,32 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                return false;
             }
       }
+   // NVC_ACCEL_SLICE=<seed>:<pct> — seeded random admission (user
+   // directive: regression suites as accel-boundary fuzzers).  Each seed
+   // draws a DIFFERENT deterministic accel/interp boundary through the
+   // same design: hash(subtree name, seed) selects pct% of subtrees for
+   // acceleration, the rest stay interpreted.  pct=100 = full-bore.
+   { static int sl_pct = -2; static unsigned sl_seed = 0;
+     if (sl_pct == -2) {
+        const char *se = getenv("NVC_ACCEL_SLICE");
+        sl_pct = -1;
+        if (se != NULL) {
+           unsigned s, p;
+           if (sscanf(se, "%u:%u", &s, &p) == 2 && p <= 100) {
+              sl_seed = s; sl_pct = (int)p;
+           }
+        }
+     }
+     if (sl_pct >= 0) {
+        uint32_t h = 2166136261u ^ sl_seed;
+        for (const char *p = top0; *p; p++)
+           h = (h ^ (uint8_t)*p) * 16777619u;
+        if ((h % 100u) >= (unsigned)sl_pct) {
+           notef("accel-jit: subtree '%s' sliced out (NVC_ACCEL_SLICE)",
+                 top0);
+           return false;
+        }
+     } }
       // NVC_ACCEL_SKIP_SCOPE=p1,p2: decline subtrees whose INSTANCE PATH
       // contains a token. Needed where module names cannot discriminate:
       // testbench memory MODELS instantiate the same rvdff primitives as the
