@@ -2149,6 +2149,7 @@ struct _aj_chunk {
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
+   bool             icg_fallwake_set; // NVC_ACCEL_ICG_FALLWAKE applied once
    // Root alias deposit targets (bind time): same-scope same-name signals the
    // FIRST-match binding missed; aj_out fans publications to them.
    rt_signal_t    *(*out_extra)[6];
@@ -3016,14 +3017,45 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          if (ip != NULL)
             for (int b = 0; b < width && b < 64; b++)
                if (ip[(size_t)(width - 1 - b) * esz] & 1) iv |= (uint64_t)1 << b;
+         // Routing metadata: which publication class this ord takes, how many
+         // quenched drivers get refreshed (drv=0 => port-hop consumers pull a
+         // STALE driving value even though the rim's effective bytes updated),
+         // and the rim nexus's output-port fanout (nout>0 => a port hop whose
+         // propagation reads driving values exists).
+         int _drv = -1, _dfr = -1, _nfl = -1, _icgf = -1, _nout = -1;
+         if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count) {
+            _dfr  = c->defer_outs[ord].defer;
+            _nfl  = c->defer_outs[ord].negflip;
+            _icgf = c->defer_outs[ord].icg;
+            if (c->out_drv_n != NULL) _drv = c->out_drv_n[ord];
+         }
+         int _npend = -1;
+         if (sigp != NULL) {
+            _nout = 0;
+            for (rt_source_t *o = ((rt_signal_t *)sigp)->nexus.outputs;
+                 o != NULL; o = o->chain_output)
+               _nout++;
+            void *pd = ((rt_signal_t *)sigp)->nexus.pending;
+            if (pointer_tag(pd) == 1) _npend = 1;
+            else if (pd != NULL) {
+               rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+               _npend = pl->count;
+            }
+            else _npend = 0;
+         }
          fprintf(stderr, "#AJOUT ord=%d t=%llu d=%u w=%d pe=%d val=0x%llx "
-                 "net=0x%llx chunk=%s sig=%s\n", ord,
+                 "net=0x%llx dfr=%d nfl=%d icg=%d drv=%d nout=%d pend=%d "
+                 "chunk=%s sig=%s scope=%s\n", ord,
                  (unsigned long long)(m ? m->now : 0),
                  m ? m->iteration : 0, width, posedge,
                  (unsigned long long)v, (unsigned long long)iv,
+                 _dfr, _nfl, _icgf, _drv, _nout, _npend,
                  (c != NULL && c->rs_top != NULL) ? c->rs_top : "?",
                  (sigp != NULL)
-                    ? istr(tree_ident(((rt_signal_t *)sigp)->where)) : "?");
+                    ? istr(tree_ident(((rt_signal_t *)sigp)->where)) : "?",
+                 (sigp != NULL
+                  && ((rt_signal_t *)sigp)->parent != NULL)
+                    ? istr(((rt_signal_t *)sigp)->parent->name) : "?");
       }
    }
 
@@ -3132,6 +3164,33 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
    if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count
        && c->defer_outs[ord].icg && width == 1) {
       aj_defer_out_t *ig = &c->defer_outs[ord];
+      // NVC_ACCEL_ICG_FALLWAKE: this rule assumes "the low-phase eval
+      // publishes the fall" — but the subscribed rerouted proc's compiled
+      // rising-edge trigger FILTERS fall wakes (run_process), so in a quiet
+      // low phase (no other input changes) the fall never publishes: the rim
+      // stays high and downstream interp consumers see alternate rises only
+      // (glue2 fixture: half the gated-clock edges).  Clearing the trigger
+      // delivers every clock event; the bridge derives its own edges, so the
+      // extra evals are correctness-neutral.  Lazy (first icg publication)
+      // so it needs no install-order guarantees; after demotion the interp
+      // proc just evals-and-holds on falls (slower, still correct).
+      { static int fw = -1;
+        if (fw < 0) fw = getenv("NVC_ACCEL_ICG_FALLWAKE") != NULL;
+        if (fw && !c->icg_fallwake_set && c->rr_count > 0) {
+           c->rr_saved[0].proc->wakeable.trigger = NULL;
+           c->icg_fallwake_set = true;
+        } }
+      { static int igdbg = -1;
+        if (igdbg < 0) igdbg = getenv("NVC_ACCEL_ICGDBG") ? 40 : 0;
+        if (igdbg > 0) {
+           igdbg--;
+           const uint8_t chv = c->bindtab != NULL && c->bindtab[4] != NULL
+              ? (((const uint8_t *)c->bindtab[4])[0] & 1) : 0xff;
+           fprintf(stderr, "ICGDBG t=%llu nb=%u last=%u clkhi=%u fwset=%d\n",
+                   (unsigned long long)m->now,
+                   ((const uint8_t *)buf)[0] & 1,
+                   c->defer_outs[ord].icg_last, chv, (int)c->icg_fallwake_set);
+        } }
       const unsigned nb = ((const uint8_t *)buf)[0] & 1;
       const uint8_t clkhi = c->bindtab != NULL && c->bindtab[4] != NULL
          ? (((const uint8_t *)c->bindtab[4])[0] & 1) : 0;
@@ -5254,6 +5313,36 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
             hash_put(bmap, c->defer_outs[ord].sigp,
                      (void *)(((uintptr_t)ci << 16) | (ord + 1)));
    }
+   // ULTIMATE-NEXUS companion map (#69, EH1a whole-core boot stall): the
+   // interp driver of a bound output frequently sits on the INNER net (the
+   // member primitive's own dout), port hops BELOW the bound rim — the
+   // signal-identity bmap misses it, the driver was disconnected, and every
+   // consumer past an interp-VISIBLE port hop above the rim (the EH1a TB's
+   // AXI memory model) re-resolved a stale driving value forever: the rim's
+   // effective bytes showed the fetch (IFU_AXI_ARVALID=1) while the TB
+   // never saw one.  Key every bridged output by the same ultimate-nexus
+   // walk the sibling-fanout pass uses so those drivers are kept + synced.
+   hash_t *ubmap = hash_new(1024);
+   const bool uq_on = getenv("NVC_ACCEL_UQUENCH") != NULL;
+   for (unsigned ci = 0; uq_on && ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++) {
+         if (c->b_out[bo].sig == NULL) continue;
+         rt_nexus_t *un = &c->b_out[bo].sig->nexus;
+         for (int hop = 0; hop < 16; hop++) {
+            rt_source_t *ps = NULL;
+            for (rt_source_t *s = &(un->sources); s != NULL;
+                 s = s->chain_input)
+               if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                  ps = s;
+            if (ps == NULL) break;
+            un = ps->u.port.input;
+         }
+         if (hash_get(ubmap, un) == NULL)
+            hash_put(ubmap, un,
+                     (void *)(((uintptr_t)ci << 16) | (bo + 1)));
+      }
+   }
 
    // NVC_ACCEL_STARVE_CENSUS: enumerate nexuses that have NO driver source
    // at all, at least one interp reader pending, and live under a rerouted
@@ -5611,6 +5700,82 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
                   "publication fanout (%d dropped: extra table full)",
                   nfan, nfull);
       }
+
+      // READABLE-SHADOW FANOUT (#69, EH1a whole-core boot stall): the
+      // iverilog-frontend translation vintage relays values up the
+      // hierarchy through per-level GLUE PROCS, and those relays read the
+      // sv2vhdl `<name>_readable` shadow — a sibling signal driven by its
+      // own glue inside the rerouted primitive.  Quenching froze the
+      // shadow at init, and because every hop is a DRIVER (not a port),
+      // none of the port-walk correlation above can see it: the chunk
+      // deposited IFU_AXI_ARVALID=1 on the bound rim (readers woke, rim
+      // bytes right) while the relay chain kept re-deriving from the dead
+      // shadow — the TB's AXI memory model never saw one fetch.  The
+      // `_readable` suffix is the translator's own naming contract, so
+      // correlate BY NAME in the bound signal's scope and fan
+      // publications to reader-bearing shadows.
+      if (getenv("NVC_ACCEL_RDFAN") != NULL) {
+         int nrd = 0, nrfull = 0;
+         for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+            aj_chunk_t *c = m->aj_chunks[ci];
+            for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++) {
+               rt_signal_t *sig = c->b_out[bo].sig;
+               if (sig == NULL || sig->parent == NULL
+                   || sig->where == NULL)
+                  continue;
+               if ((unsigned)bo >= c->defer_count) continue;
+               if (c->defer_outs[bo].icg) continue;   // clocks: never fan
+               char ln[64], rn[80];
+               aj_lower(ln, istr(tree_ident(sig->where)), sizeof ln);
+               snprintf(rn, sizeof rn, "%s_readable", ln);
+               rt_signal_t *rs = aj_find_signal(sig->parent, rn);
+               if (rs == NULL || rs == sig
+                   || rs->shared.size != sig->shared.size)
+                  continue;
+               bool irdr = false;
+               void *pd = rs->nexus.pending;
+               if (pointer_tag(pd) == 1) {
+                  rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+                  irdr = w->kind == W_PROC;
+               }
+               else if (pd != NULL) {
+                  rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+                  for (int i = 0; i < pl->count && !irdr; i++)
+                     irdr = pl->wake[i] != NULL
+                        && pl->wake[i]->kind == W_PROC;
+               }
+               if (!irdr) continue;
+               // the shadow must be DEAD (its own driver quenched or
+               // absent) — a live-driven shadow needs no help and a
+               // second writer would fight it
+               bool live = false;
+               for (rt_source_t *s = &(rs->nexus.sources);
+                    s != NULL && !live; s = s->chain_input)
+                  if (s->tag == SOURCE_DRIVER && !s->disconnected
+                      && !s->aj_rerouted && s->u.driver.proc != NULL)
+                     live = true;
+               if (live) continue;
+               if (c->out_extra == NULL) {
+                  c->out_extra   = xcalloc_array(c->defer_count,
+                                                 sizeof(*c->out_extra));
+                  c->out_extra_n = xcalloc_array(c->defer_count, 1);
+               }
+               bool dup = false;
+               for (int k = 0; k < c->out_extra_n[bo] && !dup; k++)
+                  dup = c->out_extra[bo][k] == rs;
+               if (dup) continue;
+               if (c->out_extra_n[bo] >= 6) { nrfull++; continue; }
+               c->out_extra[bo][c->out_extra_n[bo]++] = rs;
+               deposit_signal(m, rs, nexus_effective(&sig->nexus), 0,
+                              c->b_out[bo].width);
+               nrd++;
+            }
+         }
+         if (nrd > 0 || nrfull > 0)
+            notef("accel-jit: %d readable-shadow rim(s) added to the "
+                  "publication fanout (%d dropped: extra table full)",
+                  nrd, nrfull);
+      }
    }
 
    for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
@@ -5670,6 +5835,45 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
             continue;
          }
 
+         // Ultimate-nexus match: same treatment as the direct bmap hit.
+         // The driver's nexus IS the chain tail; require identical signal
+         // byte layout with the bound rim so the published buffer's offsets
+         // apply verbatim (mismatch keeps today's disconnect).
+         if (n->signal != NULL) {
+            void *uv = hash_get(ubmap, n);
+            if (uv != NULL) {
+               const unsigned uci  = (unsigned)((uintptr_t)uv >> 16);
+               const unsigned uord = (unsigned)((uintptr_t)uv & 0xffff) - 1;
+               aj_chunk_t *oc = m->aj_chunks[uci];
+               if (uord < oc->defer_count && oc->b_out[uord].sig != NULL
+                   && oc->b_out[uord].sig != n->signal
+                   && n->signal->shared.size
+                      == oc->b_out[uord].sig->shared.size) {
+                  if (oc->out_drv == NULL) {
+                     oc->out_drv   = xcalloc_array(oc->defer_count,
+                                                   sizeof(*oc->out_drv));
+                     oc->out_drv_n = xcalloc_array(oc->defer_count, 1);
+                  }
+                  if (oc->out_drv_n[uord] < 4) {
+                     unsigned off = 0;
+                     for (rt_nexus_t *x = &(n->signal->nexus);
+                          x != NULL && x != n; x = x->chain)
+                        off += x->size * x->width;
+                     oc->out_drv[uord][oc->out_drv_n[uord]++] =
+                        (struct aj_odrv){ s, n, off };
+                     nsync++;
+                     copy_value_ptr(n, &s->u.driver.waveforms.value,
+                                    nexus_effective(n));
+                     for (rt_source_t *o = n->outputs; o != NULL;
+                          o = o->chain_output)
+                        if (o->tag == SOURCE_PORT)
+                           defer_driving_update(m, o->u.port.output);
+                     continue;
+                  }
+               }
+            }
+         }
+
          s->disconnected = 1;
          nquench++;
          if (dbg && nquench <= 40)
@@ -5679,6 +5883,7 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
       }
    }
    hash_free(bmap);
+   hash_free(ubmap);
    if (nquench > 0 || nlive > 0 || nsync > 0)
       notef("accel-jit: disconnected %d driver(s) of rerouted procs "
             "(%d live fastclk skipped, %d bound-output drivers synced)",
@@ -5950,7 +6155,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    if (nck == 0)
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0;"
-                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg,"
+                 " icg_ckprev;"
                  " outputs_t o_prev;"
                  " unsigned char x_seen; unsigned short x_pin; unsigned x_hits;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", raw_total);
@@ -5963,7 +6169,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       fprintf(f, "typedef struct { state_t S; long long last_t;"
                  " unsigned char clk_last0; unsigned char ck_last[%d];"
                  "%s"
-                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg;"
+                 " inputs_t in_live; unsigned char shadow_valid, rst_prev, ext_chg,"
+                 " icg_ckprev;"
                  " outputs_t o_prev;"
                  " unsigned char x_seen; unsigned short x_pin; unsigned x_hits;"
                  " unsigned char raw_shadow[%zu]; } aj_cs_t;\n", nck,
@@ -6495,6 +6702,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "  unsigned d; long long t = NOW(MDL,&d);\n");
    // clk is one element; its 0/1 value is bit 0 of the low byte of the element.
    fprintf(f, "  int _clk = CLK[0]&1;\n");
+   // GSM_ICG2EN exported gated clocks: the model's comb-local _clk is pinned
+   // 0 by design, so gsm emits a sm_icg_clkval global its marked AND gates
+   // read; poke the real clock value before every eval.  Marker-scraped so
+   // every existing model's bridge text is byte-identical (no salt bump).
+   if (strstr(dut_text, "sm_icg_clkval") != NULL)
+      fprintf(f, "  { extern uint64_t sm_icg_clkval; sm_icg_clkval = _clk; }\n");
    fprintf(f, "  if(g_dbg>0 && _clk){ fprintf(stderr,\"AJ clk=%%d t=%%lld last=%%lld\\n\",_clk,t,last_t); g_dbg--; }\n");
    // The bridge runs on EVERY boundary-input-change delta (the rerouted
    // combinational processes wake it), not just the clock edge.  ADVANCE the
@@ -6554,12 +6767,31 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // skip: detection now rides on the same per-pin change tracking that keeps
    // in_live fresh, with zero extra copies. Disabled under VERIFY (per-delta
    // evaluation is the point there); NVC_ACCEL_NO_SKIP for A/B measurement.
+   // ICG-bearing chunks (a gated-clock output): the quiet-skip must NOT eat
+   // the eval where the base clock FELL — a gated clock is identically 0 at
+   // clk-low, and the fall must publish or downstream interp consumers see an
+   // alternate-edges-only waveform (the rim stays high, the next rise lands
+   // on 1 with no event; glue2 fixture, and the quiet-phase l1clk hazard at
+   // scale).  Whether the fall eval ARRIVES at all is the model side's
+   // NVC_ACCEL_ICG_FALLWAKE trigger-clear; the same env gates this override
+   // at RUN time so the emitted text is cache-safe.
+   bool has_icg_out = false;
+   for (int i = 0; i < npins; i++)
+      if (pins[i].is_output
+          && (pins[i].icg || strstr(pins[i].name, "l1clk") != NULL))
+         has_icg_out = true;
    {
       const char *rstv = (rst != NULL) ? "(RST[0]&1)" : "0";
       if (nck == 0) {
          fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
          fprintf(f, "    int _rn = %s;\n", rstv);
-         fprintf(f, "    if(!_noskip && !VERIFY && !posedge && !_chg && _rn==aj_cs->rst_prev) return;\n");
+         if (has_icg_out) {
+            fprintf(f, "    static int _ifw=-1; if(_ifw<0) _ifw=getenv(\"NVC_ACCEL_ICG_FALLWAKE\")?1:0;\n");
+            fprintf(f, "    int _ckfall = _ifw && !_clk && aj_cs->icg_ckprev; aj_cs->icg_ckprev=(unsigned char)_clk;\n");
+            fprintf(f, "    if(!_noskip && !VERIFY && !posedge && !_chg && !_ckfall && _rn==aj_cs->rst_prev) return;\n");
+         }
+         else
+            fprintf(f, "    if(!_noskip && !VERIFY && !posedge && !_chg && _rn==aj_cs->rst_prev) return;\n");
          fprintf(f, "    aj_cs->rst_prev = _rn; }\n");
       }
       // multi-clock: the skip is emitted inline after the post-advance scan
@@ -6780,7 +7012,13 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          const char *rstv2 = (rst != NULL) ? "(RST[0]&1)" : "0";
          fprintf(f, "  { static int _noskip=-1; if(_noskip<0) _noskip=getenv(\"NVC_ACCEL_NO_SKIP\")?1:0;\n");
          fprintf(f, "    int _rn = %s;\n", rstv2);
-         fprintf(f, "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && _rn==aj_cs->rst_prev) return;\n");
+         if (has_icg_out) {   // same fall-override as the nck==0 skip
+            fprintf(f, "    static int _ifw=-1; if(_ifw<0) _ifw=getenv(\"NVC_ACCEL_ICG_FALLWAKE\")?1:0;\n");
+            fprintf(f, "    int _ckfall = _ifw && !_clk && aj_cs->icg_ckprev; aj_cs->icg_ckprev=(unsigned char)_clk;\n");
+            fprintf(f, "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && !_ckfall && _rn==aj_cs->rst_prev) return;\n");
+         }
+         else
+            fprintf(f, "    if(!_noskip && !VERIFY && !posedge_mask && !_chg && _rn==aj_cs->rst_prev) return;\n");
          fprintf(f, "    aj_cs->rst_prev = _rn; }\n");
       }
    }
@@ -7742,6 +7980,14 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    { struct stat gst;
      if (stat(aj_gen_sm(), &gst) == 0)
         vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
+   // GSM_ICG2EN changes gsm's emitted netlist for the SAME sources: fold it
+   // into the key so toggling the env cannot serve the other config's cache.
+   { const char *icg = getenv("GSM_ICG2EN");
+     if (icg != NULL)
+        for (const char *p = "+icg2en="; *p; p++)
+           { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+     for (const char *p = icg ? icg : ""; *p; p++)
+        { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; } }
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    char **vtexts = xcalloc_array(nsrc, sizeof(char *));
    for (int i = 0; i < nsrc; i++) {
@@ -7790,7 +8036,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
    // stale and re-emit+recompile from the cached synth .c.  v2: true
    // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v7"; *p; p++)
+   for (const char *p = "bridge-v8"; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -8747,6 +8993,13 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       { struct stat gst;
         if (stat(aj_gen_sm(), &gst) == 0)
            vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
+      // Same GSM_ICG2EN key fold as the per-chunk path (toggle safety).
+      { const char *icg = getenv("GSM_ICG2EN");
+        if (icg != NULL)
+           for (const char *p = "+icg2en="; *p; p++)
+              { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+        for (const char *p = icg ? icg : ""; *p; p++)
+           { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; } }
       for (const char *p = wname; *p; p++)
          { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
       char *mtexts[2] = { NULL, NULL };
@@ -8773,7 +9026,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v7"; *p; p++)
+        for (const char *p = "bridge-v8"; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
