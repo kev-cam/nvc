@@ -4260,12 +4260,29 @@ static bool aj_blacklisted(rt_model_t *m, rt_nexus_t *n)
 // deltaq_insert_proc assert). The filter lives HERE rather than in
 // aj_pending_foreach so the unflag/stray sweeps stay unconditional (a
 // flagged proc must always be unflaggable even if its wait state moved).
+//
+// NO-TRIGGER members (wait_state==1 with no derived trigger: both-edge
+// bodies, falling-edge guards lower couldn't canonicalise, report-only
+// monitors) may act on ANY candidate event, and drive attribution
+// cannot see non-driving side effects (reports, variable state) --
+// posedge-only dispatch would silently starve them.  Every-event
+// membership is normal-path-equivalent for a clk-only proc, so admit
+// them straight into the EE tail; in non-wide mode there is no EE tail,
+// so they are not admitted at all.
+static bool fastclk_wide_enabled(void);
+
 static void aj_flag_cb(rt_wakeable_t *w, void *ctx)
 {
    if (!w->delayed && !w->pending    // mid-queue procs are not admitted
        && (w->wait_state == 1
-           || (w->trigger != NULL && w->wait_state != 2)))
+           || (w->trigger != NULL && w->wait_state != 2))) {
+      if (w->trigger == NULL) {
+         if (!fastclk_wide_enabled())
+            return;
+         w->fastclk_ee = 1;
+      }
       w->fastclk = 1;
+   }
 }
 
 static void aj_unflag_cb(rt_wakeable_t *w, void *ctx)
@@ -16610,8 +16627,21 @@ static void model_cycle(rt_model_t *m)
                continue;   // evicted mid-probation / queued outside table
             if (!edged && !aj_member_evented(m, *pr))
                continue;   // companion-only delta, own sensitivity quiet
-            if (!posedge && !(w->fastclk_ee && comp_ev))
+            if (!posedge && !(w->fastclk_ee && comp_ev)) {
                m->fastclk_probe_member = (int)i;
+               // Trigger-armed members are classified SOUNDLY here: a
+               // trigger that fires on a non-posedge delta means
+               // posedge-only dispatch would starve this member,
+               // independent of whether its probed drives happen to
+               // change values (EH1a lsu_mem_neg: its falling-edge
+               // drives rewrote equal bytes -- the hello banner's dash
+               // prefix -- so the value-compare attribution below never
+               // marked it and the member went stale after probation).
+               // run_trigger memoises per trigger_epoch, so the body's
+               // own gate check right after costs nothing extra.
+               if (w->trigger != NULL && run_trigger(m, w->trigger))
+                  m->fastclk_comb[i] = 1;
+            }
             run_process(m, *pr);
             m->fastclk_probe_member = -1;
          }
