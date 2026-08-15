@@ -2230,7 +2230,10 @@ struct _aj_chunk {
    // per-delta eval dedup (see aj_proc_eval)
    uint64_t         last_eval_now;
    int              last_eval_iter;
-   uint64_t         live_out_mask[4]; // dead-output pruning (re-applied on respec)
+   uint64_t         live_out_mask[16]; // dead-output pruning (re-applied on respec;
+                                       // 16 words = 1024 outputs — the fixed [4]
+                                       // capped models at 256 and pin-completion
+                                       // wrappers exceed that)
    // Serializes eval of THIS chunk under NVC_PARALLEL_PROCS: the chunk's .so
    // state is mutable, so two workers must never run the same chunk's eval at
    // once. Held across the dedup check + eval; different chunks have distinct
@@ -2859,6 +2862,9 @@ struct _aj_defer_out {
    void          *rh_sigp;    //   publication target for the release flush
    int            rh_width;   //   deposit element count for the flush
    bool           rh_have;    //   latch holds bytes awaiting the release
+   bool           probe;      // NVC_ACCEL_PIN_COMPLETE __ajp probe pin: values
+                              // are whole-timestep (relay feed), never a
+                              // delta-accurate oracle -- VERIFY skips compare
 };
 
 // NVC_ACCEL_VERIFY report: compact logic3d-bytes -> value hex (bit0 of each
@@ -3022,12 +3028,14 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          // STALE driving value even though the rim's effective bytes updated),
          // and the rim nexus's output-port fanout (nout>0 => a port hop whose
          // propagation reads driving values exists).
-         int _drv = -1, _dfr = -1, _nfl = -1, _icgf = -1, _nout = -1;
+         int _drv = -1, _dfr = -1, _nfl = -1, _icgf = -1, _nout = -1,
+             _xtr = -1;
          if (c != NULL && ord >= 0 && (unsigned)ord < c->defer_count) {
             _dfr  = c->defer_outs[ord].defer;
             _nfl  = c->defer_outs[ord].negflip;
             _icgf = c->defer_outs[ord].icg;
             if (c->out_drv_n != NULL) _drv = c->out_drv_n[ord];
+            if (c->out_extra_n != NULL) _xtr = c->out_extra_n[ord];
          }
          int _npend = -1;
          if (sigp != NULL) {
@@ -3044,12 +3052,12 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
             else _npend = 0;
          }
          fprintf(stderr, "#AJOUT ord=%d t=%llu d=%u w=%d pe=%d val=0x%llx "
-                 "net=0x%llx dfr=%d nfl=%d icg=%d drv=%d nout=%d pend=%d "
+                 "net=0x%llx dfr=%d nfl=%d icg=%d drv=%d nout=%d pend=%d xtr=%d "
                  "chunk=%s sig=%s scope=%s\n", ord,
                  (unsigned long long)(m ? m->now : 0),
                  m ? m->iteration : 0, width, posedge,
                  (unsigned long long)v, (unsigned long long)iv,
-                 _dfr, _nfl, _icgf, _drv, _nout, _npend,
+                 _dfr, _nfl, _icgf, _drv, _nout, _npend, _xtr,
                  (c != NULL && c->rs_top != NULL) ? c->rs_top : "?",
                  (sigp != NULL)
                     ? istr(tree_ident(((rt_signal_t *)sigp)->where)) : "?",
@@ -3066,7 +3074,9 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
    // register order matches the rerouted model; only the settle pass compares.
    if (g_aj_verify) {
       if (g_aj_vcompare && c != NULL && ord >= 0
-          && (unsigned)ord < c->defer_count) {
+          && (unsigned)ord < c->defer_count
+          && !c->defer_outs[ord].probe) {   // __ajp probes: whole-timestep
+                                            // relay feeds, not an oracle
          aj_defer_out_t *d = &c->defer_outs[ord];
          // d->eff is BANK-only; read the signal's live value directly (offset 0,
          // matching deposit_signal(sigp, buf, 0, width)).
@@ -5182,7 +5192,15 @@ static void aj_respecialize(rt_model_t *m)
       if (ffa != NULL) c->force_arm_fn = ffa;
       // the specialized .so has its own sm_live_outputs — re-apply the mask
       uint64_t *lom = dlsym(dl, "sm_live_outputs");
-      if (lom != NULL) memcpy(lom, c->live_out_mask, sizeof c->live_out_mask);
+      if (lom != NULL) {
+         // size-negotiated: newer gsm exports sm_live_outputs_words;
+         // absent symbol = legacy 4-word layout
+         const int *lw = dlsym(dl, "sm_live_outputs_words");
+         int nw = lw != NULL ? *lw : 4;
+         if (nw > 16) nw = 16;
+         if (nw < 1) nw = 4;
+         memcpy(lom, c->live_out_mask, (size_t)nw * 8);
+      }
       notef("accel-jit: respecialized '%s' (link results compiled in)",
             c->rs_top);
    }
@@ -5286,6 +5304,8 @@ static void aj_link_handoff(rt_model_t *m)
 // dbg_halt_req). The chunk owns these nets now: mark the sources so update
 // paths consume without applying, and set the VHDL disconnect flag so
 // resolution ignores them. aj_chunk_demote reconnects on writeback.
+static hash_t *g_aj_restored = NULL;   // rim-glue procs given back to interp
+
 static void aj_quench_rerouted_drivers(rt_model_t *m)
 {
    static bool done = false;
@@ -5591,6 +5611,8 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
             }
             proc_set_vtable(p, c->rr_saved[r].vt);
             deltaq_insert_proc(m, 0, p);   // catch up on missed events
+            if (g_aj_restored == NULL) g_aj_restored = hash_new(1024);
+            hash_put(g_aj_restored, p, (void *)1);   // census: LIVE reader
             nrestore++;
             if (dbg && nrestore <= 40)
                notef("accel-jit: quench RESTORE glue %s", istr(p->name));
@@ -5714,6 +5736,75 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
       // `_readable` suffix is the translator's own naming contract, so
       // correlate BY NAME in the bound signal's scope and fan
       // publications to reader-bearing shadows.
+      // OUTPUT-PORT-CHAIN FANOUT (#70, EH1a whole-core boot): in the
+      // iverilog-frontend vintage every hierarchy level above a member's
+      // flop is a DRIVERLESS port-association net (no relay procs, no
+      // collapse) — the chunk's deposit updates the bound rim's EFFECTIVE
+      // bytes, but each output-port hop above re-resolves from DRIVING
+      // values, and with no live driver anywhere the phantom yields
+      // certain-0 forever (measured: rim=3 driven-1 at 145ns while the
+      // ifu-level net re-resolved 6 at the same instant and the TB never
+      // saw a fetch).  Walk the OUTPUT-port chain from every bound output
+      // and register each driverless hop signal as an out_extra deposit
+      // target: publications then land on every level's effective bytes
+      // and no reader depends on driving-value resolution.  Hops with a
+      // LIVE driver are skipped (their driver re-derives; depositing
+      // would fight it).
+      if (getenv("NVC_ACCEL_PORTFAN") != NULL) {
+         int npf = 0, npffull = 0;
+         for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+            aj_chunk_t *c = m->aj_chunks[ci];
+            for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++) {
+               rt_signal_t *pub = c->b_out[bo].sig;
+               if (pub == NULL || (unsigned)bo >= c->defer_count) continue;
+               if (c->defer_outs[bo].icg) continue;   // clocks: never fan
+               rt_nexus_t *hop = &pub->nexus;
+               for (int depth = 0; depth < 8; depth++) {
+                  rt_source_t *op = NULL;
+                  for (rt_source_t *o = hop->outputs; o != NULL;
+                       o = o->chain_output)
+                     if (o->tag == SOURCE_PORT && o->u.port.output != NULL) {
+                        op = o;
+                        break;
+                     }
+                  if (op == NULL) break;
+                  hop = op->u.port.output;
+                  rt_signal_t *hs = hop->signal;
+                  if (hs == NULL || hs == pub
+                      || hs->shared.size != pub->shared.size)
+                     break;
+                  bool live = false;
+                  for (rt_source_t *s2 = &(hop->sources);
+                       s2 != NULL && !live; s2 = s2->chain_input)
+                     if (s2->tag == SOURCE_DRIVER && !s2->disconnected
+                         && !s2->aj_rerouted
+                         && s2->u.driver.proc != NULL)
+                        live = true;
+                  if (live) break;
+                  if (c->out_extra == NULL) {
+                     c->out_extra   = xcalloc_array(c->defer_count,
+                                                    sizeof(*c->out_extra));
+                     c->out_extra_n = xcalloc_array(c->defer_count, 1);
+                  }
+                  bool dup = false;
+                  for (int k = 0; k < c->out_extra_n[bo] && !dup; k++)
+                     dup = c->out_extra[bo][k] == hs;
+                  if (!dup) {
+                     if (c->out_extra_n[bo] >= 6) { npffull++; break; }
+                     c->out_extra[bo][c->out_extra_n[bo]++] = hs;
+                     deposit_signal(m, hs, nexus_effective(&pub->nexus), 0,
+                                    c->b_out[bo].width);
+                     npf++;
+                  }
+               }
+            }
+         }
+         if (npf > 0 || npffull > 0)
+            notef("accel-jit: %d output-port-chain hop(s) added to the "
+                  "publication fanout (%d dropped: extra table full)",
+                  npf, npffull);
+      }
+
       if (getenv("NVC_ACCEL_RDFAN") != NULL) {
          int nrd = 0, nrfull = 0;
          for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
@@ -5884,6 +5975,55 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
    }
    hash_free(bmap);
    hash_free(ubmap);
+
+   // NVC_ACCEL_PENDDUMP=<substr>: post-quench forensic — for every signal
+   // whose lowered leaf matches, print its identity (scope, sig/nexus ptrs,
+   // effective byte0) and every pending reader with its reroute status.
+   // Ground truth for wrong-sibling binds and dead-subscription questions.
+   { const char *pdn = getenv("NVC_ACCEL_PENDDUMP");
+     if (pdn != NULL) {
+        hash_t *rrm2 = hash_new(32768);
+        for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+           aj_chunk_t *c = m->aj_chunks[ci];
+           for (unsigned r = 0; r < c->rr_count; r++)
+              hash_put(rrm2, c->rr_saved[r].proc, (void *)1);
+        }
+        for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+           if (n->signal == NULL || n->signal->where == NULL
+               || n->signal->parent == NULL)
+              continue;
+           char ln[64];
+           aj_lower(ln, istr(tree_ident(n->signal->where)), sizeof ln);
+           if (strstr(ln, pdn) == NULL) continue;
+           notef("accel-jit: PENDDUMP %s sc=%s sig=%p nx=%p eff0=%u",
+                 ln, istr(n->signal->parent->name), (void *)n->signal,
+                 (void *)n,
+                 (unsigned)((unsigned char *)nexus_effective(n))[0]);
+           void *pd = n->pending;
+           if (pointer_tag(pd) == 1) {
+              rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+              if (w->kind == W_PROC) {
+                 rt_proc_t *rp = container_of(w, rt_proc_t, wakeable);
+                 notef("accel-jit:   pend %s sc=%s rr=%d", istr(rp->name),
+                       rp->scope ? istr(rp->scope->name) : "?",
+                       hash_get(rrm2, rp) != NULL);
+              }
+           }
+           else if (pd != NULL) {
+              rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+              for (int i = 0; i < pl->count; i++) {
+                 if (pl->wake[i] == NULL || pl->wake[i]->kind != W_PROC)
+                    continue;
+                 rt_proc_t *rp =
+                    container_of(pl->wake[i], rt_proc_t, wakeable);
+                 notef("accel-jit:   pend %s sc=%s rr=%d", istr(rp->name),
+                       rp->scope ? istr(rp->scope->name) : "?",
+                       hash_get(rrm2, rp) != NULL);
+              }
+           }
+        }
+        hash_free(rrm2);
+     } }
    if (nquench > 0 || nlive > 0 || nsync > 0)
       notef("accel-jit: disconnected %d driver(s) of rerouted procs "
             "(%d live fastclk skipped, %d bound-output drivers synced)",
@@ -5892,6 +6032,176 @@ static void aj_quench_rerouted_drivers(rt_model_t *m)
 
 // Undo aj_build_fastclk + the partially-built chunk when an install fails after
 // they were created, so a non-installed chunk leaves no active state.
+// ---- NVC_ACCEL_PIN_CENSUS: post-quench starved-net census dump (#70) -------
+// Runs AFTER aj_quench_rerouted_drivers so the liveness predicate is truthful
+// (bound-output synced drivers stay connected and self-exclude; disconnected
+// rerouted drivers read dead).  Records every nexus that (a) has NO live
+// driver, (b) has interp W_PROC readers, (c) lives under a rerouted member
+// scope, and (d) is not already fed by a chunk publication (bound outputs,
+// their ultimate nexuses, out_extra siblings).  These are exactly the nets
+// the relay glue reads that pin-completion must publish.  Filters applied at
+// dump time so the file contains only injectable records (marshallable
+// shape, name fits "m999_<leaf>__ajp", not clock-like).  Forward decl: the
+// member scopes live in g_aj_cands, defined later in this file.
+static int  g_aj_ncand_fwd(void);
+static bool g_aj_cand_scope_at(int i, rt_scope_t **sc, bool *is_glue);
+
+static void aj_pin_census_dump(rt_model_t *m)
+{
+   static bool done = false;
+   const char *fn = getenv("NVC_ACCEL_PIN_CENSUS");
+   if (done || fn == NULL || m->aj_chunk_count == 0)
+      return;
+   done = true;
+
+   // FED exclusion: signals (and ultimate nexuses) a chunk already publishes
+   hash_t *fed_sig = hash_new(4096);
+   hash_t *fed_nex = hash_new(4096);
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      for (unsigned ord = 0; c->defer_outs != NULL && ord < c->defer_count;
+           ord++) {
+         if (c->defer_outs[ord].sigp != NULL)
+            hash_put(fed_sig, c->defer_outs[ord].sigp, (void *)1);
+         if (c->out_extra != NULL && c->out_extra_n != NULL)
+            for (int k = 0; k < c->out_extra_n[ord]; k++)
+               hash_put(fed_sig, c->out_extra[ord][k], (void *)1);
+      }
+      for (int bo = 0; c->b_out != NULL && bo < c->n_bout; bo++) {
+         if (c->b_out[bo].sig == NULL) continue;
+         hash_put(fed_sig, c->b_out[bo].sig, (void *)1);
+         rt_nexus_t *un = &c->b_out[bo].sig->nexus;
+         for (int hop = 0; hop < 16; hop++) {
+            rt_source_t *ps = NULL;
+            for (rt_source_t *s = &(un->sources); s != NULL;
+                 s = s->chain_input)
+               if (s->tag == SOURCE_PORT && s->u.port.input != NULL)
+                  ps = s;
+            if (ps == NULL) break;
+            un = ps->u.port.input;
+         }
+         hash_put(fed_nex, un, (void *)1);
+      }
+   }
+   // member scopes (non-glue candidates)
+   hash_t *mscope = hash_new(1024);
+   for (int i = 0; i < g_aj_ncand_fwd(); i++) {
+      rt_scope_t *sc; bool gl;
+      if (g_aj_cand_scope_at(i, &sc, &gl) && !gl && sc != NULL)
+         hash_put(mscope, sc, (void *)1);
+   }
+   // rerouted procs: their stale pending subscriptions must NOT count as
+   // readers (they are dead; counting them ballooned the census 100x)
+   hash_t *rrmap = hash_new(32768);
+   for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+      aj_chunk_t *c = m->aj_chunks[ci];
+      for (unsigned r = 0; r < c->rr_count; r++) {
+         rt_proc_t *rp = c->rr_saved[r].proc;
+         // the rim-glue RESTORE pass gave some rr procs their interp
+         // vtable back — those are LIVE readers, not dead subscriptions
+         if (g_aj_restored != NULL && hash_get(g_aj_restored, rp) != NULL)
+            continue;
+         hash_put(rrmap, rp, (void *)1);
+      }
+   }
+
+   FILE *f = fopen(fn, "w");
+   if (f == NULL) {
+      warnf("accel-jit: NVC_ACCEL_PIN_CENSUS=%s: cannot open", fn);
+      hash_free(fed_sig); hash_free(fed_nex); hash_free(mscope);
+      return;
+   }
+   fprintf(f, "# aj-pin-census v1 chunks=%u cands=%d\n",
+           m->aj_chunk_count, g_aj_ncand_fwd());
+   hash_t *seen = hash_new(4096);   // signal ptr dedup (multi-nexus signals)
+   int nrec = 0, nskip = 0;
+   for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+      // (b) LIVE interp readers on this nexus (rerouted procs' stale
+      // subscriptions are dead and must not count; RESTORED rim-glue
+      // procs count as live)
+      int nrd = 0;
+      void *pd = n->pending;
+      if (pointer_tag(pd) == 1) {
+         rt_wakeable_t *w = untag_pointer(pd, rt_wakeable_t);
+         if (w->kind == W_PROC
+             && hash_get(rrmap,
+                         container_of(w, rt_proc_t, wakeable)) == NULL)
+            nrd = 1;
+      }
+      else if (pd != NULL) {
+         rt_pending_t *pl = untag_pointer(pd, rt_pending_t);
+         for (int i = 0; i < pl->count; i++)
+            if (pl->wake[i] != NULL && pl->wake[i]->kind == W_PROC
+                && hash_get(rrmap, container_of(pl->wake[i], rt_proc_t,
+                                                wakeable)) == NULL)
+               nrd++;
+      }
+      if (nrd == 0) continue;
+      // walk to the ULTIMATE driving nexus: the read head may sit ANY
+      // number of port hops above the member-internal net whose driver
+      // was quenched — record THAT signal (injection happens there, and
+      // publishing it + UQUENCH refresh feeds every hop back up)
+      rt_nexus_t *un = n;
+      for (int hop = 0; hop < 16; hop++) {
+         rt_source_t *ps = NULL;
+         for (rt_source_t *s2 = &(un->sources); s2 != NULL;
+              s2 = s2->chain_input)
+            if (s2->tag == SOURCE_PORT && s2->u.port.input != NULL)
+               ps = s2;
+         if (ps == NULL) break;
+         un = ps->u.port.input;
+      }
+      rt_signal_t *sg = un->signal;
+      if (sg == NULL || sg->parent == NULL || sg->where == NULL)
+         continue;
+      if (hash_get(seen, sg) != NULL) continue;
+      // (d) already fed by a chunk publication?
+      if (hash_get(fed_sig, sg) != NULL) continue;
+      if (hash_get(fed_nex, un) != NULL) continue;
+      // (a) live driver at the ultimate?
+      bool live = false;
+      for (rt_source_t *s2 = &(un->sources); s2 != NULL && !live;
+           s2 = s2->chain_input)
+         if (s2->tag == SOURCE_DRIVER && !s2->disconnected
+             && !s2->aj_rerouted && s2->u.driver.proc != NULL)
+            live = true;
+      if (live) continue;
+      // (c) the ultimate must live under a MEMBER scope (that is the
+      // module the injector can add a probe port to); depth from the
+      // member top decides phase-1 eligibility
+      int depth = -1;
+      for (rt_scope_t *w = sg->parent; w != NULL; w = w->parent) {
+         depth++;
+         if (hash_get(mscope, w) != NULL) break;
+         if (w->parent == NULL) depth = -1;
+      }
+      if (depth < 0) continue;
+      // filters: injectable shape only
+      const int elem  = (int)un->size;
+      const int width = elem > 0 ? (int)(sg->shared.size / elem) : 0;
+      char leaf[64];
+      aj_lower(leaf, istr(tree_ident(sg->where)), sizeof leaf);
+      if ((elem != 1 && elem != 4) || width < 1 || width > 4096
+          || sg->shared.size != (size_t)width * elem
+          || strlen(leaf) > 48
+          || strstr(leaf, "l1clk") != NULL
+          || (strlen(leaf) >= 3
+              && strcmp(leaf + strlen(leaf) - 3, "clk") == 0)) {
+         nskip++;
+         continue;
+      }
+      hash_put(seen, sg, (void *)1);
+      fprintf(f, "%s %s %d %d %d %d\n", istr(sg->parent->name), leaf,
+              width, elem, nrd, depth);
+      nrec++;
+   }
+   fclose(f);
+   hash_free(fed_sig); hash_free(fed_nex); hash_free(mscope);
+   hash_free(seen); hash_free(rrmap);
+   notef("accel-jit: pin-census: %d record(s) dumped to %s (%d filtered)",
+         nrec, fn, nskip);
+}
+
 static void aj_accel_teardown(rt_model_t *m)
 {
    // engagement telemetry reader: zero fleet passes / snapshot evals on a
@@ -7109,7 +7419,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // deposit); register-only outputs keep the real edge flag and may commit
    // in the NBA region under NVC_ACCEL_NBA. Absent table (older model .c)
    // -> every output is treated Mealy (today's behaviour).
-   char comb_out[256][64];
+   static char comb_out[1024][64];   // 256 silently misclassified overflow
+                                     // outputs as registered (Mealy relay
+                                     // temps would take negflip — the exact
+                                     // cross-boundary timing bug class)
    int n_comb_out = 0;
    {
       const char *start = strstr(dut_text, "const char *sm_comb_outputs[] = {");
@@ -7117,7 +7430,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          start += strlen("const char *sm_comb_outputs[] = {");
          const char *end = strchr(start, '}');
          const char *p = start;
-         while (end != NULL && n_comb_out < 256) {
+         while (end != NULL && n_comb_out < 1024) {
             const char *q = strchr(p, '"');
             if (q == NULL || q >= end) break;
             const char *e = strchr(q + 1, '"');
@@ -7161,6 +7474,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          d->valuesz = (size_t)bufsz;
          d->icg     = pins[i].icg
                       || strstr(pins[i].name, "l1clk") != NULL;
+         { const size_t pl_ = strlen(pins[i].name);
+           d->probe = pl_ > 5
+              && strcmp(pins[i].name + pl_ - 5, "__ajp") == 0; }
          d->defer   = (tgt != NULL);
          // Merged chunks: every REGISTERED output stages at posedge evals and
          // publishes at the domain clock's fall (the negedge state flip).  No
@@ -7525,7 +7841,188 @@ static aj_mcand_t *g_aj_cands   = NULL;
 static int         g_aj_ncand   = 0;
 static int         g_aj_candmax = 0;
 
+// accessors for the pin-census dump, which is defined before these globals
+static int g_aj_ncand_fwd(void) { return g_aj_ncand; }
+static bool g_aj_cand_scope_at(int i, rt_scope_t **sc, bool *is_glue)
+{
+   if (i < 0 || i >= g_aj_ncand) return false;
+   *sc = g_aj_cands[i].scope;
+   *is_glue = g_aj_cands[i].is_glue;
+   return true;
+}
+
 static void aj_try_merge_install(rt_model_t *m, const char *accel_dir);
+
+// ---- NVC_ACCEL_PIN_COMPLETE: starve-census pin completion (#70) ------------
+// A merged chunk internalizes member nets that live interp glue still READS
+// (this translation vintage relays values up the hierarchy through per-level
+// gated glue procs); those nets freeze at init and the relay chain starves
+// (EH1a whole-core: the model computes fetches, the TB never sees one).
+// Two-run protocol: run 1 dumps the post-quench starved-net census
+// (NVC_ACCEL_PIN_CENSUS=<file>, see aj_pin_census_dump); run 2 loads it
+// (NVC_ACCEL_PIN_COMPLETE=<file>) and injects each depth-0 record as an
+// EXTRA OUTPUT PIN on the member's emitted subtree module — an `__ajp`
+// probe port assigned from the internal net — so the standard bridge
+// output path publishes it and the relays re-derive natively.  Probe
+// values are whole-timestep relay feeds, never a delta-accurate oracle
+// (VERIFY skips their compare).
+typedef struct {
+   char scope[256];
+   char leaf[64];
+   int  width, elem, readers, depth;
+   bool used;
+} aj_pcrec_t;
+
+static aj_pcrec_t *g_aj_pcrec  = NULL;
+static int         g_aj_npcrec = -2;   // -2 = not loaded yet
+
+static void aj_pin_complete_load(void)
+{
+   if (g_aj_npcrec != -2) return;
+   g_aj_npcrec = -1;
+   const char *fn = getenv("NVC_ACCEL_PIN_COMPLETE");
+   if (fn == NULL) return;
+   FILE *f = fopen(fn, "r");
+   if (f == NULL) {
+      warnf("accel-jit: NVC_ACCEL_PIN_COMPLETE=%s: cannot open — "
+            "pin completion inert this run", fn);
+      return;
+   }
+   int cap = 0, n = 0;
+   char line[512];
+   while (fgets(line, sizeof line, f) != NULL) {
+      if (line[0] == '#' || line[0] == '\n') continue;
+      aj_pcrec_t r;
+      memset(&r, 0, sizeof r);
+      if (sscanf(line, "%255s %63s %d %d %d %d", r.scope, r.leaf,
+                 &r.width, &r.elem, &r.readers, &r.depth) != 6)
+         continue;
+      if (n == cap) {
+         cap = cap ? cap * 2 : 64;
+         g_aj_pcrec = xrealloc_array(g_aj_pcrec, cap, sizeof(aj_pcrec_t));
+      }
+      g_aj_pcrec[n++] = r;
+   }
+   fclose(f);
+   g_aj_npcrec = n;
+   notef("accel-jit: pin-complete: %d census record(s) loaded from %s", n, fn);
+}
+
+// Inject probe output ports for this member scope's depth-0 census records
+// into a PRIVATE copy of the emitted subtree .v (the shared per-entity file
+// must not leak probes into sibling candidates).  Returns the number of
+// probes injected and fills xp[]; 0 = no records/nothing injectable (dst not
+// written, caller keeps using src).
+static int aj_inject_probes(const char *src, const char *dst,
+                            const char *top_mod, rt_scope_t *scope,
+                            aj_pin_t *xp, int maxxp)
+{
+   aj_pin_complete_load();
+   if (g_aj_npcrec <= 0) return 0;
+   const char *spath = istr(scope->name);
+   int nrec = 0;
+   for (int i = 0; i < g_aj_npcrec; i++)
+      if (g_aj_pcrec[i].depth == 0 && !g_aj_pcrec[i].used
+          && strcmp(g_aj_pcrec[i].scope, spath) == 0)
+         nrec++;
+   if (nrec == 0) return 0;
+
+   char *text = aj_read_file(src);
+   if (text == NULL) return 0;
+
+   // locate the TOP module's ANSI port-list close: "module <top> (" .. ");"
+   char key[256];
+   snprintf(key, sizeof key, "module %s (", top_mod);
+   char *mh = strstr(text, key);
+   char *close = mh != NULL ? strstr(mh, ");") : NULL;
+   if (close == NULL) { free(text); return 0; }
+   // bound all body searches to THIS module: an undeclared-in-top leaf that
+   // exists in a LATER module would otherwise pass the decl check and the
+   // probe assign would create a silent 1-bit implicit wire
+   char *mod_end = strstr(close, "\nendmodule");
+   const char save_end = mod_end != NULL ? *mod_end : '\0';
+   if (mod_end != NULL) *mod_end = '\0';
+
+   char ports[8192]; ports[0] = '\0'; size_t pn = 0;
+   char assigns[8192]; assigns[0] = '\0'; size_t an = 0;
+   int nxp = 0, nskip = 0;
+   for (int i = 0; i < g_aj_npcrec && nxp < maxxp; i++) {
+      aj_pcrec_t *r = &g_aj_pcrec[i];
+      if (r->depth != 0 || r->used || strcmp(r->scope, spath) != 0)
+         continue;
+      rt_signal_t *sg = aj_find_signal(scope, r->leaf);
+      // staleness cross-check: the live signal must match the census shape
+      if (sg == NULL || (int)sg->nexus.size != r->elem
+          || (int)(sg->shared.size / (r->elem > 0 ? r->elem : 1))
+             != r->width) {
+         nskip++;
+         continue;
+      }
+      // the net must exist as a PACKED decl in the emitted top module (a
+      // memory-shaped or optimized-away net cannot become a port)
+      char decl[96];
+      snprintf(decl, sizeof decl, " %s;", r->leaf);
+      char decl2[96];
+      snprintf(decl2, sizeof decl2, " %s =", r->leaf);
+      char decl3[96];
+      snprintf(decl3, sizeof decl3, " %s <=", r->leaf);
+      if (strstr(close, decl) == NULL && strstr(close, decl2) == NULL
+          && strstr(close, decl3) == NULL) {
+         nskip++;
+         continue;
+      }
+      // already a port? (would double-publish one signal from two ordinals)
+      char pkey[96];
+      snprintf(pkey, sizeof pkey, "put %s,", r->leaf);   // in/output %s,
+      char pkey2[96];
+      snprintf(pkey2, sizeof pkey2, "put %s\n", r->leaf);
+      const char save_cl = *close;
+      *close = '\0';                       // header = [mh, close)
+      const bool isport = strstr(mh, pkey) != NULL
+         || strstr(mh, pkey2) != NULL;
+      *close = save_cl;
+      if (isport) {
+         nskip++;
+         continue;
+      }
+      if (r->width > 1)
+         pn += snprintf(ports + pn, sizeof ports - pn,
+                        ",\n  output [%d:0] %s__ajp", r->width - 1, r->leaf);
+      else
+         pn += snprintf(ports + pn, sizeof ports - pn,
+                        ",\n  output %s__ajp", r->leaf);
+      an += snprintf(assigns + an, sizeof assigns - an,
+                     "  assign %s__ajp = %s;\n", r->leaf, r->leaf);
+      if (pn >= sizeof ports - 128 || an >= sizeof assigns - 128)
+         break;   // caps full — remaining records stay for a later phase
+      aj_pin_t pin = {0};
+      snprintf(pin.name, sizeof pin.name, "%s__ajp", r->leaf);
+      pin.elem  = (int)sg->nexus.size;
+      pin.width = r->width;
+      pin.data  = (uint8_t *)sg->shared.data;
+      pin.sig   = sg;
+      pin.base  = sg->where != NULL
+         ? aj_bit_base(tree_type(sg->where)) : 0;
+      pin.is_output = true;
+      xp[nxp++] = pin;
+      r->used = true;
+   }
+   if (mod_end != NULL) *mod_end = save_end;    // restore before writing
+   if (nxp == 0) { free(text); return 0; }
+
+   FILE *o = fopen(dst, "w");
+   if (o == NULL) { free(text); return 0; }
+   fwrite(text, 1, (size_t)(close - text), o);   // header up to ");"
+   fputs(ports, o);                              // extra output ports
+   fputs("\n);\n", o);                           // close the port list
+   fputs(assigns, o);                            // probe assigns (module body)
+   fputs(close + 2, o);                          // rest after the original ");"
+   fclose(o);
+   free(text);
+   notef("accel-jit: pin-complete: injected %d probe(s) into '%s' "
+         "(%d record(s) skipped)", nxp, top_mod, nskip);
+   return nxp;
+}
 
 // Rewrite an emitted subtree .v with every module name suffixed, so N members
 // of a merge can coexist in one yosys design.  Necessary because the emit
@@ -7946,12 +8443,32 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // entity/variant name, so same-entity members with different baked
       // generics overwrite each other and collide in yosys (measured:
       // merged many_k24 silently became 24 copies of cluster 23).
+      static aj_pin_t xpins[256];
+      int nxp = 0;
       {
          char sfx[32], upath[600], utop[192];
          snprintf(sfx, sizeof sfx, "_c%d", g_aj_ncand - 1);
          snprintf(upath, sizeof upath, "%s/aj_mrg%d_subtree.v", accel_dir,
                   g_aj_ncand - 1);
-         if (!aj_uniquify_modules(srcs[0], upath, sfx, top_mod,
+         // NVC_ACCEL_PIN_COMPLETE: inject census probe ports into a private
+         // copy BEFORE uniquify — the content hash then forks the probed
+         // top's module name from unprobed same-entity siblings, and every
+         // downstream stage (wrapper pins, bridge ordinals, cache keys)
+         // follows from c->pins + the emitted bytes automatically.
+         const char *usrc = srcs[0];
+         char ppath[600];
+         if (getenv("NVC_ACCEL_PIN_COMPLETE") != NULL) {
+            snprintf(ppath, sizeof ppath, "%s/aj_pcp%d_subtree.v", accel_dir,
+                     g_aj_ncand - 1);
+            nxp = aj_inject_probes(srcs[0], ppath, top_mod, scope,
+                                   xpins, 256);
+            if (nxp > 0) usrc = ppath;
+            if (ncp + nxp > AJ_MAX_PINS) {   // never overflow into fallback
+               nxp = 0;
+               usrc = srcs[0];
+            }
+         }
+         if (!aj_uniquify_modules(usrc, upath, sfx, top_mod,
                                   utop, sizeof utop)) {
             g_aj_ncand--;
             return false;
@@ -7959,9 +8476,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          c->top_mod = xstrdup(utop);
          c->vpath   = xstrdup(upath);
       }
-      c->pins  = xmalloc_array(ncp > 0 ? ncp : 1, sizeof(aj_pin_t));
+      c->pins  = xmalloc_array(ncp + nxp > 0 ? ncp + nxp : 1,
+                               sizeof(aj_pin_t));
       memcpy(c->pins, cpins, (ncp > 0 ? ncp : 1) * sizeof(aj_pin_t));
-      c->npins = ncp;
+      if (nxp > 0)
+         memcpy(c->pins + ncp, xpins, nxp * sizeof(aj_pin_t));
+      c->npins = ncp + nxp;
       c->clk   = cpins[clk_i];
       c->ck_root = aj_ultimate_driver_nexus(&cpins[clk_i].sig->nexus, 0);
       memset(&c->rst, 0, sizeof c->rst);
@@ -8394,7 +8914,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // the model's exported sm_live_outputs so the cone cells exclusive to
       // it are skipped at run time (e.g. the retire-trace buses when the tb
       // variant doesn't sample them). VERIFY never prunes (compares all).
-      for (int mi = 0; mi < 4; mi++) chunk->live_out_mask[mi] = ~0ull;
+      for (int mi = 0; mi < 16; mi++) chunk->live_out_mask[mi] = ~0ull;
       // Opt-in only: automatic liveness detection via pending-lists is
       // UNSOUND for time-waiting readers (`wait for`/`wait until` processes
       // are not in any signal's pending list while blocked on time — the toy
@@ -8463,12 +8983,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                   p = e + 1;
                   if (*p == '}' || idx >= 256) break;
                }
-               if (found && idx < 256) {
+               if (found && idx < 1024) {
                   chunk->live_out_mask[idx >> 6] &= ~(1ull << (idx & 63));
                   pruned++;
                }
             }
-            memcpy(lom, chunk->live_out_mask, sizeof chunk->live_out_mask);
+            { const int *lw2 = dlsym(dl, "sm_live_outputs_words");
+              int nw2 = lw2 != NULL ? *lw2 : 4;
+              if (nw2 > 16) nw2 = 16;
+              if (nw2 < 1) nw2 = 4;
+              memcpy(lom, chunk->live_out_mask, (size_t)nw2 * 8); }
             if (pruned > 0)
                notef("accel-jit: pruned %d unread output cone(s)", pruned);
          }
@@ -16510,6 +17034,7 @@ void model_run(rt_model_t *m, uint64_t stop_time)
    if (m->aj_chunk_count > 0) {
       aj_link_handoff(m);   // wire packed chunk-to-chunk edges (NVC_ACCEL_HANDOFF)
       aj_quench_rerouted_drivers(m);
+      aj_pin_census_dump(m);
    }
 
    run_callbacks(m, START_OF_SIMULATION);
