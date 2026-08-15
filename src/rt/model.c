@@ -2146,6 +2146,12 @@ struct _aj_chunk {
    uint64_t         ck_arm_now;      // timestep whose rise this chunk consumed
    uint64_t         ck_xarm_now;     // timestep whose EXTRA-clock rise engaged
                                      // the pre-edge snapshot (once per instant)
+   // NVC_ACCEL_ASSERT_ORDER edge-count reconciliation (slice 2): bridge-
+   // observed posedges this timestep vs the clock nexus's real ones. The
+   // real count lives on the nexus side (ao_real/ao_real_now stamped at
+   // driver commit); this is the observed half, reset when now moves.
+   uint64_t         ao_obs_now;      // timestep the fields below belong to
+   uint8_t          ao_fall_seen;    // post-arm fall observed this timestep
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
@@ -2626,6 +2632,37 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
          && (chunk->primary_ck->shared.data[0] & 1)
          && chunk->ck_arm_now != (uint64_t)m->now + 1;
       if (armed_rose) chunk->ck_arm_now = (uint64_t)m->now + 1;  // +1: 0 unused
+      // NVC_ACCEL_ASSERT_ORDER (slice 2, chunk-local half): a rise-fall-
+      // RISE glitch within one timestep arms only once — the once-per-
+      // instant guard silently drops the second capture (the derived/
+      // gated-clock delta-race shape #72 exposed from the TB side).
+      // Track a post-arm fall; a further same-timestep rise then fires.
+      { static int _ao = -1;
+        if (_ao < 0) _ao = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
+        if (_ao) {
+           if (chunk->ao_obs_now != (uint64_t)m->now + 1) {
+              chunk->ao_obs_now = (uint64_t)m->now + 1;
+              chunk->ao_fall_seen = 0;
+           }
+           const bool lvl = (chunk->primary_ck->shared.data[0] & 1) != 0;
+           const bool armed_this_t =
+              chunk->ck_arm_now == (uint64_t)m->now + 1;
+           if (!lvl && armed_this_t)
+              chunk->ao_fall_seen = 1;
+           else if (lvl && !armed_rose && armed_this_t
+                    && chunk->ao_fall_seen
+                    && cn->last_event == (uint64_t)m->now) {
+              notef("accel-assert: DROPPED EDGE chunk %s t=%"PRIu64
+                    ": second primary-clock rise within one timestep "
+                    "(rise-fall-rise glitch) — once-per-instant arming "
+                    "captures only the first",
+                    chunk->scope != NULL && chunk->scope->where != NULL
+                       ? istr(tree_ident(chunk->scope->where)) : "?",
+                    (uint64_t)m->now);
+              chunk->ao_fall_seen = 0;   // report once per glitch pair
+           }
+        }
+      }
       (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
       // CK_LATE + dead/re-keyed primary: the bridge's raw-byte posedge
       // never fires for these, so snapS/late_pend would never arm — poke
