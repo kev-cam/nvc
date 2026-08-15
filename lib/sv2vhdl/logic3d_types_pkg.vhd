@@ -719,7 +719,7 @@ package body logic3d_types_pkg is
     function l3d_and(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -735,7 +735,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := AND_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := AND_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;
@@ -788,7 +795,7 @@ package body logic3d_types_pkg is
     function l3d_or(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -804,7 +811,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := OR_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := OR_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;
@@ -813,7 +827,7 @@ package body logic3d_types_pkg is
     function l3d_xor(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -829,7 +843,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := XOR_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := XOR_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;
@@ -838,7 +859,7 @@ package body logic3d_types_pkg is
     function l3d_nand(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -854,7 +875,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := NAND_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := NAND_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;
@@ -863,7 +891,7 @@ package body logic3d_types_pkg is
     function l3d_nor(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -879,7 +907,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := NOR_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := NOR_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;
@@ -888,7 +923,7 @@ package body logic3d_types_pkg is
     function l3d_xnor(a, b : logic3d_vector) return logic3d_vector is
         constant n : natural := minimum(a'length, b'length);
         variable result : logic3d_vector(a'range);
-        variable ai, bi : integer;
+        variable ai, bi, ri : integer;
     begin
         -- Copy-free hot path: translated signals are always `downto`, so
         -- rebasing needs only index offsets, not the two defensive vector
@@ -904,7 +939,14 @@ package body logic3d_types_pkg is
             for i in 0 to n-1 loop
                if a'ascending then ai := a'high - i; else ai := a'low + i; end if;
                if b'ascending then bi := b'high - i; else bi := b'low + i; end if;
-               result(result'low + i) := XNOR_LUT(a(ai), b(bi));
+               -- the WRITE side must honor the result direction too: for an
+               -- ASCENDING result (mixed-direction operands, e.g. an
+               -- unconstrained concat aggregate) logical bit i is element
+               -- 'high - i; result'low put the LSB in the MSB slot and
+               -- BIT-REVERSED the output (measured: {24'h0,a}^const gave
+               -- 20a5a5a5 for a5a5a504 — the EH1a registered-LSU garbage)
+               if result'ascending then ri := result'high - i; else ri := result'low + i; end if;
+               result(ri) := XNOR_LUT(a(ai), b(bi));
             end loop;
         end if;
         return result;

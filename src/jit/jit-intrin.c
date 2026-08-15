@@ -2242,15 +2242,22 @@ static inline int32_t __l3d_xor_code(int32_t a, int32_t b)
          result[j] = L3D_C0;                                            \
    }                                                                    \
                                                                         \
-   if (adesc) {                                                         \
+   /* Memory layout is FIRST-ELEMENT-FIRST regardless of range direction \
+    * (an ascending (0 to 31) and a descending (31 downto 0) holding the  \
+    * same number store identical bytes), so the op is tail-aligned       \
+    * elementwise for EVERY direction mix.  The old ascending branch      \
+    * REVERSED both operands into the result -- bit-reversing the output  \
+    * whenever `a` was ascending (an unconstrained concat/aggregate       \
+    * actual: {24'h0,a}^const gave 20a5a5a5 for a5a5a504 -- the EH1a      \
+    * registered-LSU garbage-load class).  It had faithfully copied the   \
+    * same bug from the l3d_* VHDL bodies' mixed-direction branches,      \
+    * fixed in lockstep (logic3d_types_pkg.vhd).                          */ \
+   {                                                                    \
       const int d = lb - la;                                            \
       for (int j = la - n; j < la; j++)                                 \
          result[j] = CODE_FN(adata[j], bdata[j + d]);                   \
    }                                                                    \
-   else {                                                               \
-      for (int i = 0; i < n; i++)                                       \
-         result[i] = CODE_FN(adata[la - 1 - i], bdata[lb - 1 - i]);     \
-   }                                                                    \
+   (void)adesc;                                                         \
                                                                         \
    args[0].pointer = result;                                            \
    args[1].integer = aleft;                                             \
