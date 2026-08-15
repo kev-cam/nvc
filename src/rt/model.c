@@ -6377,6 +6377,19 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             }
             p = e + 1;
          }
+         // Overflow is the silent-truncation death class (the 8-bit
+         // late_pend dropped families 8+ for ~a month): a 17th family
+         // would simply never advance while both gates stay green.
+         // Decline the chunk loudly instead of truncating.
+         if (nck == 16 && end != NULL) {
+            const char *more = strchr(p, '"');
+            if (more != NULL && more < end) {
+               notef("accel-jit: model declares more than 16 extra clock "
+                     "families — bridge tables cap at 16; declining (interp)");
+               free(dut_text);
+               return false;
+            }
+         }
       }
    }
    // SM_GROUP0_REGS: how many registers the MAIN clock group actually
@@ -6387,6 +6400,33 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    { const char *g0p = strstr(dut_text, "#define SM_GROUP0_REGS ");
      if (g0p != NULL)
         g0regs = atol(g0p + strlen("#define SM_GROUP0_REGS ")); }
+
+   // Out-of-band reset handshake. Reset is a TWO-SIDED protocol: gsm strips
+   // a port named `rst` from inputs_t and exports sm_oob_reset; the bridge
+   // diverts the same pin and drives sm_reset from RST (AJB[5]). Removing
+   // either half alone is silent poison — 8c8e1c1ba took out one side and
+   // 16/19 accelbench designs went wrong with both gates green. Marker
+   // absent (older cached model) => skip the marker check; the kept-input
+   // conflict check below is vintage-independent.
+   { long oob = -1;
+     const char *op = strstr(dut_text, "const int sm_oob_reset = ");
+     if (op != NULL) oob = atol(op + strlen("const int sm_oob_reset = "));
+     if (oob >= 0 && (oob != 0) != (rst != NULL)) {
+        notef("accel-jit: OOB-RESET CONTRACT BROKEN: model %s an out-of-band "
+              "reset but the bridge %s an rst pin — declining (interp)",
+              oob ? "expects" : "does not expect",
+              rst != NULL ? "diverted" : "did not divert");
+        free(dut_text);
+        return false;
+     }
+     if (rst != NULL && aj_model_has_field(dut_text, "rst")) {
+        notef("accel-jit: OOB-RESET CONTRACT BROKEN: bridge diverts pin "
+              "'rst' but the model kept it in inputs_t (it would read stale "
+              "zero forever) — declining (interp)");
+        free(dut_text);
+        return false;
+     }
+   }
 
    // Per-BIT vector clocks: gen_statemachine names a group on bit N of a
    // vector clock wire "<wire>__b<N>" (EH2's active_thread_l2clk[1:0] — one
