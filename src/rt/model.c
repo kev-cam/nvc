@@ -2512,7 +2512,13 @@ static bool aj_verify_diff(const unsigned char *ip, const unsigned char *ap,
 // fact this prints in one run). Census, not assertion: producer>capture
 // is NORMAL for plain next-cycle comb settle; the report is the
 // measurement that makes the gated-family cases visible.
-typedef struct { rt_nexus_t *nx; aj_chunk_t *chunk; char pin[64]; } aj_ao3_ent_t;
+typedef struct {
+   rt_nexus_t  *nx;         // ULTIMATE nexus (port-hop walk)
+   aj_chunk_t  *chunk;
+   uint8_t     *dst;        // consumer-side rim bytes (seed back-fill)
+   size_t       nbytes;
+   char         pin[64];
+} aj_ao3_ent_t;
 static aj_ao3_ent_t *g_ao3_map = NULL;
 static unsigned g_ao3_n = 0, g_ao3_max = 0;
 
@@ -2526,10 +2532,11 @@ static inline int aj_ao_level(void)
    return l;
 }
 
-static void aj_ao3_add(rt_nexus_t *nx, aj_chunk_t *chunk, const char *pin)
+static void aj_ao3_add(rt_nexus_t *nx, aj_chunk_t *chunk, const char *pin,
+                       uint8_t *dst, size_t nbytes)
 {
    for (unsigned i = 0; i < g_ao3_n; i++)
-      if (g_ao3_map[i].nx == nx) {
+      if (g_ao3_map[i].nx == nx && g_ao3_map[i].dst == dst) {
          g_ao3_map[i].chunk = chunk;
          return;
       }
@@ -2539,6 +2546,8 @@ static void aj_ao3_add(rt_nexus_t *nx, aj_chunk_t *chunk, const char *pin)
    }
    g_ao3_map[g_ao3_n].nx = nx;
    g_ao3_map[g_ao3_n].chunk = chunk;
+   g_ao3_map[g_ao3_n].dst = dst;
+   g_ao3_map[g_ao3_n].nbytes = nbytes;
    strncpy(g_ao3_map[g_ao3_n].pin, pin, sizeof(g_ao3_map[0].pin) - 1);
    g_ao3_map[g_ao3_n].pin[sizeof(g_ao3_map[0].pin) - 1] = '\0';
    g_ao3_n++;
@@ -2564,6 +2573,8 @@ static void aj_ao4_add_out(rt_nexus_t *nx, aj_chunk_t *chunk)
    }
    g_ao4_out[g_ao4_n].nx = nx;
    g_ao4_out[g_ao4_n].chunk = chunk;
+   g_ao4_out[g_ao4_n].dst = NULL;
+   g_ao4_out[g_ao4_n].nbytes = 0;
    g_ao4_out[g_ao4_n].pin[0] = '\0';
    g_ao4_n++;
 }
@@ -6811,7 +6822,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // objects joined by port sources, so exact-pointer keys never connect
    // them (measured: seedord's 3-chunk split fired zero SEED-ORDER lines
    // while reproducing the #43 wrong answer).
-   if (aj_ao_level() >= 3 && !spec)
+   if (!spec)   // always: the ordered seed pass (#43 fix) consumes these
       for (int i = 0; i < npins; i++)
          if (pins[i].is_output && pins[i].sig != NULL)
             aj_ao4_add_out(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
@@ -6989,10 +7000,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       if (!spec) {
          chunk->bindtab[6 + bridged_in] = pins[i].data;
-         if (aj_ao_level() >= 3 && !pins[i].is_output
-             && pins[i].sig != NULL && !is_ck)
+         if (!pins[i].is_output && pins[i].sig != NULL && !is_ck)
             aj_ao3_add(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
-                       chunk, pins[i].name);
+                       chunk, pins[i].name, pins[i].data,
+                       (size_t)pins[i].width * pins[i].elem);
          // snapshot slot for the two-phase edge sampling (see struct);
          // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
          // must remain visible same-delta), only clocked/timed sources
@@ -11055,9 +11066,85 @@ void accel_auto(rt_model_t *m)
       aj_chunk_t    *save_chunk = g_aj_cur_chunk[tid];
       thread->active_obj   = NULL;   // no cone proc -- deposit_signal null-guards
       thread->active_scope = NULL;
-      for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
-         aj_chunk_t *c = m->aj_chunks[ci];
+      // Dependency-ordered seed (#43 FIX): seed producers before
+      // consumers so a cross-chunk input is never read while its
+      // producer still holds 'U' (which the 2-state plane would latch
+      // as a confident 0, permanently after the first edge — seedord's
+      // deterministic wrong answer). Edges come from the always-built
+      // AO maps; repeated ready-sweeps (chunk counts are small), with
+      // any cyclic remainder (cross-chunk comb loops) appended in
+      // install order as before. NVC_ACCEL_SEED_ORDERED=0 restores the
+      // plain install-order pass for A/B.
+      const unsigned nch = m->aj_chunk_count;
+      aj_chunk_t **seed_order = xmalloc_array(nch ? nch : 1,
+                                              sizeof(aj_chunk_t *));
+      unsigned nord = 0;
+      { const char *so = getenv("NVC_ACCEL_SEED_ORDERED");
+        bool want = (so == NULL || *so != '0') && g_ao3_n > 0;
+        bool *emitted = xcalloc_array(nch ? nch : 1, sizeof(bool));
+        if (want) {
+           bool progress = true;
+           while (nord < nch && progress) {
+              progress = false;
+              for (unsigned ci = 0; ci < nch; ci++) {
+                 if (emitted[ci]) continue;
+                 aj_chunk_t *c = m->aj_chunks[ci];
+                 bool ready = true;
+                 for (unsigned i = 0; ready && i < g_ao3_n; i++) {
+                    if (g_ao3_map[i].chunk != c) continue;
+                    for (unsigned j = 0; j < g_ao4_n; j++) {
+                       if (g_ao4_out[j].nx != g_ao3_map[i].nx) continue;
+                       aj_chunk_t *p = g_ao4_out[j].chunk;
+                       if (p != c) {
+                          bool pdone = false;
+                          for (unsigned k = 0; k < nord && !pdone; k++)
+                             pdone = (seed_order[k] == p);
+                          if (!pdone) ready = false;
+                       }
+                       break;
+                    }
+                 }
+                 if (ready) {
+                    emitted[ci] = true;
+                    seed_order[nord++] = c;
+                    progress = true;
+                 }
+              }
+           }
+        }
+        for (unsigned ci = 0; ci < nch; ci++)   // remainder / ordering off
+           if (!emitted[ci])
+              seed_order[nord++] = m->aj_chunks[ci];
+        free(emitted);
+      }
+      for (unsigned ci = 0; ci < nord; ci++) {
+         aj_chunk_t *c = seed_order[ci];
          if (c->eval == NULL) continue;
+         // Cross-chunk seed BACK-FILL (#43, second half): ordering alone
+         // is NOT sufficient — a producer's seed deposit lands on ITS
+         // nexus, but port-hop propagation to this consumer's input rim
+         // needs scheduler deltas that never run during reset (measured:
+         // topo-ordered seedord still Y=190574892 with the audit clean).
+         // Copy each already-seeded producer's ultimate-nexus effective
+         // bytes straight into this chunk's rim, PORTFAN-style. Width
+         // mismatches across hops are skipped (identity hops only).
+         { const char *so2 = getenv("NVC_ACCEL_SEED_ORDERED");
+           if (so2 == NULL || *so2 != '0') {
+              for (unsigned i = 0; i < g_ao3_n; i++) {
+                 if (g_ao3_map[i].chunk != c || g_ao3_map[i].dst == NULL)
+                    continue;
+                 for (unsigned j = 0; j < g_ao4_n; j++) {
+                    if (g_ao4_out[j].nx != g_ao3_map[i].nx) continue;
+                    aj_chunk_t *p = g_ao4_out[j].chunk;
+                    rt_nexus_t *un = g_ao3_map[i].nx;
+                    const size_t unb = (size_t)un->width * un->size;
+                    if (p != c && p->ao_seeded && unb == g_ao3_map[i].nbytes)
+                       memcpy(g_ao3_map[i].dst, nexus_effective(un), unb);
+                    break;
+                 }
+              }
+           }
+         }
          // Force a comb-only settle: the bridge edge-detects on clk_last0,
          // which is 0 after reset, so a design that initialises clk HIGH
          // would read a spurious 0->1 at its first sample. The interpreter
@@ -11104,6 +11191,7 @@ void accel_auto(rt_model_t *m)
             if (setck != NULL) setck(c->state, clkp[0] & 1);
          }
       }
+      free(seed_order);
       g_aj_cur_chunk[tid] = save_chunk;
       thread->active_obj   = save_obj;
       thread->active_scope = save_scope;
@@ -15155,7 +15243,7 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    // AO>=3 census: an interp producer commits a chunk boundary input
    // AFTER the chunk's armed capture in the same timestep. One report
    // per (chunk, timestep) naming the first offending pin.
-   if (unlikely(g_ao3_n > 0)) {
+   if (unlikely(g_ao3_n > 0) && aj_ao_level() >= 3) {
       for (unsigned _i = 0; _i < g_ao3_n; _i++) {
          if (g_ao3_map[_i].nx != n) continue;
          aj_chunk_t *_c = g_ao3_map[_i].chunk;
