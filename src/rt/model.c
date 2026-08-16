@@ -6571,6 +6571,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
      }
    }
 
+   // Reader-side snapshot semantics (mode >= 4) are UNSOUND for un-merged
+   // multi-clock chunks: the mech-3 architectural verdict (2026-08-02) —
+   // mode-4 full-VeeR exited rc=0 clean at 5ns with dec's 5 extra clock
+   // families never leaving reset, while the single-clock toy passed and
+   // hid the class. Enforced until now only by config convention; convert
+   // the silent death into a named decline (assert-order rank 12).
+   if (aj_snap_mode() >= 4 && nck > 0 && (chunk == NULL || !chunk->merged)) {
+      notef("accel-jit: SNAP_MODE %d with %d extra clock famil%s on an "
+            "un-merged chunk — reader-side snapshot split is unsound for "
+            "multi-clock (mech-3 verdict 2026-08-02); declining (interp)",
+            aj_snap_mode(), nck, nck == 1 ? "y" : "ies");
+      free(dut_text);
+      return false;
+   }
+
    // Per-BIT vector clocks: gen_statemachine names a group on bit N of a
    // vector clock wire "<wire>__b<N>" (EH2's active_thread_l2clk[1:0] — one
    // group per thread).  Split into the marshalled FIELD name and the bit to
