@@ -17073,6 +17073,35 @@ static void model_cycle(rt_model_t *m)
          }
          goto fastclk_done;
       }
+      // POST-ENGAGE CANARY (assert-order rank 11): probation's
+      // classification is a point-in-time decision — a posedge-only
+      // member whose trigger fires on a later non-posedge delta was
+      // MISCLASSIFIED and is being starved right now (#72's fastclk
+      // fall-starvation went undetected for the whole run; the fixed
+      // probation closes the known escape, this catches any residual
+      // class). Sampled on candidate FALLS (1 in 64); a firing member
+      // is evicted back to the normal path (self-healing — safe under
+      // fusion, unlike re-partitioning, because evict patches the fused
+      // block) and reported once.
+      { static int _cn = -1;
+        if (_cn < 0) _cn = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
+        static unsigned _cs;
+        if (_cn && edged && !posedge && (++_cs & 63) == 0) {
+           for (unsigned i = 0; i < m->fastclk_ee_start; ) {
+              rt_wakeable_t *w = &(m->fastclk_table[i]->wakeable);
+              if (w->fastclk && !w->pending && w->trigger != NULL
+                  && run_trigger(m, w->trigger)) {
+                 notef("accel-assert: FASTCLK CANARY: posedge-only member "
+                       "proc fired its trigger on a non-posedge delta "
+                       "t=%"PRIu64" — misclassified at probation, evicting "
+                       "to the normal path", (uint64_t)m->now);
+                 aj_fastclk_evict(m, w, "post-engage canary");
+                 continue;   // evict compacts nothing; flag now clear
+              }
+              i++;
+           }
+        }
+      }
       // Steady state: posedge => whole table; any other latched wake =>
       // every-event tail only (skipped outright when the tail is empty).
       if (posedge || m->fastclk_ee_start < m->fastclk_count) {
