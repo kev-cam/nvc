@@ -2155,6 +2155,7 @@ struct _aj_chunk {
    uint64_t         ao_cap_now;      // AO>=3: timestep of the armed capture
    uint32_t         ao_cap_delta;    //   .. its delta
    uint8_t          ao_cap_fired;    //   .. census reported this timestep
+   uint8_t          ao_seeded;       // AO>=3: t=0 seed eval completed
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
@@ -2543,11 +2544,40 @@ static void aj_ao3_add(rt_nexus_t *nx, aj_chunk_t *chunk, const char *pin)
    g_ao3_n++;
 }
 
+// AO>=3 rank-4 companion: chunk OUTPUT nexuses -> producer chunk, so the
+// t=0 seed pass can audit dependency order (#43: install order is the
+// reverse of dependency order in the seedord reproducer — a downstream
+// chunk seeds from a still-U input and the 2-state plane latches it 0).
+static aj_ao3_ent_t *g_ao4_out = NULL;
+static unsigned g_ao4_n = 0, g_ao4_max = 0;
+
+static void aj_ao4_add_out(rt_nexus_t *nx, aj_chunk_t *chunk)
+{
+   for (unsigned i = 0; i < g_ao4_n; i++)
+      if (g_ao4_out[i].nx == nx) {
+         g_ao4_out[i].chunk = chunk;
+         return;
+      }
+   if (g_ao4_n == g_ao4_max) {
+      g_ao4_max = g_ao4_max ? g_ao4_max * 2 : 64;
+      g_ao4_out = xrealloc_array(g_ao4_out, g_ao4_max, sizeof(aj_ao3_ent_t));
+   }
+   g_ao4_out[g_ao4_n].nx = nx;
+   g_ao4_out[g_ao4_n].chunk = chunk;
+   g_ao4_out[g_ao4_n].pin[0] = '\0';
+   g_ao4_n++;
+}
+
 static void aj_ao3_drop_chunk(aj_chunk_t *chunk)
 {
    for (unsigned i = 0; i < g_ao3_n; )
       if (g_ao3_map[i].chunk == chunk)
          g_ao3_map[i] = g_ao3_map[--g_ao3_n];
+      else
+         i++;
+   for (unsigned i = 0; i < g_ao4_n; )
+      if (g_ao4_out[i].chunk == chunk)
+         g_ao4_out[i] = g_ao4_out[--g_ao4_n];
       else
          i++;
 }
@@ -6776,6 +6806,16 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    chunk->bindtab[3] = (void *)&aj_out;
    chunk->bindtab[4] = clk->data;
    chunk->bindtab[5] = rst ? rst->data : NULL;
+   // Both AO maps key on the ULTIMATE nexus (port-hop walk): a consumer's
+   // input rim and its producer's output rim are DIFFERENT rt_nexus_t
+   // objects joined by port sources, so exact-pointer keys never connect
+   // them (measured: seedord's 3-chunk split fired zero SEED-ORDER lines
+   // while reproducing the #43 wrong answer).
+   if (aj_ao_level() >= 3 && !spec)
+      for (int i = 0; i < npins; i++)
+         if (pins[i].is_output && pins[i].sig != NULL)
+            aj_ao4_add_out(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
+                           chunk);
    chunk->primary_ck = clk != NULL ? clk->sig : NULL;
    // Slots after the per-pin table (array is sized 6+npins+4):
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
@@ -6951,7 +6991,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          chunk->bindtab[6 + bridged_in] = pins[i].data;
          if (aj_ao_level() >= 3 && !pins[i].is_output
              && pins[i].sig != NULL && !is_ck)
-            aj_ao3_add(&pins[i].sig->nexus, chunk, pins[i].name);
+            aj_ao3_add(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
+                       chunk, pins[i].name);
          // snapshot slot for the two-phase edge sampling (see struct);
          // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
          // must remain visible same-delta), only clocked/timed sources
@@ -11028,8 +11069,34 @@ void accel_auto(rt_model_t *m)
          const bool force = (clkp != NULL && (clkp[0] & 1));
          const uint8_t saved = force ? clkp[0] : 0;
          if (force) clkp[0] = 2;   // driven-'0' (std_logic '0' / logic3d 0)
+         // AO>=3 rank-4 audit (#43): the seed runs in INSTALL order with
+         // no settle pass. A cross-chunk input whose producer has not yet
+         // seeded still reads 'U' here, and the 2-state value plane
+         // latches it as a confident 0 — permanently after the first
+         // edge. Report per offending pin; t=0 only, zero steady cost.
+         if (aj_ao_level() >= 3) {
+            for (unsigned _i = 0; _i < g_ao3_n; _i++) {
+               if (g_ao3_map[_i].chunk != c) continue;
+               for (unsigned _j = 0; _j < g_ao4_n; _j++) {
+                  if (g_ao4_out[_j].nx != g_ao3_map[_i].nx) continue;
+                  aj_chunk_t *p = g_ao4_out[_j].chunk;
+                  if (p != c && !p->ao_seeded)
+                     notef("accel-assert: SEED-ORDER t=0: chunk %s pin "
+                           "'%s' reads an output of chunk %s which is NOT "
+                           "yet seeded (install order != dependency "
+                           "order) — 2-state seed may latch U as 0 (#43)",
+                           c->scope != NULL && c->scope->where != NULL
+                              ? istr(tree_ident(c->scope->where)) : "?",
+                           g_ao3_map[_i].pin,
+                           p->scope != NULL && p->scope->where != NULL
+                              ? istr(tree_ident(p->scope->where)) : "?");
+                  break;
+               }
+            }
+         }
          g_aj_cur_chunk[tid] = c;
          c->eval(c->state, c->bindtab);
+         c->ao_seeded = 1;
          if (force) clkp[0] = saved;
          if (clkp != NULL && c->dl != NULL) {
             void (*setck)(void *, unsigned char) =
