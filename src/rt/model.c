@@ -2152,6 +2152,9 @@ struct _aj_chunk {
    // driver commit); this is the observed half, reset when now moves.
    uint64_t         ao_obs_now;      // timestep the fields below belong to
    uint8_t          ao_fall_seen;    // post-arm fall observed this timestep
+   uint64_t         ao_cap_now;      // AO>=3: timestep of the armed capture
+   uint32_t         ao_cap_delta;    //   .. its delta
+   uint8_t          ao_cap_fired;    //   .. census reported this timestep
    rt_scope_t      *scope;           // installed subtree root
    aj_defer_out_t  *defer_outs;      // per-chunk (was the single m->aj_defer_*)
    unsigned         defer_count;
@@ -2500,6 +2503,55 @@ static bool aj_verify_diff(const unsigned char *ip, const unsigned char *ap,
    return false;
 }
 
+// NVC_ACCEL_ASSERT_ORDER>=3: capture-before-producer CENSUS. Maps chunk
+// boundary-INPUT nexuses to their (chunk, pin name) so notify_event and
+// the deposit path can report interp producers that commit AFTER the
+// chunk's armed capture in the same timestep — the wb_pkt class (#68
+// took ~19 forensic rounds to hand-derive the +11-producer-vs-+3-capture
+// fact this prints in one run). Census, not assertion: producer>capture
+// is NORMAL for plain next-cycle comb settle; the report is the
+// measurement that makes the gated-family cases visible.
+typedef struct { rt_nexus_t *nx; aj_chunk_t *chunk; char pin[64]; } aj_ao3_ent_t;
+static aj_ao3_ent_t *g_ao3_map = NULL;
+static unsigned g_ao3_n = 0, g_ao3_max = 0;
+
+static inline int aj_ao_level(void)
+{
+   static int l = -1;
+   if (l < 0) {
+      const char *e = getenv("NVC_ACCEL_ASSERT_ORDER");
+      l = e == NULL ? 0 : (atoi(e) > 0 ? atoi(e) : 1);
+   }
+   return l;
+}
+
+static void aj_ao3_add(rt_nexus_t *nx, aj_chunk_t *chunk, const char *pin)
+{
+   for (unsigned i = 0; i < g_ao3_n; i++)
+      if (g_ao3_map[i].nx == nx) {
+         g_ao3_map[i].chunk = chunk;
+         return;
+      }
+   if (g_ao3_n == g_ao3_max) {
+      g_ao3_max = g_ao3_max ? g_ao3_max * 2 : 64;
+      g_ao3_map = xrealloc_array(g_ao3_map, g_ao3_max, sizeof(aj_ao3_ent_t));
+   }
+   g_ao3_map[g_ao3_n].nx = nx;
+   g_ao3_map[g_ao3_n].chunk = chunk;
+   strncpy(g_ao3_map[g_ao3_n].pin, pin, sizeof(g_ao3_map[0].pin) - 1);
+   g_ao3_map[g_ao3_n].pin[sizeof(g_ao3_map[0].pin) - 1] = '\0';
+   g_ao3_n++;
+}
+
+static void aj_ao3_drop_chunk(aj_chunk_t *chunk)
+{
+   for (unsigned i = 0; i < g_ao3_n; )
+      if (g_ao3_map[i].chunk == chunk)
+         g_ao3_map[i] = g_ao3_map[--g_ao3_n];
+      else
+         i++;
+}
+
 static inline int aj_rst_hold(void);
 static void aj_rst_release(rt_model_t *m, aj_chunk_t *c);
 static void aj_lower(char *dst, const char *src, size_t n);
@@ -2642,10 +2694,11 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       // The fall eval cannot be relied on — fall wakes are filtered by
       // the rising-edge trigger machinery, so v1's post-arm-fall tracking
       // never saw the glitch at all.
-      { static int _ao = -1;
-        if (_ao < 0) {
-           const char *e = getenv("NVC_ACCEL_ASSERT_ORDER");
-           _ao = e == NULL ? 0 : (atoi(e) > 0 ? atoi(e) : 1);
+      { const int _ao = aj_ao_level();
+        if (_ao >= 3 && armed_rose) {
+           chunk->ao_cap_now = (uint64_t)m->now + 1;
+           chunk->ao_cap_delta = (uint32_t)m->iteration;
+           chunk->ao_cap_fired = 0;
         }
         if (_ao && !armed_rose
             && chunk->ck_arm_now == (uint64_t)m->now + 1
@@ -4121,6 +4174,7 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
    const uint64_t t_vt = get_timestamp_ns();
 
    // ---- 6. unbind the chunk ----------------------------------------------
+   aj_ao3_drop_chunk(chunk);   // census map must not outlive the chunk
    // Publish any staged-but-unswapped deferred outputs first (they hold the
    // value the interp side is owed), exactly as the bank swap would.
    if (chunk->defer_outs != NULL) {
@@ -6895,6 +6949,9 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       if (!spec) {
          chunk->bindtab[6 + bridged_in] = pins[i].data;
+         if (aj_ao_level() >= 3 && !pins[i].is_output
+             && pins[i].sig != NULL && !is_ck)
+            aj_ao3_add(&pins[i].sig->nexus, chunk, pins[i].name);
          // snapshot slot for the two-phase edge sampling (see struct);
          // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
          // must remain visible same-delta), only clocked/timed sources
@@ -15020,6 +15077,28 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
      } }
    n->last_event = m->now;
    n->event_delta = m->iteration;
+
+   // AO>=3 census: an interp producer commits a chunk boundary input
+   // AFTER the chunk's armed capture in the same timestep. One report
+   // per (chunk, timestep) naming the first offending pin.
+   if (unlikely(g_ao3_n > 0)) {
+      for (unsigned _i = 0; _i < g_ao3_n; _i++) {
+         if (g_ao3_map[_i].nx != n) continue;
+         aj_chunk_t *_c = g_ao3_map[_i].chunk;
+         if (_c->ao_cap_now == (uint64_t)m->now + 1 && !_c->ao_cap_fired
+             && (uint32_t)m->iteration > _c->ao_cap_delta) {
+            _c->ao_cap_fired = 1;
+            notef("accel-assert: CENSUS capture-before-producer chunk %s "
+                  "t=%"PRIu64": captured at delta %u, input pin '%s' "
+                  "produced at delta %u",
+                  _c->scope != NULL && _c->scope->where != NULL
+                     ? istr(tree_ident(_c->scope->where)) : "?",
+                  (uint64_t)m->now, _c->ao_cap_delta, g_ao3_map[_i].pin,
+                  (unsigned)m->iteration);
+         }
+         break;
+      }
+   }
 
    if (n->flags & NET_F_CACHE_EVENT)
       n->signal->shared.flags |= SIG_F_EVENT_FLAG;
