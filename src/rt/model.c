@@ -2643,21 +2643,35 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
       // the rising-edge trigger machinery, so v1's post-arm-fall tracking
       // never saw the glitch at all.
       { static int _ao = -1;
-        if (_ao < 0) _ao = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
+        if (_ao < 0) {
+           const char *e = getenv("NVC_ACCEL_ASSERT_ORDER");
+           _ao = e == NULL ? 0 : (atoi(e) > 0 ? atoi(e) : 1);
+        }
         if (_ao && !armed_rose
             && chunk->ck_arm_now == (uint64_t)m->now + 1
             && (chunk->primary_ck->shared.data[0] & 1)
             && cn->last_event == (uint64_t)m->now
-            && cn->event_delta == m->iteration
-            && chunk->ao_obs_now != (uint64_t)m->now + 1) {
-           chunk->ao_obs_now = (uint64_t)m->now + 1;  // once per timestep
-           notef("accel-assert: DROPPED EDGE chunk %s t=%"PRIu64
-                 " delta %u: second primary-clock rise within one "
-                 "timestep (rise-fall-rise glitch) — once-per-instant "
-                 "arming captures only the first",
-                 chunk->scope != NULL && chunk->scope->where != NULL
-                    ? istr(tree_ident(chunk->scope->where)) : "?",
-                 (uint64_t)m->now, (unsigned)m->iteration);
+            && cn->event_delta == m->iteration) {
+           if (chunk->ao_obs_now != (uint64_t)m->now + 1) {
+              chunk->ao_obs_now = (uint64_t)m->now + 1;  // report 1x/timestep
+              notef("accel-assert: DROPPED EDGE chunk %s t=%"PRIu64
+                    " delta %u: second primary-clock rise within one "
+                    "timestep (rise-fall-rise glitch) — once-per-instant "
+                    "arming captures only the first%s",
+                    chunk->scope != NULL && chunk->scope->where != NULL
+                       ? istr(tree_ident(chunk->scope->where)) : "?",
+                    (uint64_t)m->now, (unsigned)m->iteration,
+                    _ao >= 2 ? "; RE-ARMING to capture it" : "");
+           }
+           // =2: capture the edge instead of only reporting it — interp
+           // is the golden reference for --accel, and interp counts both
+           // rises (glitch fixture: interp Y=56 vs un-rearmed accel
+           // Y=50). Sound against the guard's original double-capture
+           // bug: a single rise event is "new" (event_delta==iteration)
+           // in exactly one delta, and per-delta dedup stops repeat
+           // evals within it — each rise event arms at most once.
+           if (_ao >= 2)
+              armed_rose = true;
         }
       }
       (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
