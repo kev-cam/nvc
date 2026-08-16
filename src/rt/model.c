@@ -2632,35 +2632,32 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
          && (chunk->primary_ck->shared.data[0] & 1)
          && chunk->ck_arm_now != (uint64_t)m->now + 1;
       if (armed_rose) chunk->ck_arm_now = (uint64_t)m->now + 1;  // +1: 0 unused
-      // NVC_ACCEL_ASSERT_ORDER (slice 2, chunk-local half): a rise-fall-
-      // RISE glitch within one timestep arms only once — the once-per-
-      // instant guard silently drops the second capture (the derived/
-      // gated-clock delta-race shape #72 exposed from the TB side).
-      // Track a post-arm fall; a further same-timestep rise then fires.
+      // NVC_ACCEL_ASSERT_ORDER (slice 2b): a rise-fall-RISE glitch within
+      // one timestep arms only once — the once-per-instant guard silently
+      // drops the second capture (measured: /tmp/glitch73 fixture, interp
+      // Y=56 vs accel Y=50 with zero diagnostics). Detection is at the
+      // second-rise eval itself: a NEW clock event in THIS delta
+      // (event_delta == iteration, the standard consumer predicate) with
+      // the level high while this timestep's rise is already consumed.
+      // The fall eval cannot be relied on — fall wakes are filtered by
+      // the rising-edge trigger machinery, so v1's post-arm-fall tracking
+      // never saw the glitch at all.
       { static int _ao = -1;
         if (_ao < 0) _ao = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
-        if (_ao) {
-           if (chunk->ao_obs_now != (uint64_t)m->now + 1) {
-              chunk->ao_obs_now = (uint64_t)m->now + 1;
-              chunk->ao_fall_seen = 0;
-           }
-           const bool lvl = (chunk->primary_ck->shared.data[0] & 1) != 0;
-           const bool armed_this_t =
-              chunk->ck_arm_now == (uint64_t)m->now + 1;
-           if (!lvl && armed_this_t)
-              chunk->ao_fall_seen = 1;
-           else if (lvl && !armed_rose && armed_this_t
-                    && chunk->ao_fall_seen
-                    && cn->last_event == (uint64_t)m->now) {
-              notef("accel-assert: DROPPED EDGE chunk %s t=%"PRIu64
-                    ": second primary-clock rise within one timestep "
-                    "(rise-fall-rise glitch) — once-per-instant arming "
-                    "captures only the first",
-                    chunk->scope != NULL && chunk->scope->where != NULL
-                       ? istr(tree_ident(chunk->scope->where)) : "?",
-                    (uint64_t)m->now);
-              chunk->ao_fall_seen = 0;   // report once per glitch pair
-           }
+        if (_ao && !armed_rose
+            && chunk->ck_arm_now == (uint64_t)m->now + 1
+            && (chunk->primary_ck->shared.data[0] & 1)
+            && cn->last_event == (uint64_t)m->now
+            && cn->event_delta == m->iteration
+            && chunk->ao_obs_now != (uint64_t)m->now + 1) {
+           chunk->ao_obs_now = (uint64_t)m->now + 1;  // once per timestep
+           notef("accel-assert: DROPPED EDGE chunk %s t=%"PRIu64
+                 " delta %u: second primary-clock rise within one "
+                 "timestep (rise-fall-rise glitch) — once-per-instant "
+                 "arming captures only the first",
+                 chunk->scope != NULL && chunk->scope->where != NULL
+                    ? istr(tree_ident(chunk->scope->where)) : "?",
+                 (uint64_t)m->now, (unsigned)m->iteration);
         }
       }
       (*chunk->set_clklast)(chunk->state, armed_rose ? 0 : 1);
