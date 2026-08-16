@@ -7192,7 +7192,14 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // eval (see the arming block).  COMB outputs re-settle on every call
    // regardless (below).
    fprintf(f, "  int posedge;\n");
-   fprintf(f, "  if(VERIFY) posedge = (_clk && !aj_cs->clk_last0);\n");
+   // ONE shared edge-detect expression for BOTH paths (assert-order rank
+   // 5): the +4 class survived for weeks precisely because VERIFY and
+   // driving compiled DIFFERENT edge rules and the clean oracle was
+   // misread as exonerating compute. A single source string makes that
+   // divergence impossible by construction; the emitted text is
+   // byte-identical to before, so no bridge-salt bump.
+   static const char AJ_EDGE_EXPR[] = "(_clk && !aj_cs->clk_last0)";
+   fprintf(f, "  if(VERIFY) posedge = %s;\n", AJ_EDGE_EXPR);
    // Driving mode HAD `(_clk && t != last_t)` -- a level+new-timestep proxy
    // from before aj_subscribe_clocks existed, when the chunk might never
    // sample the clock-low phase.  Post-subscription the chunk wakes on every
@@ -7203,7 +7210,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // at the negedge, then the real posedge) -> retired-PC +4 on the first
    // retire of every burst.  VERIFY compiled the real edge detect all along,
    // which is why it stayed clean while the driving run diverged.
-   fprintf(f, "  else { posedge = (_clk && !aj_cs->clk_last0); if(posedge) last_t = t; }\n");
+   fprintf(f, "  else { posedge = %s; if(posedge) last_t = t; }\n", AJ_EDGE_EXPR);
    fprintf(f, "  aj_cs->clk_last0 = _clk;\n");
    // Escape hatch / A-B proof: NVC_ACCEL_NO_SETTLE restores the OLD once-per-edge
    // behaviour (no combinational re-settle on input-change deltas) — wrong for a
