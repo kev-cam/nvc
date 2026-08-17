@@ -14422,6 +14422,32 @@ void model_reset(rt_model_t *m)
 
    tlab_reset(thread->tlab);   // No allocations can be live past here
 
+   // EAGER single-driver vtable install (#74 resolver-elision directive:
+   // "do the resolver work BEFORE code-generation for interp"). The lazy
+   // rewrites in call_resolution/calculate_driving_value install these
+   // same vtables on each nexus's FIRST post-reset update, paying one
+   // full source-walk + resolution (and, for resolved types, the
+   // memo-probe path) per nexus first. Source counts are final here —
+   // add_source/force/disconnect all revert to nexus_default_vtable, so
+   // the revocation story is identical to the lazy path's. Predicates
+   // replicate the lazy sites exactly (measured census: 99.993% of
+   // driven nexuses are single-source, so this covers nearly every net).
+   // NVC_NO_EAGER_VTABLE=1 restores lazy-only for A/B.
+   if (getenv("NVC_NO_EAGER_VTABLE") == NULL) {
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         if (n->n_sources != 1 || (n->flags & NET_F_FORCED))
+            continue;
+         rt_source_t *s0 = &(n->sources);
+         if (s0->tag != SOURCE_DRIVER || s0->disconnected)
+            continue;
+         res_memo_t *r = n->signal != NULL ? n->signal->resolution : NULL;
+         if (r == NULL || (n->flags & NET_F_R_IDENT))
+            n->vtable = &nexus_single_driver_vtable;
+         else if (r->flags & R_MEMO)
+            n->vtable = &nexus_memo1_vtable;
+      }
+   }
+
    run_callbacks(m, END_OF_INITIALISATION);
 
    // Route escaping unconstrained results (the per-eval logic3d churn) into a
