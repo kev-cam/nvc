@@ -206,6 +206,7 @@ typedef enum {
    JIT_EXIT_SCHED_WAVEFORM_FAST6,
    JIT_EXIT_SCHED_WAVEFORM_FAST7,
    JIT_EXIT_SCHED_WAVEFORM_FAST8,
+   JIT_EXIT_ENABLE_LAST_VALUE,
 } jit_exit_t;
 
 // 32-bit virtual register index: very large elaborated units (e.g. a VeeR

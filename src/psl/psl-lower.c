@@ -44,6 +44,32 @@ static void psl_wait_cb(tree_t t, void *ctx)
    emit_sched_event(nets_reg, count_reg);
 }
 
+// #74 E2: 'last_value elision — register readers reachable from PSL
+// (rising_edge in clock expressions and guards); must run in the
+// property reset context, before the first commit
+static void psl_lv_guard_walk(lower_unit_t *lu, psl_guard_t g)
+{
+   if (g == NULL)
+      return;
+   switch (psl_guard_kind(g)) {
+   case GUARD_EXPR:
+      lower_last_value_walk(lu, psl_tree(psl_guard_expr(g)));
+      break;
+   case GUARD_NOT:
+      lower_last_value_walk(lu, psl_tree(psl_guard_expr(g)));
+      break;
+   case GUARD_BINOP:
+      {
+         const guard_binop_t *bop = psl_guard_binop(g);
+         psl_lv_guard_walk(lu, bop->left);
+         psl_lv_guard_walk(lu, bop->right);
+      }
+      break;
+   case GUARD_FALSE:
+      break;
+   }
+}
+
 static vcode_reg_t psl_lower_boolean(lower_unit_t *lu, psl_node_t p)
 {
    assert(psl_kind(p) == P_HDL_EXPR);
@@ -568,6 +594,13 @@ void psl_lower_directive(unit_registry_t *ur, lower_unit_t *parent,
    emit_comment("Reset property");
 
    build_wait(clk_expr, psl_wait_cb, lu);
+   lower_last_value_walk(lu, clk_expr);
+
+   for (fsm_state_t *st = fsm->states; st != NULL; st = st->next) {
+      psl_lv_guard_walk(lu, st->guard);
+      for (fsm_edge_t *e = st->edges; e != NULL; e = e->next)
+         psl_lv_guard_walk(lu, e->guard);
+   }
 
    vcode_reg_t trigger_ptr = emit_var_upref(hops, trigger_var);
    vcode_reg_t trigger_reg = emit_load_indirect(trigger_ptr);
@@ -576,6 +609,7 @@ void psl_lower_directive(unit_registry_t *ur, lower_unit_t *parent,
    psl_node_t async_abort = psl_outer_async_abort(top);
    if (async_abort != NULL) {
       build_wait(psl_tree(async_abort), psl_wait_cb, lu);
+      lower_last_value_walk(lu, psl_tree(async_abort));
 
       vcode_reg_t abort_reg =
          psl_lower_async_abort(ur, parent, async_abort, name);

@@ -65,6 +65,7 @@ typedef uint8_t net_flags_t;
 #define SIG_F_EVENT_FLAG   (1 << 11)
 #define SIG_F_REGISTER     (1 << 12)
 #define SIG_F_PIPE         (1 << 13)
+#define SIG_F_LAST_VALUE (1 << 14)  // some reader needs S'last_value (#74 E2)
 typedef uint32_t sig_flags_t;
 
 typedef enum {

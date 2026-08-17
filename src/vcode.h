@@ -180,6 +180,7 @@ typedef enum {
    VCODE_OP_PIPE_READ,
    VCODE_OP_PIPE_FULL,
    VCODE_OP_PIPE_EMPTY,
+   VCODE_OP_ENABLE_LAST_VALUE,
 } vcode_op_t;
 
 typedef enum {
@@ -477,6 +478,7 @@ vcode_reg_t emit_table_ref(vcode_reg_t array, vcode_reg_t stride,
                            const vcode_reg_t *args, int nargs);
 void emit_copy(vcode_reg_t dest, vcode_reg_t src, vcode_reg_t count);
 void emit_sched_event(vcode_reg_t nets, vcode_reg_t n_elems);
+void emit_enable_last_value(vcode_reg_t nets, vcode_reg_t n_elems);
 void emit_clear_event(vcode_reg_t nets, vcode_reg_t count);
 void emit_sched_process(vcode_reg_t delay);
 void emit_resume(ident_t func);

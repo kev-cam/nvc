@@ -353,6 +353,11 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value);
 // Global bank-select index read by JIT code emitted under NVC_BANKED_READS
 // (jit-irgen.c irgen_op_resolved).  Stays 0 until the flip goes live.
 int32_t nvc_banked_sel = 0;
+// #74 E2: some reader (S'last_value in a process, toggle coverage) needs
+// the last-value plane maintained for a signal. Registered at RESET time
+// only — the elision decision must be final before the first commit.
+static bool g_lv_copy_all = false;
+
 static int g_banked = -1;   // NVC_BANKED, resolved in accel_banked_init
 static int g_alias_flip = -1;  // NVC_ALIAS_FLIP (#74): drive-time staging,
                                // requires the banked install; resolved in
@@ -12214,7 +12219,10 @@ static void put_effective_lazy(rt_model_t *m, rt_nexus_t *n, const void *value)
           && n->event_delta == m->iteration)
          memcpy(eff, value, valuesz);   // see put_effective_impl
       else
-         copy2(last, eff, value, valuesz);
+         if (likely(!(n->signal->shared.flags & SIG_F_LAST_VALUE)))
+            memcpy(eff, value, valuesz);   // #74 E2: no 'last_value reader
+         else
+            copy2(last, eff, value, valuesz);
 
       // Arm readers: one OR per process, no list walk, no hash
       lazy_nexus_readers_t *nr = ihash_get(g_lazy_nmap, (uintptr_t)n);
@@ -14471,6 +14479,27 @@ void model_reset(rt_model_t *m)
    // replicate the lazy sites exactly (measured census: 99.993% of
    // driven nexuses are single-source, so this covers nearly every net).
    // NVC_NO_EAGER_VTABLE=1 restores lazy-only for A/B.
+   // #74 E2 policy fold. Verilog (STD_MX) designs can read the last
+   // plane through UDP edge rows whose registration is not yet plumbed —
+   // keep the copy for every signal there (v1). NVC_LV_COPYALL=1 forces
+   // the same globally. NVC_LV_POISON=1 fills the elided last planes
+   // with 0xDE so any reader this audit missed fails loudly and
+   // deterministically (mandatory gate fixture, not a one-off).
+   if (standard() == STD_MX || getenv("NVC_LV_COPYALL") != NULL)
+      g_lv_copy_all = true;
+   if (g_lv_copy_all) {
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain)
+         if (n->signal != NULL)
+            n->signal->shared.flags |= SIG_F_LAST_VALUE;
+   }
+   else if (getenv("NVC_LV_POISON") != NULL) {
+      for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+         rt_signal_t *sig = n->signal;
+         if (sig != NULL && !(sig->shared.flags & SIG_F_LAST_VALUE))
+            memset(nexus_last_value(n), 0xDE, (size_t)n->size * n->width);
+      }
+   }
+
    if (getenv("NVC_NO_EAGER_VTABLE") == NULL) {
       for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
          if (n->n_sources != 1 || (n->flags & NET_F_FORCED))
@@ -15421,7 +15450,10 @@ static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value)
           && n->event_delta == m->iteration)
          memcpy(eff, value, valuesz);
       else
-         copy2(last, eff, value, valuesz);
+         if (likely(!(n->signal->shared.flags & SIG_F_LAST_VALUE)))
+            memcpy(eff, value, valuesz);   // #74 E2: no 'last_value reader
+         else
+            copy2(last, eff, value, valuesz);
       notify_event(m, n);
    }
 }
@@ -17728,7 +17760,10 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
          unsigned char *eff = nexus_effective(n);
          unsigned char *last = nexus_last_value(n);
          if (!cmp_bytes(eff, vptr, valuesz)) {
-            copy2(last, eff, vptr, valuesz);
+            if (likely(!(n->signal->shared.flags & SIG_F_LAST_VALUE)))
+               memcpy(eff, vptr, valuesz);   // #74 E2: no 'last_value reader
+            else
+               copy2(last, eff, vptr, valuesz);
             m->trigger_epoch++;
             n->last_event = m->now;
             n->event_delta = m->iteration + 1;
@@ -17874,7 +17909,10 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
          { static int _ds = -1;
            if (_ds < 0) _ds = getenv("NVC_DEP_STATS") != NULL;
            if (_ds) { extern uint64_t g_aj_dep_chg; g_aj_dep_chg++; } }
-         copy2(last, eff, vptr, valuesz);
+         if (likely(!(n->signal->shared.flags & SIG_F_LAST_VALUE)))
+            memcpy(eff, vptr, valuesz);   // #74 E2: no 'last_value reader
+         else
+            copy2(last, eff, vptr, valuesz);
          m->trigger_epoch++;
 
          n->last_event = m->now;
@@ -18920,6 +18958,13 @@ void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count)
       count -= n->width;
       assert(count >= 0);
    }
+}
+
+void x_enable_last_value(sig_shared_t *ss, uint32_t offset, int32_t count)
+{
+   (void)offset; (void)count;   // signal-level granularity (no spare
+                                // per-nexus flag bits)
+   ss->flags |= SIG_F_LAST_VALUE;
 }
 
 void x_clear_event(sig_shared_t *ss, uint32_t offset, int32_t count)

@@ -11052,6 +11052,109 @@ static vcode_reg_t lower_process_trigger(lower_unit_t *lu, tree_t proc)
       return emit_or_trigger(branches[0], branches[1]);
 }
 
+// #74 E2: reset-time registration that this process (or a subprogram
+// declared inside it — tree_visit_only walks the whole subtree) reads
+// S'last_value, so the runtime must keep the last-value plane for S.
+// Package-level subprograms reading FORMAL'last_value are the one case
+// this walk cannot see; the STD_MX/NVC_LV_COPYALL fallback and the
+// NVC_LV_POISON gate fixture cover that residual (see model.c).
+static void lower_lv_field_cb(lower_unit_t *lu, tree_t field, vcode_reg_t ptr,
+                              vcode_reg_t unused, vcode_reg_t locus, void *ctx)
+{
+   type_t type = tree_type(field);
+   if (!type_is_homogeneous(type))
+      lower_for_each_field(lu, type, ptr, VCODE_INVALID_REG,
+                           lower_lv_field_cb, ctx);
+   else {
+      vcode_reg_t nets_reg = emit_load_indirect(ptr);
+      vcode_reg_t count_reg = lower_type_width(lu, type, nets_reg);
+      emit_enable_last_value(lower_array_data(nets_reg), count_reg);
+   }
+}
+
+static void lower_lv_register(lower_unit_t *lu, tree_t prefix)
+{
+   type_t type = tree_type(prefix);
+   vcode_reg_t nets_reg = lower_lvalue(lu, prefix);
+   if (!type_is_homogeneous(type))
+      lower_for_each_field(lu, type, nets_reg, VCODE_INVALID_REG,
+                           lower_lv_field_cb, NULL);
+   else {
+      vcode_reg_t count_reg = lower_type_width(lu, type, nets_reg);
+      emit_enable_last_value(lower_array_data(nets_reg), count_reg);
+   }
+}
+
+static void lower_lv_enable_cb(tree_t t, void *ctx)
+{
+   lower_unit_t *lu = ctx;
+   if (tree_subkind(t) != ATTR_LAST_VALUE)
+      return;
+
+   tree_t prefix = tree_name(t);
+   tree_t ref = name_to_ref(prefix);
+   if (ref == NULL || class_of(ref) != C_SIGNAL)
+      return;
+
+   // The visit descends into subprogram bodies declared in the process:
+   // a prefix rooted at a FORMAL has no register in the reset context —
+   // and needs none, since the call-cb registers the caller's actual.
+   if (tree_has_ref(ref) && tree_kind(tree_ref(ref)) == T_PARAM_DECL)
+      return;
+
+   // Register via the ROOT ref, not the full prefix: granularity is
+   // per-signal (x_enable_last_value sets ss->flags), and the prefix
+   // may contain non-static parts (s(i), relaxed rules) that have no
+   // value in the reset context.
+   lower_lv_register(lu, ref);
+}
+
+// A subprogram taking a SIGNAL-class formal may read FORMAL'last_value
+// in its body (rising_edge/falling_edge do exactly this) — the process
+// walk cannot see through the call, so register every signal actual
+// bound to a signal-class formal.  Registering at the PASSING point
+// makes transitive call chains conservative-safe with no body analysis.
+static void lower_lv_call_cb(tree_t t, void *ctx)
+{
+   lower_unit_t *lu = ctx;
+   tree_t decl = tree_has_ref(t) ? tree_ref(t) : NULL;
+
+   const int nparams = tree_params(t);
+   for (int i = 0; i < nparams; i++) {
+      tree_t p = tree_param(t, i);
+      tree_t value = tree_value(p);
+      tree_t ref = name_to_ref(value);
+      if (ref == NULL || class_of(ref) != C_SIGNAL)
+         continue;
+
+      // Formal passed onward inside a nested body: outer call site
+      // already registered the true actual
+      if (tree_has_ref(ref) && tree_kind(tree_ref(ref)) == T_PARAM_DECL)
+         continue;
+
+      bool signal_formal = true;   // unresolvable/named assoc → conservative
+      if (decl != NULL && tree_subkind(p) == P_POS) {
+         const unsigned pos = tree_pos(p);
+         if (pos < (unsigned)tree_ports(decl))
+            signal_formal = tree_class(tree_port(decl, pos)) == C_SIGNAL;
+      }
+
+      if (signal_formal)
+         lower_lv_register(lu, ref);
+   }
+}
+
+// Exported for PSL: register 'last_value readers found in an arbitrary
+// HDL expression (clock expressions, guards) in the current unit's
+// reset context
+void lower_last_value_walk(lower_unit_t *lu, tree_t expr)
+{
+   tree_visit_only(expr, lower_lv_enable_cb, lu, T_ATTR_REF);
+   tree_visit_only(expr, lower_lv_call_cb, lu, T_FCALL);
+   tree_visit_only(expr, lower_lv_call_cb, lu, T_PCALL);
+}
+
+
 void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
 {
    assert(tree_kind(proc) == T_PROCESS);
@@ -11097,6 +11200,12 @@ void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
          emit_drive_signal(lower_array_data(nets_reg), count_reg);
       }
    }
+
+   tree_visit_only(proc, lower_lv_enable_cb, lu, T_ATTR_REF);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_FCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PROT_FCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PROT_PCALL);
 
    const bool transfer = can_use_transfer_signal(proc, ds);
    vcode_reg_t trigger_reg = VCODE_INVALID_REG;

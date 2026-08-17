@@ -218,6 +218,8 @@ void x_cover_setup_toggle_cb(sig_shared_t *ss, int32_t tag)
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    rt_model_t *m = get_model();
 
+   ss->flags |= SIG_F_LAST_VALUE;   // #74 E2: toggle coverage reads 'last_value
+
    cover_data_t *data = get_coverage(m);
    if (data == NULL)
       return;

@@ -976,7 +976,7 @@ const char *vcode_op_string(vcode_op_t op)
       "map implicit", "bind external", "array scope", "record scope", "syscall",
       "put conversion", "dir check", "sched process", "table ref",
       "deposit", "init pipe", "pipe write", "pipe read", "pipe full",
-      "pipe empty",
+      "pipe empty", "enable last value",
    };
    if ((unsigned)op >= ARRAY_LEN(strs))
       return "???";
@@ -1986,6 +1986,7 @@ void vcode_dump_with_mark(int mark_op, vcode_dump_fn_t callback, void *arg)
 
          case VCODE_OP_SCHED_EVENT:
          case VCODE_OP_CLEAR_EVENT:
+         case VCODE_OP_ENABLE_LAST_VALUE:
             {
                printf("%s on ", vcode_op_string(op->kind));
                vcode_dump_reg(op->args.items[0]);
@@ -5508,6 +5509,24 @@ void emit_clear_event(vcode_reg_t nets, vcode_reg_t n_elems)
 
    VCODE_ASSERT(vcode_reg_kind(nets) == VCODE_TYPE_SIGNAL,
                 "nets argument to clear event must be signal");
+}
+
+void emit_enable_last_value(vcode_reg_t nets, vcode_reg_t n_elems)
+{
+   // #74 E2: reset-time registration that some reader needs S'last_value
+   VCODE_FOR_EACH_OP(other) {
+      if (other->kind == VCODE_OP_ENABLE_LAST_VALUE
+          && other->args.items[0] == nets
+          && other->args.items[1] == n_elems)
+         return;
+   }
+
+   op_t *op = vcode_add_op(VCODE_OP_ENABLE_LAST_VALUE);
+   vcode_add_arg(op, nets);
+   vcode_add_arg(op, n_elems);
+
+   VCODE_ASSERT(vcode_reg_kind(nets) == VCODE_TYPE_SIGNAL,
+                "nets argument to enable last value must be signal");
 }
 
 void emit_sched_process(vcode_reg_t delay)

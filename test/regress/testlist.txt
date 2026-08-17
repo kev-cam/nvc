@@ -85,6 +85,8 @@ proc5           normal
 proc6           normal
 assert2         normal,gold
 concat3         normal
+lv1             normal
+lvport          normal
 const2          normal
 func7           normal
 func8           normal
