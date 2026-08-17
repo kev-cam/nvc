@@ -16828,6 +16828,42 @@ static void model_cycle(rt_model_t *m)
    if (m->aj_chunk_count > 0 && aj_snap_mode() >= 2)
       aj_snap_fleet_take(m);
 
+   // STALE-DRIVING-VALUE audit (assert-order rank 7, sampled): the
+   // two-sided protocol assumes every publication refreshed every
+   // registered out_drv driver, so port propagation and resolution —
+   // which read DRIVING values, not effective bytes — always deliver the
+   // chunk's current value. A publication path that bypasses the refresh
+   // freezes downstream readers while both correctness gates stay green
+   // (the EH1a AXI ARVALID class: rim showed the fetch, the TB never saw
+   // one). Every 256th delta boundary, memcmp each registered driver's
+   // waveform value against its nexus's effective bytes.
+   { static int _sa = -1;
+     if (_sa < 0) _sa = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
+     static unsigned _sc;
+     if (_sa && m->aj_chunk_count > 0 && (++_sc & 255) == 0) {
+        for (unsigned ci = 0; ci < m->aj_chunk_count; ci++) {
+           aj_chunk_t *c = m->aj_chunks[ci];
+           if (c->out_drv == NULL || c->out_drv_n == NULL) continue;
+           for (unsigned ord = 0; ord < c->defer_count; ord++)
+              for (int k = 0; k < c->out_drv_n[ord]; k++) {
+                 struct aj_odrv *od = &c->out_drv[ord][k];
+                 const size_t nb = (size_t)od->nx->width * od->nx->size;
+                 const void *dv =
+                    value_ptr(od->nx, &od->src->u.driver.waveforms.value);
+                 if (memcmp(dv, nexus_effective(od->nx), nb) != 0)
+                    notef("accel-assert: STALE DRIVING VALUE chunk %s "
+                          "out %u drv %d t=%"PRIu64": driver bytes != "
+                          "effective — a publication path bypassed the "
+                          "out_drv refresh; port-hop consumers are "
+                          "resolving stale data",
+                          c->scope != NULL && c->scope->where != NULL
+                             ? istr(tree_ident(c->scope->where)) : "?",
+                          ord, k, (uint64_t)m->now);
+              }
+        }
+     }
+   }
+
    // #53 negedge STATE FLIP: merged chunks staged their registered outputs
    // at posedge evals; publish them in the delta where the domain clock's
    // FALL commits -- a derivation-free barrier strictly after every gated
