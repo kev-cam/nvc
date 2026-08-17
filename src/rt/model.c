@@ -17862,6 +17862,23 @@ void sched_deposit(rt_model_t *m, rt_signal_t *s, const void *values,
 
    assert(m->can_create_delta);
 
+   // assert-order: an NBA deposit scheduled with no active object means
+   // the scheduler is not running (install/seed context) — the nonblockq
+   // drain will not fire and the value never lands (measured: gals2
+   // seeded Y=0, fixed by routing immediate at the ONE caller that could
+   // hit it; the other nonblock call sites are posedge-gated and
+   // currently unreachable at seed — this audit pins that against drift).
+   { static int _ao = -1;
+     if (_ao < 0) _ao = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
+     if (_ao && nonblock && after == 0
+         && model_thread(m)->active_obj == NULL)
+        notef("accel-assert: NBA DEPOSIT OUTSIDE SCHEDULER sig %s "
+              "t=%"PRIu64" — nonblockq will not drain here; the value "
+              "never lands (route immediate at the caller)",
+              s->where != NULL ? istr(tree_ident(s->where)) : "?",
+              (uint64_t)m->now);
+   }
+
    rt_nexus_t *n = split_nexus(m, s, offset, count);
    const char *vptr = values;
    for (; count > 0; n = n->chain) {
