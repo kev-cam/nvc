@@ -354,6 +354,9 @@ static void banked_deposit(rt_model_t *m, rt_nexus_t *n, const void *value);
 // (jit-irgen.c irgen_op_resolved).  Stays 0 until the flip goes live.
 int32_t nvc_banked_sel = 0;
 static int g_banked = -1;   // NVC_BANKED, resolved in accel_banked_init
+static int g_alias_flip = -1;  // NVC_ALIAS_FLIP (#74): drive-time staging,
+                               // requires the banked install; resolved in
+                               // accel_banked_init alongside g_banked
 static struct {
    rt_nexus_t **items;
    size_t       count, max;
@@ -10982,8 +10985,12 @@ static void aj_banked_install_scope(rt_scope_t *s)
 // serially-passing workload (the directive's exploration corpus).
 void accel_banked_init(rt_model_t *m)
 {
-   if (g_banked < 0)
-      g_banked = getenv("NVC_BANKED") != NULL ? 1 : 0;
+   if (g_banked < 0) {
+      // NVC_ALIAS_FLIP (#74) implies the banked install: the alias-flip
+      // drive-time staging needs the class installed and the flip live.
+      g_alias_flip = getenv("NVC_ALIAS_FLIP") != NULL ? 1 : 0;
+      g_banked = (getenv("NVC_BANKED") != NULL || g_alias_flip == 1) ? 1 : 0;
+   }
    if (g_banked == 1) {
       aj_banked_install_scope(root_scope(m));
       notef("banked: copy-at-flip ACTIVE — %ld leaf nexus(es) staged "
@@ -12157,9 +12164,29 @@ static inline void *nexus_last_value(rt_nexus_t *n)
    return n->signal->shared.data + n->offset + n->signal->shared.size;
 }
 
+// #74 E1: driving value provably equals effective value — unresolved,
+// exactly one SOURCE_DRIVER, and not a connected-inout formal (LRM
+// 14.7.7.3: for everything outside the connected-INOUT branch,
+// calculate_effective_value literally DEFINES effective := driving).
+// For this class the separate driving plane is a redundant copy target;
+// readers take the effective plane and put_driving feeds put_effective
+// directly. The predicate is self-maintaining: force/deposit create
+// pseudo sources through add_source, which bumps n_sources and flips it
+// off (with a plane2 re-seed there so the raw plane is never stale).
+// Sources are never removed, so it never flips back on.
+static inline bool nexus_driving_aliased(rt_nexus_t *n)
+{
+   return (n->flags & (NET_F_EFFECTIVE | NET_F_INOUT)) == NET_F_EFFECTIVE
+      && n->n_sources == 1
+      && n->sources.tag == SOURCE_DRIVER
+      && n->signal->resolution == NULL;
+}
+
 static inline void *nexus_driving(rt_nexus_t *n)
 {
    assert(n->flags & NET_F_EFFECTIVE);
+   if (nexus_driving_aliased(n))
+      return nexus_effective(n);
    return n->signal->shared.data + n->offset + 2*n->signal->shared.size;
 }
 
@@ -12359,7 +12386,16 @@ static rt_source_t *add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
 
    if (n->n_sources > 1) {
       n->flags &= ~NET_F_FAST_DRIVER;
-      n->vtable = &nexus_default_vtable;   // Revert to full resolution
+      n->vtable = &nexus_default_vtable;
+         // #74 E1 un-alias: the nexus may have been driving-plane
+         // aliased until this second source appeared; re-seed plane 2
+         // from the effective bytes so the raw driving plane is not
+         // stale-initial when a downstream source_value reads it
+         // before the next put_driving.
+         if ((n->flags & (NET_F_EFFECTIVE | NET_F_INOUT)) == NET_F_EFFECTIVE)
+            memcpy(n->signal->shared.data + n->offset
+                   + 2*n->signal->shared.size,
+                   nexus_effective(n), (size_t)n->size * n->width);   // Revert to full resolution
    }
 
    src->chain_input  = NULL;
@@ -13434,12 +13470,14 @@ static void calculate_initial_value(rt_model_t *m, rt_nexus_t *n)
 {
    calculate_driving_value(m, n);
 
-   if (n->flags & NET_F_EFFECTIVE) {
+   if ((n->flags & NET_F_EFFECTIVE) && !nexus_driving_aliased(n)) {
       // Driving and effective values must be calculated separately
       assert(n->flags & NET_F_PENDING);
    }
    else {
       // Effective value is always the same as the driving value
+      // (including the #74 E1 aliased class, which put_driving fed
+      // straight to put_effective — no PENDING enqueue happened)
       memcpy(nexus_last_value(n), nexus_effective(n), n->size * n->width);
    }
 }
@@ -14688,6 +14726,24 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
          n->active_delta = m->iteration + 1;
          return;
       }
+      else if (unlikely(g_alias_flip == 1)
+               && n->vtable->deposit == banked_deposit) {
+         // #74 ALIAS-FLIP (resolver-elision directive): the driver's
+         // commit stages STRAIGHT into bank B and the delta-boundary
+         // flip publishes it — the deferq round trip and the boundary
+         // update_driving -> put_driving -> put_effective dispatch
+         // chain are eliminated for the aliased (banked leaf single-
+         // driver) class. Same-delta readers still see plane 0
+         // untouched (the bank IS the alias of the driver's storage),
+         // and the flip's replayed deposit keeps the change-compare /
+         // last_value / notify semantics byte-exact. The head waveform
+         // write below stays so the same-value dedup above remains
+         // sound across commits.
+         if (unlikely(m->fastclk_probe_member >= 0))
+            m->fastclk_comb[m->fastclk_probe_member] = 1;
+         banked_deposit(m, n, value);
+         m->next_is_delta = true;
+      }
       else if (signal->shared.flags & NET_F_FAST_DRIVER) {
          if (unlikely(m->fastclk_probe_member >= 0))
             m->fastclk_comb[m->fastclk_probe_member] = 1;
@@ -15517,7 +15573,17 @@ static void update_effective(rt_model_t *m, rt_nexus_t *n)
 
 static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value)
 {
-   if (n->flags & NET_F_EFFECTIVE) {
+   // #74 E1: for the aliased class (driving == effective by LRM
+   // 14.7.7.3) skip the plane-2 memcpy AND the effective-heap round
+   // trip, feeding put_effective directly — the same path 99.99% of
+   // (non-EFFECTIVE) nexuses already take. The two halves are
+   // inseparable: aliasing nexus_driving alone would turn
+   // calculate_effective_value into an eff<-eff self-compare that
+   // swallows every event on the class. NET_F_HAS_INITIAL is NOT
+   // cleared here (plane 2 keeps the default value for disconnect)
+   // and NET_F_EFFECTIVE stays set (update_outputs propagate-on-
+   // activity gating needs it for 'transaction/'quiet).
+   if ((n->flags & NET_F_EFFECTIVE) && !nexus_driving_aliased(n)) {
       TRACE("update %s driving value %s", trace_nexus(n), fmt_nexus(n, value));
 
       memcpy(nexus_driving(n), value, n->size * n->width);
