@@ -2293,6 +2293,7 @@ typedef struct {
    size_t         bufsz;
    int            width;
    bool           armed;   // false = staged this delta; true = apply next
+   uint64_t       arm_now; // timestep the entry was armed (leak audit)
 } aj_stage2_t;
 static aj_stage2_t *g_aj_stage2 = NULL;
 static int g_aj_stage2_n = 0, g_aj_stage2_cap = 0;
@@ -2340,15 +2341,32 @@ static void aj_stage2_cancel(rt_signal_t *sig)
 
 static void aj_apply_stage2(rt_model_t *m)
 {
+   // Cross-timestep LEAK audit (assert-order rank 6 / the critic's
+   // missing-delta-creation gap): the two-delta ladder assumes a further
+   // delta always follows within the SAME timestep — an armed entry
+   // applying at a LATER timestep means the staged publication leaked
+   // past the edge it belonged to, violating no intra-delta rule any
+   // other check watches.
+   static int _s2a = -1;
+   if (_s2a < 0) _s2a = getenv("NVC_ACCEL_ASSERT_ORDER") != NULL;
    for (int i = 0; i < g_aj_stage2_n; ) {
       aj_stage2_t *e = &g_aj_stage2[i];
       if (e->armed) {
+         if (_s2a && e->arm_now != (uint64_t)m->now)
+            notef("accel-assert: STAGE2 CROSS-TIMESTEP LEAK sig %s: armed "
+                  "at t=%"PRIu64" applying at t=%"PRIu64" — the two-delta "
+                  "ladder ran out of deltas; the publication belongs to "
+                  "the earlier edge",
+                  e->sig != NULL && e->sig->where != NULL
+                     ? istr(tree_ident(e->sig->where)) : "?",
+                  e->arm_now, (uint64_t)m->now);
          deposit_signal(m, e->sig, e->buf, 0, e->width);
          free(e->buf);
          *e = g_aj_stage2[--g_aj_stage2_n];
       }
       else {
          e->armed = true;
+         e->arm_now = (uint64_t)m->now;
          i++;
       }
    }
