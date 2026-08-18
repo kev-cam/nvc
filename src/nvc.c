@@ -426,6 +426,7 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
       }
    }
 
+
    jit_free(jit);
    set_error_limit(0);
 

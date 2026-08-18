@@ -80,7 +80,9 @@ typedef struct _jit {
    cover_data_t     *cover;
 } jit_t;
 
-static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to);
+static void jit_transition(jit_thread_local_t *thread, jit_t *j,
+                           jit_state_t from, jit_state_t to);
+static void jit_diag_cb(diag_t *d, void *arg);
 
 static void jit_oom_cb(mspace_t *m, size_t size)
 {
@@ -96,6 +98,7 @@ static void jit_oom_cb(mspace_t *m, size_t size)
    jit_abort_with_status(EXIT_FAILURE);
 }
 
+__attribute__((always_inline))
 static inline jit_thread_local_t **jit_thread_local_ptr(void)
 {
 #ifdef USE_EMUTLS
@@ -108,14 +111,20 @@ static inline jit_thread_local_t **jit_thread_local_ptr(void)
    return &local;
 }
 
+__attribute__((cold, noinline))
+static jit_thread_local_t *jit_alloc_thread_local(void)
+{
+   jit_thread_local_t *thread = xcalloc(sizeof(jit_thread_local_t));
+   thread->state = JIT_IDLE;
+   return thread;
+}
+
 jit_thread_local_t *jit_thread_local(void)
 {
    jit_thread_local_t **ptr = jit_thread_local_ptr();
 
-   if (unlikely(*ptr == NULL)) {
-      *ptr = xcalloc(sizeof(jit_thread_local_t));
-      (*ptr)->state = JIT_IDLE;
-   }
+   if (unlikely(*ptr == NULL))
+      *ptr = jit_alloc_thread_local();
 
    return *ptr;
 }
@@ -201,6 +210,8 @@ jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc, cover_data_t *db)
    // Ensure we can resolve symbols from the executable
    ffi_load_dll(NULL);
 
+   diag_add_hint_fn(jit_diag_cb, j);
+
    return j;
 }
 
@@ -230,6 +241,8 @@ void jit_free(jit_t *j)
       (*it->plugin.cleanup)(it->context);
       free(it);
    }
+
+   diag_remove_hint_fn(jit_diag_cb, j);
 
    mspace_destroy(j->mspace);
    chash_free(j->index);
@@ -371,8 +384,9 @@ void jit_fill_irbuf(jit_func_t *f)
    assert(f->irbuf == NULL);
 
 #ifndef USE_EMUTLS
-   const jit_state_t oldstate = jit_thread_get()->state;
-   jit_transition(f->jit, oldstate, JIT_COMPILING);
+   jit_thread_local_t *thread = jit_thread_get();
+   const jit_state_t oldstate = thread->state;
+   jit_transition(thread, f->jit, oldstate, JIT_COMPILING);
 #endif
 
    if (f->jit->pack != NULL && jit_pack_fill(f->jit->pack, f->jit, f)) {
@@ -401,7 +415,7 @@ void jit_fill_irbuf(jit_func_t *f)
 
  done:
 #ifndef USE_EMUTLS
-   jit_transition(f->jit, JIT_COMPILING, oldstate);
+   jit_transition(thread, f->jit, JIT_COMPILING, oldstate);
 #endif
 }
 
@@ -612,12 +626,13 @@ static void jit_diag_cb(diag_t *d, void *arg)
 {
    jit_t *j = arg;
 
-   if (j->silent) {
+   if (jit_thread_local()->state != JIT_RUNNING)
+      return;
+   else if (j->silent) {
       diag_suppress(d, true);
       return;
    }
-   else if (unlikely(jit_thread_get()->state != JIT_RUNNING))
-      fatal_trace("JIT diag callback called when not running");
+
 
    jit_stack_trace_t *stack LOCAL = jit_stack_trace();
 
@@ -631,9 +646,9 @@ static void jit_diag_cb(diag_t *d, void *arg)
    }
 }
 
-static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
+static void jit_transition(jit_thread_local_t *thread, jit_t *j,
+                           jit_state_t from, jit_state_t to)
 {
-   jit_thread_local_t *thread = jit_thread_get();
 
 #ifdef DEBUG
    if (thread->state != from)
@@ -644,24 +659,15 @@ static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
 
    switch (to) {
    case JIT_RUNNING:
-      if (from != JIT_RUNNING) {
-         diag_add_hint_fn(jit_diag_cb, j);
+      if (from != JIT_RUNNING)
          thread->jit = j;
-      }
       else
          assert(thread->jit == j);
       break;
    case JIT_IDLE:
-      if (from == JIT_RUNNING) {
-         diag_remove_hint_fn(jit_diag_cb);
-         thread->jit = NULL;
-      }
-      break;
    case JIT_COMPILING:
-      if (from == JIT_RUNNING) {
-         diag_remove_hint_fn(jit_diag_cb);
+      if (from == JIT_RUNNING)
          thread->jit = NULL;
-      }
       break;
    }
 }
@@ -670,7 +676,7 @@ jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate)
 {
    jit_thread_local_t *thread = jit_thread_local();
    *oldstate = thread->state;
-   jit_transition(j, *oldstate, JIT_RUNNING);
+   jit_transition(thread, j, *oldstate, JIT_RUNNING);
    return thread;
 }
 
@@ -679,7 +685,7 @@ void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
 {
    thread->jmp_buf_valid = 0;
    thread->anchor = NULL;
-   jit_transition(j, JIT_RUNNING, oldstate);
+   jit_transition(thread, j, JIT_RUNNING, oldstate);
 }
 
 static bool jit_try_vcall(jit_t *j, jit_func_t *f, jit_scalar_t *args,
@@ -691,18 +697,18 @@ static bool jit_try_vcall(jit_t *j, jit_func_t *f, jit_scalar_t *args,
    const int rc = jit_setjmp(vthread->abort_env);
    if (rc == 0) {
       vthread->jmp_buf_valid = 1;
-      jit_transition(j, oldstate, JIT_RUNNING);
+      jit_transition(vthread, j, oldstate, JIT_RUNNING);
 
       jit_entry_fn_t entry = load_acquire(&f->entry);
       (*entry)(f, NULL, args, tlab);
 
-      jit_transition(j, JIT_RUNNING, oldstate);
+      jit_transition(vthread, j, JIT_RUNNING, oldstate);
       vthread->jmp_buf_valid = 0;
       vthread->anchor = NULL;
       return true;
    }
    else {
-      jit_transition(j, JIT_RUNNING, oldstate);
+      jit_transition(vthread, j, JIT_RUNNING, oldstate);
       vthread->jmp_buf_valid = 0;
       vthread->anchor = NULL;
       return false;

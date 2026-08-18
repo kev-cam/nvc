@@ -1578,7 +1578,7 @@ static void elab_lower(tree_t b, elab_ctx_t *ctx)
    ctx->scope = create_scope(ctx->model, b, ctx->parent->scope);
 
    if (ctx->inst != NULL)
-      diag_remove_hint_fn(elab_hint_fn);
+      diag_remove_hint_fn(elab_hint_fn, ctx->inst);
 }
 
 static void elab_verilog_module(tree_t bind, ident_t label,
