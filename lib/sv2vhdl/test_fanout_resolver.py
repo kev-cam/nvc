@@ -67,10 +67,18 @@ open(f"{OUT}/fanout_dut.vhd", "w").write("\n".join(dut) + "\n")
 
 # ---------------- Variant A: resolver-generated net --------------------
 # One net: driver endpoint = src (signal), receiver endpoints = rcvI.
+# Default carries static modes (endpoint 0 = inout driver, rest = in),
+# exercising the degenerate one-alias emission.  FAN_RUNTIME=1 drops the
+# modes so the generator falls back to runtime undriven() arbitration.
+runtime_form = os.environ.get("FAN_RUNTIME") is not None
+def _drv(i):
+    d = {"ename": f".fanout_dut.drv{i}", "type": "std_logic"}
+    if not runtime_form:
+        d["mode"] = "inout" if i == 0 else "in"
+    return d
 net = {
     "net_name": "fan_net",
-    "drivers":   [{"ename": f".fanout_dut.drv{i}", "type": "std_logic"}
-                  for i in range(N)],
+    "drivers":   [_drv(i) for i in range(N)],
     "receivers": [{"ename": f".fanout_dut.rcv{i}", "type": "std_logic"}
                   for i in range(N)],
 }

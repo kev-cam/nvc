@@ -366,6 +366,16 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
                        == tran_type for i in tran_indices)
                and all((net["receivers"][i].get("type") or tran_type).lower()
                        in ("std_logic", "std_ulogic") for i in tran_indices))
+    # Static classification (mode carried by the plugin): an endpoint with
+    # mode "in" can never drive; anything else (out/inout/unknown) is
+    # driving-capable.  Exactly ONE capable endpoint -> the net is a pure
+    # alias join and the resolver degenerates to fuse calls: one process
+    # for the whole net, no runtime arbitration, O(1) fallback
+    # sensitivity.  Unknown/multi-driver keeps runtime arbitration.
+    cap = [i for i in tran_indices
+           if (net["drivers"][i].get("mode") or "").lower() != "in"]
+    static_single = (fuse_ok and len(tran_indices) >= 2 and len(cap) == 1)
+
     if fuse_ok:
         lines.append(f"library sv2vhdl;")
         lines.append(f"use sv2vhdl.fuse_pkg.all;")
@@ -439,6 +449,35 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
     if not tran_indices:
         lines.append(f"    -- no tran endpoints, nothing to resolve")
     else:
+        if static_single:
+            # Degenerate alias case: one known driver k, every other
+            # endpoint is a receiver.  Fuse them all; the driving
+            # endpoint's own view of the others is constant 'Z'.
+            k = cap[0]
+            rcvs = [i for i in tran_indices if i != k]
+            lines.append(f"    p_net: process")
+            for i in rcvs:
+                lines.append(f"        variable f_{i} : boolean := false;")
+            lines.append(f"    begin")
+            for i in rcvs:
+                lines.append(f"        f_{i} := fuse_try({drv_aliases[k]}, "
+                             f"{rcv_aliases[i]});")
+            lines.append(f"        {rcv_aliases[k]} := 'Z';")
+            all_f = " and ".join(f"f_{i}" for i in rcvs)
+            lines.append(f"        if {all_f} then")
+            lines.append(f"            wait;")
+            lines.append(f"        end if;")
+            lines.append(f"        loop")
+            for i in rcvs:
+                lines.append(f"            if not f_{i} then "
+                             f"{rcv_aliases[i]} := {drv_aliases[k]}; end if;")
+            lines.append(f"            wait on {drv_aliases[k]};")
+            lines.append(f"        end loop;")
+            lines.append(f"    end process;")
+            lines.append(f"end architecture;")
+            lines.append(f"")
+            return entity_name, "\n".join(lines)
+
         # One process per tran endpoint's 'other signal
         for i in tran_indices:
             others = [j for j in range(n_ep) if j != i]

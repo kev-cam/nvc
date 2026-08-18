@@ -86,6 +86,8 @@ typedef struct endpoint {
     char receiver_ename[MAX_NAME]; /* external name path: ".top.inst.port.other" */
     char type_name[MAX_TYPE];      /* signal type */
     int  is_signal;                /* 1 if this reads the net signal directly (no receiver) */
+    char mode[8];                  /* static port mode: "in"/"out"/"inout"/"" */
+    char kind[24];                 /* primitive entity, lowercased: "sv_alias".. */
 } endpoint_t;
 
 /*
@@ -181,7 +183,9 @@ static net_info_t *find_or_create_net(const char *name)
 static int net_add_endpoint(net_info_t *net,
                             const char *driver_ename,
                             const char *receiver_ename,
-                            const char *type_name)
+                            const char *type_name,
+                            const char *mode,
+                            const char *kind)
 {
     if (net->n_endpoints >= MAX_ENDPOINTS) {
         resolver_printf("resolver: too many endpoints on net %s", net->net_name);
@@ -191,6 +195,8 @@ static int net_add_endpoint(net_info_t *net,
     safe_copy(ep->driver_ename, driver_ename, sizeof(ep->driver_ename));
     safe_copy(ep->receiver_ename, receiver_ename, sizeof(ep->receiver_ename));
     safe_copy(ep->type_name, type_name, sizeof(ep->type_name));
+    safe_copy(ep->mode, mode ? mode : "", sizeof(ep->mode));
+    safe_copy(ep->kind, kind ? kind : "", sizeof(ep->kind));
     return 0;
 }
 
@@ -418,9 +424,13 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
 
         for (vhpiHandleT port = vhpi_scan(piter); port;
              port = vhpi_scan(piter)) {
+            /* Static direction for the Python generator: alias-class
+             * emission needs to know which endpoints can ever drive */
             vhpiModeT mode = (vhpiModeT)vhpi_get(vhpiModeP, port);
-            (void)mode;  // All port modes are candidates for resolution
-                         // (needed for back-annotation and federation)
+            const char *mode_str =
+                mode == vhpiInMode ? "in" :
+                mode == vhpiOutMode ? "out" :
+                mode == vhpiInoutMode ? "inout" : "";
 
             const char *port_name = get_name(port);
             if (!port_name) {
@@ -478,7 +488,13 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
             net_info_t *net = find_or_create_net(net_name);
             if (net) {
                 read_net_init(net);
-                net_add_endpoint(net, drv_ename, rcv_ename, port_etype);
+                char kind_lower[24];
+                safe_copy(kind_lower, entity_name ? entity_name : "",
+                          sizeof(kind_lower));
+                for (char *c = kind_lower; *c; c++)
+                    *c = tolower((unsigned char)*c);
+                net_add_endpoint(net, drv_ename, rcv_ename, port_etype,
+                                 mode_str, kind_lower);
                 indent();
                 resolver_printf("    port %s -> actual=%s net=%s init=%s",
                              port_name, actual, net_name,
@@ -1062,6 +1078,12 @@ static PyObject *build_net_dict(const net_info_t *net)
                              PyUnicode_FromString(ep->type_name));
         if (ep->is_signal)
             PyDict_SetItemString(drv, "is_signal", Py_True);
+        if (ep->mode[0])
+            PyDict_SetItemString(drv, "mode",
+                                 PyUnicode_FromString(ep->mode));
+        if (ep->kind[0])
+            PyDict_SetItemString(drv, "kind",
+                                 PyUnicode_FromString(ep->kind));
         PyList_Append(drivers, drv);
         Py_DECREF(drv);
 
