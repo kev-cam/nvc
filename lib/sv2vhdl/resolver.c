@@ -1116,6 +1116,47 @@ static PyObject *build_net_dict(const net_info_t *net)
  * Returns a PyDict {filename: vhdl_string} (new reference), or NULL.
  * Caller must Py_DECREF the result.
  */
+/* #75: register one net with the kernel solver (called only for nets
+ * the Python generator marked kernel-eligible — connect, federation,
+ * mixed-type and SV2VHDL_KERNEL_EXCLUDE'd nets never reach here). */
+static int stitch_register_net(net_info_t *n)
+{
+    const vhpiCharT *inst_paths[MAX_ENDPOINTS];
+    const vhpiCharT *port_names[MAX_ENDPOINTS];
+    static char pathbuf[MAX_ENDPOINTS][MAX_NAME];
+    static char portbuf[MAX_ENDPOINTS][MAX_NAME];
+    const char *net_path = NULL;
+    int nep = 0;
+
+    for (int i = 0; i < n->n_endpoints; i++) {
+        endpoint_t *ep = &n->endpoints[i];
+        if (ep->is_signal) {
+            net_path = ep->driver_ename;
+            continue;
+        }
+        /* driver_ename = "<inst_path>.<port>.driver" */
+        safe_copy(pathbuf[nep], ep->driver_ename, sizeof(pathbuf[nep]));
+        char *suffix = strrchr(pathbuf[nep], '.');
+        if (suffix == NULL || strcmp(suffix, ".driver") != 0)
+            return 0;
+        *suffix = '\0';
+        char *pdot = strrchr(pathbuf[nep], '.');
+        if (pdot == NULL)
+            return 0;
+        safe_copy(portbuf[nep], pdot + 1, sizeof(portbuf[nep]));
+        *pdot = '\0';
+        inst_paths[nep] = (const vhpiCharT *)pathbuf[nep];
+        port_names[nep] = (const vhpiCharT *)portbuf[nep];
+        nep++;
+    }
+
+    if (nep == 0)
+        return 0;
+
+    return nvc_vhpi_stitch_net(nep, inst_paths, port_names,
+                               (const vhpiCharT *)net_path);
+}
+
 static PyObject *call_python_resolver(void)
 {
     if (!g_python_ok || !g_py_func) {
@@ -1290,68 +1331,6 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         return;
     }
 
-    /* Phase 2.5 (#75): try to register each net with the kernel net
-     * solver.  A registered net needs no generated VHDL and no runtime
-     * machinery — the kernel keeps per-plane counts and produces the
-     * resolved value and 'other views with index-addressed wakeups.
-     * SV2VHDL_KERNEL_NETS=0 disables; declined nets fall through to
-     * the legacy generation path unchanged. */
-    if (getenv("SV2VHDL_KERNEL_NETS") == NULL ||
-        strcmp(getenv("SV2VHDL_KERNEL_NETS"), "0") != 0) {
-        int stitched = 0;
-        for (net_info_t *n = g_nets; n; n = n->next) {
-            const vhpiCharT *inst_paths[MAX_ENDPOINTS];
-            const vhpiCharT *port_names[MAX_ENDPOINTS];
-            static char pathbuf[MAX_ENDPOINTS][MAX_NAME];
-            static char portbuf[MAX_ENDPOINTS][MAX_NAME];
-            const char *net_path = NULL;
-            int nep = 0;
-            int ok = 1;
-
-            for (int i = 0; i < n->n_endpoints; i++) {
-                endpoint_t *ep = &n->endpoints[i];
-                if (ep->is_signal) {
-                    net_path = ep->driver_ename;
-                    continue;
-                }
-                /* driver_ename = "<inst_path>.<port>.driver" */
-                safe_copy(pathbuf[nep], ep->driver_ename,
-                          sizeof(pathbuf[nep]));
-                char *suffix = strrchr(pathbuf[nep], '.');
-                if (suffix == NULL || strcmp(suffix, ".driver") != 0) {
-                    ok = 0;
-                    break;
-                }
-                *suffix = '\0';
-                char *pdot = strrchr(pathbuf[nep], '.');
-                if (pdot == NULL) {
-                    ok = 0;
-                    break;
-                }
-                safe_copy(portbuf[nep], pdot + 1, sizeof(portbuf[nep]));
-                *pdot = '\0';
-                inst_paths[nep] = (const vhpiCharT *)pathbuf[nep];
-                port_names[nep] = (const vhpiCharT *)portbuf[nep];
-                nep++;
-            }
-
-            if (ok && nep > 0 &&
-                nvc_vhpi_stitch_net(nep, inst_paths, port_names,
-                                    (const vhpiCharT *)net_path)) {
-                n->needs_resolution = 0;
-                stitched++;
-            }
-        }
-        resolver_printf("resolver: kernel solver took %d net(s)", stitched);
-        nets_needing -= stitched;
-        if (nets_needing == 0) {
-            resolver_printf("resolver: all nets kernel-stitched");
-            cleanup();
-            vhpi_release_handle(root);
-            return;
-        }
-    }
-
     /* Phase 3: Call Python to generate per-net VHDL files */
     PyObject *file_dict = call_python_resolver();
     if (!file_dict) {
@@ -1365,6 +1344,41 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         cleanup();
         vhpi_release_handle(root);
         return;
+    }
+
+    /* #75: register the generator's kernel-eligible nets with the
+     * kernel solver.  Nets the generator kept for itself (connect,
+     * federation, mixed-type, excluded) are untouched. */
+    {
+        PyObject *py_kn = PyDict_GetItemString(file_dict, "__kernel_nets__");
+        if (py_kn != NULL) {
+            const char *kn = PyUnicode_AsUTF8(py_kn);
+            int stitched = 0, declined = 0;
+            char name[MAX_NAME];
+            while (kn != NULL && *kn != '\0') {
+                const char *nl = strchr(kn, '\n');
+                const size_t len = nl ? (size_t)(nl - kn) : strlen(kn);
+                snprintf(name, sizeof(name), "%.*s", (int)len, kn);
+                for (net_info_t *n = g_nets; n; n = n->next) {
+                    if (strcmp(n->net_name, name) != 0)
+                        continue;
+                    if (stitch_register_net(n)) {
+                        n->needs_resolution = 0;
+                        stitched++;
+                    }
+                    else {
+                        declined++;
+                        resolver_printf("resolver: kernel declined %s "
+                                        "(UNRESOLVED)", n->net_name);
+                    }
+                    break;
+                }
+                kn = nl ? nl + 1 : NULL;
+            }
+            resolver_printf("resolver: kernel solver took %d net(s), "
+                            "%d declined", stitched, declined);
+            PyDict_DelItemString(file_dict, "__kernel_nets__");
+        }
     }
 
     Py_ssize_t n_files = PyDict_Size(file_dict);

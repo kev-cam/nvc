@@ -781,7 +781,50 @@ def resolve_net(nets, design_name):
     files = {}
     entity_names = []
 
-    # #75: flatten tran-connected components first (opt out with
+    # #75: the GENERATOR decides which nets the kernel net solver may
+    # take.  Everything the external VHDL resolver machinery exists for
+    # stays here: connect nets (mixed-discipline cosim bridges),
+    # federation nets (peer-simulator bridging), mixed-type nets
+    # (value-identity broken by conversions), and anything named in
+    # SV2VHDL_KERNEL_EXCLUDE (comma-separated substrings — the hook for
+    # SPEF back-annotation and hot-plug flows that must keep the
+    # generated interception layer).  Only the plain uniform tran/alias
+    # class is offered to the kernel; the plugin registers those and
+    # generates nothing for them.  SV2VHDL_KERNEL_NETS=0 disables.
+    kernel_nets = []
+    excl = [e for e in (os.environ.get("SV2VHDL_KERNEL_EXCLUDE") or
+                        "").split(",") if e]
+
+    def _kernel_eligible(net):
+        if os.environ.get("SV2VHDL_KERNEL_NETS") == "0":
+            return False
+        if _is_connect_net(net) or _is_federation_net(net):
+            return False
+        for e in excl:
+            if e in net["net_name"]:
+                return False
+        types = set()
+        for drv in net["drivers"]:
+            t = (drv.get("type") or "").lower()
+            if not drv.get("is_signal"):
+                types.add(t)
+        if len(types) != 1:
+            return False
+        t = types.pop()
+        if not ("logic3ds" in t or "logic3d" in t or "std_logic" in t
+                or "std_ulogic" in t):
+            return False
+        return True
+
+    remaining = []
+    for net in nets:
+        if _kernel_eligible(net):
+            kernel_nets.append(net["net_name"])
+        else:
+            remaining.append(net)
+    nets = remaining
+
+    # #75: flatten tran-connected components (opt out with
     # SV2VHDL_NO_FLATTEN=1) — plain tran/alias joins collapse to one
     # resolver per component; remaining nets emit per-net as before
     if os.environ.get("SV2VHDL_NO_FLATTEN") is None:
@@ -821,6 +864,9 @@ def resolve_net(nets, design_name):
     lines.append(f"")
 
     files[f"{design_name}_wrapper.vhd"] = "\n".join(lines)
+
+    # Special key consumed by the plugin, never written to disk
+    files["__kernel_nets__"] = "\n".join(kernel_nets)
 
     return files
 
