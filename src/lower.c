@@ -12054,6 +12054,16 @@ static void lower_direct_mapped_port(lower_unit_t *lu, tree_t block, tree_t map,
 
    tree_t value = tree_value(map);
 
+   // Dialect cross-type associations (e.g. a std_logic control port
+   // mapped to a resolved_logic3d net, as the self-gated tranif form
+   // produces) cannot collapse: the port var and the actual's handle
+   // lower to different types.  Fall back to the normal port-map path
+   // which applies the conversion semantics.
+   if (type_is_scalar(tree_type(port))
+       && !vtype_eq(lower_type(tree_type(port)),
+                    lower_type(tree_type(value))))
+      return;
+
    if (tree_class(port) == C_VARIABLE) {
       // Variable ports are always directly aliased to the actual
       // variable in the parent scope
