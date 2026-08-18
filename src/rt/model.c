@@ -19222,6 +19222,329 @@ bool x_fuse_signals(sig_shared_t *ss_a, uint32_t off_a,
    return true;
 }
 
+// ===== #75 kernel net solver ("stitching") ==============================
+//
+// A tran/switch net's static endpoint sets are registered once at start
+// of simulation (via the resolver plugin); the kernel keeps per-plane
+// counts state and on each contributor transition (O(1)) produces the
+// resolved value and the per-endpoint exclude-self 'other views, waking
+// only observers whose view changed.  Per-plane work is elided when a
+// plane has no consumers (3D logic separates concerns); data layouts
+// are unchanged — this is code specialization only.
+
+typedef enum {
+   STITCH_STD  = 0,   // std_logic byte
+   STITCH_L3D  = 1,   // logic3d 4-byte int
+   STITCH_L3DS = 2,   // logic3ds 4-byte record
+} stitch_type_t;
+
+// Canonical contribution (l3ds semantics)
+typedef struct {
+   uint8_t val;       // 0 or 255 (other -> escape)
+   uint8_t str;       // 0..31
+   uint8_t flags;     // l3ds_flags 0..5
+} stitch_ctr_t;
+
+#define STITCH_FL_KNOWN       0
+#define STITCH_FL_UNKNOWN     1
+#define STITCH_FL_UNDRIVEN    2
+#define STITCH_FL_NOPOWER     3
+#define STITCH_FL_UNK_NOPOWER 4
+#define STITCH_FL_UDR_NOPOWER 5
+
+#define STITCH_ST_HIGHZ  0
+#define STITCH_ST_WEAK   2
+#define STITCH_ST_SUPPLY 16
+
+typedef struct {
+   uint16_t n_val0, n_val1, n_valother, n_unk;
+} stitch_scnt_t;
+
+typedef struct {
+   rt_signal_t  *drv;          // contributor ('driver implicit or net signal)
+   rt_signal_t  *other;        // exclude-self view output (NULL = none)
+   stitch_type_t dtype;        // contributor value encoding
+   stitch_type_t otype;        // 'other value encoding
+   bool          is_member;    // net-signal endpoint: exclude own implicit
+   stitch_ctr_t  last;         // last classified contribution
+} stitch_ep_t;
+
+typedef struct _rt_stitch_net {
+   struct _rt_stitch_net *chain;
+   int            nep;
+   stitch_scnt_t  cnt[32];     // per strength level
+   uint16_t       n_supply_pwr;
+   rt_watch_t    *watch;
+   stitch_ep_t    ep[];
+} rt_stitch_net_t;
+
+static rt_stitch_net_t *g_stitch_nets = NULL;
+
+static const uint8_t stitch_l3d_from_std[9] = {7, 6, 2, 3, 4, 5, 0, 1, 6};
+static const uint8_t stitch_std_from_l3d[8] = {6, 7, 2, 3, 4, 5, 1, 0};
+
+static stitch_ctr_t stitch_classify(const stitch_ep_t *ep, const void *raw)
+{
+   stitch_ctr_t c = { 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
+   uint32_t l3d = 8;
+
+   switch (ep->dtype) {
+   case STITCH_L3DS:
+      {
+         const uint8_t *b = raw;
+         c.val = b[0]; c.str = b[1]; c.flags = b[2];
+         return c;
+      }
+   case STITCH_L3D:
+      l3d = *(const uint32_t *)raw & 7;
+      break;
+   case STITCH_STD:
+      {
+         const uint8_t sl = *(const uint8_t *)raw;
+         l3d = stitch_l3d_from_std[sl < 9 ? sl : 1];
+      }
+      break;
+   }
+
+   // to_logic3ds(l3d, ST_SUPPLY) — net contributions enter at supply
+   // strength, matching the generated resolvers' historical choice
+   switch (l3d) {
+   case 2: c = (stitch_ctr_t){ 0,   STITCH_ST_SUPPLY, STITCH_FL_KNOWN }; break;
+   case 3: c = (stitch_ctr_t){ 255, STITCH_ST_SUPPLY, STITCH_FL_KNOWN }; break;
+   case 0: c = (stitch_ctr_t){ 0,   STITCH_ST_WEAK,   STITCH_FL_KNOWN }; break;
+   case 1: c = (stitch_ctr_t){ 255, STITCH_ST_WEAK,   STITCH_FL_KNOWN }; break;
+   case 4: c = (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN }; break;
+   case 6: c = (stitch_ctr_t){ 0, STITCH_ST_SUPPLY, STITCH_FL_UNKNOWN }; break;
+   case 5: c = (stitch_ctr_t){ 0, STITCH_ST_WEAK,   STITCH_FL_UNKNOWN }; break;
+   default: c = (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNKNOWN }; break;
+   }
+   return c;
+}
+
+static inline bool stitch_active(const stitch_ctr_t *c)
+{
+   return c->str != STITCH_ST_HIGHZ && c->flags != STITCH_FL_UNDRIVEN
+      && c->flags != STITCH_FL_UDR_NOPOWER;
+}
+
+static void stitch_count(rt_stitch_net_t *net, const stitch_ctr_t *c, int dir)
+{
+   if (!stitch_active(c))
+      return;
+   stitch_scnt_t *s = &(net->cnt[c->str & 31]);
+   if (c->flags == STITCH_FL_UNKNOWN || c->flags == STITCH_FL_UNK_NOPOWER)
+      s->n_unk += dir;
+   else if (c->val == 0)
+      s->n_val0 += dir;
+   else if (c->val == 255)
+      s->n_val1 += dir;
+   else
+      s->n_valother += dir;   // non-binary byte: forces exact escape
+   if (c->str == STITCH_ST_SUPPLY
+       && (c->flags == STITCH_FL_NOPOWER || c->flags == STITCH_FL_UNK_NOPOWER))
+      net->n_supply_pwr += dir;
+}
+
+// Resolve from counts, optionally excluding one contribution.  Scan
+// strength bases high to low; within a base the active (cap=0) level
+// beats capacitive (cap=1).  Exact counterpart of l3ds_resolve.
+static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
+                                   const stitch_ctr_t *excl)
+{
+   const bool ex_ok = excl != NULL && stitch_active(excl);
+   const bool ex_unk = ex_ok && (excl->flags == STITCH_FL_UNKNOWN
+                                 || excl->flags == STITCH_FL_UNK_NOPOWER);
+
+   int pwr = net->n_supply_pwr;
+   if (ex_ok && excl->str == STITCH_ST_SUPPLY
+       && (excl->flags == STITCH_FL_NOPOWER
+           || excl->flags == STITCH_FL_UNK_NOPOWER))
+      pwr--;
+
+   for (int base = 15; base >= 0; base--) {
+      for (int cap = 0; cap <= 1; cap++) {
+         const int str = base*2 + cap;
+         if (str == STITCH_ST_HIGHZ)
+            continue;
+         const stitch_scnt_t *s = &(net->cnt[str]);
+         int n0 = s->n_val0, n1 = s->n_val1, no = s->n_valother,
+             nu = s->n_unk;
+         if (ex_ok && excl->str == str) {
+            if (ex_unk) nu--;
+            else if (excl->val == 0) n0--;
+            else if (excl->val == 255) n1--;
+            else no--;
+         }
+         if (n0 + n1 + no + nu == 0)
+            continue;
+
+         stitch_ctr_t r = { 0, (uint8_t)str, STITCH_FL_KNOWN };
+         if (nu > 0 || no > 0 || (n0 > 0 && n1 > 0))
+            r.flags = STITCH_FL_UNKNOWN;   // X / contention (value dead)
+         else
+            r.val = (n1 > 0) ? 255 : 0;
+
+         if (pwr > 0)
+            r.flags = (r.flags == STITCH_FL_UNKNOWN)
+               ? STITCH_FL_UNK_NOPOWER : STITCH_FL_NOPOWER;
+         return r;
+      }
+   }
+
+   return (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };  // Z
+}
+
+// Encode a canonical result in an endpoint's output type
+static void stitch_encode(stitch_type_t t, const stitch_ctr_t *c,
+                          uint8_t *out, size_t *sz)
+{
+   uint32_t l3d;
+   switch (c->flags) {
+   case STITCH_FL_UNDRIVEN: case STITCH_FL_UDR_NOPOWER:
+      l3d = 4; break;                            // Z
+   case STITCH_FL_UNKNOWN: case STITCH_FL_UNK_NOPOWER:
+      l3d = (c->str > STITCH_ST_WEAK) ? 6 : 5; break;   // X : W
+   case STITCH_FL_NOPOWER:
+      l3d = 6; break;                            // X
+   default:
+      if (c->str > STITCH_ST_WEAK)
+         l3d = (c->val >= 127) ? 3 : 2;          // '1' : '0'
+      else
+         l3d = (c->val >= 127) ? 1 : 0;          // 'H' : 'L'
+      break;
+   }
+
+   switch (t) {
+   case STITCH_L3DS:
+      out[0] = c->val; out[1] = c->str; out[2] = c->flags; out[3] = 0;
+      *sz = 4;
+      break;
+   case STITCH_L3D:
+      *(uint32_t *)out = l3d;
+      *sz = 4;
+      break;
+   case STITCH_STD:
+      out[0] = stitch_std_from_l3d[l3d];
+      *sz = 1;
+      break;
+   }
+}
+
+// Deposit an output value to a view signal if it changed (index-
+// addressed wakeup: only this signal's pending list is notified)
+static void stitch_put(rt_model_t *m, rt_signal_t *s, const uint8_t *val,
+                       size_t sz)
+{
+   rt_nexus_t *n = &(s->nexus);
+   if (memcmp(nexus_effective(n), val, sz) == 0)
+      return;
+   n->vtable->deposit(m, n, val);
+}
+
+static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
+{
+   uint8_t buf[8];
+   size_t sz;
+   for (int i = 0; i < net->nep; i++) {
+      stitch_ep_t *ep = &(net->ep[i]);
+      if (ep->other == NULL)
+         continue;
+      stitch_ctr_t v = stitch_resolve(net, &(ep->last));
+      stitch_encode(ep->otype, &v, buf, &sz);
+      stitch_put(m, ep->other, buf, sz);
+   }
+}
+
+// Contributor event: O(1) counts transition, then refresh views.  The
+// moving endpoint's own view is unchanged by construction (its
+// excluded set did not move) — stitch_put's compare makes that free.
+static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
+                            void *user)
+{
+   rt_model_t *m = get_model();
+   rt_stitch_net_t *net = user;
+
+   for (int i = 0; i < net->nep; i++) {
+      stitch_ep_t *ep = &(net->ep[i]);
+      if (ep->drv != s)
+         continue;
+      stitch_ctr_t c = stitch_classify(ep, ep->drv->shared.data
+                                       + ep->drv->nexus.offset);
+      stitch_count(net, &(ep->last), -1);
+      stitch_count(net, &c, +1);
+      ep->last = c;
+   }
+
+   stitch_update_views(m, net);
+}
+
+// Register one net's static endpoint sets.  Called (indirectly, via
+// the VHPI extension) from the resolver plugin at start of simulation.
+// Endpoint i: drv_ss[i] = contributor signal; oth_ss[i] = exclude-self
+// view output or NULL; dtypes/otypes = stitch_type_t per endpoint.
+bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
+                           sig_shared_t **oth_ss,
+                           const uint8_t *dtypes, const uint8_t *otypes)
+{
+   rt_model_t *m = get_model();
+
+   static int no_stitch = -1;
+   if (no_stitch < 0)
+      no_stitch = getenv("NVC_NO_STITCH") != NULL;
+   if (no_stitch || nep < 1)
+      return false;
+
+   static int stitch_dbg = -1;
+   if (stitch_dbg < 0)
+      stitch_dbg = getenv("NVC_STITCH_DEBUG") != NULL;
+
+   rt_stitch_net_t *net =
+      xcalloc_flex(sizeof(rt_stitch_net_t), nep, sizeof(stitch_ep_t));
+   net->nep = nep;
+
+   for (int i = 0; i < nep; i++) {
+      stitch_ep_t *ep = &(net->ep[i]);
+      ep->drv = container_of(drv_ss[i], rt_signal_t, shared);
+      ep->other = oth_ss[i] == NULL
+         ? NULL : container_of(oth_ss[i], rt_signal_t, shared);
+      ep->dtype = (stitch_type_t)dtypes[i];
+      ep->otype = (stitch_type_t)otypes[i];
+
+      // v1: scalar endpoints only
+      const size_t want = (ep->dtype == STITCH_STD) ? 1 : 4;
+      if (ep->drv->n_nexus != 1 || ep->drv->shared.size != want) {
+         if (stitch_dbg)
+            fprintf(stderr, "#STITCH decline: endpoint %d shape\n", i);
+         free(net);
+         return false;
+      }
+   }
+
+   // Seed counts from current (post-initial) values
+   for (int i = 0; i < nep; i++) {
+      stitch_ep_t *ep = &(net->ep[i]);
+      ep->last = stitch_classify(ep, ep->drv->shared.data
+                                 + ep->drv->nexus.offset);
+      stitch_count(net, &(ep->last), +1);
+   }
+
+   // Subscribe to every contributor
+   net->watch = watch_new(m, stitch_event_cb, net, WATCH_EVENT, nep);
+   for (int i = 0; i < nep; i++)
+      model_set_event_cb(m, net->ep[i].drv, net->watch);
+
+   // Publish initial views
+   stitch_update_views(m, net);
+
+   net->chain = g_stitch_nets;
+   g_stitch_nets = net;
+
+   if (stitch_dbg)
+      fprintf(stderr, "#STITCH net registered: %d endpoints\n", nep);
+
+   return true;
+}
+
 int64_t x_last_event(sig_shared_t *ss, uint32_t offset, int32_t count)
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
