@@ -444,6 +444,9 @@ def _gen_net_vhdl(net, idx, design_name, fix_ename):
             return f"to_std_logic({expr})"
         if tran_type == "logic3d" and sig_type == "std_logic":
             return f"to_std_logic({expr})"
+        if tran_type == "logic3ds" and "logic3d" in sig_type:
+            # logic3d / resolved_logic3d signal endpoint (strength lost)
+            return f"to_logic3d({expr})"
         return expr
 
     if not tran_indices:
