@@ -15,6 +15,8 @@ sv2vhdl_DATA = \
 	lib/sv2vhdl/SV2VHDL.LOGIC3D_VEC_PKG-body \
 	lib/sv2vhdl/SV2VHDL.LOGIC3DW_PKG \
 	lib/sv2vhdl/SV2VHDL.LOGIC3DW_PKG-body \
+	lib/sv2vhdl/SV2VHDL.FUSE_PKG \
+	lib/sv2vhdl/SV2VHDL.FUSE_PKG-body \
 	lib/sv2vhdl/SV2VHDL.SV_PRIMITIVES \
 	lib/sv2vhdl/SV2VHDL.SV_AND \
 	lib/sv2vhdl/SV2VHDL.SV_AND-BEHAVIORAL \
@@ -97,6 +99,7 @@ EXTRA_DIST += \
 	lib/sv2vhdl/logic3da_pkg.vhd \
 	lib/sv2vhdl/logic3d_vec_pkg.vhd \
 	lib/sv2vhdl/logic3dw_pkg.vhd \
+	lib/sv2vhdl/fuse_pkg.vhd \
 	lib/sv2vhdl/sv_primitives.vhd \
 	lib/sv2vhdl/sv_gates.vhd \
 	lib/sv2vhdl/sv_mos.vhd \
@@ -145,6 +148,11 @@ lib/sv2vhdl/SV2VHDL.LOGIC3DW_PKG: $(srcdir)/lib/sv2vhdl/logic3dw_pkg.vhd @ifGNUm
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/logic3dw_pkg.vhd
 
 lib/sv2vhdl/SV2VHDL.LOGIC3DW_PKG-body: lib/sv2vhdl/SV2VHDL.LOGIC3DW_PKG
+
+lib/sv2vhdl/SV2VHDL.FUSE_PKG: $(srcdir)/lib/sv2vhdl/fuse_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/fuse_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.FUSE_PKG-body: lib/sv2vhdl/SV2VHDL.FUSE_PKG
 
 lib/sv2vhdl/SV2VHDL.SV_MATH_PKG: $(srcdir)/lib/sv2vhdl/sv_math_pkg.vhd @ifGNUmake@ | $(DRIVER)
 	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/sv_math_pkg.vhd

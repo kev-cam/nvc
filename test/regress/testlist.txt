@@ -1262,3 +1262,4 @@ logic3dw1       normal,2040
 ieee20          fail,gold,2008
 logic3dw2       normal,2040
 logic3dw3       normal,2040
+fuse1           normal,2040

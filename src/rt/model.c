@@ -334,6 +334,34 @@ static void calculate_driving_memo1(rt_model_t *m, rt_nexus_t *n);
 static const rt_nexus_vtable_t nexus_single_driver_vtable;
 static const rt_nexus_vtable_t nexus_memo1_vtable;
 
+// #74 fuse: signal B's readers were repointed onto A at initialization.
+// Nothing may ever drive, deposit to, or notify through B's dead nexus —
+// a late driver/force/VHPI deposit lands here and fails loudly.
+static void fused_nexus_trap(rt_model_t *m, rt_nexus_t *n)
+{
+   fatal("signal %s was fused onto another signal at initialization and "
+         "can no longer be driven independently; rerun with NVC_NO_FUSE=1",
+         n->signal->where ? istr(tree_ident(n->signal->where)) : "?");
+}
+
+static void fused_nexus_deposit(rt_model_t *m, rt_nexus_t *n, const void *value)
+{
+   fused_nexus_trap(m, n);
+}
+
+static void *fused_nexus_read(rt_nexus_t *n, rt_source_t *src)
+{
+   fatal("read of fused nexus %s source",
+         n->signal->where ? istr(tree_ident(n->signal->where)) : "?");
+}
+
+static const rt_nexus_vtable_t nexus_fused_vtable = {
+   .update_driving = fused_nexus_trap,
+   .deposit        = fused_nexus_deposit,
+   .read_source    = fused_nexus_read,
+   .notify         = fused_nexus_trap,
+};
+
 // NVC_BANKED=1 — increment I1 SCAFFOLDING for the double-banked SMP
 // substrate (see the smp-double-banked directive / design_banked_smp.md).
 // I1 changes NO behavior: the banked vtable's deposit performs exactly the
@@ -12376,6 +12404,9 @@ static void check_multiple_sources(rt_nexus_t *n, source_kind_t kind)
 
 static rt_source_t *add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
 {
+   if (unlikely(n->vtable == &nexus_fused_vtable))
+      fused_nexus_trap(m, n);   // #74: no new sources on a fused signal
+
    rt_source_t *src = NULL;
    if (n->n_sources == 0)
       src = &(n->sources);
@@ -19040,6 +19071,152 @@ void x_alias_signal(sig_shared_t *ss, tree_t where)
 
    model_thread_t *thread = model_thread(get_model());
    APUSH(thread->active_scope->aliases, a);
+}
+
+// #74 fuse: TRUE iff this scalar signal could not contribute a value to a
+// resolved net — no sources, no port fanout, and its effective value is 'Z'
+// (the resolution identity, so its constant contribution is vacuous).
+bool x_signal_undriven(sig_shared_t *ss, uint32_t offset)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   if (s->n_nexus != 1 || s->nexus.width != 1 || s->nexus.size != 1)
+      return false;
+
+   rt_nexus_t *n = &(s->nexus);
+   if (n->n_sources != 0 || n->outputs != NULL)
+      return false;
+
+   return ss->data[n->offset] == 0x04;   // 'Z'
+}
+
+// #74 fuse: repoint signal B's frame-var handle at signal A so every
+// subsequent read of B resolves into A's storage (zero per-event copies).
+// Wakeables already registered on B are spliced onto A's pending list;
+// everything registering after the swap lands on A natively.  Returns
+// false (caller keeps its copy-loop fallback) on any structural doubt.
+bool x_fuse_signals(sig_shared_t *ss_a, uint32_t off_a,
+                    sig_shared_t *ss_b, uint32_t off_b)
+{
+   rt_model_t *m = get_model();
+   rt_signal_t *sa = container_of(ss_a, rt_signal_t, shared);
+   rt_signal_t *sb = container_of(ss_b, rt_signal_t, shared);
+
+   static int no_fuse = -1;
+   if (no_fuse < 0)
+      no_fuse = getenv("NVC_NO_FUSE") != NULL;
+
+   static int fuse_dbg = -1;
+   if (fuse_dbg < 0)
+      fuse_dbg = getenv("NVC_FUSE_DEBUG") != NULL;
+
+#define FUSE_DECLINE(why) do {                                          \
+      if (fuse_dbg)                                                     \
+         fprintf(stderr, "#FUSE decline %s -> %s: %s\n",               \
+                 sb->where ? istr(tree_ident(sb->where)) : "?",         \
+                 sa->where ? istr(tree_ident(sa->where)) : "?", why);   \
+      return false;                                                     \
+   } while (0)
+
+   if (no_fuse)
+      FUSE_DECLINE("NVC_NO_FUSE");
+   if (m->now != 0 || m->iteration > 0)
+      FUSE_DECLINE("not initialization");
+   if (sa == sb)
+      FUSE_DECLINE("self");
+   if (sa->n_nexus != 1 || sb->n_nexus != 1
+       || sa->nexus.width != 1 || sb->nexus.width != 1
+       || sa->nexus.size != sb->nexus.size)
+      FUSE_DECLINE("not matching scalars");
+   if (sb->nexus.outputs != NULL)
+      FUSE_DECLINE("B has port fanout");
+
+   // The generated arbitration process carries its own fallback copy
+   // branch, so B has a pre-created driver owned by the CALLING process.
+   // That driver never fires once the caller parks after a successful
+   // fuse; any other source keeps copy semantics.
+   if (sb->nexus.n_sources > 0) {
+      rt_proc_t *caller = get_active_proc();
+      for (rt_source_t *src = &(sb->nexus.sources); src != NULL;
+           src = src->chain_input) {
+         if (src->tag != SOURCE_DRIVER || src->u.driver.proc != caller)
+            FUSE_DECLINE("B has a foreign source");
+      }
+   }
+   if (ss_b->flags & (SIG_F_FUSED | SIG_F_FUSE_TARGET | SIG_F_REGISTER
+                      | SIG_F_PIPE | SIG_F_IMPLICIT))
+      FUSE_DECLINE("B flag class");
+   if (ss_a->flags & SIG_F_FUSED)
+      FUSE_DECLINE("A already fused");
+   if (sa->nexus.vtable == &nexus_fused_vtable)
+      FUSE_DECLINE("A tombstoned");
+   if (m->aj_chunk_count > 0)
+      FUSE_DECLINE("accel chunks installed");
+   if (sb->where == NULL || sb->parent == NULL)
+      FUSE_DECLINE("B anonymous");
+
+   // A waveform/VHPI watch pinned to B would keep formatting B's stale
+   // bytes while firing off A's events — keep copy semantics instead
+   if (sb->nexus.pending != NULL) {
+      if (pointer_tag(sb->nexus.pending) == 1) {
+         rt_wakeable_t *w = untag_pointer(sb->nexus.pending, rt_wakeable_t);
+         if (w->kind == W_WATCH)
+            FUSE_DECLINE("B watched");
+      }
+      else {
+         rt_pending_t *p = untag_pointer(sb->nexus.pending, rt_pending_t);
+         for (int i = 0; i < p->count; i++)
+            if (p->wake[i] != NULL && p->wake[i]->kind == W_WATCH)
+               FUSE_DECLINE("B watched");
+      }
+   }
+
+   if (sb->parent->privdata == MPTR_INVALID)
+      FUSE_DECLINE("B scope not linked");
+
+   jit_handle_t h = jit_lazy_compile(m->jit, sb->parent->name);
+   if (h == JIT_HANDLE_INVALID)
+      FUSE_DECLINE("B scope unit not found");
+
+   void *slot = jit_try_get_frame_var(m->jit, h, tree_ident(sb->where));
+   if (slot == NULL)
+      FUSE_DECLINE("no frame var for B");
+   if (*(sig_shared_t **)slot != ss_b)
+      FUSE_DECLINE("frame var does not hold B");
+
+   // Splice wakeables already registered on B onto A
+   if (sb->nexus.pending != NULL) {
+      if (pointer_tag(sb->nexus.pending) == 1) {
+         rt_wakeable_t *w = untag_pointer(sb->nexus.pending, rt_wakeable_t);
+         sched_event(m, &(sa->nexus.pending), w);
+      }
+      else {
+         rt_pending_t *p = untag_pointer(sb->nexus.pending, rt_pending_t);
+         for (int i = 0; i < p->count; i++)
+            if (p->wake[i] != NULL)
+               sched_event(m, &(sa->nexus.pending), p->wake[i]);
+      }
+      sb->nexus.pending = NULL;
+   }
+
+   // Reader-need flags must follow the readers
+   sa->nexus.flags |= (sb->nexus.flags & (NET_F_CACHE_EVENT | NET_F_PENDING));
+   ss_a->flags |= (ss_b->flags & (SIG_F_CACHE_EVENT | SIG_F_LAST_VALUE));
+
+   ss_b->flags |= SIG_F_FUSED;
+   ss_a->flags |= SIG_F_FUSE_TARGET;
+   sb->nexus.vtable = &nexus_fused_vtable;
+
+   *(sig_shared_t **)slot = ss_a;
+   *(int32_t *)((char *)slot + 8) = off_a;
+
+   if (fuse_dbg)
+      fprintf(stderr, "#FUSE ok %s -> %s\n",
+              istr(tree_ident(sb->where)),
+              sa->where ? istr(tree_ident(sa->where)) : "?");
+
+#undef FUSE_DECLINE
+   return true;
 }
 
 int64_t x_last_event(sig_shared_t *ss, uint32_t offset, int32_t count)

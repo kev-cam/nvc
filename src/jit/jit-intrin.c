@@ -21,6 +21,11 @@
 #include "jit/jit.h"
 #include "option.h"
 #include "rt/assert.h"
+#include "jit/jit-exits.h"
+#include "rt/rt.h"
+
+#include <inttypes.h>
+#include <stdio.h>
 #include "thread.h"
 
 #include <assert.h>
@@ -2863,7 +2868,36 @@ static void l3d_resize_s_vec(jit_func_t *func, jit_anchor_t *anchor,
 #define L3WP "SV2VHDL.LOGIC3DW_PKG."
 #define L3WV "32SV2VHDL.LOGIC3DW_PKG.L3DW_VECTOR"
 
+// #74 fuse: net-fusion primitives (SV2VHDL.FUSE_PKG).  Signal-class
+// arguments arrive as two slots {sig_shared_t *, offset}; args[0] is the
+// context pointer and also receives the scalar boolean result.
+// NVC_FUSE_ARGS=1 dumps the raw arg block for empirical layout checks.
+static void sv2vhdl_undriven(jit_func_t *func, jit_anchor_t *anchor,
+                             jit_scalar_t *args, tlab_t *tlab)
+{
+   if (unlikely(getenv("NVC_FUSE_ARGS") != NULL))
+      fprintf(stderr, "#UNDRIVEN args %p %p %"PRIi64" %p %"PRIi64"\n",
+              args[0].pointer, args[1].pointer, args[2].integer,
+              args[3].pointer, args[4].integer);
+
+   args[0].integer = x_signal_undriven(args[1].pointer, args[2].integer);
+}
+
+static void sv2vhdl_fuse_try(jit_func_t *func, jit_anchor_t *anchor,
+                             jit_scalar_t *args, tlab_t *tlab)
+{
+   if (unlikely(getenv("NVC_FUSE_ARGS") != NULL))
+      fprintf(stderr, "#FUSE_TRY args %p %p %"PRIi64" %p %"PRIi64"\n",
+              args[0].pointer, args[1].pointer, args[2].integer,
+              args[3].pointer, args[4].integer);
+
+   args[0].integer = x_fuse_signals(args[1].pointer, args[2].integer,
+                                    args[3].pointer, args[4].integer);
+}
+
 static jit_intrinsic_t intrinsic_list[] = {
+   { "SV2VHDL.FUSE_PKG.UNDRIVEN(sU)B", sv2vhdl_undriven },
+   { "SV2VHDL.FUSE_PKG.FUSE_TRY(sUsU)B", sv2vhdl_fuse_try },
    { L3WP "L3DW_AND(" L3WV L3WV ")" L3WV, l3dw_and_vector },
    { L3WP "L3DW_OR("  L3WV L3WV ")" L3WV, l3dw_or_vector },
    { L3WP "L3DW_XOR(" L3WV L3WV ")" L3WV, l3dw_xor_vector },

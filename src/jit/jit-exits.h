@@ -41,6 +41,9 @@ int32_t x_test_net_active(sig_shared_t *ss, uint32_t offset,
                           int32_t count);
 void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count);
 void x_enable_last_value(sig_shared_t *ss, uint32_t offset, int32_t count);
+bool x_signal_undriven(sig_shared_t *ss, uint32_t offset);
+bool x_fuse_signals(sig_shared_t *ss_a, uint32_t off_a,
+                    sig_shared_t *ss_b, uint32_t off_b);
 void x_alias_signal(sig_shared_t *ss, tree_t where);
 void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject);
