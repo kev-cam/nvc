@@ -808,12 +808,23 @@ def resolve_net(nets, design_name):
             t = (drv.get("type") or "").lower()
             if not drv.get("is_signal"):
                 types.add(t)
-        if len(types) != 1:
+        if os.environ.get("SV2VHDL_KERNEL_DEBUG"):
+            import sys
+            print("#KE net=%s types=%r drivers=%r" % (
+                net["net_name"], sorted(types),
+                [(d.get("ename"), d.get("type"), d.get("is_signal"),
+                  d.get("kind"), d.get("mode")) for d in net["drivers"]]),
+                file=sys.stderr)
+        # The kernel solver classifies each endpoint by its own type
+        # (logic3ds record / logic3d / std_logic), so a mix of family
+        # types on one net is fine — only a type outside the family
+        # (mixed-signal, user nettypes) needs generated VHDL
+        if not types:
             return False
-        t = types.pop()
-        if not ("logic3ds" in t or "logic3d" in t or "std_logic" in t
-                or "std_ulogic" in t):
-            return False
+        for t in types:
+            if not ("logic3ds" in t or "logic3d" in t or "std_logic" in t
+                    or "std_ulogic" in t):
+                return False
         return True
 
     remaining = []

@@ -5646,7 +5646,7 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
    if (nep < 1 || nep > 64)
       { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 1); return 0; }
 
-   sig_shared_t *drv_ss[66*3], *oth_ss[66*3];
+   sig_shared_t *drv_ss[66*3], *oth_ss[66*3], *echo_ss[66];
    uint8_t dtypes[66], otypes[66];
    int n = 0;
 
@@ -5728,6 +5728,25 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
          oth_ss[n*3 + f] = oth_f[f] ? &(oth_f[f]->shared) : NULL;
       }
       dtypes[n] = otypes[n] = t;
+
+      // The port signal itself: its edge into the member duplicates
+      // this endpoint's 'driver (STD_MX auto-connect), so the solver
+      // must exclude it from the member fold.  Best-effort — a missing
+      // handle just skips the exclusion for this endpoint.
+      echo_ss[n] = NULL;
+      {
+         char pbuf[512];
+         checked_sprintf(pbuf, sizeof(pbuf), "%s.%s",
+                         (const char *)inst_paths[i], (const char *)ports[i]);
+         vhpiHandleT ph = vhpi_handle_by_name(pbuf, NULL);
+         if (ph != NULL) {
+            c_vhpiObject *pobj = from_handle(ph);
+            c_objDecl *pdecl = pobj ? is_objDecl(pobj) : NULL;
+            rt_signal_t *psig = pdecl ? vhpi_get_signal_objDecl(pdecl) : NULL;
+            if (psig != NULL)
+               echo_ss[n] = &(psig->shared);
+         }
+      }
       n++;
    }
 
@@ -5755,10 +5774,12 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
       drv_ss[n*3+1] = drv_ss[n*3+2] = NULL;
       oth_ss[n*3+1] = oth_ss[n*3+2] = NULL;
       dtypes[n] = otypes[n] = t;
+      echo_ss[n] = NULL;
       n++;
    }
 
-   return x_stitch_net_register(n, drv_ss, oth_ss, dtypes, otypes) ? 1 : 0;
+   return x_stitch_net_register(n, drv_ss, oth_ss, dtypes, otypes,
+                                echo_ss) ? 1 : 0;
 }
 
 void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)

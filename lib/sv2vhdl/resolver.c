@@ -1134,6 +1134,12 @@ static int stitch_register_net(net_info_t *n)
             net_path = ep->driver_ename;
             continue;
         }
+        /* Receiver-only in-mode ports contribute nothing and their
+           'driver implicits may not exist (never referenced): the port
+           reads the resolved actual through the normal port-map
+           conversion instead */
+        if (strcmp(ep->mode, "in") == 0)
+            continue;
         /* driver_ename = "<inst_path>.<port>.driver" */
         safe_copy(pathbuf[nep], ep->driver_ename, sizeof(pathbuf[nep]));
         char *suffix = strrchr(pathbuf[nep], '.');

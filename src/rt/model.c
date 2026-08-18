@@ -13075,11 +13075,15 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
          return value_ptr(nexus, &(src->u.driver.waveforms.value));
 
    case SOURCE_PORT:
-      if (unlikely(standard() == STD_MX)) {
+      if (unlikely(standard() == STD_MX)
+          && likely(src->u.port.conv_func == NULL)) {
          // Mixed mode: a port with no real driver is not a source.
          // Walk SOURCE_PORT chain transitively until we find a
          // SOURCE_DRIVER (real driver) or detect a cycle (circular
-         // back-ref from inout bidirectional mapping).
+         // back-ref from inout bidirectional mapping).  Conversion
+         // sources are computed values, not wire joins — their inputs
+         // live in the conv closure, so the driver walk would always
+         // prune them (u.port.input is not the conversion input)
          rt_nexus_t *input = src->u.port.input;
          rt_nexus_t *seen[8];   // small bounded cycle-guard
          int n_seen = 0;
@@ -13367,12 +13371,15 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          return;
       }
       else if (unlikely(standard() == STD_MX
-                        && s->tag == SOURCE_PORT)) {
+                        && s->tag == SOURCE_PORT
+                        && s->u.port.conv_func == NULL)) {
          // Mixed mode: skip port with no real driver.
          // Walk SOURCE_PORT chain transitively: a nested port-binding
          // (inner OUT → outer OUT → tb signal) has no SOURCE_DRIVER on
          // the immediate input, only further along the chain.  Cycle
-         // guard handles the inout back-ref case.
+         // guard handles the inout back-ref case.  Conversion sources
+         // are computed values (inputs live in the conv closure, not
+         // u.port.input) — the walk would always prune them.
          rt_nexus_t *input = s->u.port.input;
          rt_nexus_t *seen[8];
          int n_seen = 0;
@@ -19274,6 +19281,11 @@ typedef struct {
    stitch_ctr_t  last;         // last classified contribution
    rt_signal_t  *plug;         // member: solver-owned SOURCE_IMPLICIT input
    rt_source_t  *real_src;     // member: its own real driver source (or NULL)
+   rt_signal_t  *echo;         // port signal whose edge into the member
+                               // duplicates this endpoint's 'driver
+                               // (STD_MX auto-connect); excluded from
+                               // the member fold to keep exclude-self
+                               // views honest
 } stitch_ep_t;
 
 typedef struct _rt_stitch_net {
@@ -19299,62 +19311,24 @@ static inline bool stitch_trace(void)
 static const uint8_t stitch_l3d_from_std[9] = {7, 6, 2, 3, 4, 5, 0, 1, 6};
 static const uint8_t stitch_std_from_l3d[8] = {6, 7, 2, 3, 4, 5, 1, 0};
 
-static stitch_ctr_t stitch_classify(const stitch_ep_t *ep)
+static stitch_ctr_t stitch_classify_raw(stitch_type_t dtype, const void *raw)
 {
    stitch_ctr_t c = { 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
    uint32_t l3d = 8;
 
-   switch (ep->dtype) {
+   switch (dtype) {
    case STITCH_L3DS:
       {
-         // Record fields lower at their own widths: VALUE/STRENGTH are
-         // 4-byte naturals, FLAGS a 1-byte enum.  Values are 0..255 so
-         // the low byte suffices; read per-field width (little endian).
-#define STITCH_FLD(ep, f) \
-         ((ep)->drv[f]->shared.size == 1 \
-          ? (ep)->drv[f]->shared.data[(ep)->drv[f]->nexus.offset] \
-          : (uint8_t)*(const uint32_t *)((ep)->drv[f]->shared.data \
-                                         + (ep)->drv[f]->nexus.offset))
-         c.val   = STITCH_FLD(ep, 0);
-         c.str   = STITCH_FLD(ep, 1);
-         c.flags = STITCH_FLD(ep, 2);
-#undef STITCH_FLD
+         const uint8_t *b = raw;
+         c.val = b[0]; c.str = b[1]; c.flags = b[2];
          return c;
       }
    case STITCH_L3D:
-      {
-         const void *raw;
-         if (ep->is_member) {
-            // Contribution = the member's own drivers only; the merged
-            // effective includes our plug and must not re-enter
-            if (ep->real_src == NULL)
-               return c;   // no real driver: permanent Z
-            raw = ep->drv[0]->nexus.vtable->read_source(&(ep->drv[0]->nexus),
-                                                        ep->real_src);
-            if (raw == NULL)
-               return c;
-         }
-         else
-            raw = ep->drv[0]->shared.data + ep->drv[0]->nexus.offset;
-         l3d = *(const uint32_t *)raw & 7;
-      }
+      l3d = *(const uint32_t *)raw & 7;
       break;
    case STITCH_STD:
-      {
-         const void *raw;
-         if (ep->is_member) {
-            if (ep->real_src == NULL)
-               return c;
-            raw = ep->drv[0]->nexus.vtable->read_source(&(ep->drv[0]->nexus),
-                                                        ep->real_src);
-            if (raw == NULL)
-               return c;
-         }
-         else
-            raw = ep->drv[0]->shared.data + ep->drv[0]->nexus.offset;
-         l3d = stitch_l3d_from_std[*(const uint8_t *)raw < 9
-                                   ? *(const uint8_t *)raw : 1];
-      }
+      l3d = stitch_l3d_from_std[*(const uint8_t *)raw < 9
+                                ? *(const uint8_t *)raw : 1];
       break;
    }
 
@@ -19373,17 +19347,98 @@ static stitch_ctr_t stitch_classify(const stitch_ep_t *ep)
    return c;
 }
 
+static void stitch_count_into(stitch_scnt_t *cnt, int *pwr,
+                              const stitch_ctr_t *c, int dir);
+static stitch_ctr_t stitch_resolve_counts(const stitch_scnt_t *cnt,
+                                          int pwr,
+                                          const stitch_ctr_t *excl);
+
+// A registered endpoint's 'driver auto-connects to its parent port
+// signal in STD_MX mode, so the same contribution arrives at the member
+// twice: once via our 'driver watch and once as a port edge.  Skip the
+// port-edge copy — counting it would fold each endpoint's own drive
+// into every exclude-self view
+static bool stitch_is_echo(const rt_stitch_net_t *net, const rt_source_t *src)
+{
+   if (src->tag != SOURCE_PORT && src->tag != SOURCE_IMPLICIT)
+      return false;
+   for (int i = 0; i < net->nep; i++) {
+      const stitch_ep_t *e2 = &(net->ep[i]);
+      if (e2->echo != NULL && src->u.port.input == &(e2->echo->nexus))
+         return true;
+   }
+   return false;
+}
+
+static stitch_ctr_t stitch_classify(const rt_stitch_net_t *net,
+                                    const stitch_ep_t *ep)
+{
+   if (!ep->is_member) {
+      if (ep->dtype == STITCH_L3DS) {
+         // Record fields lower at their own widths: VALUE/STRENGTH are
+         // 4-byte naturals, FLAGS a 1-byte enum.  Values are 0..255 so
+         // the low byte suffices; read per-field width (little endian).
+#define STITCH_FLD(ep, f) \
+         ((ep)->drv[f]->shared.size == 1 \
+          ? (ep)->drv[f]->shared.data[(ep)->drv[f]->nexus.offset] \
+          : (uint8_t)*(const uint32_t *)((ep)->drv[f]->shared.data \
+                                         + (ep)->drv[f]->nexus.offset))
+         stitch_ctr_t c = { STITCH_FLD(ep, 0), STITCH_FLD(ep, 1),
+                            STITCH_FLD(ep, 2) };
+#undef STITCH_FLD
+         return c;
+      }
+      return stitch_classify_raw(ep->dtype,
+                                 ep->drv[0]->shared.data
+                                 + ep->drv[0]->nexus.offset);
+   }
+
+   // Member endpoint: the contribution is the fold of ALL its
+   // driver-backed sources except our own plug — primitives with OUT
+   // ports (pullup, bufif) reach the net through port edges, not
+   // SOURCE_DRIVERs, and their weak/strong distinction rides the l3d
+   // H/L vs 1/0 alphabet.  source_value applies the STD_MX pruning so
+   // inert edges contribute nothing.
+   rt_nexus_t *mn = &(ep->drv[0]->nexus);
+   stitch_scnt_t cnt[32];
+   memset(cnt, 0, sizeof(cnt));
+   int pwr = 0, nc = 0;
+
+   if (mn->n_sources > 0) {
+      for (rt_source_t *src = &(mn->sources); src != NULL;
+           src = src->chain_input) {
+         if (src->tag == SOURCE_IMPLICIT
+             && src->u.port.input == &(ep->plug->nexus))
+            continue;
+         if (stitch_is_echo(net, src))
+            continue;
+         const void *sv = mn->vtable->read_source(mn, src);
+         if (sv == NULL)
+            continue;
+         stitch_ctr_t c = stitch_classify_raw(ep->dtype, sv);
+         stitch_count_into(cnt, &pwr, &c, +1);
+         nc++;
+      }
+   }
+
+   if (nc == 0)
+      return (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
+
+   return stitch_resolve_counts(cnt, pwr, NULL);
+}
+
 static inline bool stitch_active(const stitch_ctr_t *c)
 {
    return c->str != STITCH_ST_HIGHZ && c->flags != STITCH_FL_UNDRIVEN
       && c->flags != STITCH_FL_UDR_NOPOWER;
 }
 
-static void stitch_count(rt_stitch_net_t *net, const stitch_ctr_t *c, int dir)
+static void stitch_count_into(stitch_scnt_t *cnt, int *pwr,
+                              const stitch_ctr_t *c, int dir)
 {
    if (!stitch_active(c))
       return;
-   stitch_scnt_t *s = &(net->cnt[c->str & 31]);
+   stitch_scnt_t *s = &(cnt[c->str & 31]);
    if (c->flags == STITCH_FL_UNKNOWN || c->flags == STITCH_FL_UNK_NOPOWER)
       s->n_unk += dir;
    else if (c->val == 0)
@@ -19394,20 +19449,27 @@ static void stitch_count(rt_stitch_net_t *net, const stitch_ctr_t *c, int dir)
       s->n_valother += dir;   // non-binary byte: forces exact escape
    if (c->str == STITCH_ST_SUPPLY
        && (c->flags == STITCH_FL_NOPOWER || c->flags == STITCH_FL_UNK_NOPOWER))
-      net->n_supply_pwr += dir;
+      *pwr += dir;
+}
+
+static void stitch_count(rt_stitch_net_t *net, const stitch_ctr_t *c, int dir)
+{
+   int pwr = net->n_supply_pwr;
+   stitch_count_into(net->cnt, &pwr, c, dir);
+   net->n_supply_pwr = pwr;
 }
 
 // Resolve from counts, optionally excluding one contribution.  Scan
 // strength bases high to low; within a base the active (cap=0) level
 // beats capacitive (cap=1).  Exact counterpart of l3ds_resolve.
-static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
-                                   const stitch_ctr_t *excl)
+static stitch_ctr_t stitch_resolve_counts(const stitch_scnt_t *cnt,
+                                          int pwr,
+                                          const stitch_ctr_t *excl)
 {
    const bool ex_ok = excl != NULL && stitch_active(excl);
    const bool ex_unk = ex_ok && (excl->flags == STITCH_FL_UNKNOWN
                                  || excl->flags == STITCH_FL_UNK_NOPOWER);
 
-   int pwr = net->n_supply_pwr;
    if (ex_ok && excl->str == STITCH_ST_SUPPLY
        && (excl->flags == STITCH_FL_NOPOWER
            || excl->flags == STITCH_FL_UNK_NOPOWER))
@@ -19418,7 +19480,7 @@ static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
          const int str = base*2 + cap;
          if (str == STITCH_ST_HIGHZ)
             continue;
-         const stitch_scnt_t *s = &(net->cnt[str]);
+         const stitch_scnt_t *s = &(cnt[str]);
          int n0 = s->n_val0, n1 = s->n_val1, no = s->n_valother,
              nu = s->n_unk;
          if (ex_ok && excl->str == str) {
@@ -19444,6 +19506,12 @@ static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
    }
 
    return (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };  // Z
+}
+
+static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
+                                   const stitch_ctr_t *excl)
+{
+   return stitch_resolve_counts(net->cnt, net->n_supply_pwr, excl);
 }
 
 // Encode a canonical result in an endpoint's output type
@@ -19515,7 +19583,11 @@ static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
             memcpy(ep->plug->shared.data, buf, sz);
             ep->plug->nexus.last_event = m->now;   // mark deposited
             rt_nexus_t *n = &(ep->drv[0]->nexus);
-            n->vtable->update_driving(m, n);
+            // Full driving update (not the bare vtable method): the
+            // wrapper also walks n->outputs so port fanout and
+            // conversion-function edges see the new value — a switch
+            // ctrl fed through to_std_logic(net) re-evaluates
+            update_driving(m, n, true);
             // Effective-class members (inout port fanout) publish
             // through the effective plane
             if (n->flags & NET_F_EFFECTIVE)
@@ -19534,6 +19606,11 @@ static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
          for (int f = 0; f < 3; f++) {
             uint8_t fb[4] = { buf[f], 0, 0, 0 };   // LE widen 0..255
             stitch_put(m, ep->other[f], fb, ep->other[f]->shared.size);
+            if (stitch_trace())
+               fprintf(stderr, "#ST put net=%p ep=%d f=%d want=%u eff=%u "
+                       "sz=%d\n", (void *)net, i, f, buf[f],
+                       ((const uint8_t *)nexus_effective(&(ep->other[f]->nexus)))[0],
+                       (int)ep->other[f]->shared.size);
          }
       }
       else
@@ -19558,7 +19635,7 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
       stitch_ep_t *ep = &(net->ep[i]);
       if (ep->drv[0] != s && ep->drv[1] != s && ep->drv[2] != s)
          continue;
-      stitch_ctr_t c = stitch_classify(ep);
+      stitch_ctr_t c = stitch_classify(net, ep);
       if (stitch_trace())
          fprintf(stderr, "#ST ev net=%p ep=%d (%u,%u,%u)->(%u,%u,%u)\n",
                  (void *)net, i, ep->last.val, ep->last.str, ep->last.flags,
@@ -19577,7 +19654,8 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
 // view output or NULL; dtypes/otypes = stitch_type_t per endpoint.
 bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
                            sig_shared_t **oth_ss,
-                           const uint8_t *dtypes, const uint8_t *otypes)
+                           const uint8_t *dtypes, const uint8_t *otypes,
+                           sig_shared_t **echo_ss)
 {
    // drv_ss/oth_ss carry 3 slots per endpoint (fields for l3ds record
    // implicits; scalar endpoints use slot 0 with slots 1-2 NULL)
@@ -19609,6 +19687,8 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
       ep->dtype = (stitch_type_t)dtypes[i];
       ep->otype = (stitch_type_t)otypes[i];
       ep->is_member = (ep->other[0] == ep->drv[0]);
+      ep->echo = (echo_ss == NULL || echo_ss[i] == NULL)
+         ? NULL : container_of(echo_ss[i], rt_signal_t, shared);
 
       const int nfld = (ep->dtype == STITCH_L3DS && ep->drv[1] != NULL)
          ? 3 : 1;
@@ -19624,28 +19704,8 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
       if (ep->is_member) {
          rt_nexus_t *mn = &(ep->drv[0]->nexus);
 
-         // The member's contribution folds its DRIVER sources only:
-         // inout tran-port edges are value-inert (the switch entities
-         // never assign their ports) and our own implicit is the view.
-         // v1: at most one real driver.
-         ep->real_src = NULL;
-         if (mn->n_sources > 0) {
-            int ndrv = 0;
-            for (rt_source_t *src = &(mn->sources); src != NULL;
-                 src = src->chain_input) {
-               if (src->tag == SOURCE_DRIVER) {
-                  ep->real_src = src;
-                  ndrv++;
-               }
-            }
-            if (ndrv > 1) {
-               if (stitch_dbg)
-                  fprintf(stderr, "#STITCH decline: member %d has %d "
-                          "drivers\n", i, ndrv);
-               free(net);
-               return false;
-            }
-         }
+         // Member contributions fold ALL driver-backed sources except
+         // our plug at classification time — no per-driver limits
 
          // Solver-owned plug signal backing the SOURCE_IMPLICIT input
          const size_t psz = ep->drv[0]->shared.size;
@@ -19674,7 +19734,7 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
    // Seed counts from current (post-initial) values
    for (int i = 0; i < nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
-      ep->last = stitch_classify(ep);
+      ep->last = stitch_classify(net, ep);
       if (stitch_trace())
          fprintf(stderr, "#ST seed net=%p ep=%d m=%d (%u,%u,%u)\n",
                  (void *)net, i, ep->is_member,
