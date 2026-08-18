@@ -42,6 +42,9 @@ static int g_quiet = 0;
 
 /* NVC extension: port map and implicit type discovery */
 extern const vhpiCharT *nvc_vhpi_get_port_map(vhpiHandleT inst_handle);
+extern int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
+                               const vhpiCharT **ports,
+                               const vhpiCharT *net_path);
 extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
                                                   const vhpiCharT *port_name);
 
@@ -1285,6 +1288,68 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         cleanup();
         vhpi_release_handle(root);
         return;
+    }
+
+    /* Phase 2.5 (#75): try to register each net with the kernel net
+     * solver.  A registered net needs no generated VHDL and no runtime
+     * machinery — the kernel keeps per-plane counts and produces the
+     * resolved value and 'other views with index-addressed wakeups.
+     * SV2VHDL_KERNEL_NETS=0 disables; declined nets fall through to
+     * the legacy generation path unchanged. */
+    if (getenv("SV2VHDL_KERNEL_NETS") == NULL ||
+        strcmp(getenv("SV2VHDL_KERNEL_NETS"), "0") != 0) {
+        int stitched = 0;
+        for (net_info_t *n = g_nets; n; n = n->next) {
+            const vhpiCharT *inst_paths[MAX_ENDPOINTS];
+            const vhpiCharT *port_names[MAX_ENDPOINTS];
+            static char pathbuf[MAX_ENDPOINTS][MAX_NAME];
+            static char portbuf[MAX_ENDPOINTS][MAX_NAME];
+            const char *net_path = NULL;
+            int nep = 0;
+            int ok = 1;
+
+            for (int i = 0; i < n->n_endpoints; i++) {
+                endpoint_t *ep = &n->endpoints[i];
+                if (ep->is_signal) {
+                    net_path = ep->driver_ename;
+                    continue;
+                }
+                /* driver_ename = "<inst_path>.<port>.driver" */
+                safe_copy(pathbuf[nep], ep->driver_ename,
+                          sizeof(pathbuf[nep]));
+                char *suffix = strrchr(pathbuf[nep], '.');
+                if (suffix == NULL || strcmp(suffix, ".driver") != 0) {
+                    ok = 0;
+                    break;
+                }
+                *suffix = '\0';
+                char *pdot = strrchr(pathbuf[nep], '.');
+                if (pdot == NULL) {
+                    ok = 0;
+                    break;
+                }
+                safe_copy(portbuf[nep], pdot + 1, sizeof(portbuf[nep]));
+                *pdot = '\0';
+                inst_paths[nep] = (const vhpiCharT *)pathbuf[nep];
+                port_names[nep] = (const vhpiCharT *)portbuf[nep];
+                nep++;
+            }
+
+            if (ok && nep > 0 &&
+                nvc_vhpi_stitch_net(nep, inst_paths, port_names,
+                                    (const vhpiCharT *)net_path)) {
+                n->needs_resolution = 0;
+                stitched++;
+            }
+        }
+        resolver_printf("resolver: kernel solver took %d net(s)", stitched);
+        nets_needing -= stitched;
+        if (nets_needing == 0) {
+            resolver_printf("resolver: all nets kernel-stitched");
+            cleanup();
+            vhpi_release_handle(root);
+            return;
+        }
     }
 
     /* Phase 3: Call Python to generate per-net VHDL files */

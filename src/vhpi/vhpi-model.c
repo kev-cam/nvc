@@ -36,6 +36,7 @@
 #include <assert.h>
 #include <math.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -5571,6 +5572,193 @@ const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
    }
 
    return NULL;
+}
+
+// Resolve an implicit-signal decl to runtime signals.  Scalar
+// implicits are ordinary signals; l3ds RECORD implicits materialize as
+// a child SCOPE (named e.g. "A$other") holding per-field signals
+// VALUE/STRENGTH/FLAGS/RESERVED.  Fills fld[0..2] (scalar: fld[0]
+// only) and returns the field count, or 0 if not found.
+static int stitch_find_implicit(rt_scope_t *scope, tree_t decl,
+                                rt_signal_t **fld)
+{
+   fld[0] = fld[1] = fld[2] = NULL;
+
+   rt_signal_t *sig = find_signal(scope, decl);
+   if (sig == NULL) {
+      ident_t id = tree_ident(decl);
+      for (int i = 0; i < scope->signals.count; i++) {
+         tree_t w = scope->signals.items[i]->where;
+         if (w != NULL && tree_ident(w) == id) {
+            sig = scope->signals.items[i];
+            break;
+         }
+      }
+   }
+   if (sig != NULL) {
+      fld[0] = sig;
+      return 1;
+   }
+
+   // Record implicit: child scope whose name ends with the decl ident
+   const char *want = istr(tree_ident(decl));
+   for (int i = 0; i < scope->children.count; i++) {
+      rt_scope_t *cs = scope->children.items[i];
+      const char *cn = istr(cs->name);
+      const size_t cl = strlen(cn), wl = strlen(want);
+      if (cl < wl || strcasecmp(cn + cl - wl, want) != 0)
+         continue;
+      for (int j = 0; j < cs->signals.count; j++) {
+         tree_t w = cs->signals.items[j]->where;
+         if (w == NULL)
+            continue;
+         const char *fn = istr(tree_ident(w));
+         if (strcasecmp(fn, "VALUE") == 0)
+            fld[0] = cs->signals.items[j];
+         else if (strcasecmp(fn, "STRENGTH") == 0)
+            fld[1] = cs->signals.items[j];
+         else if (strcasecmp(fn, "FLAGS") == 0)
+            fld[2] = cs->signals.items[j];
+      }
+      if (fld[0] != NULL && fld[1] != NULL && fld[2] != NULL)
+         return 3;
+   }
+
+   fld[0] = fld[1] = fld[2] = NULL;
+   return 0;
+}
+
+/*
+ * NVC extension (#75): register a tran net's static endpoint sets with
+ * the kernel net solver.  Per tran endpoint i: insts[i]/ports[i] name a
+ * component-instance port whose IMPLICIT_DRIVER / IMPLICIT_OTHER
+ * signals are the contributor and the exclude-self view.  net_sig, if
+ * not NULL, is the net's parent signal, added as a member endpoint
+ * (contributor + rest-of-net view target).  Returns 1 when the kernel
+ * accepted the net, 0 to keep the caller's fallback behaviour.
+ */
+DLLEXPORT
+int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
+                        const vhpiCharT **ports, const vhpiCharT *net_path)
+{
+   vhpi_clear_error();
+
+   if (nep < 1 || nep > 64)
+      { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 1); return 0; }
+
+   sig_shared_t *drv_ss[66*3], *oth_ss[66*3];
+   uint8_t dtypes[66], otypes[66];
+   int n = 0;
+
+   for (int i = 0; i < nep; i++) {
+      vhpiHandleT ih = vhpi_handle_by_name((const char *)inst_paths[i], NULL);
+      if (ih == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 2); return 0; }
+      c_vhpiObject *obj = from_handle(ih);
+      if (obj == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 3); return 0; }
+      c_abstractRegion *r = is_abstractRegion(obj);
+      if (r == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 4); return 0; }
+
+      rt_scope_t *scope = vhpi_get_scope_abstractRegion(r);
+      if (scope == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 5); return 0; }
+
+      char port_upper[256];
+      {
+         const char *pn = (const char *)ports[i];
+         size_t k = 0;
+         for (; pn[k] != '\0' && k < sizeof(port_upper) - 1; k++)
+            port_upper[k] = toupper((unsigned char)pn[k]);
+         port_upper[k] = '\0';
+      }
+      ident_t port_id = ident_new(port_upper);
+      tree_t block = r->tree;
+      const int ndecls = tree_decls(block);
+
+      rt_signal_t *drv_f[3] = { NULL, NULL, NULL };
+      rt_signal_t *oth_f[3] = { NULL, NULL, NULL };
+      int drv_nf = 0, oth_nf = 0;
+      const char *tname = NULL;
+
+      for (int j = 0; j < ndecls; j++) {
+         tree_t d = tree_decl(block, j);
+         if (tree_kind(d) != T_IMPLICIT_SIGNAL)
+            continue;
+         const int sk = tree_subkind(d);
+         if (sk != IMPLICIT_DRIVER && sk != IMPLICIT_OTHER)
+            continue;
+         if (!tree_has_value(d))
+            continue;
+         tree_t val = tree_value(d);
+         if (tree_kind(val) != T_REF || !tree_has_ref(val))
+            continue;
+         if (tree_ident(tree_ref(val)) != port_id)
+            continue;
+
+         rt_signal_t *fld[3];
+         const int nf = stitch_find_implicit(scope, d, fld);
+         if (nf == 0) {
+            if (getenv("NVC_STITCH_DEBUG"))
+               fprintf(stderr, "#STITCH no runtime signal for %s\n",
+                       istr(tree_ident(d)));
+            return 0;
+         }
+         if (sk == IMPLICIT_DRIVER) {
+            memcpy(drv_f, fld, sizeof(drv_f));
+            drv_nf = nf;
+            tname = type_pp(tree_type(d));
+         }
+         else {
+            memcpy(oth_f, fld, sizeof(oth_f));
+            oth_nf = nf;
+         }
+      }
+
+      if (drv_nf == 0 || oth_nf == 0 || tname == NULL)
+         { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 7); return 0; }
+
+      uint8_t t = 0;   // STITCH_STD
+      if (strstr(tname, "logic3ds") || strstr(tname, "LOGIC3DS"))
+         t = 2;        // STITCH_L3DS
+      else if (strstr(tname, "logic3d") || strstr(tname, "LOGIC3D"))
+         t = 1;        // STITCH_L3D
+      if (t == 2 && (drv_nf != 3 || oth_nf != 3))
+         { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 12); return 0; }
+
+      for (int f = 0; f < 3; f++) {
+         drv_ss[n*3 + f] = drv_f[f] ? &(drv_f[f]->shared) : NULL;
+         oth_ss[n*3 + f] = oth_f[f] ? &(oth_f[f]->shared) : NULL;
+      }
+      dtypes[n] = otypes[n] = t;
+      n++;
+   }
+
+   if (net_path != NULL) {
+      vhpiHandleT nh = vhpi_handle_by_name((const char *)net_path, NULL);
+      if (nh == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 8); return 0; }
+      c_vhpiObject *obj = from_handle(nh);
+      if (obj == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 9); return 0; }
+      c_objDecl *decl = is_objDecl(obj);
+      if (decl == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 10); return 0; }
+      rt_signal_t *sig = vhpi_get_signal_objDecl(decl);
+      if (sig == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 11); return 0; }
+
+      const char *tname = type_pp(tree_type(decl->decl.tree));
+      uint8_t t = 0;
+      if (tname != NULL) {
+         if (strstr(tname, "logic3ds") || strstr(tname, "LOGIC3DS"))
+            t = 2;
+         else if (strstr(tname, "logic3d") || strstr(tname, "LOGIC3D"))
+            t = 1;
+      }
+
+      drv_ss[n*3] = &(sig->shared);
+      oth_ss[n*3] = &(sig->shared);   // member: view deposits back into it
+      drv_ss[n*3+1] = drv_ss[n*3+2] = NULL;
+      oth_ss[n*3+1] = oth_ss[n*3+2] = NULL;
+      dtypes[n] = otypes[n] = t;
+      n++;
+   }
+
+   return x_stitch_net_register(n, drv_ss, oth_ss, dtypes, otypes) ? 1 : 0;
 }
 
 void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)

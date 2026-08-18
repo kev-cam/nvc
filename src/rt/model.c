@@ -13130,7 +13130,9 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
          if (input == NULL)
             return NULL;
          tree_t iwhere = input->signal->where;
-         if (tree_kind(iwhere) == T_IMPLICIT_SIGNAL
+         // A NULL where marks a solver-owned plug (#75): it always
+         // contributes its current value
+         if (iwhere != NULL && tree_kind(iwhere) == T_IMPLICIT_SIGNAL
              && tree_subkind(iwhere) == IMPLICIT_DRIVER) {
             // Forward implicit: auto-created 'driver → parent.
             // Only contribute when the driver has at least one
@@ -19261,12 +19263,17 @@ typedef struct {
 } stitch_scnt_t;
 
 typedef struct {
-   rt_signal_t  *drv;          // contributor ('driver implicit or net signal)
-   rt_signal_t  *other;        // exclude-self view output (NULL = none)
+   // Scalar endpoints use [0] only; l3ds RECORD implicits materialize
+   // as per-field signals {VALUE, STRENGTH, FLAGS} (child scope of the
+   // instance) and use all three slots
+   rt_signal_t  *drv[3];       // contributor ('driver fields or net signal)
+   rt_signal_t  *other[3];     // exclude-self view output (NULL = none)
    stitch_type_t dtype;        // contributor value encoding
    stitch_type_t otype;        // 'other value encoding
-   bool          is_member;    // net-signal endpoint: exclude own implicit
+   bool          is_member;    // net-signal endpoint (other == drv)
    stitch_ctr_t  last;         // last classified contribution
+   rt_signal_t  *plug;         // member: solver-owned SOURCE_IMPLICIT input
+   rt_source_t  *real_src;     // member: its own real driver source (or NULL)
 } stitch_ep_t;
 
 typedef struct _rt_stitch_net {
@@ -19274,16 +19281,25 @@ typedef struct _rt_stitch_net {
    int            nep;
    stitch_scnt_t  cnt[32];     // per strength level
    uint16_t       n_supply_pwr;
-   rt_watch_t    *watch;
    stitch_ep_t    ep[];
 } rt_stitch_net_t;
 
 static rt_stitch_net_t *g_stitch_nets = NULL;
+static int g_stitch_trace = -1;
+
+static inline bool stitch_trace(void)
+{
+   if (g_stitch_trace < 0) {
+      const char *e = getenv("NVC_STITCH_DEBUG");
+      g_stitch_trace = (e != NULL && atoi(e) >= 2);
+   }
+   return g_stitch_trace;
+}
 
 static const uint8_t stitch_l3d_from_std[9] = {7, 6, 2, 3, 4, 5, 0, 1, 6};
 static const uint8_t stitch_std_from_l3d[8] = {6, 7, 2, 3, 4, 5, 1, 0};
 
-static stitch_ctr_t stitch_classify(const stitch_ep_t *ep, const void *raw)
+static stitch_ctr_t stitch_classify(const stitch_ep_t *ep)
 {
    stitch_ctr_t c = { 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
    uint32_t l3d = 8;
@@ -19291,17 +19307,53 @@ static stitch_ctr_t stitch_classify(const stitch_ep_t *ep, const void *raw)
    switch (ep->dtype) {
    case STITCH_L3DS:
       {
-         const uint8_t *b = raw;
-         c.val = b[0]; c.str = b[1]; c.flags = b[2];
+         // Record fields lower at their own widths: VALUE/STRENGTH are
+         // 4-byte naturals, FLAGS a 1-byte enum.  Values are 0..255 so
+         // the low byte suffices; read per-field width (little endian).
+#define STITCH_FLD(ep, f) \
+         ((ep)->drv[f]->shared.size == 1 \
+          ? (ep)->drv[f]->shared.data[(ep)->drv[f]->nexus.offset] \
+          : (uint8_t)*(const uint32_t *)((ep)->drv[f]->shared.data \
+                                         + (ep)->drv[f]->nexus.offset))
+         c.val   = STITCH_FLD(ep, 0);
+         c.str   = STITCH_FLD(ep, 1);
+         c.flags = STITCH_FLD(ep, 2);
+#undef STITCH_FLD
          return c;
       }
    case STITCH_L3D:
-      l3d = *(const uint32_t *)raw & 7;
+      {
+         const void *raw;
+         if (ep->is_member) {
+            // Contribution = the member's own drivers only; the merged
+            // effective includes our plug and must not re-enter
+            if (ep->real_src == NULL)
+               return c;   // no real driver: permanent Z
+            raw = ep->drv[0]->nexus.vtable->read_source(&(ep->drv[0]->nexus),
+                                                        ep->real_src);
+            if (raw == NULL)
+               return c;
+         }
+         else
+            raw = ep->drv[0]->shared.data + ep->drv[0]->nexus.offset;
+         l3d = *(const uint32_t *)raw & 7;
+      }
       break;
    case STITCH_STD:
       {
-         const uint8_t sl = *(const uint8_t *)raw;
-         l3d = stitch_l3d_from_std[sl < 9 ? sl : 1];
+         const void *raw;
+         if (ep->is_member) {
+            if (ep->real_src == NULL)
+               return c;
+            raw = ep->drv[0]->nexus.vtable->read_source(&(ep->drv[0]->nexus),
+                                                        ep->real_src);
+            if (raw == NULL)
+               return c;
+         }
+         else
+            raw = ep->drv[0]->shared.data + ep->drv[0]->nexus.offset;
+         l3d = stitch_l3d_from_std[*(const uint8_t *)raw < 9
+                                   ? *(const uint8_t *)raw : 1];
       }
       break;
    }
@@ -19447,11 +19499,45 @@ static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
    size_t sz;
    for (int i = 0; i < net->nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
-      if (ep->other == NULL)
+      if (ep->other[0] == NULL)
          continue;
       stitch_ctr_t v = stitch_resolve(net, &(ep->last));
       stitch_encode(ep->otype, &v, buf, &sz);
-      stitch_put(m, ep->other, buf, sz);
+      if (stitch_trace())
+         fprintf(stderr, "#ST vw net=%p ep=%d m=%d view=(%u,%u,%u)\n",
+                 (void *)net, i, ep->is_member, v.val, v.str, v.flags);
+      if (ep->is_member) {
+         // Rest-of-net view enters through the solver-owned
+         // SOURCE_IMPLICIT plug: the member's own resolution combines
+         // it with its real drivers, so nothing fights and readers see
+         // the merged net value
+         if (memcmp(ep->plug->shared.data, buf, sz) != 0) {
+            memcpy(ep->plug->shared.data, buf, sz);
+            ep->plug->nexus.last_event = m->now;   // mark deposited
+            rt_nexus_t *n = &(ep->drv[0]->nexus);
+            n->vtable->update_driving(m, n);
+            // Effective-class members (inout port fanout) publish
+            // through the effective plane
+            if (n->flags & NET_F_EFFECTIVE)
+               update_effective(m, n);
+            if (stitch_trace())
+               fprintf(stderr, "#ST plug net=%p ep=%d wrote %u eff now %u "
+                       "nsrc %u vt%d res%d fl%02x\n", (void *)net, i,
+                       buf[0], ep->drv[0]->shared.data[n->offset],
+                       n->n_sources, n->vtable == &nexus_default_vtable,
+                       ep->drv[0]->resolution != NULL, n->flags);
+
+         }
+         continue;
+      }
+      if (ep->otype == STITCH_L3DS && ep->other[1] != NULL) {
+         for (int f = 0; f < 3; f++) {
+            uint8_t fb[4] = { buf[f], 0, 0, 0 };   // LE widen 0..255
+            stitch_put(m, ep->other[f], fb, ep->other[f]->shared.size);
+         }
+      }
+      else
+         stitch_put(m, ep->other[0], buf, sz);
    }
 }
 
@@ -19464,12 +19550,19 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
    rt_model_t *m = get_model();
    rt_stitch_net_t *net = user;
 
+   if (stitch_trace())
+      fprintf(stderr, "#ST cb net=%p sig=%s\n", (void *)net,
+              s->where ? istr(tree_ident(s->where)) : "?");
+
    for (int i = 0; i < net->nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
-      if (ep->drv != s)
+      if (ep->drv[0] != s && ep->drv[1] != s && ep->drv[2] != s)
          continue;
-      stitch_ctr_t c = stitch_classify(ep, ep->drv->shared.data
-                                       + ep->drv->nexus.offset);
+      stitch_ctr_t c = stitch_classify(ep);
+      if (stitch_trace())
+         fprintf(stderr, "#ST ev net=%p ep=%d (%u,%u,%u)->(%u,%u,%u)\n",
+                 (void *)net, i, ep->last.val, ep->last.str, ep->last.flags,
+                 c.val, c.str, c.flags);
       stitch_count(net, &(ep->last), -1);
       stitch_count(net, &c, +1);
       ep->last = c;
@@ -19486,6 +19579,9 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
                            sig_shared_t **oth_ss,
                            const uint8_t *dtypes, const uint8_t *otypes)
 {
+   // drv_ss/oth_ss carry 3 slots per endpoint (fields for l3ds record
+   // implicits; scalar endpoints use slot 0 with slots 1-2 NULL)
+
    rt_model_t *m = get_model();
 
    static int no_stitch = -1;
@@ -19504,34 +19600,100 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
 
    for (int i = 0; i < nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
-      ep->drv = container_of(drv_ss[i], rt_signal_t, shared);
-      ep->other = oth_ss[i] == NULL
-         ? NULL : container_of(oth_ss[i], rt_signal_t, shared);
+      for (int f = 0; f < 3; f++) {
+         ep->drv[f] = drv_ss[i*3 + f] == NULL
+            ? NULL : container_of(drv_ss[i*3 + f], rt_signal_t, shared);
+         ep->other[f] = oth_ss[i*3 + f] == NULL
+            ? NULL : container_of(oth_ss[i*3 + f], rt_signal_t, shared);
+      }
       ep->dtype = (stitch_type_t)dtypes[i];
       ep->otype = (stitch_type_t)otypes[i];
+      ep->is_member = (ep->other[0] == ep->drv[0]);
 
-      // v1: scalar endpoints only
-      const size_t want = (ep->dtype == STITCH_STD) ? 1 : 4;
-      if (ep->drv->n_nexus != 1 || ep->drv->shared.size != want) {
-         if (stitch_dbg)
-            fprintf(stderr, "#STITCH decline: endpoint %d shape\n", i);
-         free(net);
-         return false;
+      const int nfld = (ep->dtype == STITCH_L3DS && ep->drv[1] != NULL)
+         ? 3 : 1;
+      for (int f = 0; f < nfld; f++) {
+         if (ep->drv[f] == NULL || ep->drv[f]->n_nexus != 1) {
+            if (stitch_dbg)
+               fprintf(stderr, "#STITCH decline: endpoint %d shape\n", i);
+            free(net);
+            return false;
+         }
+      }
+
+      if (ep->is_member) {
+         rt_nexus_t *mn = &(ep->drv[0]->nexus);
+
+         // The member's contribution folds its DRIVER sources only:
+         // inout tran-port edges are value-inert (the switch entities
+         // never assign their ports) and our own implicit is the view.
+         // v1: at most one real driver.
+         ep->real_src = NULL;
+         if (mn->n_sources > 0) {
+            int ndrv = 0;
+            for (rt_source_t *src = &(mn->sources); src != NULL;
+                 src = src->chain_input) {
+               if (src->tag == SOURCE_DRIVER) {
+                  ep->real_src = src;
+                  ndrv++;
+               }
+            }
+            if (ndrv > 1) {
+               if (stitch_dbg)
+                  fprintf(stderr, "#STITCH decline: member %d has %d "
+                          "drivers\n", i, ndrv);
+               free(net);
+               return false;
+            }
+         }
+
+         // Solver-owned plug signal backing the SOURCE_IMPLICIT input
+         const size_t psz = ep->drv[0]->shared.size;
+         rt_signal_t *plug = xcalloc(sizeof(rt_signal_t) + MAX(psz, 8));
+         plug->n_nexus = 1;
+         plug->shared.size = psz;
+         plug->nexus.vtable = &nexus_default_vtable;
+         plug->nexus.signal = plug;
+         plug->nexus.width  = 1;
+         plug->nexus.size   = psz;
+         plug->nexus.last_event = TIME_HIGH;
+         // Initial plug value = Z view so seeding is neutral
+         {
+            stitch_ctr_t z = { 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
+            uint8_t zb[8]; size_t zsz;
+            stitch_encode(ep->otype, &z, zb, &zsz);
+            memcpy(plug->shared.data, zb, zsz);
+         }
+         ep->plug = plug;
+
+         rt_source_t *src = add_source(m, mn, SOURCE_IMPLICIT);
+         src->u.port.input = &(plug->nexus);
       }
    }
 
    // Seed counts from current (post-initial) values
    for (int i = 0; i < nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
-      ep->last = stitch_classify(ep, ep->drv->shared.data
-                                 + ep->drv->nexus.offset);
+      ep->last = stitch_classify(ep);
+      if (stitch_trace())
+         fprintf(stderr, "#ST seed net=%p ep=%d m=%d (%u,%u,%u)\n",
+                 (void *)net, i, ep->is_member,
+                 ep->last.val, ep->last.str, ep->last.flags);
       stitch_count(net, &(ep->last), +1);
    }
 
-   // Subscribe to every contributor
-   net->watch = watch_new(m, stitch_event_cb, net, WATCH_EVENT, nep);
-   for (int i = 0; i < nep; i++)
-      model_set_event_cb(m, net->ep[i].drv, net->watch);
+   // One single-slot watch per contributor field: async_watch_callback
+   // always reports signals[0], so a shared multi-slot watch would
+   // coalesce same-delta events and misreport the firing signal
+   for (int i = 0; i < nep; i++) {
+      for (int f = 0; f < 3; f++) {
+         if (net->ep[i].drv[f] == NULL)
+            continue;
+         rt_watch_t *w = watch_new(m, stitch_event_cb, net,
+                                   WATCH_EVENT, 1);
+         model_set_event_cb(m, net->ep[i].drv[f], w);
+      }
+   }
 
    // Publish initial views
    stitch_update_views(m, net);
@@ -19539,8 +19701,20 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
    net->chain = g_stitch_nets;
    g_stitch_nets = net;
 
-   if (stitch_dbg)
+   if (stitch_dbg) {
       fprintf(stderr, "#STITCH net registered: %d endpoints\n", nep);
+      for (int i = 0; i < nep; i++)
+         for (int f = 0; f < 3; f++)
+            if (net->ep[i].drv[f] != NULL)
+               fprintf(stderr, "#STITCH  ep%d f%d size %u type %d m %d "
+                       "sig %s.%s\n", i, f,
+                       net->ep[i].drv[f]->shared.size, net->ep[i].dtype,
+                       net->ep[i].is_member,
+                       net->ep[i].drv[f]->parent
+                       ? istr(net->ep[i].drv[f]->parent->name) : "?",
+                       net->ep[i].drv[f]->where
+                       ? istr(tree_ident(net->ep[i].drv[f]->where)) : "?");
+   }
 
    return true;
 }
