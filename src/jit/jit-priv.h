@@ -555,6 +555,11 @@ void pack_writer_string_table(pack_writer_t *pw, const char **tab,
                               size_t *size);
 void pack_writer_free(pack_writer_t *pw);
 
+// Codegen target identity string ("native:<cpu>:<features>" or
+// "generic") — part of the persistent-cache key so host-specific
+// objects never load on a different micro-architecture
+const char *jit_llvm_target_identity(void);
+
 void jit_bind_foreign(jit_func_t *f, const uint8_t *spec, size_t length,
                       tree_t where);
 void jit_do_syscall(vlog_node_t where, jit_anchor_t *caller, jit_scalar_t *args,

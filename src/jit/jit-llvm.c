@@ -499,12 +499,16 @@ static void llvm_optimise(LLVMModuleRef module, LLVMTargetMachineRef target,
    assert(olevel >= LLVM_O0 && olevel <= LLVM_O3);
 
 #if LLVM_HAS_PASS_BUILDER
+   // The vectorizers/unroller stay off at the cheap tiers (compile
+   // latency); the O3 tier is quality-first — the persistent cache
+   // amortizes its cost — so they run there (SLP picks up l3d lanes)
+   const bool aggressive = olevel >= LLVM_O3;
    LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
    LLVMPassBuilderOptionsSetDebugLogging(options, false);
-   LLVMPassBuilderOptionsSetLoopVectorization(options, false);
-   LLVMPassBuilderOptionsSetLoopInterleaving(options, false);
-   LLVMPassBuilderOptionsSetSLPVectorization(options, false);
-   LLVMPassBuilderOptionsSetLoopUnrolling(options, false);
+   LLVMPassBuilderOptionsSetLoopVectorization(options, aggressive);
+   LLVMPassBuilderOptionsSetLoopInterleaving(options, aggressive);
+   LLVMPassBuilderOptionsSetSLPVectorization(options, aggressive);
+   LLVMPassBuilderOptionsSetLoopUnrolling(options, aggressive);
    LLVMPassBuilderOptionsSetCallGraphProfile(options, false);
 
    const char *passes[] = {
@@ -542,6 +546,35 @@ static void llvm_optimise(LLVMModuleRef module, LLVMTargetMachineRef target,
 #endif
 }
 
+// Generate for the actual host micro-architecture (AVX2 etc.) rather
+// than the generic baseline; the persistent cache key includes this
+// identity so cached objects never migrate to a different CPU.
+// NVC_JIT_NO_NATIVE=1 restores the portable baseline.
+static bool llvm_use_native_cpu(void)
+{
+   static int use = -1;
+   if (use < 0)
+      use = getenv("NVC_JIT_NO_NATIVE") == NULL;
+   return use;
+}
+
+const char *jit_llvm_target_identity(void)
+{
+   static char *ident = NULL;
+   if (ident == NULL) {
+      if (llvm_use_native_cpu()) {
+         char *cpu = LLVMGetHostCPUName();
+         char *features = LLVMGetHostCPUFeatures();
+         ident = xasprintf("native:%s:%s", cpu, features);
+         LLVMDisposeMessage(cpu);
+         LLVMDisposeMessage(features);
+      }
+      else
+         ident = xstrdup("generic");
+   }
+   return ident;
+}
+
 static LLVMTargetMachineRef llvm_target_machine(LLVMRelocMode reloc,
                                                 LLVMCodeModel model)
 {
@@ -551,10 +584,23 @@ static LLVMTargetMachineRef llvm_target_machine(LLVMRelocMode reloc,
    if (LLVMGetTargetFromTriple(def_triple, &target_ref, &error))
       fatal("failed to get LLVM target for %s: %s", def_triple, error);
 
+   char *host_cpu = NULL, *host_features = NULL;
+   const char *cpu = "", *features = "";
+   if (llvm_use_native_cpu()) {
+      host_cpu = LLVMGetHostCPUName();
+      host_features = LLVMGetHostCPUFeatures();
+      cpu = host_cpu;
+      features = host_features;
+   }
+
    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target_ref, def_triple,
-                                                     "", "",
-                                                     LLVMCodeGenLevelDefault,
+                                                     cpu, features,
+                                                     LLVMCodeGenLevelAggressive,
                                                      reloc, model);
+   if (host_cpu != NULL)
+      LLVMDisposeMessage(host_cpu);
+   if (host_features != NULL)
+      LLVMDisposeMessage(host_features);
    LLVMDisposeMessage(def_triple);
 
    return tm;
@@ -3892,7 +3938,19 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
 
    llvm_dump_module(obj.module, "initial");
    llvm_verify_module(obj.module);
-   llvm_optimise(obj.module, obj.target, obj.opt_hint > 0 ? LLVM_O1 : LLVM_O0);
+   // Hot tier default is O1: the marginal-cost A/B on VeeR CoreMark
+   // (t(200us)-t(100us), compile excluded) measured O3 code 4-12%
+   // SLOWER — aggressive unroll/vectorize bloats the big merged
+   // process functions, which are branchy and loop-free.  The host-CPU
+   // target machine is kept (orthogonal, cache-keyed).
+   // NVC_JIT_HOT_OLEVEL=1..3 overrides for re-measurement.
+   static int hot_olevel = -1;
+   if (hot_olevel < 0) {
+      const char *env = getenv("NVC_JIT_HOT_OLEVEL");
+      hot_olevel = env != NULL ? MAX(1, MIN(atoi(env), 3)) : 1;
+   }
+   llvm_optimise(obj.module, obj.target,
+                 obj.opt_hint > 0 ? (llvm_opt_level_t)hot_olevel : LLVM_O0);
    llvm_dump_module(obj.module, "final");
 
    if (jit_is_shutdown(f->jit))
@@ -3922,7 +3980,7 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
       // under an equal manifest) and/or store; returns the symbol table
       // for resolving this object's nvc.* references at load
       symtab = jit_cache_finish(jc, f, obj.inlined, obj.ninlined,
-                                obj.opt_hint > 0 ? 1 : 0, helper_mask,
+                                obj.opt_hint > 0 ? 3 : 0, helper_mask,
                                 LLVMGetBufferStart(buf), objsz,
                                 !obj.inline_raced, pending);
    }

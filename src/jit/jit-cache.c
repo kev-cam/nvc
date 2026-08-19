@@ -353,6 +353,11 @@ static bool hash_build_identity(sha256_t *c)
       return true;
    }
 
+   // Host-specific codegen (-mcpu=native class): a cache shared
+   // between machines must key on the target identity or foreign
+   // objects would fault with illegal instructions
+   hash_str(c, jit_llvm_target_identity());
+
    buildid_scan_t scan = { .hash = c, .found_exe = false };
    dl_iterate_phdr(build_id_iter_cb, &scan);
 
