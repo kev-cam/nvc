@@ -13106,7 +13106,13 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
             if (input->n_sources > 0) {
                for (rt_source_t *s = &(input->sources); s;
                     s = s->chain_input) {
-                  if (s->tag == SOURCE_DRIVER) {
+                  // SOURCE_IMPLICIT counts as a driver — the solver
+                  // plug always contributes.  MUST match the twin walk
+                  // in calculate_driving_value: if the walks disagree,
+                  // nonnull over-counts and the resolution reads an
+                  // uninitialized vals slot (pr2834340 garbage index)
+                  if (s->tag == SOURCE_DRIVER
+                      || s->tag == SOURCE_IMPLICIT) {
                      has_driver = true;
                      break;
                   }
@@ -13127,6 +13133,12 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
             return NULL;
       }
       if (likely(src->u.port.conv_func == NULL)) {
+         // STD_MX tolerated cross-width map (1-byte std formal on a
+         // 4-byte l3d net): a raw read reinterprets adjacent bytes as
+         // part of the value — never a real contribution
+         if (unlikely(standard() == STD_MX
+                      && src->u.port.input->size != nexus->size))
+            return NULL;
          if (src->u.port.input->flags & NET_F_EFFECTIVE)
             return nexus_driving(src->u.port.input);
          else
@@ -13293,7 +13305,7 @@ static void call_resolution(rt_model_t *m, rt_nexus_t *n, res_memo_t *r,
             type *p = (type *)resolved;                                 \
             jit_scalar_t result;                                        \
             if (!jit_try_call(m->jit, r->closure.handle, &result,       \
-                              r->closure.context, vals, nonnull))       \
+                              r->closure.context, vals, o))             \
                m->force_stop = true;                                    \
             p[j] = result.integer;                                      \
          } while (0)
@@ -13387,6 +13399,8 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
       else if (unlikely(standard() == STD_MX
                         && s->tag == SOURCE_PORT
                         && s->u.port.conv_func == NULL)) {
+         if (s->u.port.input->size != n->size)
+            continue;   // cross-width raw edge — garbage if read
          // Mixed mode: skip port with no real driver.
          // Walk SOURCE_PORT chain transitively: a nested port-binding
          // (inner OUT → outer OUT → tb signal) has no SOURCE_DRIVER on
@@ -19358,15 +19372,18 @@ static stitch_ctr_t stitch_classify_raw(stitch_type_t dtype, const void *raw)
       break;
    }
 
-   // to_logic3ds(l3d, ST_SUPPLY) — net contributions enter at supply
-   // strength, matching the generated resolvers' historical choice
+   // A plain Verilog driver is STRONG by definition; the l3d weak
+   // alphabet (H/L/W) enters at WEAK.  Only an explicit strength spec
+   // (l3ds 'driver endpoints) can contribute SUPPLY or PULL — a plain
+   // driver classified at supply would wrongly tie an opposing
+   // supply-spec assign into X (drive_strength su1st0)
    switch (l3d) {
-   case 2: c = (stitch_ctr_t){ 0,   STITCH_ST_SUPPLY, STITCH_FL_KNOWN }; break;
-   case 3: c = (stitch_ctr_t){ 255, STITCH_ST_SUPPLY, STITCH_FL_KNOWN }; break;
+   case 2: c = (stitch_ctr_t){ 0,   STITCH_ST_STRONG, STITCH_FL_KNOWN }; break;
+   case 3: c = (stitch_ctr_t){ 255, STITCH_ST_STRONG, STITCH_FL_KNOWN }; break;
    case 0: c = (stitch_ctr_t){ 0,   STITCH_ST_WEAK,   STITCH_FL_KNOWN }; break;
    case 1: c = (stitch_ctr_t){ 255, STITCH_ST_WEAK,   STITCH_FL_KNOWN }; break;
    case 4: c = (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN }; break;
-   case 6: c = (stitch_ctr_t){ 0, STITCH_ST_SUPPLY, STITCH_FL_UNKNOWN }; break;
+   case 6: c = (stitch_ctr_t){ 0, STITCH_ST_STRONG, STITCH_FL_UNKNOWN }; break;
    case 5: c = (stitch_ctr_t){ 0, STITCH_ST_WEAK,   STITCH_FL_UNKNOWN }; break;
    default: c = (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNKNOWN }; break;
    }
@@ -19549,7 +19566,14 @@ static void stitch_encode(stitch_type_t t, const stitch_ctr_t *c,
    case STITCH_FL_UNDRIVEN: case STITCH_FL_UDR_NOPOWER:
       l3d = 4; break;                            // Z
    case STITCH_FL_UNKNOWN: case STITCH_FL_UNK_NOPOWER:
-      l3d = (c->str >= STITCH_ST_STRONG) ? 6 : 5; break;   // X : W
+      // Strong conflicts export X.  Below-strong conflicts export Z:
+      // W (code 5) carries value-plane 1, which breaks the doctrine's
+      // value-plane compares against a 1'bx literal (L3D_X, value 0),
+      // while X would wrongly tie a native STRONG driver into X (the
+      // keeper's uncertain phases must lose to the bufif).  Z keeps
+      // the uncertain bit ($isunknown sees it), reads as value 0, and
+      // is identity in native resolution — every present constraint
+      l3d = (c->str >= STITCH_ST_STRONG) ? 6 : 4; break;
    case STITCH_FL_NOPOWER:
       l3d = 6; break;                            // X
    default:
@@ -19747,13 +19771,14 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
          plug->nexus.width  = 1;
          plug->nexus.size   = psz;
          plug->nexus.last_event = TIME_HIGH;
-         // Initial plug value = Z view so seeding is neutral
-         {
-            stitch_ctr_t z = { 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };
-            uint8_t zb[8]; size_t zsz;
-            stitch_encode(ep->otype, &z, zb, &zsz);
-            memcpy(plug->shared.data, zb, zsz);
-         }
+         // Initial plug bytes = 0xFF sentinel, which no encoding
+         // produces: the first stitch_update_views publication then
+         // ALWAYS writes and refreshes the member, even when the
+         // first view is Z — otherwise an all-Z net (opposing
+         // highz-spec assigns) never overwrites the member's
+         // initial X (drive_strength hz1hz0).  Registration writes
+         // the real view before any delta can read the plug.
+         memset(plug->shared.data, 0xFF, psz);
          ep->plug = plug;
 
          rt_source_t *src = add_source(m, mn, SOURCE_IMPLICIT);

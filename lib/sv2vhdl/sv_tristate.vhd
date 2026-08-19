@@ -181,7 +181,7 @@ entity sv_strength_buf is
         str0 : natural := 8    -- strength when driving 0
     );
     port (
-        y    : inout std_logic;
+        y    : inout logic3d;
         data : in    logic3d
     );
 end entity sv_strength_buf;

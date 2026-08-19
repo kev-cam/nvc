@@ -214,6 +214,10 @@ package logic3d_types_pkg is
     function l3d_nor(a, b : logic3d) return logic3d;
     function l3d_xnor(a, b : logic3d) return logic3d;
     function l3d_buf(a : logic3d) return logic3d;
+    -- Re-strengthen: a plain assign drives its OWN (strong) strength;
+    -- weak alphabet codes normalize to driven ones, Z stays Z
+    --                  L  H  0  1  Z  W  X  U
+    function l3d_strengthen(a : logic3d) return logic3d;
     function l3d_weaken(a : logic3d) return logic3d;
     function l3d_set_uncertain(a : logic3d) return logic3d;
 
@@ -553,6 +557,12 @@ package body logic3d_types_pkg is
     function l3d_buf(a : logic3d) return logic3d is
     begin
         return a;
+    end function;
+
+    function l3d_strengthen(a : logic3d) return logic3d is
+        constant STRENGTHEN_LUT : lut1_t := (2, 3, 2, 3, 4, 6, 6, 7);
+    begin
+        return STRENGTHEN_LUT(a);
     end function;
 
     function l3d_weaken(a : logic3d) return logic3d is
