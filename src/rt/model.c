@@ -4471,18 +4471,31 @@ static bool aj_blacklisted(rt_model_t *m, rt_nexus_t *n)
 // so they are not admitted at all.
 static bool fastclk_wide_enabled(void);
 
+// NVC_FASTCLK_CENSUS: admission exclusion tally (indexes: 0 admitted,
+// 1 delayed, 2 mid-queue pending, 3 dynamic wait_state==2,
+// 4 wait_state==0 no-trigger limbo, 5 no-trigger non-wide decline)
+static unsigned aj_flag_census[6];
+
 static void aj_flag_cb(rt_wakeable_t *w, void *ctx)
 {
-   if (!w->delayed && !w->pending    // mid-queue procs are not admitted
-       && (w->wait_state == 1
-           || (w->trigger != NULL && w->wait_state != 2))) {
+   if (w->delayed)
+      { aj_flag_census[1]++; return; }
+   if (w->pending)                   // mid-queue procs are not admitted
+      { aj_flag_census[2]++; return; }
+   if (w->wait_state == 2 && w->trigger != NULL)
+      { aj_flag_census[3]++; return; }
+   if (w->wait_state == 1
+       || (w->trigger != NULL && w->wait_state != 2)) {
       if (w->trigger == NULL) {
          if (!fastclk_wide_enabled())
-            return;
+            { aj_flag_census[5]++; return; }
          w->fastclk_ee = 1;
       }
+      aj_flag_census[0]++;
       w->fastclk = 1;
    }
+   else
+      aj_flag_census[4]++;
 }
 
 static void aj_unflag_cb(rt_wakeable_t *w, void *ctx)
@@ -4856,6 +4869,13 @@ static void aj_build_fastclk(rt_model_t *m, rt_signal_t *clksig, uint8_t *clkdat
 
    // Pass 0: provisionally flag every clk-pending proc.
    aj_pending_foreach(clkn->pending, aj_flag_cb, NULL);
+   if (getenv("NVC_FASTCLK_CENSUS") != NULL) {
+      notef("fastclk admission: admitted=%u delayed=%u midq=%u dynwait=%u "
+            "limbo=%u nonwide=%u", aj_flag_census[0], aj_flag_census[1],
+            aj_flag_census[2], aj_flag_census[3], aj_flag_census[4],
+            aj_flag_census[5]);
+      memset(aj_flag_census, 0, sizeof(aj_flag_census));
+   }
 
    const bool strict = getenv("NVC_FAST_CLK_STRICT") != NULL;
    const bool wide   = fastclk_wide_enabled();
@@ -17153,6 +17173,22 @@ static void model_cycle(rt_model_t *m)
          // known fanout-1 data-signal misfire class (wait5).  The full
          // regression gate is the empirical judge of this value.
          min_fanout = (e != NULL) ? MAX(atoi(e), 1) : 4;
+      }
+      // NVC_FASTCLK_FANOUT: one-shot histogram of single-bit nexus
+      // pending-list sizes — sizes multi-table coverage (which gated
+      // clocks carry how many waiters)
+      if (getenv("NVC_FASTCLK_FANOUT") != NULL) {
+         static bool dumped = false;
+         if (!dumped) {
+            dumped = true;
+            for (rt_nexus_t *n = m->nexuses; n != NULL; n = n->chain) {
+               if (n->width != 1 || n->signal->n_nexus != 1) continue;
+               const unsigned c = aj_pending_count(n->pending);
+               if (c >= 4)
+                  notef("fanout: %s pending=%u",
+                        istr(tree_ident(n->signal->where)), c);
+            }
+         }
       }
       for (int k = 0; k < 4 && !m->fastclk_on; k++) {
          rt_nexus_t *best = NULL;
