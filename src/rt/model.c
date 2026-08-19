@@ -17281,6 +17281,21 @@ static void model_cycle(rt_model_t *m)
             if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
                notef("accel-jit: fast-clk probation done — kept %u evicted %u",
                      kept, evicted);
+            if (getenv("NVC_FASTCLK_CENSUS") != NULL) {
+               // C1 bound: probation survivors are posedge-only-PROVEN,
+               // so trigger-armed survivors are exactly the class an
+               // extended fused-block eligibility would newly admit
+               unsigned trig = 0, notrig = 0, ee = 0;
+               for (unsigned i = 0; i < m->fastclk_count; i++) {
+                  rt_wakeable_t *w = &(m->fastclk_table[i]->wakeable);
+                  if (w->trigger != NULL) trig++;
+                  else notrig++;
+                  if (w->fastclk_ee) ee++;
+               }
+               notef("fastclk census: kept=%u trigger-armed=%u (C1 class) "
+                     "no-trigger=%u ee-tail=%u evicted=%u",
+                     m->fastclk_count, trig, notrig, ee, evicted);
+            }
             if (kept == 0) {
                if (m->fastclk_ncomp > 0) {
                   // P6: a table that HAD companions may have been built
