@@ -198,7 +198,11 @@ begin
             smax := str0;
         end if;
 
-        if is_uncertain(data) then
+        if data = L3D_Z then
+            -- A released r-value contributes nothing: the assign's
+            -- own strength applies to driven values only
+            v := L3DS_Z;
+        elsif is_uncertain(data) then
             v := (value => 0, strength => smax,
                   flags => FL_UNKNOWN, reserved => 0);
         elsif is_one(data) then

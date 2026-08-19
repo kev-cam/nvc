@@ -19288,6 +19288,7 @@ typedef struct {
 
 #define STITCH_ST_HIGHZ  0
 #define STITCH_ST_WEAK   2
+#define STITCH_ST_STRONG 8
 #define STITCH_ST_SUPPLY 16
 
 typedef struct {
@@ -19548,11 +19549,15 @@ static void stitch_encode(stitch_type_t t, const stitch_ctr_t *c,
    case STITCH_FL_UNDRIVEN: case STITCH_FL_UDR_NOPOWER:
       l3d = 4; break;                            // Z
    case STITCH_FL_UNKNOWN: case STITCH_FL_UNK_NOPOWER:
-      l3d = (c->str > STITCH_ST_WEAK) ? 6 : 5; break;   // X : W
+      l3d = (c->str >= STITCH_ST_STRONG) ? 6 : 5; break;   // X : W
    case STITCH_FL_NOPOWER:
       l3d = 6; break;                            // X
    default:
-      if (c->str > STITCH_ST_WEAK)
+      // The l3d alphabet has two levels: everything below STRONG
+      // (weak, pull) projects onto the weak codes so a native strong
+      // driver still wins the exported view — matching the kernel's
+      // own exact-ladder resolution
+      if (c->str >= STITCH_ST_STRONG)
          l3d = (c->val >= 127) ? 3 : 2;          // '1' : '0'
       else
          l3d = (c->val >= 127) ? 1 : 0;          // 'H' : 'L'
