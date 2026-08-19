@@ -5753,8 +5753,31 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
       n++;
    }
 
+   int32_t member_elem = -1;
    if (net_path != NULL) {
-      vhpiHandleT nh = vhpi_handle_by_name((const char *)net_path, NULL);
+      // A trailing "(N)" indexes one element of a vector net signal
+      // (per-bit strength nets key by the indexed port-map actual).
+      // Strip it for name resolution; the element offset passes to
+      // registration.
+      char nbase[512];
+      const char *np = (const char *)net_path;
+      const size_t nl = strlen(np);
+      int32_t vidx = -1;
+      if (nl >= 4 && nl < sizeof(nbase) && np[nl - 1] == ')') {
+         const char *lp = strrchr(np, '(');
+         if (lp != NULL && lp > np) {
+            char *end = NULL;
+            const long v = strtol(lp + 1, &end, 10);
+            if (end != NULL && *end == ')' && *(end + 1) == '\0' && v >= 0) {
+               const size_t bl = lp - np;
+               memcpy(nbase, np, bl);
+               nbase[bl] = '\0';
+               vidx = (int32_t)v;
+            }
+         }
+      }
+
+      vhpiHandleT nh = vhpi_handle_by_name(vidx >= 0 ? nbase : np, NULL);
       if (nh == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 8); return 0; }
       c_vhpiObject *obj = from_handle(nh);
       if (obj == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 9); return 0; }
@@ -5762,6 +5785,15 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
       if (decl == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 10); return 0; }
       rt_signal_t *sig = vhpi_get_signal_objDecl(decl);
       if (sig == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 11); return 0; }
+
+      if (vidx >= 0) {
+         // Translator vectors are (msb downto 0), stored left-to-right:
+         // canonical element offset = width-1 - index
+         const uint32_t sw = signal_width(sig);
+         if ((uint32_t)vidx >= sw)
+            { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 13); return 0; }
+         member_elem = (int32_t)sw - 1 - vidx;
+      }
 
       const char *tname = type_pp(tree_type(decl->decl.tree));
       uint8_t t = 0;
@@ -5783,7 +5815,7 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
 
    return x_stitch_net_register(n, drv_ss, oth_ss, dtypes, otypes,
                                 echo_ss,
-                                (const char *)net_path) ? 1 : 0;
+                                (const char *)net_path, member_elem) ? 1 : 0;
 }
 
 void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)

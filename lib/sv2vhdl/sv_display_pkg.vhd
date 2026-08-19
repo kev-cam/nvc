@@ -32,6 +32,16 @@ package sv_display_pkg is
     -- Strip leading '0' characters (Verilog %0b/%0h/%0o minimum-width), keeping
     -- at least one character.
     function sv_strip0(s : string) return string;
+    -- Verilog %c: the low 8 bits as one ASCII character
+    function sv_cstr(v : std_logic_vector) return string;
+    -- $write line buffering: partial text accumulates until a newline
+    -- (vvp semantics — consecutive $write calls build one output line).
+    -- sv_write_buf appends and flushes embedded newlines; sv_display_line
+    -- flushes pending text & s as a complete line; sv_write_flush emits
+    -- any residue (called by $finish).
+    procedure sv_write_buf(s : string);
+    procedure sv_display_line(s : string);
+    procedure sv_write_flush;
     -- $timeformat(units, precision, suffix, min_width): set the global %t format.
     procedure sv_set_timeformat(u : integer; pr : integer; suf : string;
                                 w : integer);
@@ -373,6 +383,76 @@ package body sv_display_pkg is
         end if;
     end function;
 
+    function sv_cstr(v : std_logic_vector) return string is
+        alias av : std_logic_vector(v'length - 1 downto 0) is v;
+        variable ci : natural := 0;
+    begin
+        for b in 0 to 7 loop
+            if b <= av'high and av(b) = '1' then
+                ci := ci + 2 ** b;
+            end if;
+        end loop;
+        return "" & character'val(ci);
+    end function;
+
+    type t_wbuf is protected
+        procedure append(s : string);
+        procedure flush_line;
+        procedure flush_partial;
+    end protected;
+
+    type t_wbuf is protected body
+        variable buf : string(1 to 8192);
+        variable len : natural := 0;
+
+        procedure append(s : string) is
+        begin
+            for k in s'range loop
+                if s(k) = LF then
+                    report buf(1 to len);
+                    len := 0;
+                elsif len < buf'length then
+                    len := len + 1;
+                    buf(len) := s(k);
+                end if;
+            end loop;
+        end procedure;
+
+        procedure flush_line is
+        begin
+            report buf(1 to len);
+            len := 0;
+        end procedure;
+
+        procedure flush_partial is
+        begin
+            if len > 0 then
+                report buf(1 to len);
+                len := 0;
+            end if;
+        end procedure;
+    end protected body;
+
+    shared variable g_wbuf : t_wbuf;
+
+    procedure sv_write_buf(s : string) is
+    begin
+        g_wbuf.append(s);
+    end procedure;
+
+    procedure sv_display_line(s : string) is
+    begin
+        -- $display: pending partial text & s form one line; embedded
+        -- newlines split exactly as vvp splits them
+        g_wbuf.append(s);
+        g_wbuf.flush_line;
+    end procedure;
+
+    procedure sv_write_flush is
+    begin
+        g_wbuf.flush_partial;
+    end procedure;
+
 end package body;
 
 ---------------------------------------------------------------------------
@@ -385,6 +465,13 @@ use work.logic3d_types_pkg.all;
 
 package sv_strength_pkg is
     impure function sv_vstr(v : logic3d; path : string) return string;
+    -- Vector %v: per-bit strength tokens, MSB first, joined with '_'
+    -- (each bit is its own kernel net, keyed "path(i)")
+    impure function sv_vstr(v : logic3d_vector; path : string) return string;
+    -- $swrite support: pack a formatted string into a logic3d_vector
+    -- as 8-bit ASCII, right-justified, zero-filled (the Verilog
+    -- string-in-reg convention)
+    function sv_str2vec(s : string; w : natural) return logic3d_vector;
 end package sv_strength_pkg;
 
 package body sv_strength_pkg is
@@ -440,6 +527,41 @@ package body sv_strength_pkg is
             when L3D_W => return "WeX";
             when others => return "StX";
         end case;
+    end function;
+
+    impure function sv_vstr(v : logic3d_vector; path : string) return string is
+        variable r   : string(1 to 4 * v'length - 1);
+        variable pos : positive := 1;
+    begin
+        -- Translator vectors are (msb downto 0): 'range iterates MSB
+        -- first, matching Verilog %v bit order.  Every scalar token is
+        -- exactly 3 characters.
+        for i in v'range loop
+            r(pos to pos + 2) :=
+                sv_vstr(v(i), path & "(" & integer'image(i) & ")");
+            if i /= v'right then
+                r(pos + 3) := '_';
+                pos := pos + 4;
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    function sv_str2vec(s : string; w : natural) return logic3d_vector is
+        variable r  : logic3d_vector(w - 1 downto 0) := (others => L3D_0);
+        variable ci : natural;
+    begin
+        -- Last character occupies bits 7..0; unused high bits stay 0
+        for k in 0 to s'length - 1 loop
+            exit when k * 8 + 7 > w - 1;
+            ci := character'pos(s(s'right - k));
+            for b in 0 to 7 loop
+                if (ci / 2 ** b) mod 2 = 1 then
+                    r(k * 8 + b) := L3D_1;
+                end if;
+            end loop;
+        end loop;
+        return r;
     end function;
 
 end package body sv_strength_pkg;

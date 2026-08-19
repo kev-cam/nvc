@@ -19319,6 +19319,9 @@ typedef struct {
    stitch_type_t otype;        // 'other value encoding
    bool          is_member;    // net-signal endpoint (other == drv)
    stitch_ctr_t  last;         // last classified contribution
+   rt_nexus_t   *mnex;         // member: the resolved nexus — the whole
+                               // signal's for scalars, the element's
+                               // for one bit of a vector net
    rt_signal_t  *plug;         // member: solver-owned SOURCE_IMPLICIT input
    rt_source_t  *real_src;     // member: its own real driver source (or NULL)
    rt_signal_t  *echo;         // port signal whose edge into the member
@@ -19443,7 +19446,7 @@ static stitch_ctr_t stitch_classify(const rt_stitch_net_t *net,
    // SOURCE_DRIVERs, and their weak/strong distinction rides the l3d
    // H/L vs 1/0 alphabet.  source_value applies the STD_MX pruning so
    // inert edges contribute nothing.
-   rt_nexus_t *mn = &(ep->drv[0]->nexus);
+   rt_nexus_t *mn = ep->mnex;
    stitch_scnt_t cnt[32];
    memset(cnt, 0, sizeof(cnt));
    int pwr = 0, nc = 0;
@@ -19637,7 +19640,7 @@ static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
          if (memcmp(ep->plug->shared.data, buf, sz) != 0) {
             memcpy(ep->plug->shared.data, buf, sz);
             ep->plug->nexus.last_event = m->now;   // mark deposited
-            rt_nexus_t *n = &(ep->drv[0]->nexus);
+            rt_nexus_t *n = ep->mnex;
             // Full driving update (not the bare vtable method): the
             // wrapper also walks n->outputs so port fanout and
             // conversion-function edges see the new value — a switch
@@ -19740,7 +19743,8 @@ int32_t sv2vhdl_net_strength(const uint8_t *path, int32_t len)
 bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
                            sig_shared_t **oth_ss,
                            const uint8_t *dtypes, const uint8_t *otypes,
-                           sig_shared_t **echo_ss, const char *net_path)
+                           sig_shared_t **echo_ss, const char *net_path,
+                           int32_t member_elem)
 {
    // drv_ss/oth_ss carry 3 slots per endpoint (fields for l3ds record
    // implicits; scalar endpoints use slot 0 with slots 1-2 NULL)
@@ -19784,7 +19788,11 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
       const int nfld = (ep->dtype == STITCH_L3DS && ep->drv[1] != NULL)
          ? 3 : 1;
       for (int f = 0; f < nfld; f++) {
-         if (ep->drv[f] == NULL || ep->drv[f]->n_nexus != 1) {
+         // A vector member signal legitimately has one nexus per
+         // driven element; the element lookup below picks ours
+         if (ep->drv[f] == NULL
+             || (ep->drv[f]->n_nexus != 1
+                 && !(ep->is_member && member_elem >= 0))) {
             if (stitch_dbg)
                fprintf(stderr, "#STITCH decline: endpoint %d shape\n", i);
             free(net);
@@ -19794,12 +19802,15 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
 
       if (ep->is_member) {
          rt_nexus_t *mn = &(ep->drv[0]->nexus);
+         if (member_elem >= 0)
+            mn = split_nexus(m, ep->drv[0], member_elem, 1);
+         ep->mnex = mn;
 
          // Member contributions fold ALL driver-backed sources except
          // our plug at classification time — no per-driver limits
 
          // Solver-owned plug signal backing the SOURCE_IMPLICIT input
-         const size_t psz = ep->drv[0]->shared.size;
+         const size_t psz = (size_t)mn->size * mn->width;
          rt_signal_t *plug = xcalloc(sizeof(rt_signal_t) + MAX(psz, 8));
          plug->n_nexus = 1;
          plug->shared.size = psz;
