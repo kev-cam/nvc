@@ -5782,7 +5782,8 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
    }
 
    return x_stitch_net_register(n, drv_ss, oth_ss, dtypes, otypes,
-                                echo_ss) ? 1 : 0;
+                                echo_ss,
+                                (const char *)net_path) ? 1 : 0;
 }
 
 void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)

@@ -66,7 +66,7 @@ rt_watch_t *model_set_event_cb(rt_model_t *m, rt_signal_t *s, rt_watch_t *w);
 bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
                            sig_shared_t **oth_ss,
                            const uint8_t *dtypes, const uint8_t *otypes,
-                           sig_shared_t **echo_ss);
+                           sig_shared_t **echo_ss, const char *net_path);
 void model_set_timeout_cb(rt_model_t *m, uint64_t when, rt_event_fn_t fn,
                           void *user);
 

@@ -374,3 +374,72 @@ package body sv_display_pkg is
     end function;
 
 end package body;
+
+---------------------------------------------------------------------------
+-- %v strength formatting.  A separate package so only %v-using designs
+-- reference the VHPIDIRECT query (hosted by libresolver.so).
+---------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use work.logic3d_types_pkg.all;
+
+package sv_strength_pkg is
+    impure function sv_vstr(v : logic3d; path : string) return string;
+end package sv_strength_pkg;
+
+package body sv_strength_pkg is
+
+    impure function sv_net_strength(path : string) return integer is
+    begin
+        -- Stub body; replaced by VHPIDIRECT at load time
+        return -1;
+    end function;
+    attribute foreign of sv_net_strength [string return integer] : function is
+        "VHPIDIRECT sv2vhdl_net_strength";
+
+    function strength_prefix(sc : integer) return string is
+    begin
+        if sc >= 16 then
+            return "Su";
+        elsif sc >= 8 then
+            return "St";
+        elsif sc >= 4 then
+            return "Pu";
+        else
+            return "We";
+        end if;
+    end function;
+
+    impure function sv_vstr(v : logic3d; path : string) return string is
+        variable q, vl, sc, fl : integer;
+    begin
+        q := sv_net_strength(path);
+        if q >= 0 then
+            vl := q / 65536;
+            sc := (q / 256) mod 256;
+            fl := q mod 256;
+            if fl = 2 or fl = 5 then                     -- UNDRIVEN
+                return "HiZ";
+            elsif fl = 1 or fl = 4 then                  -- UNKNOWN
+                return strength_prefix(sc) & "X";
+            elsif vl >= 127 then
+                return strength_prefix(sc) & "1";
+            else
+                return strength_prefix(sc) & "0";
+            end if;
+        end if;
+
+        -- Not a kernel net: derive from the value alphabet — plain
+        -- drivers are strong, H/L are the weak codes
+        case v is
+            when L3D_0 => return "St0";
+            when L3D_1 => return "St1";
+            when L3D_L => return "We0";
+            when L3D_H => return "We1";
+            when L3D_Z => return "HiZ";
+            when L3D_W => return "WeX";
+            when others => return "StX";
+        end case;
+    end function;
+
+end package body sv_strength_pkg;

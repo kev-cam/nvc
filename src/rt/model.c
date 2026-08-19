@@ -19330,6 +19330,7 @@ typedef struct {
 
 typedef struct _rt_stitch_net {
    struct _rt_stitch_net *chain;
+   char          *path;        // member signal's hierarchical path
    int            nep;
    stitch_scnt_t  cnt[32];     // per strength level
    uint16_t       n_supply_pwr;
@@ -19702,6 +19703,36 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
    stitch_update_views(m, net);
 }
 
+// VHPIDIRECT %v strength query (sv_strength_pkg.sv_net_strength).
+// Pure kernel lookup: registration stored each net's hierarchical
+// path, so no VHPI or scope walking is involved and the query works
+// identically with or without the resolver plugin (no plugin -> no
+// registered nets -> -1 -> the value-alphabet fallback in sv_vstr).
+// Returns (val << 16) | (str << 8) | flags.  String ABI = (ptr, len).
+int32_t sv2vhdl_net_strength(const uint8_t *path, int32_t len)
+{
+   char buf[512];
+   if (len <= 0 || len >= (int32_t)sizeof(buf))
+      return -1;
+   memcpy(buf, path, len);
+   buf[len] = '\0';
+   const char *p = buf;
+   if (*p == '.') p++;
+
+   for (rt_stitch_net_t *net = g_stitch_nets; net; net = net->chain) {
+      if (net->path == NULL || strcasecmp(net->path, p) != 0)
+         continue;
+      stitch_ctr_t c = stitch_resolve(net, NULL);
+      const int32_t r = (c.val << 16) | (c.str << 8) | c.flags;
+      if (getenv("SV2VHDL_KERNEL_DEBUG") != NULL)
+         fprintf(stderr, "#VQ path='%s' -> %d\n", p, r);
+      return r;
+   }
+   if (getenv("SV2VHDL_KERNEL_DEBUG") != NULL)
+      fprintf(stderr, "#VQ path='%s' -> -1 (no kernel net)\n", p);
+   return -1;
+}
+
 // Register one net's static endpoint sets.  Called (indirectly, via
 // the VHPI extension) from the resolver plugin at start of simulation.
 // Endpoint i: drv_ss[i] = contributor signal; oth_ss[i] = exclude-self
@@ -19709,7 +19740,7 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
 bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
                            sig_shared_t **oth_ss,
                            const uint8_t *dtypes, const uint8_t *otypes,
-                           sig_shared_t **echo_ss)
+                           sig_shared_t **echo_ss, const char *net_path)
 {
    // drv_ss/oth_ss carry 3 slots per endpoint (fields for l3ds record
    // implicits; scalar endpoints use slot 0 with slots 1-2 NULL)
@@ -19729,6 +19760,12 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
    rt_stitch_net_t *net =
       xcalloc_flex(sizeof(rt_stitch_net_t), nep, sizeof(stitch_ep_t));
    net->nep = nep;
+   if (net_path != NULL) {
+      if (*net_path == '.') net_path++;
+      net->path = xstrdup(net_path);
+      for (char *c = net->path; *c; c++)
+         *c = tolower((unsigned char)*c);
+   }
 
    for (int i = 0; i < nep; i++) {
       stitch_ep_t *ep = &(net->ep[i]);
