@@ -13097,14 +13097,28 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
                break;   // cycle (e.g. inout back-ref); abandon this port
             seen[n_seen++] = input;
             rt_nexus_t *next = NULL;
-            for (rt_source_t *s = &(input->sources); s; s = s->chain_input) {
-               if (s->tag == SOURCE_DRIVER) {
-                  has_driver = true;
-                  break;
+            // n_sources guard: an undriven nexus's embedded sources
+            // struct is zeroed, and tag 0 is SOURCE_DRIVER — walking
+            // it invents a phantom driver and lets a never-driven
+            // inout port contribute its stale initial bytes.  A
+            // deposit-driven nexus (:= comb fusion) has no sources
+            // either but stamps last_event — its value is real.
+            if (input->n_sources > 0) {
+               for (rt_source_t *s = &(input->sources); s;
+                    s = s->chain_input) {
+                  if (s->tag == SOURCE_DRIVER) {
+                     has_driver = true;
+                     break;
+                  }
+                  else if (s->tag == SOURCE_PORT && next == NULL)
+                     next = s->u.port.input;
                }
-               else if (s->tag == SOURCE_PORT && next == NULL)
-                  next = s->u.port.input;
             }
+            else if (!(input->flags & NET_F_INOUT)
+                     && input->last_event < TIME_HIGH)
+               has_driver = true;   // deposit-written OUT-port class;
+                                    // inout formals stamp last_event
+                                    // from effective tracking alone
             if (has_driver)
                break;
             input = next;
@@ -13393,16 +13407,27 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
                break;
             seen[n_seen++] = input;
             rt_nexus_t *next = NULL;
-            for (rt_source_t *si = &(input->sources);
-                 si; si = si->chain_input) {
-               if (si->tag == SOURCE_DRIVER
-                   || si->tag == SOURCE_IMPLICIT) {
-                  has_driver = true;
-                  break;
+            // Same n_sources guard as source_value: tag 0 in a zeroed
+            // sources struct is SOURCE_DRIVER (phantom driver);
+            // deposit-driven (:=) nexuses stamp last_event and count
+            // as driven
+            if (input->n_sources > 0) {
+               for (rt_source_t *si = &(input->sources);
+                    si; si = si->chain_input) {
+                  if (si->tag == SOURCE_DRIVER
+                      || si->tag == SOURCE_IMPLICIT) {
+                     has_driver = true;
+                     break;
+                  }
+                  else if (si->tag == SOURCE_PORT && next == NULL)
+                     next = si->u.port.input;
                }
-               else if (si->tag == SOURCE_PORT && next == NULL)
-                  next = si->u.port.input;
             }
+            else if (!(input->flags & NET_F_INOUT)
+                     && input->last_event < TIME_HIGH)
+               has_driver = true;   // deposit-written OUT-port class;
+                                    // inout formals stamp last_event
+                                    // from effective tracking alone
             if (has_driver)
                break;
             input = next;

@@ -60,7 +60,7 @@ extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
 static const char *tran_entities[] = {
     "SV_TRAN", "SV_TRANIF0", "SV_TRANIF1",
     "SV_RTRAN", "SV_RTRANIF0", "SV_RTRANIF1",
-    "SV_ALIAS",
+    "SV_ALIAS", "SV_STRENGTH_BUF",
     NULL
 };
 
@@ -1156,8 +1156,12 @@ static int stitch_register_net(net_info_t *n)
         nep++;
     }
 
-    if (nep == 0)
-        return 0;
+    if (nep == 0) {
+        /* Every capable endpoint was a receiver (mode in): the signal's
+           native drivers already feed them through the port maps —
+           nothing to solve, trivially handled */
+        return net_path != NULL;
+    }
 
     return nvc_vhpi_stitch_net(nep, inst_paths, port_names,
                                (const vhpiCharT *)net_path);

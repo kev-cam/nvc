@@ -160,3 +160,63 @@ begin
         y <= result;
     end process;
 end architecture behavioral;
+
+---------------------------------------------------------------------------
+-- STRENGTH BUFFER: a continuous assign with a drive-strength spec,
+--   assign (STR1, STR0) y = data;
+-- Generic strengths use the l3ds codes (ST_HIGHZ=0 / ST_WEAK=2 /
+-- ST_PULL=4 / ST_STRONG=8 / ST_SUPPLY=16).  The driven value enters net
+-- resolution through y'driver at the exact specified strength; the port
+-- itself never drives (kernel net solver / generated resolver carries
+-- the contribution, mirroring the sv_tran family).
+---------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use work.logic3d_types_pkg.all;
+use work.logic3ds_pkg.all;
+
+entity sv_strength_buf is
+    generic (
+        str1 : natural := 8;   -- strength when driving 1
+        str0 : natural := 8    -- strength when driving 0
+    );
+    port (
+        y    : inout std_logic;
+        data : in    logic3d
+    );
+end entity sv_strength_buf;
+
+architecture strength of sv_strength_buf is
+begin
+    process (data)
+        variable v : logic3ds;
+        variable smax : natural;
+    begin
+        if str1 > str0 then
+            smax := str1;
+        else
+            smax := str0;
+        end if;
+
+        if is_uncertain(data) then
+            v := (value => 0, strength => smax,
+                  flags => FL_UNKNOWN, reserved => 0);
+        elsif is_one(data) then
+            if str1 = 0 then
+                v := L3DS_Z;
+            else
+                v := (value => 255, strength => str1,
+                      flags => FL_KNOWN, reserved => 0);
+            end if;
+        else
+            if str0 = 0 then
+                v := L3DS_Z;
+            else
+                v := (value => 0, strength => str0,
+                      flags => FL_KNOWN, reserved => 0);
+            end if;
+        end if;
+
+        y'driver := v;
+    end process;
+end architecture strength;

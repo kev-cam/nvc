@@ -815,6 +815,14 @@ def resolve_net(nets, design_name):
                 [(d.get("ename"), d.get("type"), d.get("is_signal"),
                   d.get("kind"), d.get("mode")) for d in net["drivers"]]),
                 file=sys.stderr)
+        # A net whose primitive endpoints are ALL receivers (mode in —
+        # e.g. a strength buffer's data input) needs no resolution at
+        # all: the signal's native drivers feed the ports through the
+        # normal port maps.  Hand it to the kernel, which recognizes
+        # the zero-contributor case as trivially handled.
+        if all((d.get("mode") or "") == "in"
+               for d in net["drivers"] if not d.get("is_signal")):
+            return True
         # The kernel solver classifies each endpoint by its own type
         # (logic3ds record / logic3d / std_logic), so a mix of family
         # types on one net is fine — only a type outside the family

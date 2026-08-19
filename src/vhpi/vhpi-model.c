@@ -5712,7 +5712,10 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
          }
       }
 
-      if (drv_nf == 0 || oth_nf == 0 || tname == NULL)
+      // A pure-driver endpoint (strength buffer: writes y'driver, never
+      // reads y'other) has no IMPLICIT_OTHER — the solver simply skips
+      // its view writes.  Only the 'driver side is mandatory.
+      if (drv_nf == 0 || tname == NULL)
          { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 7); return 0; }
 
       uint8_t t = 0;   // STITCH_STD
@@ -5720,7 +5723,7 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
          t = 2;        // STITCH_L3DS
       else if (strstr(tname, "logic3d") || strstr(tname, "LOGIC3D"))
          t = 1;        // STITCH_L3D
-      if (t == 2 && (drv_nf != 3 || oth_nf != 3))
+      if (t == 2 && (drv_nf != 3 || (oth_nf != 0 && oth_nf != 3)))
          { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 12); return 0; }
 
       for (int f = 0; f < 3; f++) {
