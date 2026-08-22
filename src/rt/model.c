@@ -19384,6 +19384,7 @@ typedef struct {
 
 typedef struct _rt_stitch_net {
    struct _rt_stitch_net *chain;
+   uint64_t       n_events;    // contributor transitions (NVC_STITCH_PROF)
    char          *path;        // member signal's hierarchical path
    int            nep;
    stitch_scnt_t  cnt[32];     // per strength level
@@ -19606,9 +19607,126 @@ static stitch_ctr_t stitch_resolve_counts(const stitch_scnt_t *cnt,
    return (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };  // Z
 }
 
+// #75 A/B (user directive "state-machine where possible"): resolve by
+// folding the endpoints' cached contributions directly instead of
+// reading the counts state.  O(nep) per view against the counts scan's
+// O(strength levels); tran pairs (nep 2-3) dominate real designs, so
+// the crossover matters.  Semantics must match stitch_resolve_counts
+// EXACTLY: same dominance order (higher base wins; within a base the
+// active cap=0 level beats capacitive cap=1), same one-contribution
+// value-exclusion, same supply-power flagging.  NVC_STITCH_ITERATE=1
+// selects this form; NVC_STITCH_PROF=1 dumps per-net event/view tallies.
+static stitch_ctr_t stitch_resolve_iterate(const rt_stitch_net_t *net,
+                                           const stitch_ctr_t *excl)
+{
+   bool ex_pending = excl != NULL && stitch_active(excl);
+   const bool ex_unk = ex_pending && (excl->flags == STITCH_FL_UNKNOWN
+                                      || excl->flags == STITCH_FL_UNK_NOPOWER);
+   bool ex_pwr_pending = ex_pending && excl->str == STITCH_ST_SUPPLY
+      && (excl->flags == STITCH_FL_NOPOWER
+          || excl->flags == STITCH_FL_UNK_NOPOWER);
+
+   // Comparable rank reproducing the counts scan order (base 15..0,
+   // cap 0 before cap 1): higher base first, even str beats odd
+   #define STITCH_RANK(str) ((((str) & ~1) << 1) | (((str) & 1) ^ 1))
+
+   int pwr = 0, bestrank = -1;
+   uint8_t beststr = 0;
+   int n0 = 0, n1 = 0, no = 0, nu = 0;
+
+   for (int i = 0; i < net->nep; i++) {
+      const stitch_ctr_t *c = &(net->ep[i].last);
+      if (!stitch_active(c))
+         continue;
+
+      const bool c_unk = c->flags == STITCH_FL_UNKNOWN
+         || c->flags == STITCH_FL_UNK_NOPOWER;
+
+      if (c->str == STITCH_ST_SUPPLY
+          && (c->flags == STITCH_FL_NOPOWER
+              || c->flags == STITCH_FL_UNK_NOPOWER)) {
+         if (ex_pwr_pending) ex_pwr_pending = false;
+         else pwr++;
+      }
+
+      // Value-exclusion of exactly ONE matching contribution, like the
+      // counts form's bucket decrement (equal contributions are
+      // interchangeable in the fold)
+      if (ex_pending && c->str == excl->str && c_unk == ex_unk
+          && (c_unk || c->val == excl->val)) {
+         ex_pending = false;
+         continue;
+      }
+
+      if (c->str == STITCH_ST_HIGHZ)
+         continue;   // the counts scan skips this level too
+
+      const int rank = STITCH_RANK(c->str);
+      if (rank < bestrank)
+         continue;
+      if (rank > bestrank) {
+         bestrank = rank;
+         beststr = c->str;
+         n0 = n1 = no = nu = 0;
+      }
+      if (c_unk) nu++;
+      else if (c->val == 0) n0++;
+      else if (c->val == 255) n1++;
+      else no++;
+   }
+   #undef STITCH_RANK
+
+   if (bestrank < 0)
+      return (stitch_ctr_t){ 0, STITCH_ST_HIGHZ, STITCH_FL_UNDRIVEN };  // Z
+
+   stitch_ctr_t r = { 0, beststr, STITCH_FL_KNOWN };
+   if (nu > 0 || no > 0 || (n0 > 0 && n1 > 0))
+      r.flags = STITCH_FL_UNKNOWN;
+   else
+      r.val = (n1 > 0) ? 255 : 0;
+
+   if (pwr > 0)
+      r.flags = (r.flags == STITCH_FL_UNKNOWN)
+         ? STITCH_FL_UNK_NOPOWER : STITCH_FL_NOPOWER;
+   return r;
+}
+
+static int g_stitch_iterate = -1;
+static uint64_t g_stitch_n_resolve = 0;
+
+// Per-net solver profile (#75 residue): NVC_STITCH_PROF=1 dumps each
+// net's endpoint count and contributor-event tally at exit, plus the
+// global resolve-call count and which resolver form ran
+__attribute__((destructor))
+static void stitch_prof_dump(void)
+{
+   const char *e = getenv("NVC_STITCH_PROF");
+   if (e == NULL || atoi(e) == 0 || g_stitch_nets == NULL)
+      return;
+   uint64_t tot = 0;
+   unsigned nnets = 0;
+   for (rt_stitch_net_t *net = g_stitch_nets; net; net = net->chain) {
+      fprintf(stderr, "NVC_STITCH_PROF: net=%s nep=%d events=%"PRIu64"\n",
+              net->path ? net->path : "?", net->nep, net->n_events);
+      tot += net->n_events;
+      nnets++;
+   }
+   fprintf(stderr, "NVC_STITCH_PROF: nets=%u events=%"PRIu64
+           " resolves=%"PRIu64" form=%s\n", nnets, tot,
+           g_stitch_n_resolve,
+           g_stitch_iterate == 1 ? "iterate" : "counts");
+}
+
 static stitch_ctr_t stitch_resolve(rt_stitch_net_t *net,
                                    const stitch_ctr_t *excl)
 {
+   if (unlikely(g_stitch_iterate < 0)) {
+      const char *e = getenv("NVC_STITCH_ITERATE");
+      g_stitch_iterate = (e != NULL && atoi(e) != 0);
+   }
+   g_stitch_n_resolve++;
+   if (g_stitch_iterate)
+      return stitch_resolve_iterate(net, excl);
    return stitch_resolve_counts(net->cnt, net->n_supply_pwr, excl);
 }
 
@@ -19735,6 +19853,8 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
 {
    rt_model_t *m = get_model();
    rt_stitch_net_t *net = user;
+
+   net->n_events++;
 
    if (stitch_trace())
       fprintf(stderr, "#ST cb net=%p sig=%s\n", (void *)net,
