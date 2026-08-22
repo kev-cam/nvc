@@ -61,6 +61,18 @@ tlab_t *tlab_acquire(mspace_t *m);
 void tlab_release(tlab_t *t);
 void *tlab_alloc(tlab_t *t, size_t size);
 
+// Eval-lifetime arena: chained bump-allocated blocks for values that must
+// outlive the JIT call that produced them (e.g. unconstrained array results)
+// but die at the end of a process evaluation. Reset — not freed — between
+// evals, and grown by LINKING new blocks so already-live pointers never move
+// (a single eval can hold tens of thousands of live results). After warm-up a
+// static design reaches its high-water block count and allocates nothing more.
+typedef struct _eval_arena eval_arena_t;
+eval_arena_t *eval_arena_new(void);
+void eval_arena_free(eval_arena_t *a);
+void *eval_arena_alloc(eval_arena_t *a, size_t size);
+void eval_arena_reset(eval_arena_t *a);
+
 mptr_t mptr_new(mspace_t *m, const char *name);
 void mptr_free(mspace_t *m, mptr_t *ptr);
 void **mptr_get(mptr_t ptr);

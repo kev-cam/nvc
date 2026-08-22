@@ -81,6 +81,19 @@ const char *jit_cc_name(jit_cc_t cc)
 
 const char *jit_exit_name(jit_exit_t exit)
 {
+   // Appended out-of-band so the positional table below stays untouched
+   switch (exit) {
+   case JIT_EXIT_SCHED_WAVEFORM_FAST1: return "SCHED_WAVEFORM_FAST1";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST2: return "SCHED_WAVEFORM_FAST2";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST3: return "SCHED_WAVEFORM_FAST3";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST4: return "SCHED_WAVEFORM_FAST4";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST5: return "SCHED_WAVEFORM_FAST5";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST6: return "SCHED_WAVEFORM_FAST6";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST7: return "SCHED_WAVEFORM_FAST7";
+   case JIT_EXIT_SCHED_WAVEFORM_FAST8: return "SCHED_WAVEFORM_FAST8";
+   default: break;
+   }
+
    static const char *names[] = {
       "INDEX_FAIL", "OVERFLOW", "NULL_DEREF", "LENGTH_FAIL", "UNREACHABLE",
       "DIV_ZERO", "EXPONENT_FAIL", "REPORT", "ASSERT_FAIL", "RANGE_FAIL",

@@ -412,6 +412,85 @@ void *tlab_alloc(tlab_t *t, size_t size)
       return mspace_alloc(t->mspace, size);
 }
 
+////////////////////////////////////////////////////////////////////////////
+// Eval-lifetime arena (see mspace.h). A growable chain of bump blocks used
+// for values that must outlive a JIT call but die at the end of a process
+// evaluation. Reset between evals; never freed mid-run; blocks never move so
+// the tens of thousands of live results inside one eval stay valid.
+
+#define ARENA_BLOCK_MIN (64 * 1024)
+
+typedef struct _arena_block {
+   struct _arena_block *next;
+   size_t               cap;
+   size_t               used;
+   char                 data[];
+} arena_block_t;
+
+struct _eval_arena {
+   arena_block_t *head;
+   arena_block_t *cur;
+};
+
+eval_arena_t *eval_arena_new(void)
+{
+   return xcalloc(sizeof(eval_arena_t));
+}
+
+void eval_arena_free(eval_arena_t *a)
+{
+   for (arena_block_t *b = a->head, *tmp; b; b = tmp) {
+      tmp = b->next;
+      free(b);
+   }
+   free(a);
+}
+
+static arena_block_t *eval_arena_make_block(size_t need)
+{
+   size_t cap = ARENA_BLOCK_MIN;
+   while (cap < need) cap *= 2;
+
+   arena_block_t *b = xmalloc(sizeof(arena_block_t) + cap);
+   b->next = NULL;
+   b->cap  = cap;
+   b->used = 0;
+   return b;
+}
+
+void *eval_arena_alloc(eval_arena_t *a, size_t size)
+{
+   size = ALIGN_UP(size, sizeof(double));
+
+   arena_block_t *b = a->cur;
+   if (unlikely(b == NULL)) {
+      b = a->head = a->cur = eval_arena_make_block(size);
+   }
+   else if (unlikely(b->used + size > b->cap)) {
+      if (b->next != NULL && size <= b->next->cap) {
+         b = a->cur = b->next;     // reuse the next block from a prior eval
+         b->used = 0;              // lazily rewound on entry
+      }
+      else {
+         arena_block_t *nb = eval_arena_make_block(size);
+         nb->next = b->next;       // splice in, preserving the tail
+         b->next  = nb;
+         b = a->cur = nb;
+      }
+   }
+
+   void *p = b->data + b->used;
+   b->used += size;
+   return p;
+}
+
+void eval_arena_reset(eval_arena_t *a)
+{
+   a->cur = a->head;
+   if (a->head != NULL)
+      a->head->used = 0;
+}
+
 __attribute__((always_inline))
 static inline bool is_mspace_ptr(mspace_t *m, char *p)
 {

@@ -189,10 +189,33 @@ typedef enum {
    JIT_EXIT_PIPE_READ,
    JIT_EXIT_PIPE_FULL,
    JIT_EXIT_PIPE_EMPTY,
+
+   // Native-projection pilot (NVC_INLINE_DRIVE): a SCHED_WAVEFORM site whose
+   // static shape is a scalar delta assignment (after == 0, reject == 0,
+   // scalar value of 1..8 bytes; FASTn = n-byte element).  Every backend
+   // except LLVM treats these exactly like JIT_EXIT_SCHED_WAVEFORM; the LLVM
+   // backend may replace the runtime call with an inlined guarded fast path
+   // specialized against the runtime's frozen layout (see
+   // cgen_inline_drive_body in jit-llvm.c).  Contiguous by size so that
+   // size == exit - JIT_EXIT_SCHED_WAVEFORM_FAST1 + 1.
+   JIT_EXIT_SCHED_WAVEFORM_FAST1,
+   JIT_EXIT_SCHED_WAVEFORM_FAST2,
+   JIT_EXIT_SCHED_WAVEFORM_FAST3,
+   JIT_EXIT_SCHED_WAVEFORM_FAST4,
+   JIT_EXIT_SCHED_WAVEFORM_FAST5,
+   JIT_EXIT_SCHED_WAVEFORM_FAST6,
+   JIT_EXIT_SCHED_WAVEFORM_FAST7,
+   JIT_EXIT_SCHED_WAVEFORM_FAST8,
+   JIT_EXIT_ENABLE_LAST_VALUE,
 } jit_exit_t;
 
-typedef uint16_t jit_reg_t;
-#define JIT_REG_INVALID UINT16_MAX
+// 32-bit virtual register index: very large elaborated units (e.g. a VeeR
+// branch predictor) need more than 65535 JIT registers. jit_reg_t lives in the
+// 8-byte union of jit_value_t and fills existing padding in jit_ir_t, so both
+// sizeof() static asserts below are unchanged; the on-disk pack format encodes
+// registers as varints, so it stays backward compatible.
+typedef uint32_t jit_reg_t;
+#define JIT_REG_INVALID UINT32_MAX
 
 typedef enum {
    JIT_VALUE_INVALID,
@@ -381,6 +404,7 @@ struct _jit_thread_local {
    jit_jmpbuf_t           abort_env;
    volatile sig_atomic_t  jmp_buf_valid;
    jit_anchor_t          *anchor;
+   eval_arena_t          *eval_arena;   // non-NULL: route __nvc_mspace_alloc here
 };
 
 typedef struct _code_cache code_cache_t;
@@ -420,7 +444,23 @@ void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f);
 void jit_tier_up(jit_func_t *f);
 jit_thread_local_t *jit_thread_local(void);
 void jit_thread_install_fast_path(void);
+
+// Run-region landing pad. The scheduler loop arms ONE abort landing pad around
+// the whole run (see model_run) instead of jit_try_vcall arming a setjmp on
+// every process activation. Entering puts the thread in JIT_RUNNING and
+// registers the JIT diagnostic hook once; jit_try_vcall then takes a fast path
+// that skips the per-call setjmp, both state transitions and the diag-hint
+// add/remove churn. An abort inside any process unwinds straight to the
+// scheduler's pad, which sets force_stop. Callers outside a region (elaboration
+// -time folding, foreign calls) still arm their own per-call pad as before.
+bool jit_fastcall_inregion(jit_t *j, jit_handle_t handle,
+                           jit_scalar_t *result, jit_scalar_t p1,
+                           jit_scalar_t p2, tlab_t *tlab);
+jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate);
+void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
+                          jit_state_t oldstate);
 void jit_fill_irbuf(jit_func_t *f);
+bool jit_try_fill_irbuf(jit_func_t *f);
 int32_t *jit_get_cover_ptr(jit_func_t *f, jit_value_t addr);
 jit_entry_fn_t jit_bind_intrinsic(ident_t name);
 jit_thread_local_t *jit_attach_thread(jit_anchor_t *anchor);
@@ -455,11 +495,41 @@ typedef void (*code_patch_fn_t)(code_blob_t *, jit_label_t, uint8_t *,
 
 code_blob_t *code_blob_new(code_cache_t *code, ident_t name, size_t hint);
 void code_blob_emit(code_blob_t *blob, const uint8_t *bytes, size_t len);
+
+// Entry-publication watch: notify a consumer that has BAKED a copy of
+// *slot (e.g. an immediate direct-call target in an emitted block) whenever
+// code_blob_finalise publishes a new entry through that slot, so the baked
+// copy can be re-patched.  Registration/removal is single-writer (the model
+// thread); the notify callback may run on ANY thread (async tier-up
+// compiles finalise on a worker thread), so callbacks must only record the
+// new target -- never patch executable code from the compile thread.  The
+// callback runs under the internal watch lock: code_entry_unwatch returning
+// guarantees no callback with that ctx is in flight or will fire again.
+typedef void (*code_watch_fn_t)(jit_entry_fn_t *slot, jit_entry_fn_t entry,
+                                void *ctx);
+void code_entry_watch(jit_entry_fn_t *slot, code_watch_fn_t fn, void *ctx);
+void code_entry_unwatch(void *ctx);
 void code_blob_align(code_blob_t *blob, unsigned align);
 void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry);
 void code_blob_mark(code_blob_t *blob, jit_label_t label);
 void code_blob_patch(code_blob_t *blob, jit_label_t label, code_patch_fn_t fn);
-void code_load_object(code_blob_t *blob, const void *data, size_t size);
+
+// Resolver for the loader-patched nvc.* symbol namespace emitted in
+// cacheable mode (persistent JIT cache): returns the address for `name`
+// or NULL if unknown.  Consulted after the fixed runtime symbol table.
+typedef void *(*code_resolve_fn_t)(const char *name, void *ctx);
+
+void code_load_object(code_blob_t *blob, const void *data, size_t size,
+                      code_resolve_fn_t resolve, void *rctx);
+
+// Fail-soft validating prepass for objects read back from the persistent
+// cache (validate-before-mutate): checks every header/offset against
+// `size`, every relocation type against the supported set, and resolves
+// every symbol -- WITHOUT touching any code blob.  Returns false on any
+// doubt so the caller can treat the record as a cache MISS instead of
+// hitting one of code_load_elf's fatal paths.  linux/x86_64 only.
+bool code_object_probe(code_cache_t *code, ident_t name, const void *data,
+                       size_t size, code_resolve_fn_t resolve, void *rctx);
 
 #ifdef DEBUG
 __attribute__((format(printf, 2, 3)))
@@ -473,8 +543,10 @@ void code_blob_print_ir(code_blob_t *blob, jit_ir_t *ir);
 #endif
 
 bool jit_pack_fill(jit_pack_t *jp, jit_t *j, jit_func_t *f);
+bool jit_pack_has(jit_pack_t *jp, ident_t name);
 void jit_pack_put(jit_pack_t *jp, ident_t name, const uint8_t *cpool,
                   const char *strtab, const uint8_t *buf);
+jit_pack_t *jit_get_pack(jit_t *j);
 
 pack_writer_t *pack_writer_new(void);
 void pack_writer_emit(pack_writer_t *pw, jit_t *j, jit_handle_t handle,
@@ -483,6 +555,11 @@ unsigned pack_writer_get_string(pack_writer_t *pw, const char *str);
 void pack_writer_string_table(pack_writer_t *pw, const char **tab,
                               size_t *size);
 void pack_writer_free(pack_writer_t *pw);
+
+// Codegen target identity string ("native:<cpu>:<features>" or
+// "generic") — part of the persistent-cache key so host-specific
+// objects never load on a different micro-architecture
+const char *jit_llvm_target_identity(void);
 
 void jit_bind_foreign(jit_func_t *f, const uint8_t *spec, size_t length,
                       tree_t where);

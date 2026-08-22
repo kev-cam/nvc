@@ -108,6 +108,7 @@
 #define F_ARRAYS  (1 << 26)
 #define F_SEED    (1 << 27)
 #define F_PERFILE (1 << 28)
+#define F_2040    (1 << 29)   // --std=2040 (STD_MX): use the sv2vhdl packages
 
 typedef struct test test_t;
 typedef struct param param_t;
@@ -420,6 +421,8 @@ static bool parse_test_list(void)
             test->flags |= F_2002;
          else if (strcmp(opt, "2019") == 0)
             test->flags |= F_2019;
+         else if (strcmp(opt, "2040") == 0)
+            test->flags |= F_2040;
          else if (strcmp(opt, "vhpi") == 0)
             test->flags |= F_VHPI;
          else if (strcmp(opt, "shell") == 0)
@@ -687,7 +690,7 @@ static run_status_t run_cmd(FILE *log, arglist_t **args)
 
 static void push_std(test_t *test, arglist_t **args)
 {
-   if (test->flags & (F_MIXED | F_VERILOG))
+   if (test->flags & (F_MIXED | F_VERILOG | F_2040))
       push_arg(args, "--std=2040");
    else if (test->flags & F_2000)
       push_arg(args, "--std=2000");

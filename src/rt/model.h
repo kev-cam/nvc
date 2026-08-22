@@ -61,6 +61,15 @@ void watch_free(rt_model_t *m, rt_watch_t *w);
 void model_set_phase_cb(rt_model_t *m, model_phase_t phase, rt_event_fn_t fn,
                         void *user);
 rt_watch_t *model_set_event_cb(rt_model_t *m, rt_signal_t *s, rt_watch_t *w);
+
+// #75 kernel net solver registration (called via the VHPI extension).
+// member_elem >= 0 selects one element of a vector member signal (the
+// canonical element offset, left-to-right storage order); -1 = whole.
+bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
+                           sig_shared_t **oth_ss,
+                           const uint8_t *dtypes, const uint8_t *otypes,
+                           sig_shared_t **echo_ss, const char *net_path,
+                           int32_t member_elem);
 void model_set_timeout_cb(rt_model_t *m, uint64_t when, rt_event_fn_t fn,
                           void *user);
 
@@ -90,6 +99,9 @@ void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt);
 void proc_reset_vtable(rt_proc_t *proc);
 bool accel_load(rt_model_t *m, const char *so_path);
 void accel_auto(rt_model_t *m);
+void accel_levelize(rt_model_t *m);
+void accel_banked_init(rt_model_t *m);
+int accel_demote(rt_model_t *m, const char *tok);
 void lazy_eval_install(rt_model_t *m);
 
 const void *signal_value(rt_signal_t *s);

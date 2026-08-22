@@ -80,7 +80,9 @@ typedef struct _jit {
    cover_data_t     *cover;
 } jit_t;
 
-static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to);
+static void jit_transition(jit_thread_local_t *thread, jit_t *j,
+                           jit_state_t from, jit_state_t to);
+static void jit_diag_cb(diag_t *d, void *arg);
 
 static void jit_oom_cb(mspace_t *m, size_t size)
 {
@@ -96,6 +98,7 @@ static void jit_oom_cb(mspace_t *m, size_t size)
    jit_abort_with_status(EXIT_FAILURE);
 }
 
+__attribute__((always_inline))
 static inline jit_thread_local_t **jit_thread_local_ptr(void)
 {
 #ifdef USE_EMUTLS
@@ -108,16 +111,58 @@ static inline jit_thread_local_t **jit_thread_local_ptr(void)
    return &local;
 }
 
+__attribute__((cold, noinline))
+static jit_thread_local_t *jit_alloc_thread_local(void)
+{
+   jit_thread_local_t *thread = xcalloc(sizeof(jit_thread_local_t));
+   thread->state = JIT_IDLE;
+   return thread;
+}
+
 jit_thread_local_t *jit_thread_local(void)
 {
    jit_thread_local_t **ptr = jit_thread_local_ptr();
 
-   if (unlikely(*ptr == NULL)) {
-      *ptr = xcalloc(sizeof(jit_thread_local_t));
-      (*ptr)->state = JIT_IDLE;
-   }
+   if (unlikely(*ptr == NULL))
+      *ptr = jit_alloc_thread_local();
 
    return *ptr;
+}
+
+void jit_eval_arena_enable(bool on)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   if (on && thread->eval_arena == NULL)
+      thread->eval_arena = eval_arena_new();
+   else if (!on && thread->eval_arena != NULL) {
+      eval_arena_free(thread->eval_arena);
+      thread->eval_arena = NULL;
+   }
+}
+
+// Point the current thread's eval-arena at `a` (an instance's own scratch),
+// returning the previous arena so the caller can restore it. Lets each
+// instance's process-body transients live in its OWN arena -- isolation for
+// parallel eval and locality for debugging -- while resolution/init between
+// evals keep using the default arena.
+eval_arena_t *jit_eval_arena_swap(eval_arena_t *a)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   eval_arena_t *old = thread->eval_arena;
+   thread->eval_arena = a;
+   return old;
+}
+
+bool jit_eval_arena_enabled(void)
+{
+   return jit_thread_get()->eval_arena != NULL;
+}
+
+void jit_eval_arena_reset(void)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   if (thread->eval_arena != NULL)
+      eval_arena_reset(thread->eval_arena);
 }
 
 // Shim: initially routes through jit_thread_local (TLS lookup).
@@ -165,6 +210,8 @@ jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc, cover_data_t *db)
    // Ensure we can resolve symbols from the executable
    ffi_load_dll(NULL);
 
+   diag_add_hint_fn(jit_diag_cb, j);
+
    return j;
 }
 
@@ -194,6 +241,8 @@ void jit_free(jit_t *j)
       (*it->plugin.cleanup)(it->context);
       free(it);
    }
+
+   diag_remove_hint_fn(jit_diag_cb, j);
 
    mspace_destroy(j->mspace);
    chash_free(j->index);
@@ -305,38 +354,59 @@ static void jit_missing_unit(jit_func_t *f)
    __builtin_unreachable();
 }
 
-void jit_fill_irbuf(jit_func_t *f)
+static bool jit_fill_irbuf_inner(jit_func_t *f, bool fatal_on_missing)
 {
    const func_state_t state = load_acquire(&(f->state));
    switch (state) {
    case JIT_FUNC_READY:
       if (f->irbuf != NULL)
-         return;
+         return true;
       // Fall-through
    case JIT_FUNC_PLACEHOLDER:
       if (atomic_cas(&(f->state), state, JIT_FUNC_COMPILING))
          break;
       // Fall-through
    case JIT_FUNC_COMPILING:
-      // Another thread is compiling this function
-      for (int timeout = 0; load_acquire(&(f->state)) != JIT_FUNC_READY; ) {
+      // Another thread is compiling this function.  Break out on ERROR
+      // too: previously a waiter would spin forever if the compiling
+      // thread marked the function missing (moot when that thread
+      // fataled the process, but the soft path returns instead).
+      for (int timeout = 0; ; ) {
+         const func_state_t now = load_acquire(&(f->state));
+         if (now == JIT_FUNC_READY)
+            return true;
+         else if (now == JIT_FUNC_ERROR) {
+            if (fatal_on_missing)
+               jit_missing_unit(f);
+            return false;
+         }
          if (++timeout % COMPILE_TIMEOUT == 0)
             warnf("waiting for %s to finish compiling", istr(f->name));
          thread_sleep(100);
       }
-      return;
    case JIT_FUNC_ERROR:
-      jit_missing_unit(f);
-      break;
+      if (fatal_on_missing)
+         jit_missing_unit(f);
+      return false;
    default:
       fatal_trace("illegal function state for %s", istr(f->name));
    }
 
    assert(f->irbuf == NULL);
 
+   bool ok = true;
+
 #ifndef USE_EMUTLS
-   const jit_state_t oldstate = jit_thread_get()->state;
-   jit_transition(f->jit, oldstate, JIT_COMPILING);
+   // Use the REAL per-thread state, not the jit_thread_get shim: after
+   // jit_thread_install_fast_path the shim returns the MAIN thread's
+   // cached struct on EVERY thread, and this function now also runs on
+   // cgen workers (deterministic inlining) -- transitioning through the
+   // shim there would mutate the simulating thread's state machine
+   // concurrently (observed as thread->jit corruption -> SEGV in
+   // jit_attach_thread).  Fill is cold code; the TLS lookup is fine.
+   jit_thread_local_t *thread = jit_thread_local();
+   const jit_state_t oldstate = thread->state;
+   jit_transition(thread, f->jit, oldstate, JIT_COMPILING);
 #endif
 
    if (f->jit->pack != NULL && jit_pack_fill(f->jit->pack, f->jit, f)) {
@@ -356,7 +426,10 @@ void jit_fill_irbuf(jit_func_t *f)
 
    if (mu == NULL) {
       store_release(&(f->state), JIT_FUNC_ERROR);
-      jit_missing_unit(f);
+      if (fatal_on_missing)
+         jit_missing_unit(f);
+      ok = false;
+      goto done;
    }
 
    f->counters = cover_get_counters(f->jit->cover, f->name);
@@ -365,8 +438,34 @@ void jit_fill_irbuf(jit_func_t *f)
 
  done:
 #ifndef USE_EMUTLS
-   jit_transition(f->jit, JIT_COMPILING, oldstate);
+   jit_transition(thread, f->jit, JIT_COMPILING, oldstate);
 #endif
+   return ok;
+}
+
+void jit_fill_irbuf(jit_func_t *f)
+{
+   (void)jit_fill_irbuf_inner(f, true);
+}
+
+// Best-effort fill for speculative consumers on CGEN WORKER threads
+// (deterministic inlining, #33).  Restricted to precompiled-pack
+// functions: the pack path is a pure decode, whereas the MIR/irgen
+// path can cascade into linking other units and even executing code
+// (package initialisers), which is not legal on a worker concurrent
+// with the simulation (observed: a worker without an attached JIT
+// thread-local running LOGIC3D "&" -> mspace_alloc -> SEGV).  A
+// missing body returns false instead of a fatal diagnostic because
+// the call-site being lowered may never execute.
+bool jit_try_fill_irbuf(jit_func_t *f)
+{
+   if (load_acquire(&(f->state)) == JIT_FUNC_READY && f->irbuf != NULL)
+      return true;
+
+   if (f->jit->pack == NULL || !jit_pack_has(f->jit->pack, f->name))
+      return false;
+
+   return jit_fill_irbuf_inner(f, false);
 }
 
 jit_handle_t jit_compile(jit_t *j, ident_t name)
@@ -417,6 +516,22 @@ void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f)
       f->privdata = mptr_new(j->mspace, "privdata");
 
    return mptr_get(f->privdata);
+}
+
+void *jit_try_get_frame_var(jit_t *j, jit_handle_t handle, ident_t name)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (f->privdata == MPTR_INVALID)
+      return NULL;
+
+   jit_fill_irbuf(f);
+
+   for (int i = 0; i < f->nvars; i++) {
+      if (f->linktab[i].name == name)
+         return *mptr_get(f->privdata) + f->linktab[i].offset;
+   }
+
+   return NULL;
 }
 
 void *jit_get_frame_var(jit_t *j, jit_handle_t handle, ident_t name)
@@ -560,12 +675,13 @@ static void jit_diag_cb(diag_t *d, void *arg)
 {
    jit_t *j = arg;
 
-   if (j->silent) {
+   if (jit_thread_local()->state != JIT_RUNNING)
+      return;
+   else if (j->silent) {
       diag_suppress(d, true);
       return;
    }
-   else if (unlikely(jit_thread_get()->state != JIT_RUNNING))
-      fatal_trace("JIT diag callback called when not running");
+
 
    jit_stack_trace_t *stack LOCAL = jit_stack_trace();
 
@@ -579,9 +695,9 @@ static void jit_diag_cb(diag_t *d, void *arg)
    }
 }
 
-static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
+static void jit_transition(jit_thread_local_t *thread, jit_t *j,
+                           jit_state_t from, jit_state_t to)
 {
-   jit_thread_local_t *thread = jit_thread_get();
 
 #ifdef DEBUG
    if (thread->state != from)
@@ -592,53 +708,99 @@ static void jit_transition(jit_t *j, jit_state_t from, jit_state_t to)
 
    switch (to) {
    case JIT_RUNNING:
-      if (from != JIT_RUNNING) {
-         diag_add_hint_fn(jit_diag_cb, j);
+      if (from != JIT_RUNNING)
          thread->jit = j;
-      }
       else
          assert(thread->jit == j);
       break;
    case JIT_IDLE:
-      if (from == JIT_RUNNING) {
-         diag_remove_hint_fn(jit_diag_cb);
-         thread->jit = NULL;
-      }
-      break;
    case JIT_COMPILING:
-      if (from == JIT_RUNNING) {
-         diag_remove_hint_fn(jit_diag_cb);
+      if (from == JIT_RUNNING)
          thread->jit = NULL;
-      }
       break;
    }
+}
+
+jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate)
+{
+   jit_thread_local_t *thread = jit_thread_local();
+   *oldstate = thread->state;
+   jit_transition(thread, j, *oldstate, JIT_RUNNING);
+   return thread;
+}
+
+void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
+                          jit_state_t oldstate)
+{
+   thread->jmp_buf_valid = 0;
+   thread->anchor = NULL;
+   jit_transition(thread, j, JIT_RUNNING, oldstate);
 }
 
 static bool jit_try_vcall(jit_t *j, jit_func_t *f, jit_scalar_t *args,
                           tlab_t *tlab)
 {
-   jit_thread_local_t *volatile thread = jit_thread_get();
-   volatile const jit_state_t oldstate = thread->state;
+   jit_thread_local_t *volatile vthread = jit_thread_get();
+   volatile const jit_state_t oldstate = vthread->state;
 
-   const int rc = jit_setjmp(thread->abort_env);
+   const int rc = jit_setjmp(vthread->abort_env);
    if (rc == 0) {
-      thread->jmp_buf_valid = 1;
-      jit_transition(j, oldstate, JIT_RUNNING);
+      vthread->jmp_buf_valid = 1;
+      jit_transition(vthread, j, oldstate, JIT_RUNNING);
 
       jit_entry_fn_t entry = load_acquire(&f->entry);
       (*entry)(f, NULL, args, tlab);
 
-      jit_transition(j, JIT_RUNNING, oldstate);
-      thread->jmp_buf_valid = 0;
-      thread->anchor = NULL;
+      jit_transition(vthread, j, JIT_RUNNING, oldstate);
+      vthread->jmp_buf_valid = 0;
+      vthread->anchor = NULL;
       return true;
    }
    else {
-      jit_transition(j, JIT_RUNNING, oldstate);
-      thread->jmp_buf_valid = 0;
-      thread->anchor = NULL;
+      jit_transition(vthread, j, JIT_RUNNING, oldstate);
+      vthread->jmp_buf_valid = 0;
+      vthread->anchor = NULL;
       return false;
    }
+}
+
+// Explicit in-region call, used ONLY by the scheduler's process activation
+// (run_process), which we know executes inside the landing pad armed by
+// model_run. Because the caller states the context rather than this code
+// inferring it from shared mutable flags, elaboration/folding can never reach
+// here -- an earlier attempt keyed off (jmp_buf_valid && state == JIT_RUNNING)
+// and misfired on nested elaboration calls that already had an outer pad.
+// Skips the per-call setjmp, both state transitions and the diag-hint
+// add/remove; an abort unwinds to model_run's pad. Falls back to the normal
+// path when no region is armed (model_step / shell / VHPI stepping).
+static bool jit_vcall_inregion(jit_t *j, jit_func_t *f, jit_scalar_t *args,
+                               tlab_t *tlab)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+
+   if (unlikely(!thread->jmp_buf_valid || thread->state != JIT_RUNNING))
+      return jit_try_vcall(j, f, args, tlab);
+
+   jit_entry_fn_t entry = load_acquire(&f->entry);
+   (*entry)(f, NULL, args, tlab);
+   thread->anchor = NULL;
+   return true;
+}
+
+bool jit_fastcall_inregion(jit_t *j, jit_handle_t handle, jit_scalar_t *result,
+                           jit_scalar_t p1, jit_scalar_t p2, tlab_t *tlab)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+
+   jit_scalar_t args[JIT_MAX_ARGS];
+   args[0] = p1;
+   args[1] = p2;
+
+   if (!jit_vcall_inregion(j, f, args, tlab))
+      return false;
+
+   *result = args[0];
+   return true;
 }
 
 static void jit_unpack_args(jit_func_t *f, jit_scalar_t *args, va_list ap)
@@ -925,6 +1087,11 @@ ident_t jit_get_name(jit_t *j, jit_handle_t handle)
    return jit_get_func(j, handle)->name;
 }
 
+jit_pack_t *jit_get_pack(jit_t *j)
+{
+   return j->pack;
+}
+
 object_t *jit_get_object(jit_t *j, jit_handle_t handle)
 {
    jit_func_t *f = jit_get_func(j, handle);
@@ -955,19 +1122,21 @@ jit_handle_t jit_assemble(jit_t *j, ident_t name, const char *text)
    if (f != NULL)
       return f->handle;
 
-   SCOPED_LOCK(j->lock);
+   {
+      SCOPED_LOCK(j->lock);
 
-   f = xcalloc(sizeof(jit_func_t));
+      f = xcalloc(sizeof(jit_func_t));
 
-   f->name      = name;
-   f->state     = JIT_FUNC_READY;
-   f->jit       = j;
-   f->handle    = j->next_handle++;
-   f->next_tier = j->tiers;
-   f->hotness   = f->next_tier ? f->next_tier->threshold : 0;
-   f->entry     = jit_interp;
+      f->name      = name;
+      f->state     = JIT_FUNC_READY;
+      f->jit       = j;
+      f->handle    = j->next_handle++;
+      f->next_tier = j->tiers;
+      f->hotness   = f->next_tier ? f->next_tier->threshold : 0;
+      f->entry     = jit_interp;
 
-   jit_install(j, f);
+      jit_install(j, f);
+   }
 
    enum { LABEL, INS, CCSIZE, RESULT, ARG1, ARG2, NEWLINE, CP } state = LABEL;
 
@@ -1089,8 +1258,7 @@ jit_handle_t jit_assemble(jit_t *j, ident_t name, const char *text)
 
             int ipos = 0;
             for (; ipos < ARRAY_LEN(optab)
-                    && strcmp(optab[ipos].name, tok); ipos++)
-               ;
+                    && strcmp(optab[ipos].name, tok); ipos++);
 
             if (ipos == ARRAY_LEN(optab))
                fatal_trace("illegal instruction %s", tok);

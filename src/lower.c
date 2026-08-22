@@ -3098,7 +3098,7 @@ static vcode_reg_t lower_ref(lower_unit_t *lu, tree_t ref, expr_ctx_t ctx)
       return lower_generic_ref(lu, decl, ctx);
 
    case T_SIGNAL_DECL:
-      if (standard() == STD_MX && ctx == EXPR_TARGET) {
+      if (0 /* STD_MX disabled */ && ctx == EXPR_TARGET) {
          // Signal assignment target: redirect to 'driver so that
          // the parent signal can resolve all driver contributions.
          tree_t imp = lower_find_stdmx_implicit(lu, decl,
@@ -5907,7 +5907,7 @@ static void lower_fill_target_parts(lower_unit_t *lu, tree_t target,
       ++(*ptr);
    }
    else {
-      (*ptr)->reg    = (standard() == STD_MX)
+      (*ptr)->reg    = (0)
          ? lower_expr(lu, target, EXPR_TARGET)
          : lower_lvalue(lu, target);
       (*ptr)->target = target;
@@ -6437,15 +6437,81 @@ static void lower_deposit(lower_unit_t *lu, tree_t stmt)
 
       vcode_reg_t count_reg = lower_array_total_len(lu, type, nets);
       vcode_reg_t data_reg = lower_array_data(value_reg);
-      emit_deposit(lower_array_data(nets), count_reg, data_reg);
+      vcode_reg_t nets_reg = lower_array_data(nets);
+
+      // Deposit gate: measured on VeeR interp, 93.1% of deposit-nexus
+      // visits carry bytes already equal to the effective value (77.3M
+      // visits in 3000ns; deposit+cmp ~15-20% of steady sim).  The
+      // runtime performs the same equality test only AFTER the JIT exit,
+      // split_nexus and per-nexus scaffolding — so compare inline against
+      // the resolved bytes and branch around the deposit entirely when
+      // nothing changes.  Byte-equal deposits are event-free no-ops in
+      // deposit_signal_impl, so skipping the call is observationally
+      // identical (forced nets: an equal-value deposit is LOST either
+      // way).  The NVC_ACCEL_FORCEEV diagnostic knob (force events on
+      // byte-equal deposits; measured neutral, default off) is bypassed
+      // by this gate.
+      vcode_type_t voffset = vtype_offset();
+      vcode_reg_t res_reg = emit_resolved(nets_reg, count_reg);
+
+      vcode_var_t i_var = lower_temp_var(lu, "depgate_i", voffset, voffset);
+      emit_store(emit_const(voffset, 0), i_var);
+
+      vcode_block_t head_bb = emit_block();
+      vcode_block_t body_bb = emit_block();
+      vcode_block_t next_bb = emit_block();
+      vcode_block_t diff_bb = emit_block();
+      vcode_block_t skip_bb = emit_block();
+      emit_jump(head_bb);
+
+      vcode_select_block(head_bb);
+      vcode_reg_t i_reg = emit_load(i_var);
+      vcode_reg_t done_reg = emit_cmp(VCODE_CMP_EQ, i_reg, count_reg);
+      emit_cond(done_reg, skip_bb, body_bb);
+
+      vcode_select_block(body_bb);
+      vcode_reg_t cur_reg = emit_load_indirect(emit_array_ref(res_reg, i_reg));
+      vcode_reg_t new_reg = emit_load_indirect(emit_array_ref(data_reg, i_reg));
+      vcode_reg_t neq_reg = emit_cmp(VCODE_CMP_NEQ, cur_reg, new_reg);
+      emit_cond(neq_reg, diff_bb, next_bb);
+
+      vcode_select_block(next_bb);
+      emit_store(emit_add(i_reg, emit_const(voffset, 1)), i_var);
+      emit_jump(head_bb);
+
+      vcode_select_block(diff_bb);
+      emit_deposit(nets_reg, count_reg, data_reg);
+      emit_jump(skip_bb);
+
+      vcode_select_block(skip_bb);
    }
    else if (type_is_record(type)) {
       vcode_reg_t locus = lower_debug_locus(value);
       lower_for_each_field_2(lu, type, value_type, nets, value_reg, locus,
                              lower_deposit_field_cb, NULL);
    }
-   else
-      emit_deposit(nets, emit_const(vtype_offset(), 1), value_reg);
+   else {
+      // Scalar deposit gate: the 77M VeeR deposit visits are per-wire
+      // scalar := writes (1 lane x 4-byte l3d elem), 93.1% byte-equal
+      // no-ops — the array-path gate above never sees them.  One inline
+      // load+compare skips the JIT exit and the whole runtime path when
+      // the value is unchanged (same observational-equivalence argument
+      // as the array gate).
+      vcode_reg_t one_reg = emit_const(vtype_offset(), 1);
+      vcode_reg_t res_ptr = emit_resolved(nets, one_reg);
+      vcode_reg_t cur_reg = emit_load_indirect(res_ptr);
+      vcode_reg_t neq_reg = emit_cmp(VCODE_CMP_NEQ, cur_reg, value_reg);
+
+      vcode_block_t dep_bb  = emit_block();
+      vcode_block_t skip_bb = emit_block();
+      emit_cond(neq_reg, dep_bb, skip_bb);
+
+      vcode_select_block(dep_bb);
+      emit_deposit(nets, one_reg, value_reg);
+      emit_jump(skip_bb);
+
+      vcode_select_block(skip_bb);
+   }
 }
 
 static void lower_release_field_cb(lower_unit_t *lu, tree_t field,
@@ -7116,7 +7182,12 @@ static void lower_case_array(lower_unit_t *lu, tree_t stmt, loop_stack_t *loops)
       type_t c0_type = tree_type(c0);
 
       int64_t c0_length;
-      if (folded_length(range_of(c0_type, 0), &c0_length))
+      // Unconstrained choice types have no statically-known range:
+      // skip the folded_length attempt and use the runtime path.
+      // This shows up in STD_MX mode when iverilog-generated VHDL
+      // dispatches `case` on a slice of an unresolved_unsigned signal.
+      if (!type_is_unconstrained(c0_type)
+          && folded_length(range_of(c0_type, 0), &c0_length))
          c0_length_reg = emit_const(voffset, c0_length);
       else {
          c0_reg = lower_rvalue(lu, c0);
@@ -10981,6 +11052,109 @@ static vcode_reg_t lower_process_trigger(lower_unit_t *lu, tree_t proc)
       return emit_or_trigger(branches[0], branches[1]);
 }
 
+// #74 E2: reset-time registration that this process (or a subprogram
+// declared inside it — tree_visit_only walks the whole subtree) reads
+// S'last_value, so the runtime must keep the last-value plane for S.
+// Package-level subprograms reading FORMAL'last_value are the one case
+// this walk cannot see; the STD_MX/NVC_LV_COPYALL fallback and the
+// NVC_LV_POISON gate fixture cover that residual (see model.c).
+static void lower_lv_field_cb(lower_unit_t *lu, tree_t field, vcode_reg_t ptr,
+                              vcode_reg_t unused, vcode_reg_t locus, void *ctx)
+{
+   type_t type = tree_type(field);
+   if (!type_is_homogeneous(type))
+      lower_for_each_field(lu, type, ptr, VCODE_INVALID_REG,
+                           lower_lv_field_cb, ctx);
+   else {
+      vcode_reg_t nets_reg = emit_load_indirect(ptr);
+      vcode_reg_t count_reg = lower_type_width(lu, type, nets_reg);
+      emit_enable_last_value(lower_array_data(nets_reg), count_reg);
+   }
+}
+
+static void lower_lv_register(lower_unit_t *lu, tree_t prefix)
+{
+   type_t type = tree_type(prefix);
+   vcode_reg_t nets_reg = lower_lvalue(lu, prefix);
+   if (!type_is_homogeneous(type))
+      lower_for_each_field(lu, type, nets_reg, VCODE_INVALID_REG,
+                           lower_lv_field_cb, NULL);
+   else {
+      vcode_reg_t count_reg = lower_type_width(lu, type, nets_reg);
+      emit_enable_last_value(lower_array_data(nets_reg), count_reg);
+   }
+}
+
+static void lower_lv_enable_cb(tree_t t, void *ctx)
+{
+   lower_unit_t *lu = ctx;
+   if (tree_subkind(t) != ATTR_LAST_VALUE)
+      return;
+
+   tree_t prefix = tree_name(t);
+   tree_t ref = name_to_ref(prefix);
+   if (ref == NULL || class_of(ref) != C_SIGNAL)
+      return;
+
+   // The visit descends into subprogram bodies declared in the process:
+   // a prefix rooted at a FORMAL has no register in the reset context —
+   // and needs none, since the call-cb registers the caller's actual.
+   if (tree_has_ref(ref) && tree_kind(tree_ref(ref)) == T_PARAM_DECL)
+      return;
+
+   // Register via the ROOT ref, not the full prefix: granularity is
+   // per-signal (x_enable_last_value sets ss->flags), and the prefix
+   // may contain non-static parts (s(i), relaxed rules) that have no
+   // value in the reset context.
+   lower_lv_register(lu, ref);
+}
+
+// A subprogram taking a SIGNAL-class formal may read FORMAL'last_value
+// in its body (rising_edge/falling_edge do exactly this) — the process
+// walk cannot see through the call, so register every signal actual
+// bound to a signal-class formal.  Registering at the PASSING point
+// makes transitive call chains conservative-safe with no body analysis.
+static void lower_lv_call_cb(tree_t t, void *ctx)
+{
+   lower_unit_t *lu = ctx;
+   tree_t decl = tree_has_ref(t) ? tree_ref(t) : NULL;
+
+   const int nparams = tree_params(t);
+   for (int i = 0; i < nparams; i++) {
+      tree_t p = tree_param(t, i);
+      tree_t value = tree_value(p);
+      tree_t ref = name_to_ref(value);
+      if (ref == NULL || class_of(ref) != C_SIGNAL)
+         continue;
+
+      // Formal passed onward inside a nested body: outer call site
+      // already registered the true actual
+      if (tree_has_ref(ref) && tree_kind(tree_ref(ref)) == T_PARAM_DECL)
+         continue;
+
+      bool signal_formal = true;   // unresolvable/named assoc → conservative
+      if (decl != NULL && tree_subkind(p) == P_POS) {
+         const unsigned pos = tree_pos(p);
+         if (pos < (unsigned)tree_ports(decl))
+            signal_formal = tree_class(tree_port(decl, pos)) == C_SIGNAL;
+      }
+
+      if (signal_formal)
+         lower_lv_register(lu, ref);
+   }
+}
+
+// Exported for PSL: register 'last_value readers found in an arbitrary
+// HDL expression (clock expressions, guards) in the current unit's
+// reset context
+void lower_last_value_walk(lower_unit_t *lu, tree_t expr)
+{
+   tree_visit_only(expr, lower_lv_enable_cb, lu, T_ATTR_REF);
+   tree_visit_only(expr, lower_lv_call_cb, lu, T_FCALL);
+   tree_visit_only(expr, lower_lv_call_cb, lu, T_PCALL);
+}
+
+
 void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
 {
    assert(tree_kind(proc) == T_PROCESS);
@@ -11013,7 +11187,7 @@ void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
       assert(!di->tentative);
       type_t prefix_type = tree_type(di->prefix);
       // STD_MX: redirect driver creation to 'driver implicit signal
-      vcode_reg_t nets_reg = (standard() == STD_MX)
+      vcode_reg_t nets_reg = (0)
          ? lower_expr(lu, di->prefix, EXPR_TARGET)
          : lower_lvalue(lu, di->prefix);
 
@@ -11026,6 +11200,12 @@ void lower_process(lower_unit_t *parent, tree_t proc, driver_set_t *ds)
          emit_drive_signal(lower_array_data(nets_reg), count_reg);
       }
    }
+
+   tree_visit_only(proc, lower_lv_enable_cb, lu, T_ATTR_REF);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_FCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PROT_FCALL);
+   tree_visit_only(proc, lower_lv_call_cb, lu, T_PROT_PCALL);
 
    const bool transfer = can_use_transfer_signal(proc, ds);
    vcode_reg_t trigger_reg = VCODE_INVALID_REG;
@@ -11873,6 +12053,16 @@ static void lower_direct_mapped_port(lower_unit_t *lu, tree_t block, tree_t map,
    assert(tree_kind(port) == T_PORT_DECL);
 
    tree_t value = tree_value(map);
+
+   // Dialect cross-type associations (e.g. a std_logic control port
+   // mapped to a resolved_logic3d net, as the self-gated tranif form
+   // produces) cannot collapse: the port var and the actual's handle
+   // lower to different types.  Fall back to the normal port-map path
+   // which applies the conversion semantics.
+   if (type_is_scalar(tree_type(port))
+       && !vtype_eq(lower_type(tree_type(port)),
+                    lower_type(tree_type(value))))
+      return;
 
    if (tree_class(port) == C_VARIABLE) {
       // Variable ports are always directly aliased to the actual

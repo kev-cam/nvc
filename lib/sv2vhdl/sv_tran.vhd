@@ -60,6 +60,45 @@ begin
 end architecture strength;
 
 ---------------------------------------------------------------------------
+-- ALIAS: permanent bidirectional short (SystemVerilog 'alias' statement).
+-- Like TRAN but a true wire join: no strength reduction in either variant,
+-- so a value driven on one side appears unchanged on the other. The
+-- translator emits this to short ports that share a net (e.g. module id(a,a)).
+---------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity sv_alias is
+    port (
+        a : inout std_logic;
+        b : inout std_logic
+    );
+end entity sv_alias;
+
+architecture behavioral of sv_alias is
+begin
+    process (a'other, b'other)
+    begin
+        a'driver := b'other;
+        b'driver := a'other;
+    end process;
+end architecture behavioral;
+
+-- Strength-aware: identical to behavioral — an alias is a wire join, so it
+-- passes strength through unchanged (no cap, no weaken).
+library ieee;
+use ieee.std_logic_1164.all;
+
+architecture strength of sv_alias is
+begin
+    process (a'other, b'other)
+    begin
+        a'driver := b'other;
+        b'driver := a'other;
+    end process;
+end architecture strength;
+
+---------------------------------------------------------------------------
 -- TRANIF0: Bidirectional switch, conducts when ctrl=0
 ---------------------------------------------------------------------------
 library ieee;

@@ -1,8 +1,8 @@
 -- SystemVerilog Multi-input and Multi-output Gates
 -- IEEE 1800 Sections 28.4 and 28.5
 --
--- Ports use std_logic for external compatibility.
--- Architectures use logic3d LUT functions for enhanced X-propagation.
+-- Ports use logic3d/logic3d_vector for native 3D logic semantics.
+-- No std_logic conversion overhead.
 
 ---------------------------------------------------------------------------
 -- AND Gate: N-input AND
@@ -14,8 +14,8 @@ use work.logic3d_types_pkg.all;
 entity sv_and is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_and;
 
@@ -26,9 +26,9 @@ begin
     begin
         result := L3D_1;
         for i in a'range loop
-            result := l3d_and(result, to_logic3d(a(i)));
+            result := l3d_and(result, a(i));
         end loop;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -42,8 +42,8 @@ use work.logic3d_types_pkg.all;
 entity sv_nand is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_nand;
 
@@ -54,9 +54,9 @@ begin
     begin
         result := L3D_1;
         for i in a'range loop
-            result := l3d_and(result, to_logic3d(a(i)));
+            result := l3d_and(result, a(i));
         end loop;
-        y <= to_std_logic(l3d_not(result));
+        y <= l3d_not(result);
     end process;
 end architecture behavioral;
 
@@ -70,8 +70,8 @@ use work.logic3d_types_pkg.all;
 entity sv_or is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_or;
 
@@ -82,9 +82,9 @@ begin
     begin
         result := L3D_0;
         for i in a'range loop
-            result := l3d_or(result, to_logic3d(a(i)));
+            result := l3d_or(result, a(i));
         end loop;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -98,8 +98,8 @@ use work.logic3d_types_pkg.all;
 entity sv_nor is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_nor;
 
@@ -110,9 +110,9 @@ begin
     begin
         result := L3D_0;
         for i in a'range loop
-            result := l3d_or(result, to_logic3d(a(i)));
+            result := l3d_or(result, a(i));
         end loop;
-        y <= to_std_logic(l3d_not(result));
+        y <= l3d_not(result);
     end process;
 end architecture behavioral;
 
@@ -126,8 +126,8 @@ use work.logic3d_types_pkg.all;
 entity sv_xor is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_xor;
 
@@ -138,9 +138,9 @@ begin
     begin
         result := L3D_0;
         for i in a'range loop
-            result := l3d_xor(result, to_logic3d(a(i)));
+            result := l3d_xor(result, a(i));
         end loop;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -154,8 +154,8 @@ use work.logic3d_types_pkg.all;
 entity sv_xnor is
     generic (n : positive := 2);
     port (
-        y : out std_logic;
-        a : in  std_logic_vector(0 to n-1)
+        y : out logic3d;
+        a : in  logic3d_vector(0 to n-1)
     );
 end entity sv_xnor;
 
@@ -166,9 +166,9 @@ begin
     begin
         result := L3D_0;
         for i in a'range loop
-            result := l3d_xor(result, to_logic3d(a(i)));
+            result := l3d_xor(result, a(i));
         end loop;
-        y <= to_std_logic(l3d_not(result));
+        y <= l3d_not(result);
     end process;
 end architecture behavioral;
 
@@ -182,27 +182,19 @@ use work.logic3d_types_pkg.all;
 entity sv_buf is
     generic (n : positive := 1);
     port (
-        y : out std_logic_vector(0 to n-1);
-        a : in  std_logic
+        y : out logic3d_vector(0 to n-1);
+        a : in  logic3d
     );
 end entity sv_buf;
 
 architecture behavioral of sv_buf is
 begin
     process (a)
-        variable inp : logic3d;
         variable result : logic3d;
     begin
-        inp := to_logic3d(a);
-        if is_uncertain(inp) then
-            result := L3D_X;
-        elsif is_one(inp) then
-            result := L3D_1;
-        else
-            result := L3D_0;
-        end if;
+        result := l3d_buf(a);
         for i in y'range loop
-            y(i) <= to_std_logic(result);
+            y(i) <= result;
         end loop;
     end process;
 end architecture behavioral;
@@ -217,27 +209,19 @@ use work.logic3d_types_pkg.all;
 entity sv_not is
     generic (n : positive := 1);
     port (
-        y : out std_logic_vector(0 to n-1);
-        a : in  std_logic
+        y : out logic3d_vector(0 to n-1);
+        a : in  logic3d
     );
 end entity sv_not;
 
 architecture behavioral of sv_not is
 begin
     process (a)
-        variable inp : logic3d;
         variable result : logic3d;
     begin
-        inp := to_logic3d(a);
-        if is_uncertain(inp) then
-            result := L3D_X;
-        elsif is_one(inp) then
-            result := L3D_0;
-        else
-            result := L3D_1;
-        end if;
+        result := l3d_not(a);
         for i in y'range loop
-            y(i) <= to_std_logic(result);
+            y(i) <= result;
         end loop;
     end process;
 end architecture behavioral;

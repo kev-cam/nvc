@@ -45,14 +45,40 @@ typedef enum {
    FUNC_TRIGGER, OR_TRIGGER, CMP_TRIGGER, LEVEL_TRIGGER
 } trigger_kind_t;
 
+// Virtual method table for a schedulable object. The scheduler dispatches
+// through this instead of switching on `kind`, so a new kind of schedulable
+// is a new vtable rather than another case in the hot loop -- and an
+// individual object can be given a specialized vtable (e.g. an accel chunk
+// that schedules itself once per delta) without changing its kind.
+typedef struct _wakeable_vtable wakeable_vtable_t;
+
 typedef struct {
+   const wakeable_vtable_t *vtable;  // FIRST: zero-offset recovery for dispatch
    wakeable_kind_t kind : 8;
    unsigned        pending : 1;
    unsigned        postponed : 1;
    unsigned        delayed : 1;
    unsigned        zombie : 1;
+   unsigned        fastclk : 1;   // NVC_FAST_CLK: clk-only, dispatched by table
+   unsigned        fastclk_ee : 1; // wide table: EVERY-EVENT member (also pends
+                                   // on a registered companion, e.g. async rst);
+                                   // cleared everywhere fastclk is cleared
+   unsigned        fastclk_counted : 1; // this pend incremented fastclk_npending
+                                   // (exact pairing so the atomic decrement at
+                                   // resume/evict can never under/overshoot)
+   unsigned        fused_cone : 1; // comb_fused_* block: force/release re-runs it
+   unsigned        dep_recorded : 1; // cone's depositor map entries complete
+   unsigned        wait_state : 2; // 0=first activation, 1=static (entries
+                                   // persist, sched/clear no-op), 2=dynamic
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
+
+// wake: enqueue this object to run in the current delta (what the old
+// wakeup_one switch did per kind). Called with the fastclk/pending guards
+// already applied.
+struct _wakeable_vtable {
+   void (*wake)(rt_model_t *m, rt_wakeable_t *obj);
+};
 
 typedef struct _rt_trigger {
    rt_wakeable_t   wakeable;
@@ -74,6 +100,11 @@ typedef void (*proc_eval_fn)(rt_model_t *m, rt_proc_t *proc);
 typedef struct _rt_proc_vtable {
    proc_eval_fn eval;     // execute one cycle
    void (*reset)(rt_proc_t *proc);  // revert to default vtable
+   // Per-instance abort policy. Invoked at the scheduler's landing pad after an
+   // abort unwound out of THIS process, so an instance decides what an abort
+   // means for it (stop the run, record and continue, demote severity) instead
+   // of one global rule baked into the unwind target. NULL => stop the run.
+   void (*on_abort)(rt_model_t *m, rt_proc_t *proc);
 } rt_proc_vtable_t;
 
 struct _rt_proc {
@@ -85,9 +116,24 @@ struct _rt_proc {
    tlab_t        *tlab;
    rt_scope_t    *scope;
    mptr_t         privdata;
+   // Static-wait tracking: registered sensitivity set (built on the first
+   // activation, entries then persist on the pending lists forever) and
+   // the fingerprint used to verify later activations re-arm the same set.
+   rt_nexus_t   **wait_set;
+   unsigned       wait_count, wait_cap;   // wait_set[] registrations
+   unsigned       wait_fpcount;            // fingerprint sched-call count
+   // Phase D S2a partition id (PART_NONE when unpartitioned).  Placed in the
+   // existing 4-byte alignment hole between wait_fpcount and wait_sig, so
+   // sizeof(rt_proc_t) is unchanged at 144 bytes -- see rt/partition.h.
+   uint16_t       part;
+   uint64_t       wait_sig;
+   unsigned       cur_count;
+   uint64_t       cur_sig;
+   rt_nexus_t   **cur_set;      // this activation's re-arm set (for demote)
+   unsigned       cur_cap;
 };
 
-STATIC_ASSERT(sizeof(rt_proc_t) <= 136);
+STATIC_ASSERT(sizeof(rt_proc_t) <= 184);   // +static-wait tracking
 
 typedef struct _rt_prop {
    rt_wakeable_t  wakeable;
@@ -175,6 +221,7 @@ typedef struct _rt_source {
    unsigned        sigqueued : 1;
    unsigned        pseudoqueued : 1;
    unsigned        was_active : 1;
+   unsigned        aj_rerouted : 1;   // owning proc rerouted into accel chunk
    union {
       rt_port_t   port;
       rt_driver_t driver;
@@ -207,10 +254,15 @@ typedef struct _rt_pipe_fifo {
 // Can be replaced at runtime with short-circuit fast paths
 // (e.g. single-driver direct store, federation bridge redirect).
 typedef struct _rt_nexus_vtable {
+   // Ordered hottest-first, so the hottest dispatch lands at vtable offset 0
+   // (zero-displacement indirect call, first in the vtable's cache line). The
+   // per-delta driving recompute and event notify are the hot pair; deposit
+   // (effective-value) is colder; read_source is never dispatched through the
+   // vtable (only stored) so it goes last.
    void  (*update_driving)(rt_model_t *m, rt_nexus_t *n);
+   void  (*notify)(rt_model_t *m, rt_nexus_t *n);
    void  (*deposit)(rt_model_t *m, rt_nexus_t *n, const void *value);
    void *(*read_source)(rt_nexus_t *nexus, rt_source_t *src);
-   void  (*notify)(rt_model_t *m, rt_nexus_t *n);
 } rt_nexus_vtable_t;
 
 typedef struct _rt_nexus {
@@ -302,6 +354,7 @@ typedef struct _rt_scope {
    mptr_t           privdata;
    rt_scope_t      *parent;
    scope_list_t     children;
+   eval_arena_t    *scratch;   // per-instance transient arena (reset per eval)
 } rt_scope_t;
 
 typedef struct _rt_watch {

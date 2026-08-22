@@ -192,7 +192,9 @@ static jit_ir_t *irgen_append(jit_irgen_t *g)
 
 static jit_value_t irgen_alloc_reg(jit_irgen_t *g, int slots)
 {
-   if (unlikely(g->next_reg + slots > JIT_REG_INVALID))
+   // Evaluate in 64 bits: with a 32-bit jit_reg_t, next_reg + slots would wrap
+   // modulo 2^32 and the guard could never fire (JIT_REG_INVALID == UINT32_MAX).
+   if (unlikely((uint64_t)g->next_reg + slots > JIT_REG_INVALID))
       fatal("unit %s is too big to compile", istr(g->func->name));
    else {
       jit_value_t result = { .kind = JIT_VALUE_REG, .reg = g->next_reg };
@@ -3431,6 +3433,32 @@ static void irgen_op_resolved(jit_irgen_t *g, mir_value_t n)
    jit_value_t data_ptr = irgen_alloc_temp(g);
    irgen_lea(g, data_ptr, jit_addr_from_value(shared, 8));
 
+   // NVC_BANKED_READS: the double-bank read form — value plane selected by
+   // the global bank index (data + 8 + sel*3*size reaches value bank B at
+   // plane 3 when sel==1; see the NVC_BANKED substrate in rt/model.c).
+   // With sel pinned at 0 this is the PRICING build: identical behavior,
+   // and the marginal cost of the extra load-sel/load-size/mul/add per
+   // signal read is measurable directly.  Startup-env-picked so the
+   // default lowering stays byte-identical to today's.
+   static int banked_reads = -1;
+   if (banked_reads < 0)
+      banked_reads = getenv("NVC_BANKED_READS") != NULL ? 1 : 0;
+   if (banked_reads) {
+      extern int32_t nvc_banked_sel;
+      jit_value_t sel = irgen_alloc_temp(g);
+      j_load(g, JIT_SZ_32, sel, jit_addr_from_value(
+                jit_value_from_int64((int64_t)(intptr_t)&nvc_banked_sel), 0));
+      jit_value_t szv = irgen_alloc_temp(g);
+      j_load(g, JIT_SZ_32, szv, jit_addr_from_value(shared, 0));
+      jit_value_t t1 = irgen_alloc_temp(g);
+      j_mul(g, t1, sel, szv);
+      jit_value_t t2 = irgen_alloc_temp(g);
+      j_mul(g, t2, t1, jit_value_from_int64(3));
+      jit_value_t np = irgen_alloc_temp(g);
+      j_add(g, np, data_ptr, t2);
+      data_ptr = np;
+   }
+
    mir_type_t type = mir_get_pointer(g->mu, mir_get_type(g->mu, n));
 
    const int scale = irgen_size_bytes(g, type);
@@ -3462,6 +3490,66 @@ static void irgen_op_last_value(jit_irgen_t *g, mir_value_t n)
    j_add(g, last_value, last_value, scaled);
 }
 
+// ---------------------------------------------------------------------------
+// Native-projection pilot: SPECIALIZATION DECISION for signal assignment.
+//
+// The event-driven runtime is an executable spec; a sched_waveform site whose
+// static shape is "scalar delta assignment" (after == 0, reject == 0, scalar
+// value) is a candidate for having the spec's driver-update path inlined into
+// the compiled process code, guarded by the per-nexus dynamic eligibility
+// tests (single fast driver, no resolution, not postponed, ...) which the
+// LLVM backend emits inline (cgen_inline_drive_body).  This function is the
+// COMPILE-TIME half of that decision and is deliberately separable:
+// ldx-extraction material -- the decision "which uses of a runtime primitive
+// have a statically known shape that admits specialization" is independent of
+// nvc's plumbing; only the arguments inspected are nvc-specific.
+//
+// The handle compiled here is shared by every instance of the design unit, so
+// ONLY link-time facts may be used: the delay/reject literals and the value's
+// scalarness are per-DESIGN properties identical for all instances.  Anything
+// per-INSTANCE (driver count, resolution, forcing, probation, postponed
+// processes reached through shared procedures) is left to the inline runtime
+// guards, which decline to the unchanged C spec path.
+static jit_exit_t irgen_sched_waveform_exit(jit_irgen_t *g, mir_value_t n)
+{
+   mir_value_t value = mir_get_arg(g->mu, n, 2);
+   if (mir_is(g->mu, value, MIR_TYPE_POINTER))
+      return JIT_EXIT_SCHED_WAVEFORM;   // Vector assignment: spec path
+
+   int64_t after, reject;
+   if (!mir_get_const(g->mu, mir_get_arg(g->mu, n, 4), &after) || after != 0)
+      return JIT_EXIT_SCHED_WAVEFORM;   // Delayed assignment: spec path
+   else if (!mir_get_const(g->mu, mir_get_arg(g->mu, n, 3), &reject)
+            || reject != 0)
+      return JIT_EXIT_SCHED_WAVEFORM;   // Pulse rejection: spec path
+
+   // The runtime element size is type_byte_width of the SIGNAL's base type
+   // (see lower_signal_decl); the value operand may be wider.  A mismatch
+   // is still caught by the emitted n->size guard, so this only has to be
+   // right for the fast path to engage, not for correctness.
+   mir_type_t sigtype = mir_get_type(g->mu, mir_get_arg(g->mu, n, 0));
+   mir_type_t base = mir_get_base(g->mu, sigtype);
+   if (mir_is_null(base))
+      return JIT_EXIT_SCHED_WAVEFORM;
+
+   // Element assignment into an array signal: strip to the element type
+   for (mir_type_t e; !mir_is_null(e = mir_get_elem(g->mu, base)); base = e);
+
+   // Any element size that fits rt_value_t's inline qword (1..8 bytes) has
+   // a specialized exit: FASTn <=> n-byte element.  Odd sizes arise only
+   // from user-declared integer BASE types (`type T is range 0 to 2**20-1'
+   // = 3 bytes): `integer range ...' subtypes erase to 4-byte INTEGER on
+   // both this side (lower_type recurses to type_base) and the runtime
+   // side (type_byte_width), so the two computations stay consistent and
+   // the emitted n->size guard is a belt-and-braces decline, not the
+   // common case.
+   const int bytes = irgen_size_bytes(g, base);
+   if (bytes >= 1 && bytes <= 8)
+      return JIT_EXIT_SCHED_WAVEFORM_FAST1 + (bytes - 1);
+   else
+      return JIT_EXIT_SCHED_WAVEFORM;
+}
+
 static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
@@ -3481,7 +3569,7 @@ static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)
    j_send(g, 5, reject);
    j_send(g, 6, scalar);
 
-   macro_exit(g, JIT_EXIT_SCHED_WAVEFORM);
+   macro_exit(g, irgen_sched_waveform_exit(g, n));
 }
 
 static void irgen_op_disconnect(jit_irgen_t *g, mir_value_t n)
@@ -3703,6 +3791,19 @@ static void irgen_op_sched_event(jit_irgen_t *g, mir_value_t n)
       j_send(g, 0, trigger);
       macro_exit(g, JIT_EXIT_ENABLE_TRIGGER);
    }
+}
+
+static void irgen_op_enable_last_value(jit_irgen_t *g, mir_value_t n)
+{
+   mir_value_t on = mir_get_arg(g->mu, n, 0);
+   jit_value_t shared = irgen_get_slot(g, on, 0);
+   jit_value_t offset = irgen_get_slot(g, on, 1);
+   jit_value_t count = irgen_get_arg(g, n, 1);
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+   macro_exit(g, JIT_EXIT_ENABLE_LAST_VALUE);
 }
 
 static void irgen_op_clear_event(jit_irgen_t *g, mir_value_t n)
@@ -4927,6 +5028,9 @@ static void irgen_block(jit_irgen_t *g, mir_block_t block)
          break;
       case MIR_OP_SCHED_EVENT:
          irgen_op_sched_event(g, n);
+         break;
+      case MIR_OP_ENABLE_LAST_VALUE:
+         irgen_op_enable_last_value(g, n);
          break;
       case MIR_OP_CLEAR_EVENT:
          irgen_op_clear_event(g, n);

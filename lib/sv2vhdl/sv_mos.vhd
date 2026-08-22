@@ -10,9 +10,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_nmos is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        gate : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        gate : in  logic3d
     );
 end entity sv_nmos;
 
@@ -22,8 +22,8 @@ begin
         variable d, g : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        g := to_logic3d(gate);
+        d := data;
+        g := gate;
         if not is_uncertain(g) and is_one(g) then
             result := d;
         elsif not is_uncertain(g) and is_zero(g) then
@@ -34,7 +34,7 @@ begin
             else                    result := L3D_L;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -47,9 +47,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_pmos is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        gate : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        gate : in  logic3d
     );
 end entity sv_pmos;
 
@@ -59,8 +59,8 @@ begin
         variable d, g : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        g := to_logic3d(gate);
+        d := data;
+        g := gate;
         if not is_uncertain(g) and is_zero(g) then
             result := d;
         elsif not is_uncertain(g) and is_one(g) then
@@ -71,7 +71,7 @@ begin
             else                    result := L3D_L;
             end if;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -84,9 +84,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_rnmos is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        gate : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        gate : in  logic3d
     );
 end entity sv_rnmos;
 
@@ -96,8 +96,8 @@ begin
         variable d, g : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        g := to_logic3d(gate);
+        d := data;
+        g := gate;
         if not is_uncertain(g) and is_one(g) then
             result := l3d_weaken(d);
         elsif not is_uncertain(g) and is_zero(g) then
@@ -105,7 +105,7 @@ begin
         else
             result := l3d_weaken(d);
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -118,9 +118,9 @@ use work.logic3d_types_pkg.all;
 
 entity sv_rpmos is
     port (
-        y    : out std_logic;
-        data : in  std_logic;
-        gate : in  std_logic
+        y    : out logic3d;
+        data : in  logic3d;
+        gate : in  logic3d
     );
 end entity sv_rpmos;
 
@@ -130,8 +130,8 @@ begin
         variable d, g : logic3d;
         variable result : logic3d;
     begin
-        d := to_logic3d(data);
-        g := to_logic3d(gate);
+        d := data;
+        g := gate;
         if not is_uncertain(g) and is_zero(g) then
             result := l3d_weaken(d);
         elsif not is_uncertain(g) and is_one(g) then
@@ -139,7 +139,7 @@ begin
         else
             result := l3d_weaken(d);
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -152,10 +152,10 @@ use work.logic3d_types_pkg.all;
 
 entity sv_cmos is
     port (
-        y     : out std_logic;
-        data  : in  std_logic;
-        ngate : in  std_logic;
-        pgate : in  std_logic
+        y     : out logic3d;
+        data  : in  logic3d;
+        ngate : in  logic3d;
+        pgate : in  logic3d
     );
 end entity sv_cmos;
 
@@ -166,9 +166,9 @@ begin
         variable n_cond, p_cond : boolean;
         variable result : logic3d;
     begin
-        d  := to_logic3d(data);
-        ng := to_logic3d(ngate);
-        pg := to_logic3d(pgate);
+        d  := data;
+        ng := ngate;
+        pg := pgate;
 
         n_cond := not is_uncertain(ng) and is_one(ng);
         p_cond := not is_uncertain(pg) and is_zero(pg);
@@ -183,7 +183,7 @@ begin
         else
             result := L3D_Z;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;
 
@@ -196,10 +196,10 @@ use work.logic3d_types_pkg.all;
 
 entity sv_rcmos is
     port (
-        y     : out std_logic;
-        data  : in  std_logic;
-        ngate : in  std_logic;
-        pgate : in  std_logic
+        y     : out logic3d;
+        data  : in  logic3d;
+        ngate : in  logic3d;
+        pgate : in  logic3d
     );
 end entity sv_rcmos;
 
@@ -210,9 +210,9 @@ begin
         variable n_cond, p_cond : boolean;
         variable result : logic3d;
     begin
-        d  := to_logic3d(data);
-        ng := to_logic3d(ngate);
-        pg := to_logic3d(pgate);
+        d  := data;
+        ng := ngate;
+        pg := pgate;
 
         n_cond := not is_uncertain(ng) and is_one(ng);
         p_cond := not is_uncertain(pg) and is_zero(pg);
@@ -222,6 +222,6 @@ begin
         else
             result := L3D_Z;
         end if;
-        y <= to_std_logic(result);
+        y <= result;
     end process;
 end architecture behavioral;

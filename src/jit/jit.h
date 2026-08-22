@@ -59,6 +59,7 @@ jit_handle_t jit_lazy_compile(jit_t *j, ident_t name);
 jit_handle_t jit_assemble(jit_t *j, ident_t name, const char *text);
 void *jit_link(jit_t *j, jit_handle_t handle);
 void *jit_get_frame_var(jit_t *j, jit_handle_t handle, ident_t name);
+void *jit_try_get_frame_var(jit_t *j, jit_handle_t handle, ident_t name);
 void jit_set_silent(jit_t *j, bool silent);
 mspace_t *jit_get_mspace(jit_t *j);
 void jit_load_pack(jit_t *j, FILE *f);
@@ -73,6 +74,17 @@ void jit_interrupt(jit_t *j, jit_irq_fn_t fn, void *ctx);
 void jit_check_interrupt(jit_t *j);
 void jit_reset(jit_t *j);
 bool jit_is_shutdown(jit_t *j);
+
+// Per-thread eval-lifetime arena for the simulation runtime. When enabled,
+// __nvc_mspace_alloc (escaping unconstrained results) is served from a
+// growable arena that is reset each process eval instead of the collected
+// heap — eliminating GC churn for static (RTL) designs. Enable only after
+// initialisation, on the thread that will run process bodies.
+void jit_eval_arena_enable(bool on);
+void jit_eval_arena_reset(void);
+typedef struct _eval_arena eval_arena_t;
+eval_arena_t *jit_eval_arena_swap(eval_arena_t *a);
+bool jit_eval_arena_enabled(void);
 
 void *jit_mspace_alloc(size_t size) RETURNS_NONNULL;
 jit_stack_trace_t *jit_stack_trace(void);

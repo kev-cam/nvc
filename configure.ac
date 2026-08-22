@@ -93,6 +93,23 @@ AX_CHECK_COMPILE_FLAG([-fPIC],
   [SHLIB_CFLAGS="-fPIC"],
   [SHLIB_CFLAGS=""],
   [-Werror])
+
+# Initial-exec TLS + no-PLT calls on ELF hosts.  libnvc.so is DT_NEEDED (never
+# dlopen'd) so the initial-exec model is legal, and the accel plugin .so's
+# carry no TLS of their own.  The default global-dynamic model routes every
+# hot-path thread-local read (jit_attach_thread, get_model -- once per JIT'd
+# function entry) through a __tls_get_addr PLT call: measured 4.2% of VeeR
+# EH2 wall time and ~3% of retired instructions.  -fno-plt likewise turns
+# intra-library PLT stubs into direct GOT loads.  Both are ELF/gcc+clang
+# specific, hence probed rather than hardwired (MinGW/macOS fall through).
+case $host_os in
+  linux*|*bsd*)
+    AX_CHECK_COMPILE_FLAG([-ftls-model=initial-exec],
+      [SHLIB_CFLAGS="$SHLIB_CFLAGS -ftls-model=initial-exec"], [], [-Werror])
+    AX_CHECK_COMPILE_FLAG([-fno-plt],
+      [SHLIB_CFLAGS="$SHLIB_CFLAGS -fno-plt"], [], [-Werror])
+    ;;
+esac
 AC_SUBST(SHLIB_CFLAGS)
 
 case $target_cpu in

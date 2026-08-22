@@ -4813,19 +4813,30 @@ static bool sem_check_port_actual(formal_map_t *formals, int nformals,
    type_t value_type = tree_type(expr), atype;
 
    if (!sem_check_type(expr, type, tab)) {
-      diag_t *d = diag_new(DIAG_ERROR, tree_loc(value));
-      diag_printf(d, "type of actual %pT does not match type %pT of formal "
-                  "port %pI", value_type, type, tree_ident(decl));
-
-      if (type_is_generic(type)) {
-         hash_t *map = get_generic_map(tab);
-         if (map != NULL && (atype = hash_get(map, type)))
-            diag_hint(d, NULL, "generic type %pT is mapped to %pT",
-                      type, atype);
+      if (standard() == STD_MX) {
+         // STD_MX: tolerate port type mismatches from iverilog VHDL backend
+         // (e.g. UNSIGNED actual vs STD_LOGIC formal — implicit conversion)
+         diag_t *d = diag_new(DIAG_WARN, tree_loc(value));
+         diag_printf(d, "type of actual %pT does not match type %pT of formal "
+                     "port %pI (accepted in STD_MX mode)",
+                     value_type, type, tree_ident(decl));
+         diag_emit(d);
       }
+      else {
+         diag_t *d = diag_new(DIAG_ERROR, tree_loc(value));
+         diag_printf(d, "type of actual %pT does not match type %pT of formal "
+                     "port %pI", value_type, type, tree_ident(decl));
 
-      diag_emit(d);
-      return false;
+         if (type_is_generic(type)) {
+            hash_t *map = get_generic_map(tab);
+            if (map != NULL && (atype = hash_get(map, type)))
+               diag_hint(d, NULL, "generic type %pT is mapped to %pT",
+                         type, atype);
+         }
+
+         diag_emit(d);
+         return false;
+      }
    }
 
    const port_mode_t mode = tree_subkind(decl);
@@ -6048,8 +6059,17 @@ static bool sem_check_case(tree_t t, nametab_t *tab)
             if (!sem_check_type(name, type, tab))
                sem_error(name, "case choice must have type %s but found %s",
                          type_pp(type), type_pp(tree_type(name)));
-            else if (!(*static_fn)(name))
-               sem_error(name, "case choice must be %s static", static_str);
+            else if (!(*static_fn)(name)) {
+               if (standard() == STD_MX) {
+                  // STD_MX: tolerate non-static case choices from iverilog
+                  diag_t *d = diag_new(DIAG_WARN, tree_loc(name));
+                  diag_printf(d, "case choice is not %s static "
+                              "(accepted in STD_MX mode)", static_str);
+                  diag_emit(d);
+               }
+               else
+                  sem_error(name, "case choice must be %s static", static_str);
+            }
          }
          else if (tree_ranges(a) > 0) {
             tree_t r = tree_range(a, 0);

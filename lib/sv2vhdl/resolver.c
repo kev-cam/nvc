@@ -42,6 +42,9 @@ static int g_quiet = 0;
 
 /* NVC extension: port map and implicit type discovery */
 extern const vhpiCharT *nvc_vhpi_get_port_map(vhpiHandleT inst_handle);
+extern int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
+                               const vhpiCharT **ports,
+                               const vhpiCharT *net_path);
 extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
                                                   const vhpiCharT *port_name);
 
@@ -51,10 +54,13 @@ extern const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
 #define MAX_TYPE  128
 #define MAX_VAL   1024
 
-/* Tran-like entity names (bidirectional switches using 'driver/'other) */
+/* Tran-like entity names (bidirectional switches using 'driver/'other).
+ * SV_ALIAS is a permanent wire join (the SystemVerilog 'alias' short); it
+ * uses the same 'driver/'other endpoint mechanism, so it resolves identically. */
 static const char *tran_entities[] = {
     "SV_TRAN", "SV_TRANIF0", "SV_TRANIF1",
     "SV_RTRAN", "SV_RTRANIF0", "SV_RTRANIF1",
+    "SV_ALIAS", "SV_STRENGTH_BUF",
     NULL
 };
 
@@ -83,6 +89,8 @@ typedef struct endpoint {
     char receiver_ename[MAX_NAME]; /* external name path: ".top.inst.port.other" */
     char type_name[MAX_TYPE];      /* signal type */
     int  is_signal;                /* 1 if this reads the net signal directly (no receiver) */
+    char mode[8];                  /* static port mode: "in"/"out"/"inout"/"" */
+    char kind[24];                 /* primitive entity, lowercased: "sv_alias".. */
 } endpoint_t;
 
 /*
@@ -178,7 +186,9 @@ static net_info_t *find_or_create_net(const char *name)
 static int net_add_endpoint(net_info_t *net,
                             const char *driver_ename,
                             const char *receiver_ename,
-                            const char *type_name)
+                            const char *type_name,
+                            const char *mode,
+                            const char *kind)
 {
     if (net->n_endpoints >= MAX_ENDPOINTS) {
         resolver_printf("resolver: too many endpoints on net %s", net->net_name);
@@ -188,6 +198,8 @@ static int net_add_endpoint(net_info_t *net,
     safe_copy(ep->driver_ename, driver_ename, sizeof(ep->driver_ename));
     safe_copy(ep->receiver_ename, receiver_ename, sizeof(ep->receiver_ename));
     safe_copy(ep->type_name, type_name, sizeof(ep->type_name));
+    safe_copy(ep->mode, mode ? mode : "", sizeof(ep->mode));
+    safe_copy(ep->kind, kind ? kind : "", sizeof(ep->kind));
     return 0;
 }
 
@@ -415,9 +427,13 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
 
         for (vhpiHandleT port = vhpi_scan(piter); port;
              port = vhpi_scan(piter)) {
+            /* Static direction for the Python generator: alias-class
+             * emission needs to know which endpoints can ever drive */
             vhpiModeT mode = (vhpiModeT)vhpi_get(vhpiModeP, port);
-            (void)mode;  // All port modes are candidates for resolution
-                         // (needed for back-annotation and federation)
+            const char *mode_str =
+                mode == vhpiInMode ? "in" :
+                mode == vhpiOutMode ? "out" :
+                mode == vhpiInoutMode ? "inout" : "";
 
             const char *port_name = get_name(port);
             if (!port_name) {
@@ -475,7 +491,13 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
             net_info_t *net = find_or_create_net(net_name);
             if (net) {
                 read_net_init(net);
-                net_add_endpoint(net, drv_ename, rcv_ename, port_etype);
+                char kind_lower[24];
+                safe_copy(kind_lower, entity_name ? entity_name : "",
+                          sizeof(kind_lower));
+                for (char *c = kind_lower; *c; c++)
+                    *c = tolower((unsigned char)*c);
+                net_add_endpoint(net, drv_ename, rcv_ename, port_etype,
+                                 mode_str, kind_lower);
                 indent();
                 resolver_printf("    port %s -> actual=%s net=%s init=%s",
                              port_name, actual, net_name,
@@ -563,8 +585,25 @@ static void analyze_nets(void)
                 safe_copy(ep->driver_ename, n->net_name,
                           sizeof(ep->driver_ename));
                 ep->receiver_ename[0] = '\0';
-                safe_copy(ep->type_name, "std_logic",
-                          sizeof(ep->type_name));
+                /* Type the signal endpoint by the net's actual declared type
+                 * (e.g. logic3d), not a hardcoded std_logic. The generated
+                 * resolver assigns between this signal and a tran/alias port's
+                 * driver/other (integer-based logic3d), so a std_logic signal
+                 * would be a type mismatch (STD_LOGIC vs INTEGER). */
+                const char *path = n->net_name;
+                if (*path == '.') path++;
+                vhpiHandleT sh = vhpi_handle_by_name(path, NULL);
+                if (sh) {
+                    char st[MAX_TYPE], et[MAX_TYPE];
+                    get_type_info(sh, st, sizeof st, et, sizeof et);
+                    safe_copy(ep->type_name,
+                              (st[0] && st[0] != '?') ? st : "std_logic",
+                              sizeof(ep->type_name));
+                    vhpi_release_handle(sh);
+                } else {
+                    safe_copy(ep->type_name, "std_logic",
+                              sizeof(ep->type_name));
+                }
                 ep->is_signal = 1;
             }
             n->needs_resolution = 1;
@@ -1042,6 +1081,12 @@ static PyObject *build_net_dict(const net_info_t *net)
                              PyUnicode_FromString(ep->type_name));
         if (ep->is_signal)
             PyDict_SetItemString(drv, "is_signal", Py_True);
+        if (ep->mode[0])
+            PyDict_SetItemString(drv, "mode",
+                                 PyUnicode_FromString(ep->mode));
+        if (ep->kind[0])
+            PyDict_SetItemString(drv, "kind",
+                                 PyUnicode_FromString(ep->kind));
         PyList_Append(drivers, drv);
         Py_DECREF(drv);
 
@@ -1071,6 +1116,57 @@ static PyObject *build_net_dict(const net_info_t *net)
  * Returns a PyDict {filename: vhdl_string} (new reference), or NULL.
  * Caller must Py_DECREF the result.
  */
+/* #75: register one net with the kernel solver (called only for nets
+ * the Python generator marked kernel-eligible — connect, federation,
+ * mixed-type and SV2VHDL_KERNEL_EXCLUDE'd nets never reach here). */
+static int stitch_register_net(net_info_t *n)
+{
+    const vhpiCharT *inst_paths[MAX_ENDPOINTS];
+    const vhpiCharT *port_names[MAX_ENDPOINTS];
+    static char pathbuf[MAX_ENDPOINTS][MAX_NAME];
+    static char portbuf[MAX_ENDPOINTS][MAX_NAME];
+    const char *net_path = NULL;
+    int nep = 0;
+
+    for (int i = 0; i < n->n_endpoints; i++) {
+        endpoint_t *ep = &n->endpoints[i];
+        if (ep->is_signal) {
+            net_path = ep->driver_ename;
+            continue;
+        }
+        /* Receiver-only in-mode ports contribute nothing and their
+           'driver implicits may not exist (never referenced): the port
+           reads the resolved actual through the normal port-map
+           conversion instead */
+        if (strcmp(ep->mode, "in") == 0)
+            continue;
+        /* driver_ename = "<inst_path>.<port>.driver" */
+        safe_copy(pathbuf[nep], ep->driver_ename, sizeof(pathbuf[nep]));
+        char *suffix = strrchr(pathbuf[nep], '.');
+        if (suffix == NULL || strcmp(suffix, ".driver") != 0)
+            return 0;
+        *suffix = '\0';
+        char *pdot = strrchr(pathbuf[nep], '.');
+        if (pdot == NULL)
+            return 0;
+        safe_copy(portbuf[nep], pdot + 1, sizeof(portbuf[nep]));
+        *pdot = '\0';
+        inst_paths[nep] = (const vhpiCharT *)pathbuf[nep];
+        port_names[nep] = (const vhpiCharT *)portbuf[nep];
+        nep++;
+    }
+
+    if (nep == 0) {
+        /* Every capable endpoint was a receiver (mode in): the signal's
+           native drivers already feed them through the port maps —
+           nothing to solve, trivially handled */
+        return net_path != NULL;
+    }
+
+    return nvc_vhpi_stitch_net(nep, inst_paths, port_names,
+                               (const vhpiCharT *)net_path);
+}
+
 static PyObject *call_python_resolver(void)
 {
     if (!g_python_ok || !g_py_func) {
@@ -1258,6 +1354,41 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         cleanup();
         vhpi_release_handle(root);
         return;
+    }
+
+    /* #75: register the generator's kernel-eligible nets with the
+     * kernel solver.  Nets the generator kept for itself (connect,
+     * federation, mixed-type, excluded) are untouched. */
+    {
+        PyObject *py_kn = PyDict_GetItemString(file_dict, "__kernel_nets__");
+        if (py_kn != NULL) {
+            const char *kn = PyUnicode_AsUTF8(py_kn);
+            int stitched = 0, declined = 0;
+            char name[MAX_NAME];
+            while (kn != NULL && *kn != '\0') {
+                const char *nl = strchr(kn, '\n');
+                const size_t len = nl ? (size_t)(nl - kn) : strlen(kn);
+                snprintf(name, sizeof(name), "%.*s", (int)len, kn);
+                for (net_info_t *n = g_nets; n; n = n->next) {
+                    if (strcmp(n->net_name, name) != 0)
+                        continue;
+                    if (stitch_register_net(n)) {
+                        n->needs_resolution = 0;
+                        stitched++;
+                    }
+                    else {
+                        declined++;
+                        resolver_printf("resolver: kernel declined %s "
+                                        "(UNRESOLVED)", n->net_name);
+                    }
+                    break;
+                }
+                kn = nl ? nl + 1 : NULL;
+            }
+            resolver_printf("resolver: kernel solver took %d net(s), "
+                            "%d declined", stitched, declined);
+            PyDict_DelItemString(file_dict, "__kernel_nets__");
+        }
     }
 
     Py_ssize_t n_files = PyDict_Size(file_dict);

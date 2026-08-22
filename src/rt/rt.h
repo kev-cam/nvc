@@ -23,6 +23,10 @@
 #include <stdint.h>
 
 #define RT_ALIGN_MASK    0x7
+// Default build is multithreaded: activates the RT_LOCK annotations and the
+// per-thread model state (model_thread lazy-alloc) the runtime carries
+// throughout, so the simulation kernel is thread-safe for the parallel
+// (SMP) process scheduler. See docs/parallel-simulation.md.
 #define RT_MULTITHREADED 0
 
 #define TIME_HIGH INT64_MAX  // Value of TIME'HIGH
@@ -61,6 +65,9 @@ typedef uint8_t net_flags_t;
 #define SIG_F_EVENT_FLAG   (1 << 11)
 #define SIG_F_REGISTER     (1 << 12)
 #define SIG_F_PIPE         (1 << 13)
+#define SIG_F_LAST_VALUE (1 << 14)  // some reader needs S'last_value (#74 E2)
+#define SIG_F_FUSED        (1 << 15)  // readers repointed onto another signal (#74)
+#define SIG_F_FUSE_TARGET  (1 << 16)  // fuse target; must not itself be fused away
 typedef uint32_t sig_flags_t;
 
 typedef enum {

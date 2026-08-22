@@ -561,6 +561,62 @@ code_blob_t *code_blob_new(code_cache_t *code, ident_t name, size_t hint)
    return blob;
 }
 
+// ---- Entry-publication watches ---------------------------------------------
+// Consumers (the fused-block emitter in rt/model.c) bake the current value
+// of a jit_func_t's entry pointer as an immediate call target.  A later
+// tier-up publish through code_blob_finalise must tell them so they can
+// re-patch.  The registry is a simple global array: watch/unwatch are
+// single-writer (model thread), notify may run on any thread (async cgen),
+// all three serialised by one lock.  Notify runs the callbacks under the
+// lock, so unwatch returning means no callback with that ctx can be running.
+
+typedef struct {
+   jit_entry_fn_t *slot;
+   code_watch_fn_t fn;
+   void           *ctx;
+} entry_watch_t;
+
+static entry_watch_t *entry_watches = NULL;
+static unsigned       n_entry_watches = 0;
+static unsigned       max_entry_watches = 0;
+static nvc_lock_t     entry_watch_lock = 0;
+
+void code_entry_watch(jit_entry_fn_t *slot, code_watch_fn_t fn, void *ctx)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   if (n_entry_watches == max_entry_watches) {
+      max_entry_watches = MAX(max_entry_watches * 2, 64);
+      entry_watches = xrealloc_array(entry_watches, max_entry_watches,
+                                     sizeof(entry_watch_t));
+   }
+
+   entry_watches[n_entry_watches++] =
+      (entry_watch_t){ .slot = slot, .fn = fn, .ctx = ctx };
+}
+
+void code_entry_unwatch(void *ctx)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   unsigned wptr = 0;
+   for (unsigned i = 0; i < n_entry_watches; i++) {
+      if (entry_watches[i].ctx != ctx)
+         entry_watches[wptr++] = entry_watches[i];
+   }
+   n_entry_watches = wptr;
+}
+
+static void code_entry_notify(jit_entry_fn_t *slot, jit_entry_fn_t fn)
+{
+   SCOPED_LOCK(entry_watch_lock);
+
+   for (unsigned i = 0; i < n_entry_watches; i++) {
+      if (entry_watches[i].slot == slot)
+         (*entry_watches[i].fn)(slot, fn, entry_watches[i].ctx);
+   }
+}
+
 void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry)
 {
    code_span_t *span = blob->span;
@@ -599,6 +655,10 @@ void code_blob_finalise(code_blob_t *blob, jit_entry_fn_t *entry)
    thread_wx_mode(WX_EXECUTE);
 
    store_release(entry, (jit_entry_fn_t)span->entry);
+
+   // Tell anyone who baked the old entry as an immediate (fused blocks)
+   if (unlikely(relaxed_load(&n_entry_watches) > 0))
+      code_entry_notify(entry, (jit_entry_fn_t)span->entry);
 
    DEBUG_ONLY(relaxed_add(&span->owner->used, span->size));
    free(blob);
@@ -1189,7 +1249,8 @@ static void code_load_macho(code_blob_t *blob, const void *data, size_t size)
    }
 }
 #elif !defined __MINGW32__
-static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
+static void code_load_elf(code_blob_t *blob, const void *data, size_t size,
+                          code_resolve_fn_t resolve, void *rctx)
 {
    const Elf64_Ehdr *ehdr = data;
 
@@ -1289,8 +1350,12 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
          switch (ELF64_ST_TYPE(sym->st_info)) {
          case STT_NOTYPE:
          case STT_FUNC:
-            if (sym->st_shndx == 0)
+         case STT_OBJECT:
+            if (sym->st_shndx == 0) {
                ptr = shash_get(external, strtab + sym->st_name);
+               if (ptr == NULL && resolve != NULL)
+                  ptr = (*resolve)(strtab + sym->st_name, rctx);
+            }
             else
                ptr = load_addr[sym->st_shndx] + sym->st_value;
             break;
@@ -1381,13 +1446,220 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
 }
 #endif
 
-void code_load_object(code_blob_t *blob, const void *data, size_t size)
+void code_load_object(code_blob_t *blob, const void *data, size_t size,
+                      code_resolve_fn_t resolve, void *rctx)
 {
 #if defined __APPLE__
+   (void)resolve; (void)rctx;   // Persistent cache is linux/x86_64 only
    code_load_macho(blob, data, size);
 #elif defined __MINGW32__
+   (void)resolve; (void)rctx;
    code_load_pe(blob, data, size);
 #else
-   code_load_elf(blob, data, size);
+   code_load_elf(blob, data, size, resolve, rctx);
 #endif
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Fail-soft validating prepass for persistent-cache objects.  The normal
+// loader above trusts its input (it just emitted it) and fatals on any
+// surprise; a cached file from disk gets NO such trust.  This probe
+// bounds-checks every access against `size`, whitelists relocation
+// types, and resolves every symbol -- all BEFORE any code blob memory is
+// written (validate-before-mutate).  Anything unexpected returns false
+// and the caller recompiles: a MISS is always safe.
+
+#if defined __linux__ && defined ARCH_X86_64 && !defined __MINGW32__
+
+static bool probe_str_ok(const char *strtab, size_t strtabsz, uint32_t off)
+{
+   if (off >= strtabsz)
+      return false;
+   return memchr(strtab + off, '\0', strtabsz - off) != NULL;
+}
+
+bool code_object_probe(code_cache_t *code, ident_t name, const void *data,
+                       size_t size, code_resolve_fn_t resolve, void *rctx)
+{
+   if (size < sizeof(Elf64_Ehdr))
+      return false;
+
+   const Elf64_Ehdr *ehdr = data;
+   if (ehdr->e_ident[EI_MAG0] != ELFMAG0
+       || ehdr->e_ident[EI_MAG1] != ELFMAG1
+       || ehdr->e_ident[EI_MAG2] != ELFMAG2
+       || ehdr->e_ident[EI_MAG3] != ELFMAG3)
+      return false;
+   else if (ehdr->e_ident[EI_CLASS] != ELFCLASS64
+            || ehdr->e_ident[EI_DATA] != ELFDATA2LSB)
+      return false;
+   else if (ehdr->e_type != ET_REL || ehdr->e_machine != EM_X86_64)
+      return false;
+   else if (ehdr->e_shentsize != sizeof(Elf64_Shdr))
+      return false;
+   else if (ehdr->e_shnum == 0 || ehdr->e_shoff > size
+            || ehdr->e_shnum > (size - ehdr->e_shoff) / sizeof(Elf64_Shdr))
+      return false;
+   else if (ehdr->e_shstrndx >= ehdr->e_shnum)
+      return false;
+
+#define PROBE_SHDR(i) \
+   ((const Elf64_Shdr *)(data + ehdr->e_shoff + (i) * sizeof(Elf64_Shdr)))
+
+   const Elf64_Shdr *strtab_hdr = PROBE_SHDR(ehdr->e_shstrndx);
+   if (strtab_hdr->sh_type != SHT_STRTAB
+       || strtab_hdr->sh_offset > size
+       || strtab_hdr->sh_size > size - strtab_hdr->sh_offset)
+      return false;
+
+   const char *strtab = data + strtab_hdr->sh_offset;
+   const size_t strtabsz = strtab_hdr->sh_size;
+
+   bool *loadable LOCAL = xcalloc_array(ehdr->e_shnum, sizeof(bool));
+
+   for (int i = 0; i < ehdr->e_shnum; i++) {
+      const Elf64_Shdr *shdr = PROBE_SHDR(i);
+
+      switch (shdr->sh_type) {
+      case SHT_PROGBITS:
+         if (shdr->sh_flags & SHF_ALLOC) {
+            if (shdr->sh_offset > size || shdr->sh_size > size - shdr->sh_offset)
+               return false;
+            if (shdr->sh_addralign == 0
+                || shdr->sh_addralign > CODE_BLOB_ALIGN
+                || (shdr->sh_addralign & (shdr->sh_addralign - 1)) != 0)
+               return false;
+            loadable[i] = true;
+         }
+         break;
+      case SHT_RELA:
+         if (shdr->sh_entsize != sizeof(Elf64_Rela)
+             || shdr->sh_offset > size
+             || shdr->sh_size > size - shdr->sh_offset)
+            return false;
+         break;
+      case SHT_SYMTAB:
+         if (shdr->sh_entsize != sizeof(Elf64_Sym)
+             || shdr->sh_offset > size
+             || shdr->sh_size > size - shdr->sh_offset)
+            return false;
+         break;
+      default:
+         break;   // Ignored by the loader
+      }
+   }
+
+   // The entry function must exist as an STT_FUNC symbol in a loaded
+   // section or the loader would fall back to the span base
+   bool entry_found = false;
+   for (int i = 0; i < ehdr->e_shnum; i++) {
+      const Elf64_Shdr *shdr = PROBE_SHDR(i);
+      if (shdr->sh_type != SHT_SYMTAB)
+         continue;
+
+      for (int j = 0; j < shdr->sh_size / shdr->sh_entsize; j++) {
+         const Elf64_Sym *sym = data + shdr->sh_offset + j * shdr->sh_entsize;
+         if (!probe_str_ok(strtab, strtabsz, sym->st_name))
+            return false;
+         if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC)
+            continue;
+         if (icmp(name, strtab + sym->st_name)) {
+            if (sym->st_shndx >= ehdr->e_shnum || !loadable[sym->st_shndx])
+               return false;
+            entry_found = true;
+         }
+      }
+   }
+
+   if (!entry_found)
+      return false;
+
+   shash_t *external = load_acquire(&code->symbols);
+
+   for (int i = 0; i < ehdr->e_shnum; i++) {
+      const Elf64_Shdr *shdr = PROBE_SHDR(i);
+      if (shdr->sh_type != SHT_RELA)
+         continue;
+
+      if (shdr->sh_info >= ehdr->e_shnum || shdr->sh_link >= ehdr->e_shnum)
+         return false;
+
+      const Elf64_Shdr *mod = PROBE_SHDR(shdr->sh_info);
+      if (mod->sh_type != SHT_PROGBITS || !(mod->sh_flags & SHF_ALLOC))
+         continue;   // Loader skips relocations for unloaded sections
+      else if (!loadable[shdr->sh_info])
+         return false;
+
+      const Elf64_Shdr *symtab = PROBE_SHDR(shdr->sh_link);
+      if (symtab->sh_type != SHT_SYMTAB)
+         return false;
+
+      const size_t nsyms = symtab->sh_size / symtab->sh_entsize;
+
+      const Elf64_Rela *endp = data + shdr->sh_offset + shdr->sh_size;
+      for (const Elf64_Rela *r = data + shdr->sh_offset; r < endp; r++) {
+         if (ELF64_R_SYM(r->r_info) >= nsyms)
+            return false;
+
+         const Elf64_Sym *sym = data + symtab->sh_offset
+            + ELF64_R_SYM(r->r_info) * symtab->sh_entsize;
+
+         if (!probe_str_ok(strtab, strtabsz, sym->st_name))
+            return false;
+
+         switch (ELF64_ST_TYPE(sym->st_info)) {
+         case STT_NOTYPE:
+         case STT_FUNC:
+         case STT_OBJECT:
+            if (sym->st_shndx == 0) {
+               void *ptr = shash_get(external, strtab + sym->st_name);
+               if (ptr == NULL && resolve != NULL)
+                  ptr = (*resolve)(strtab + sym->st_name, rctx);
+               if (ptr == NULL)
+                  return false;   // Unknown symbol: MISS, never fatal
+            }
+            else if (sym->st_shndx >= ehdr->e_shnum
+                     || !loadable[sym->st_shndx])
+               return false;
+            break;
+         case STT_SECTION:
+            if (sym->st_shndx >= ehdr->e_shnum || !loadable[sym->st_shndx])
+               return false;
+            break;
+         default:
+            return false;
+         }
+
+         size_t width;
+         switch (ELF64_R_TYPE(r->r_info)) {
+         case R_X86_64_64:
+            width = 8;
+            break;
+         case R_X86_64_PC32:
+         case R_X86_64_GOTPCREL:
+         case R_X86_64_PLT32:
+            width = 4;
+            break;
+         default:
+            return false;   // Foreign reloc flavour: MISS
+         }
+
+         if (r->r_offset > mod->sh_size || width > mod->sh_size - r->r_offset)
+            return false;
+      }
+   }
+
+#undef PROBE_SHDR
+
+   return true;
+}
+
+#else
+
+bool code_object_probe(code_cache_t *code, ident_t name, const void *data,
+                       size_t size, code_resolve_fn_t resolve, void *rctx)
+{
+   return false;   // Cache unsupported on this platform: always a MISS
+}
+
+#endif  // __linux__ && ARCH_X86_64

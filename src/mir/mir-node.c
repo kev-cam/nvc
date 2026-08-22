@@ -3246,6 +3246,15 @@ void mir_build_sched_event(mir_unit_t *mu, mir_value_t on, mir_value_t count)
    }
 }
 
+void mir_build_enable_last_value(mir_unit_t *mu, mir_value_t on, mir_value_t count)
+{
+   mir_build_2(mu, MIR_OP_ENABLE_LAST_VALUE, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               on, count);
+
+   MIR_ASSERT(mir_is_signal(mu, on), "argument must be signal");
+   MIR_ASSERT(mir_is_offset(mu, count), "count argument must be offset");
+}
+
 void mir_build_clear_event(mir_unit_t *mu, mir_value_t on, mir_value_t count)
 {
    if (mir_is_null(count)) {

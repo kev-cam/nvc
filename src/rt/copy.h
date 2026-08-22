@@ -20,6 +20,8 @@
 
 #include "prim.h"
 
+#include <string.h>
+
 void _copy2(void *p1, void *p2, const void *src, size_t len);
 
 __attribute__((always_inline))
@@ -36,13 +38,44 @@ static inline void copy2(void *p1, void *p2, const void *src, size_t len)
 bool _cmp_bytes(const void *a, const void *b, size_t size)
    __attribute__((pure));
 
+// The common sizes are small fixed widths: logic3d signals are four
+// bytes per element with nexuses split per driven element, std_logic
+// is one byte.  Compare those with single word loads (memcpy-style —
+// the pointers are byte offsets into shared.data and need not be
+// aligned) instead of paying the call, the per-call CPU-feature test
+// and the masked SSE tail in _cmp_bytes, which also over-reads for
+// small sizes.  The size branch predicts near-perfectly: it is
+// constant per nexus and effectively constant per call-site stream.
 __attribute__((always_inline))
 static inline bool cmp_bytes(const void *a, const void *b, size_t size)
 {
-   if (size == 1)
-      return *(unsigned char *)a == *(unsigned char *)b;
-   else
+   switch (size) {
+   case 4:
+      {
+         uint32_t ua, ub;
+         memcpy(&ua, a, 4);
+         memcpy(&ub, b, 4);
+         return ua == ub;
+      }
+   case 8:
+      {
+         uint64_t ua, ub;
+         memcpy(&ua, a, 8);
+         memcpy(&ub, b, 8);
+         return ua == ub;
+      }
+   case 1:
+      return *(const unsigned char *)a == *(const unsigned char *)b;
+   case 2:
+      {
+         uint16_t ua, ub;
+         memcpy(&ua, a, 2);
+         memcpy(&ub, b, 2);
+         return ua == ub;
+      }
+   default:
       return _cmp_bytes(a, b, size);
+   }
 }
 
 #endif   // _RT_COPY_H

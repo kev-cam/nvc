@@ -14,6 +14,7 @@ lib_libnvc_a_SOURCES = \
 	src/simp.c \
 	src/dump.c \
 	src/common.c \
+	src/vhdl2vlog.c \
 	src/fbuf.c \
 	src/hash.c \
 	src/bounds.c \
@@ -56,6 +57,7 @@ lib_libnvc_a_SOURCES = \
 	src/inst.h \
 	src/inst.c \
 	src/cgen.c \
+	src/cppgen.c \
 	src/printf.h \
 	src/printf.c
 

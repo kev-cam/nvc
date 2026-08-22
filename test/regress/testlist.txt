@@ -85,6 +85,8 @@ proc5           normal
 proc6           normal
 assert2         normal,gold
 concat3         normal
+lv1             normal
+lvport          normal
 const2          normal
 func7           normal
 func8           normal
@@ -1253,3 +1255,11 @@ logic3d7        normal
 logic3d8        normal
 logic3d9        normal,deps=logic3d8
 logic3d10       normal
+mx_nested_port  shell
+numstd_mul1     normal,2008
+logic3dw1       normal,2040
+
+ieee20          fail,gold,2008
+logic3dw2       normal,2040
+logic3dw3       normal,2040
+fuse1           normal,2040

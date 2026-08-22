@@ -788,6 +788,13 @@ static void import_sched_event(mir_unit_t *mu, mir_import_t *imp, int op)
    mir_build_sched_event(mu, signal, count);
 }
 
+static void import_enable_last_value(mir_unit_t *mu, mir_import_t *imp, int op)
+{
+   mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
+   mir_value_t count  = imp->map[vcode_get_arg(op, 1)];
+   mir_build_enable_last_value(mu, signal, count);
+}
+
 static void import_clear_event(mir_unit_t *mu, mir_import_t *imp, int op)
 {
    mir_value_t signal = imp->map[vcode_get_arg(op, 0)];
@@ -1649,6 +1656,9 @@ static void import_block(mir_unit_t *mu, mir_import_t *imp)
          break;
       case VCODE_OP_SCHED_EVENT:
          import_sched_event(mu, imp, i);
+         break;
+      case VCODE_OP_ENABLE_LAST_VALUE:
+         import_enable_last_value(mu, imp, i);
          break;
       case VCODE_OP_CLEAR_EVENT:
          import_clear_event(mu, imp, i);

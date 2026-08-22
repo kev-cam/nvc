@@ -483,6 +483,14 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
       break;
 
    case JIT_EXIT_SCHED_WAVEFORM:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST1:   // Statically-shaped variants: the
+   case JIT_EXIT_SCHED_WAVEFORM_FAST2:   // interp/x86 tiers always take the
+   case JIT_EXIT_SCHED_WAVEFORM_FAST3:   // full spec path; only the LLVM
+   case JIT_EXIT_SCHED_WAVEFORM_FAST4:   // backend may inline (NVC_INLINE_DRIVE)
+   case JIT_EXIT_SCHED_WAVEFORM_FAST5:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST6:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST7:
+   case JIT_EXIT_SCHED_WAVEFORM_FAST8:
       __nvc_sched_waveform(anchor, args, tlab);
       break;
 
@@ -497,6 +505,16 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
          int32_t       count   = args[2].integer;
 
          x_sched_event(shared, offset, count);
+      }
+      break;
+
+   case JIT_EXIT_ENABLE_LAST_VALUE:
+      {
+         sig_shared_t *shared  = args[0].pointer;
+         int32_t       offset  = args[1].integer;
+         int32_t       count   = args[2].integer;
+
+         x_enable_last_value(shared, offset, count);
       }
       break;
 
@@ -1361,7 +1379,9 @@ void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor)
    else if (size == 0)
       size = 1;   // Never return a NULL pointer
 
-   void *ptr = jit_mspace_alloc(size);
+   void *ptr = thread->eval_arena != NULL
+      ? eval_arena_alloc(thread->eval_arena, size)
+      : jit_mspace_alloc(size);
 
    thread->anchor = NULL;
    return ptr;

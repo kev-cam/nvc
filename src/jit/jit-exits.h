@@ -40,6 +40,10 @@ int32_t x_test_net_event(sig_shared_t *ss, uint32_t offset, int32_t count);
 int32_t x_test_net_active(sig_shared_t *ss, uint32_t offset,
                           int32_t count);
 void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count);
+void x_enable_last_value(sig_shared_t *ss, uint32_t offset, int32_t count);
+bool x_signal_undriven(sig_shared_t *ss, uint32_t offset);
+bool x_fuse_signals(sig_shared_t *ss_a, uint32_t off_a,
+                    sig_shared_t *ss_b, uint32_t off_b);
 void x_alias_signal(sig_shared_t *ss, tree_t where);
 void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject);
@@ -124,5 +128,62 @@ void x_pipe_read(sig_shared_t *ss, uint32_t offset, int32_t count,
                  void *result);
 bool x_pipe_full(sig_shared_t *ss, uint32_t offset, int32_t count);
 bool x_pipe_empty(sig_shared_t *ss, uint32_t offset, int32_t count);
+
+// ---------------------------------------------------------------------------
+// Native-projection pilot (NVC_INLINE_DRIVE): the runtime publishes the
+// frozen layout facts of its driver-update fast path so a backend can
+// specialize signal-assignment sites against them at JIT compile time
+// (first Futamura projection done natively: the spec's structure is data
+// for the compiler, the spec itself remains the fallback).  All offsets are
+// bytes; bitfield positions are probed at startup so no assumption is made
+// about the C compiler's bitfield allocation.  `valid` is false when any
+// probe failed or the runtime configuration (e.g. RT_MULTITHREADED) makes
+// the single-threaded inline path unsound -- backends must then keep the
+// plain call.  Implemented in rt/model.c which owns all these types.
+
+typedef struct {
+   bool     valid;
+   // Addresses stable for the process lifetime
+   void    *model_var;               // rt_model_t ** -- current model
+   void    *par_active_var;          // int * -- worker-eval window active
+   void    *trace_var;               // bool * -- --trace enabled
+   void    *fast_driver_fn;          // void (*)(rt_model_t *, void *)
+   // rt_signal_t / sig_shared_t / rt_nexus_t
+   int32_t  signal_shared;           // offsetof(rt_signal_t, shared)
+   int32_t  signal_nexus;            // offsetof(rt_signal_t, nexus)
+   int32_t  shared_flags;            // offsetof(sig_shared_t, flags)
+   int32_t  nexus_flags;             // u8
+   int32_t  nexus_size;              // u8
+   int32_t  nexus_n_sources;         // u8
+   int32_t  nexus_width;             // u32
+   int32_t  nexus_active_delta;      // u16 (delta_cycle_t)
+   int32_t  nexus_sources;           // embedded rt_source_t
+   // rt_source_t (single fast driver)
+   int32_t  source_bits;             // byte containing the flag bitfields
+   uint8_t  source_fastqueued_mask;
+   uint8_t  source_was_active_mask;
+   int32_t  source_when;             // u.driver.waveforms.when (u64)
+   int32_t  source_value;            // u.driver.waveforms.value (rt_value_t)
+   // rt_model_t
+   int32_t  model_now;               // u64
+   int32_t  model_iteration;         // i32
+   int32_t  model_next_is_delta;     // bool (u8)
+   int32_t  model_probe_member;      // i32 (fast-clk probation)
+   int32_t  model_thread0;           // threads[0] (model_thread_t *)
+   int32_t  thread_active_obj;       // rt_wakeable_t *
+   int32_t  wakeable_bits;           // byte containing postponed bit
+   uint8_t  wakeable_postponed_mask;
+   // deferq (driverq) push
+   int32_t  driverq_tasks;           // defer_task_t *
+   int32_t  driverq_count;           // u32
+   int32_t  driverq_max;             // u32
+   int32_t  task_size;               // sizeof(defer_task_t)
+   int32_t  task_fn;                 // offsetof(defer_task_t, fn)
+   int32_t  task_arg;                // offsetof(defer_task_t, arg)
+   // Flag constants
+   uint32_t net_f_fast_driver;       // NET_F_FAST_DRIVER
+} jit_drive_layout_t;
+
+const jit_drive_layout_t *jit_drive_layout(void);
 
 #endif  // _JIT_EXITS_H

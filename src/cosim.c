@@ -30,6 +30,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+// Verbose co-sim tracing.  Flip to 1 (or build with -DCOSIM_DEBUG=1) to enable;
+// 0 lets the compiler dead-strip every trace.  See also cosim_bridge.cpp.
+#ifndef COSIM_DEBUG
+#define COSIM_DEBUG 0
+#endif
+
+// monotonic wall-clock seconds (for COSIM_PROFILE timing)
+static double prof_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 // Bridge function pointers (loaded via dlopen of libcosim_bridge.so)
 typedef void (*bridge_deposit_fn)(void *ctx, double voltage, double time_s);
@@ -41,12 +56,14 @@ typedef int  (*bridge_register_fn)(const char *name, int dir,
 typedef void (*bridge_update_d2a_fn)(int idx, double voltage,
                                       double next_v, double next_time);
 typedef void (*bridge_reset_fn)(void);
+typedef double (*bridge_a2d_next_fn)(void);
 
 static struct {
    void               *lib;
    bridge_register_fn  reg;
    bridge_update_d2a_fn update;
    bridge_reset_fn     reset;
+   bridge_a2d_next_fn  a2d_next;   // earliest predicted A2D crossing (optional)
 } bridge;
 
 static bool bridge_load(void)
@@ -72,6 +89,8 @@ static bool bridge_load(void)
                                                 "cosim_bridge_update_d2a");
    bridge.reset  = (bridge_reset_fn)dlsym(bridge.lib,
                                            "cosim_bridge_reset");
+   bridge.a2d_next = (bridge_a2d_next_fn)dlsym(bridge.lib,
+                                           "cosim_bridge_a2d_next_time");
 
    if (!bridge.reg || !bridge.update || !bridge.reset) {
       warnf("cosim bridge missing symbols: %s", dlerror());
@@ -142,7 +161,13 @@ static bool xyce_load(xyce_handle_t *x)
    };
 
    for (const char **p = libnames; *p != NULL; p++) {
-      x->lib = dlopen(*p, RTLD_NOW | RTLD_GLOBAL);
+      // RTLD_LAZY (not RTLD_NOW): libXyceLib pulls in the Trilinos amesos2/
+      // tpetra chain transitively, and that chain has uninstantiated Kokkos
+      // ETI symbols (e.g. KokkosBlas::Impl::NrmInf) that are never called on
+      // Xyce's default KLU/basker solver path. The Xyce executable itself
+      // loads these lazily and runs fine; RTLD_NOW here would force-resolve
+      // them and fail the load. Match Xyce's own lazy binding.
+      x->lib = dlopen(*p, RTLD_LAZY | RTLD_GLOBAL);
       if (x->lib != NULL)
          break;
    }
@@ -412,8 +437,16 @@ static void a2d_deposit(void *ctx, double voltage, double time_s)
 {
    a2d_deposit_ctx_t *dc = (a2d_deposit_ctx_t *)ctx;
 
+   if (COSIM_DEBUG) {
+      static int once = 0;
+      if (!once++) fprintf(stderr, "[a2d-dep] signal size=%u\n", dc->size);
+   }
+
    if (dc->size == 1) {
       uint8_t sl = (voltage > 0.9) ? 3 : 2;  // std_logic '1' or '0'
+      if (COSIM_DEBUG)
+         fprintf(stderr, "[a2d-dep] V=%.3f -> '%c' @%.4gns\n",
+                 voltage, sl == 3 ? '1' : '0', time_s * 1e9);
       deposit_signal(dc->model, dc->signal, &sl, 0, 1);
    }
    else if (dc->size == sizeof(double)) {
@@ -489,6 +522,9 @@ static void update_d2a_bridges(cosim_state_t *cs, rt_model_t *m,
       // For next_voltage we use the same value — the actual next value
       // isn't known until NVC processes the event.  The breakpoint
       // at next_time_s ensures a re-sync happens then.
+      if (COSIM_DEBUG)
+         fprintf(stderr, "[d2a-upd] %s V=%.3f next_evt=%.3gns\n",
+                 b->xyce_name, voltage, next_time_s * 1e9);
       bridge.update(b->bridge_idx, voltage, voltage, next_time_s);
    }
 }
@@ -567,43 +603,114 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
    double stop_time_s = (double)stop_time / FS_PER_SEC;
    int cycle = 0;
 
+   // Settle the digital at time zero: run through all the t=0 delta cycles
+   // (Xyce's init/DCOP has already deposited the t=0 node voltages via the A2D
+   // probes) so the digital schedules its first *future* events.  Without this,
+   // model_next_time() returns the t=0 event (== now), we request no breakpoint,
+   // and Xyce over-runs straight to stop_time.
+   model_step_to(m, 1);
+
    notef("starting co-simulation loop (stop_time=%.3g s)", stop_time_s);
 
+   // Event-driven lock-step (analog master, digital evaluated AFTER the analog
+   // model eval so it sees the fresh node voltages).  Each cycle:
+   //   1. Propose acceptance = xyce_time + dt_max, but PULL IT IN to the next
+   //      pending digital event (the next D2A / PWL update) so the analog
+   //      stops where the digital is about to change.
+   //   2. Push the current D2A values (held across the analog step).
+   //   3. Advance/accept Xyce to that time — A2D callbacks deposit the node
+   //      voltages into NVC during the solve.
+   //   4. Step the digital up to the new analog time: it processes the
+   //      just-deposited A2D inputs and schedules its next D2A event, which
+   //      caps the next analog step.  (The digital never runs ahead of the
+   //      analog, so no A2D deposit is missed.)
+   // COSIM_PROFILE: per-cycle wall-clock breakdown of simulateUntil (analog)
+   // vs model_step_to (digital), to localise where the time goes.
+   const bool prof = getenv("COSIM_PROFILE") != NULL;
+   double prof_sim = 0.0, prof_dig = 0.0;     // accumulated seconds
+   double prof_worst_sim = 0.0, prof_worst_dig = 0.0;
+   int prof_worst_cyc = -1;
+   double prof_t0 = prof ? prof_now() : 0.0;
+
+   double last_time = -1.0;   // stall detection
    while (xyce_time < stop_time_s) {
 
-      // Step NVC to current analog time
-      uint64_t nvc_target = (uint64_t)(xyce_time * FS_PER_SEC);
-      int64_t next_digital = model_step_to(m, nvc_target);
+      // Bound the next analog step (simulateUntil's target is what makes it
+      // RETURN -- add_break only steers Xyce's internal stepping).  Run only as
+      // far as the next thing that needs the digital:
+      //   - the next scheduled digital (D2A) event, and
+      //   - the earliest predicted A2D crossing (the I-PWL probes' dV/dt
+      //     prediction from the previous step),
+      // else free-run to stop_time.  No fixed dt_max.
+      int64_t now_fs   = (int64_t)(xyce_time * FS_PER_SEC);
+      int64_t next_evt = model_next_time(m);
 
-      // Update bridge with current NVC signal values
-      update_d2a_bridges(&cs, m, next_digital);
+      double target = stop_time_s;
+      if (next_evt > now_fs) {
+         double e = (double)next_evt / FS_PER_SEC;
+         if (e < target) target = e;
+      }
+      double a2d_next = bridge.a2d_next ? bridge.a2d_next() : -1.0;
+      if (a2d_next > xyce_time && a2d_next < target)
+         target = a2d_next;
+      // first step only: no probe has run yet, so take a small prime step to
+      // let the I-PWL probes observe dV/dt and start predicting.
+      if (cycle == 0 && a2d_next < 0.0 && !(next_evt > now_fs)
+          && target >= stop_time_s)
+         target = xyce_time + 1e-9;
+      if (target <= xyce_time) target = xyce_time + 1e-12;
 
-      // Determine next sync point
-      double next_d_sec = (next_digital > 0)
-         ? (double)next_digital / FS_PER_SEC
-         : xyce_time + cs.dt_max;
-      double target = fmin(next_d_sec, xyce_time + cs.dt_max);
-      if (target <= xyce_time)
-         target = xyce_time + cs.dt_min;
+      update_d2a_bridges(&cs, m, (next_evt > now_fs) ? next_evt : -1);
 
-      // Advance Xyce — DPWL callbacks fire during this call:
-      //   D2A sources read NVC values from the bridge
-      //   A2D sources detect voltage changes and deposit into NVC directly
+      double t_a = prof ? prof_now() : 0.0;
       double actual_time = 0.0;
       rc = cs.xyce.simulateUntil(&cs.xyce.ptr, target, &actual_time);
+      double dt_sim = prof ? prof_now() - t_a : 0.0;
       if (rc == 0) {
          if (cs.xyce.simulationComplete(&cs.xyce.ptr))
             notef("Xyce simulation complete at time %.6g s", xyce_time);
          else
-            warnf("xyce_simulateUntil(%.6g) failed at cycle %d",
-                  target, cycle);
+            warnf("xyce_simulateUntil failed at cycle %d (t=%.6g)", cycle, xyce_time);
          break;
       }
       xyce_time = actual_time;
 
+      // evaluate the digital up to the new analog time (digital AFTER model eval)
+      double t_d = prof ? prof_now() : 0.0;
+      model_step_to(m, (uint64_t)(xyce_time * FS_PER_SEC) + 1);
+      double dt_dig = prof ? prof_now() - t_d : 0.0;
+
+      if (prof) {
+         prof_sim += dt_sim;  prof_dig += dt_dig;
+         if (dt_sim + dt_dig > prof_worst_sim + prof_worst_dig) {
+            prof_worst_sim = dt_sim; prof_worst_dig = dt_dig; prof_worst_cyc = cycle;
+         }
+         if (dt_sim + dt_dig > 20e-3)
+            notef("[prof] cycle %d t=%.4gns  sim=%.1fms dig=%.1fms",
+                  cycle, xyce_time*1e9, dt_sim*1e3, dt_dig*1e3);
+      }
+
+      // stall guard: two consecutive cycles with no analog progress and no
+      // pending digital event means nothing more will happen.
+      if (xyce_time <= last_time && model_next_time(m) < 0) {
+         notef("co-simulation stalled at %.6g s (no progress)", xyce_time);
+         break;
+      }
+      last_time = xyce_time;
+
       cycle++;
       if (cycle <= 10 || cycle % 100 == 0)
          notef("cycle %d t=%.3gns", cycle, xyce_time * 1e9);
+   }
+
+   if (prof) {
+      double wall = prof_now() - prof_t0;
+      notef("[prof] %d cycles in %.2fs wall: simulateUntil %.2fs (%.0f%%), "
+            "model_step_to %.2fs (%.0f%%); worst cycle %d "
+            "(sim=%.1fms dig=%.1fms)",
+            cycle, wall, prof_sim, 100*prof_sim/(wall>0?wall:1),
+            prof_dig, 100*prof_dig/(wall>0?wall:1), prof_worst_cyc,
+            prof_worst_sim*1e3, prof_worst_dig*1e3);
    }
 
    notef("co-simulation complete: %d cycles, final_time=%.6g s",

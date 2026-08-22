@@ -44,6 +44,7 @@
 
 #include <getopt.h>
 #include <dlfcn.h>
+#include <glob.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -237,6 +238,7 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    const char *file_list = NULL;
    const char *spec = ":D:f:I:";
    bool no_save = false;
+   char incdir_args[4096] = "", define_args[4096] = "";   // forwarded to sv2ghdl batch
 
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
       switch (c) {
@@ -269,6 +271,8 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          break;
       case 'D':
          parse_pp_define(optarg);
+         strncat(define_args, " -D", sizeof(define_args) - strlen(define_args) - 1);
+         strncat(define_args, optarg, sizeof(define_args) - strlen(define_args) - 1);
          break;
       case 'f':
          file_list = optarg;
@@ -281,6 +285,8 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          break;
       case 'I':
          add_include_dir(optarg);
+         strncat(incdir_args, " -I", sizeof(incdir_args) - strlen(incdir_args) - 1);
+         strncat(incdir_args, optarg, sizeof(incdir_args) - strlen(incdir_args) - 1);
          break;
       case 'u':
          opt_set_int(OPT_SINGLE_UNIT, 1);
@@ -320,12 +326,106 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    else if (optind == next_cmd)
       fatal("missing file name");
 
+   // Batch-translate all Verilog source files TOGETHER via sv2ghdl, so cross-
+   // module instantiations resolve consistently. Per-file translation (the hook
+   // in analyse_file) leaves some modules as VHDL and others as native Verilog
+   // when a file references a module defined elsewhere — the "2040 cross-
+   // instantiation" bug ("unit X is not a Verilog module" at elaborate). One
+   // sv2ghdl call over the whole set makes every module a VHDL entity.
+   bool vlog_batched = false;
+   {
+      const char *translator = getenv("SV2GHDL");
+      if (!(translator && access(translator, X_OK) == 0)) {
+         translator = NULL;
+         static const char *cand[] = { "iverilog-sv2ghdl",
+            "/usr/local/src/sv2ghdl/bin/iverilog-sv2ghdl", NULL };
+         for (const char **p = cand; *p; p++)
+            if (access(*p, X_OK) == 0) { translator = *p; break; }
+      }
+      char vfiles[8192] = ""; int nv = 0;
+      for (int i = optind; i < next_cmd; i++) {
+         if (argv[i][0] == '@') continue;
+         const char *e = strrchr(argv[i], '.');
+         if (e && (!strcmp(e, ".v") || !strcmp(e, ".sv")
+                   || !strcmp(e, ".vh") || !strcmp(e, ".svh"))) {
+            strncat(vfiles, " '", sizeof(vfiles) - strlen(vfiles) - 1);
+            strncat(vfiles, argv[i], sizeof(vfiles) - strlen(vfiles) - 1);
+            strncat(vfiles, "'", sizeof(vfiles) - strlen(vfiles) - 1);
+            nv++;
+         }
+      }
+      if (translator != NULL && nv > 1) {
+         char tmpdir[512];
+         checked_sprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_batch_%d", getpid());
+         char cmd[18000];
+         checked_sprintf(cmd, sizeof(cmd), "%s -o '%s'%s%s%s 2>&1",
+                         translator, tmpdir, incdir_args, define_args, vfiles);
+         notef("translating %d Verilog files together via %s", nv, translator);
+         if (system(cmd) == 0) {
+            char vhd[600];
+            checked_sprintf(vhd, sizeof(vhd), "%s/design.vhd", tmpdir);
+            if (access(vhd, F_OK) == 0) {
+               // Single combined VHDL file (iverilog-sv2ghdl stage 1).
+               analyse_file(vhd, jit, state->registry, state->mir);
+               vlog_batched = true;
+            }
+            else {
+               // No single design.vhd: the translator emitted per-module VHDL
+               // (one <module>.vhd per module, the stage-2 fallback). Analyse
+               // them all, with the top entity's file last so the entities it
+               // instantiates are already in the library when it is processed.
+               char topfile[700] = "";
+               char metapath[600];
+               checked_sprintf(metapath, sizeof(metapath), "%s/_metadata", tmpdir);
+               FILE *mf = fopen(metapath, "r");
+               if (mf != NULL) {
+                  char line[256];
+                  while (fgets(line, sizeof(line), mf) != NULL) {
+                     char top[128];
+                     if (sscanf(line, "TOP_ENTITY=\"%127[^\"]\"", top) == 1) {
+                        checked_sprintf(topfile, sizeof(topfile),
+                                        "%s/%s.vhd", tmpdir, top);
+                        break;
+                     }
+                  }
+                  fclose(mf);
+               }
+               char pat[600];
+               checked_sprintf(pat, sizeof(pat), "%s/*.vhd", tmpdir);
+               glob_t g;
+               if (glob(pat, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+                  for (size_t k = 0; k < g.gl_pathc; k++) {
+                     if (topfile[0] != '\0'
+                         && strcmp(g.gl_pathv[k], topfile) == 0)
+                        continue;   // defer top file to last
+                     analyse_file(g.gl_pathv[k], jit, state->registry,
+                                  state->mir);
+                  }
+                  if (topfile[0] != '\0' && access(topfile, F_OK) == 0)
+                     analyse_file(topfile, jit, state->registry, state->mir);
+                  vlog_batched = true;
+                  globfree(&g);
+               }
+            }
+         }
+         if (!vlog_batched)
+            warnf("batch Verilog translation failed; falling back to per-file");
+      }
+   }
+
    for (int i = optind; i < next_cmd; i++) {
       if (argv[i][0] == '@')
          do_file_list(argv[i] + 1, jit, state->registry, state->mir);
-      else
+      else {
+         const char *e = strrchr(argv[i], '.');
+         const bool isv = e && (!strcmp(e, ".v") || !strcmp(e, ".sv")
+                                || !strcmp(e, ".vh") || !strcmp(e, ".svh"));
+         if (isv && vlog_batched)
+            continue;   // already analysed via the batch translation above
          analyse_file(argv[i], jit, state->registry, state->mir);
+      }
    }
+
 
    jit_free(jit);
    set_error_limit(0);
@@ -457,6 +557,7 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
    static struct option long_options[] = {
       { "dump-llvm",       no_argument,       0, 'd' },
       { "dump-vcode",      optional_argument, 0, 'v' },
+      { "emit-cpp",        optional_argument, 0, 'P' },
       { "cover",           optional_argument, 0, 'c' },
       { "cover-file",      required_argument, 0, 'F' },
       { "cover-spec",      required_argument, 0, 's' },
@@ -489,6 +590,9 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
          break;
       case 'v':
          opt_set_str(OPT_LOWER_VERBOSE, optarg ?: "");
+         break;
+      case 'P':
+         opt_set_str(OPT_EMIT_CPP, optarg ?: ".");
          break;
       case 'c':
          if (optarg)
@@ -635,6 +739,10 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    if (!no_save)
       cgen(top, state->registry, state->mir, state->jit);
+
+   const char *cppdir = opt_get_str(OPT_EMIT_CPP);
+   if (cppdir != NULL)
+      cppgen(top, state->registry, state->mir, cppdir);
 
    argc -= next_cmd - 1;
    argv += next_cmd - 1;
@@ -856,7 +964,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *resolver_dir = NULL;
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
-   bool          use_accel = false;
+   // NVC_ACCEL in the environment is the equivalent of the --accel option
+   // (auto-compile + engage via accel_auto), so test harnesses/scripts can opt
+   // in without being modified. NVC_ACCEL=0 / empty / unset = off. This is
+   // distinct from NVC_USE_ACCEL, which names a prebuilt .so for accel_load.
+   const char   *accel_env = getenv("NVC_ACCEL");
+   bool          use_accel = (accel_env != NULL && accel_env[0] != '\0'
+                              && strcmp(accel_env, "0") != 0);
    bool          lazy_eval = false;
    const char   *launch_debug = NULL;
    const char   *cocotb_so = NULL;
@@ -1100,8 +1214,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    model_reset(state->model);
 
+   accel_banked_init(state->model);   // NVC_BANKED (no-op unless env set)
+
    if (use_accel)
       accel_auto(state->model);
+   else if (getenv("NVC_LEVELIZE_SWEEP") != NULL
+            || getenv("NVC_LEVELIZE_STATIC") != NULL)
+      accel_levelize(state->model);
 
    if (lazy_eval)
       lazy_eval_install(state->model);

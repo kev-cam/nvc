@@ -7,10 +7,13 @@ lib_libnvc_a_SOURCES += \
 	src/rt/heap.h \
 	src/rt/mspace.h \
 	src/rt/mspace.c \
+	src/rt/l3dplane.h \
+	src/rt/l3dplane.c \
 	src/rt/stdenv.c \
 	src/rt/standard.c \
 	src/rt/simpkg.c \
 	src/rt/structs.h \
+	src/rt/partition.h \
 	src/rt/model.h \
 	src/rt/model.c \
 	src/rt/fileio.c \

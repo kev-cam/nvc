@@ -59,6 +59,7 @@ void thread_init(void);
 int thread_id(void);
 bool thread_attached(void);
 void thread_sleep(int usec);
+void thread_quiesce_workers(void);   // join the pool -> single-threaded (for fork())
 
 typedef void *(*thread_fn_t)(void *);
 
