@@ -38,7 +38,9 @@ Determine where the current looseness actually is:
 
 ## 1. In-process Yosys
 
-- [ ] Build Yosys with `ENABLE_LIBYOSYS=1`.
+- [x] Build Yosys with `ENABLE_LIBYOSYS=1`.  Already done:
+      gen_statemachine dynamically links
+      `/usr/local/src/yosys-build/libyosys.so`.
 - [ ] Construct `RTLIL::Design` directly from NVC's elaborated tree.
       No Frontend/Pass plugin required — that machinery only exists to
       add `read_*` commands to the yosys CLI. NVC is the host process.
