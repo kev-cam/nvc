@@ -123,6 +123,7 @@ typedef struct _code_span {
    ident_t       name;
    uint8_t      *base;
    void         *entry;
+   size_t        entry_size;   // extent of the entry STT_FUNC symbol (0 if unknown)
    size_t        size;
 #ifdef DEBUG
    code_debug_t  debug;
@@ -1305,6 +1306,7 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size,
                            strtab + sym->st_name);
             else {
                blob->span->entry = load_addr[sym->st_shndx] + sym->st_value;
+               blob->span->entry_size = sym->st_size;
                break;
             }
          }
@@ -1459,6 +1461,463 @@ void code_load_object(code_blob_t *blob, const void *data, size_t size,
    code_load_elf(blob, data, size, resolve, rctx);
 #endif
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Body splice: copy an already-JIT-compiled entry function's machine code
+// into another blob so it runs inline (fall-through) instead of via
+// call/return.  NO recompilation: the LLVM JIT emits bodies with no
+// RIP-relative references and no rel32 calls (every external reference is
+// an absolute movabs), so the instruction stream is position-independent
+// under copy.  The only rewriting needed is (a) each terminal RET becomes
+// JMP rel32 to the end of the copy (+4 bytes per seam) and (b) intra-body
+// relative branch displacements straddling a seam shift by 4 per seam
+// crossed.  Anything outside that contract -- indirect jumps (tables),
+// RIP-relative operands, relative calls, absolute immediates pointing into
+// the copied extent (resume records), undecodable bytes -- DECLINES: the
+// caller keeps the ordinary call site.  Priority queue, not admission gate.
+//
+// Single-caller discipline: the model thread only (fused block build).
+
+#if defined ARCH_X86_64 && defined HAVE_CAPSTONE
+
+typedef struct {
+   uint32_t old_off;    // instruction start in the source extent
+   uint32_t new_off;    // instruction start in the emitted copy
+   uint8_t  size;       // source instruction size
+   uint8_t  kind;       // SPLICE_* below
+   uint8_t  imm_off;    // branch/movabs: immediate offset within insn
+   uint8_t  imm_size;   // branch only: displacement size (1 or 4)
+   uint16_t aux;        // movabs: capstone register id; tbl: table index
+   uint64_t target;     // branch: target addr; movabs: imm value
+} splice_insn_t;
+
+#define SPLICE_COPY    0
+#define SPLICE_RET     1
+#define SPLICE_BRANCH  2
+#define SPLICE_MOVABS  3   // movabs reg, imm64 (candidate jump-table base)
+#define SPLICE_CMPIMM  5   // cmp reg, imm (candidate table bounds check)
+#define SPLICE_TBLBASE 4   // movabs later claimed by an indirect jump: the
+                           // imm is rewritten to the rebased table copy
+
+// Jump table claimed by an indirect `jmp [base + idx*8]`: the absolute
+// entries are code addresses inside the extent, so the whole table is
+// copied into the blob (after the code) with every entry rebased.
+typedef struct {
+   uint64_t old_addr;   // table base in the source span
+   uint32_t nentries;
+   uint32_t new_off;    // offset of the rebased copy from the code start
+} splice_table_t;
+
+#define SPLICE_MAX_EXTENT  65536
+#define SPLICE_MAX_INSNS   20000
+#define SPLICE_MAX_TABLES  32
+#define SPLICE_MAX_TBLENT  1024
+
+static bool splice_debug(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("NVC_SPLICE_DEBUG") != NULL;
+   return on;
+}
+
+#define SPLICE_DECLINE(fmt, ...) do {                                   \
+      if (splice_debug())                                               \
+         notef("splice: decline %s: " fmt, istr(blob->span->name),      \
+               ##__VA_ARGS__);                                          \
+      goto decline;                                                     \
+   } while (0)
+
+// Map a 32-bit GPR to its 64-bit parent (bounds check `cmp eax, N`
+// guarding an index used as `[rdx + rax*8]`)
+static uint16_t splice_reg64(uint16_t reg)
+{
+   switch (reg) {
+   case X86_REG_EAX: return X86_REG_RAX;
+   case X86_REG_EBX: return X86_REG_RBX;
+   case X86_REG_ECX: return X86_REG_RCX;
+   case X86_REG_EDX: return X86_REG_RDX;
+   case X86_REG_ESI: return X86_REG_RSI;
+   case X86_REG_EDI: return X86_REG_RDI;
+   case X86_REG_EBP: return X86_REG_RBP;
+   case X86_REG_ESP: return X86_REG_RSP;
+   case X86_REG_R8D:  return X86_REG_R8;
+   case X86_REG_R9D:  return X86_REG_R9;
+   case X86_REG_R10D: return X86_REG_R10;
+   case X86_REG_R11D: return X86_REG_R11;
+   case X86_REG_R12D: return X86_REG_R12;
+   case X86_REG_R13D: return X86_REG_R13;
+   case X86_REG_R14D: return X86_REG_R14;
+   case X86_REG_R15D: return X86_REG_R15;
+   default: return reg;
+   }
+}
+
+bool code_blob_splice(code_blob_t *blob, const void *entry, size_t extent)
+{
+   if (extent == 0 || extent > SPLICE_MAX_EXTENT)
+      return false;
+
+   static csh handle;
+   static bool handle_valid = false;
+   if (!handle_valid) {
+      if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+         return false;
+      cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+      handle_valid = true;
+   }
+
+   splice_insn_t *insns LOCAL =
+      xmalloc_array(SPLICE_MAX_INSNS, sizeof(splice_insn_t));
+   splice_table_t tables[SPLICE_MAX_TABLES];
+   unsigned count = 0, ntables = 0;
+
+   const uint64_t base = (uint64_t)(uintptr_t)entry;
+   const uint8_t *code = entry;
+   size_t left = extent;
+   uint64_t address = base;
+
+   cs_insn *ci = cs_malloc(handle);
+
+   // Pass 1: decode, classify, place.  new_off tracks the emitted layout
+   // (identical sizes except RET 1 -> JMP rel32 5).
+   uint32_t new_off = 0;
+   bool ok = true;
+   while (left > 0) {
+      if (count == SPLICE_MAX_INSNS)
+         SPLICE_DECLINE("instruction budget exceeded");
+      if (!cs_disasm_iter(handle, &code, &left, &address, ci))
+         SPLICE_DECLINE("undecodable at +0x%"PRIx64, address - base);
+
+      splice_insn_t *si = &(insns[count++]);
+      si->old_off = (uint32_t)(ci->address - base);
+      si->new_off = new_off;
+      si->size    = ci->size;
+      si->kind    = SPLICE_COPY;
+      si->aux     = 0;
+
+      const cs_x86 *x86 = &(ci->detail->x86);
+
+      // RIP-relative memory operands never appear in JIT output; a copy
+      // would silently read/write the wrong address, so refuse hard.
+      for (int i = 0; i < x86->op_count; i++) {
+         if (x86->operands[i].type == X86_OP_MEM
+             && x86->operands[i].mem.base == X86_REG_RIP)
+            SPLICE_DECLINE("RIP-relative operand at +0x%x", si->old_off);
+      }
+
+      const bool is_call = cs_insn_group(handle, ci, X86_GRP_CALL);
+      const bool is_jump = cs_insn_group(handle, ci, X86_GRP_JUMP);
+
+      if (ci->id == X86_INS_RET) {
+         si->kind = SPLICE_RET;
+         new_off += 5;         // becomes jmp rel32
+         continue;
+      }
+      else if (ci->id == X86_INS_RETF || ci->id == X86_INS_IRET
+               || ci->id == X86_INS_IRETD || ci->id == X86_INS_IRETQ)
+         SPLICE_DECLINE("far/interrupt return at +0x%x", si->old_off);
+      else if (is_call || is_jump) {
+         const cs_x86_op *op = &(x86->operands[0]);
+         if (op->type == X86_OP_IMM) {
+            const uint64_t target = (uint64_t)op->imm;
+            if (target >= base && target < base + extent) {
+               si->kind     = SPLICE_BRANCH;
+               si->imm_off  = x86->encoding.imm_offset;
+               si->imm_size = x86->encoding.imm_size;
+               si->aux      = (uint16_t)ci->id;
+               si->target   = target;
+               if (si->imm_size != 1 && si->imm_size != 4)
+                  SPLICE_DECLINE("branch imm size %d at +0x%x",
+                                 si->imm_size, si->old_off);
+            }
+            else
+               // Relative transfer out of the extent: displacement would
+               // need rebasing against a far-away blob; never seen in JIT
+               // output (external refs are movabs+reg), so just refuse
+               SPLICE_DECLINE("relative %s out of extent at +0x%x",
+                              is_call ? "call" : "jump", si->old_off);
+         }
+         else if (is_jump) {
+            // Indirect jump: admit ONLY the LLVM switch-table contract --
+            //   cmp IDX, BOUND ; ja <default>
+            //   movabs BASE, <table>
+            //   jmp [BASE + IDX*8]
+            // The table holds absolute code addresses inside the extent;
+            // it is copied into the blob with every entry rebased and the
+            // movabs immediate rewritten (see the check/emit passes).
+            if (op->type != X86_OP_MEM
+                || op->mem.base == X86_REG_INVALID
+                || op->mem.index == X86_REG_INVALID
+                || op->mem.scale != 8 || op->mem.disp != 0
+                || op->mem.segment != X86_REG_INVALID)
+               SPLICE_DECLINE("indirect jump at +0x%x", si->old_off);
+
+            // The movabs that loaded the table base, within a short window
+            int mov_i = -1;
+            for (int k = (int)count - 2, w = 0; k >= 0 && w < 8; k--, w++) {
+               if ((insns[k].kind == SPLICE_MOVABS
+                    || insns[k].kind == SPLICE_TBLBASE)
+                   && insns[k].aux == (uint16_t)op->mem.base) {
+                  mov_i = k;
+                  break;
+               }
+            }
+            if (mov_i < 0)
+               SPLICE_DECLINE("indirect jump without table base at +0x%x",
+                              si->old_off);
+
+            // The bounds check on the index register: `cmp IDX, N`
+            // immediately followed by the guarding branch.  JA excludes
+            // idx > N (N+1 entries); JAE/JGE exclude idx >= N (N
+            // entries; LLVM range-checks negatives separately, exactly
+            // as the original code does).
+            int64_t nentries = -1;
+            const uint16_t idx64 = splice_reg64((uint16_t)op->mem.index);
+            for (int k = (int)count - 2, w = 0; k >= 0 && w < 8; k--, w++) {
+               if (insns[k].kind != SPLICE_CMPIMM || insns[k].aux != idx64
+                   || k + 1 >= (int)count
+                   || insns[k+1].kind != SPLICE_BRANCH)
+                  continue;
+               const uint16_t br = insns[k+1].aux;
+               if (br == (uint16_t)X86_INS_JA)
+                  nentries = (int64_t)insns[k].target + 1;
+               else if (br == (uint16_t)X86_INS_JAE
+                        || br == (uint16_t)X86_INS_JGE)
+                  nentries = (int64_t)insns[k].target;
+               else
+                  continue;
+               break;
+            }
+            if (nentries <= 0 || nentries > SPLICE_MAX_TBLENT)
+               SPLICE_DECLINE("unbounded indirect jump at +0x%x",
+                              si->old_off);
+
+            const uint64_t tbl_addr = insns[mov_i].target;
+            if (tbl_addr >= base && tbl_addr < base + extent)
+               SPLICE_DECLINE("jump table inside code extent at +0x%x",
+                              si->old_off);
+
+            unsigned t = 0;
+            for (; t < ntables; t++)
+               if (tables[t].old_addr == tbl_addr)
+                  break;
+            if (t == ntables) {
+               if (ntables == SPLICE_MAX_TABLES)
+                  SPLICE_DECLINE("table budget exceeded");
+               tables[ntables++] = (splice_table_t){
+                  .old_addr = tbl_addr,
+                  .nentries = (uint32_t)nentries,
+               };
+            }
+            else if (tables[t].nentries < (uint32_t)nentries)
+               tables[t].nentries = (uint32_t)nentries;
+
+            insns[mov_i].kind = SPLICE_TBLBASE;
+            // jmp itself copies verbatim (registers unchanged)
+         }
+         // Indirect calls (movabs'd helper pointers) copy verbatim
+      }
+      else if ((ci->id == X86_INS_MOV || ci->id == X86_INS_MOVABS)
+               && x86->op_count == 2
+               && x86->operands[0].type == X86_OP_REG
+               && x86->operands[1].type == X86_OP_IMM
+               && x86->operands[1].size == 8) {
+         const uint64_t imm = (uint64_t)x86->operands[1].imm;
+         if (imm >= base && imm < base + extent)
+            // Absolute immediate pointing back into the extent (e.g. a
+            // baked resume address) would still target the ORIGINAL body
+            SPLICE_DECLINE("self-referential imm64 at +0x%x", si->old_off);
+         si->kind    = SPLICE_MOVABS;
+         si->aux     = (uint16_t)x86->operands[0].reg;
+         si->imm_off = x86->encoding.imm_offset;
+         si->target  = imm;
+      }
+      else {
+         if (ci->id == X86_INS_CMP && x86->op_count == 2
+             && x86->operands[0].type == X86_OP_REG
+             && x86->operands[1].type == X86_OP_IMM) {
+            si->kind   = SPLICE_CMPIMM;
+            si->aux    = splice_reg64((uint16_t)x86->operands[0].reg);
+            si->target = (uint64_t)x86->operands[1].imm;
+         }
+         for (int i = 0; i < x86->op_count; i++) {
+            if (x86->operands[i].type == X86_OP_IMM
+                && x86->operands[i].size == 8
+                && (uint64_t)x86->operands[i].imm >= base
+                && (uint64_t)x86->operands[i].imm < base + extent)
+               SPLICE_DECLINE("self-referential imm64 at +0x%x", si->old_off);
+         }
+      }
+
+      new_off += ci->size;
+   }
+   goto have_insns;
+
+ decline:
+   ok = false;
+
+ have_insns:
+   cs_free(ci, 1);
+   if (!ok)
+      return false;
+
+   const uint32_t new_code_end = new_off;
+
+   // Table layout: 8-aligned block AFTER the copied code; rets jump past it
+   uint32_t tables_base = (new_code_end + 7) & ~7u;
+   uint32_t tables_off = tables_base, total_entries = 0;
+   for (unsigned t = 0; t < ntables; t++) {
+      tables[t].new_off = tables_off;
+      tables_off += tables[t].nentries * 8;
+      total_entries += tables[t].nentries;
+   }
+   const uint32_t new_total = tables_off;   // ret/continuation target
+
+   // Check pass: resolve every internal branch target to an instruction
+   // start and verify the recomputed displacement fits its encoding,
+   // BEFORE any byte is emitted -- a decline must leave the blob intact.
+   // The resolved displacement is cached in `target` for the emit pass.
+   for (unsigned i = 0; i < count; i++) {
+      splice_insn_t *si = &(insns[i]);
+      if (si->kind != SPLICE_BRANCH)
+         continue;
+
+      const uint32_t target_old = (uint32_t)(si->target - base);
+
+      unsigned lo = 0, hi = count;
+      while (lo < hi) {
+         const unsigned mid = (lo + hi) / 2;
+         if (insns[mid].old_off < target_old)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      if (lo == count || insns[lo].old_off != target_old) {
+         if (splice_debug())
+            notef("splice: decline %s: branch into mid-instruction +0x%x",
+                  istr(blob->span->name), target_old);
+         return false;
+      }
+
+      const int64_t disp = (int64_t)insns[lo].new_off
+         - ((int64_t)si->new_off + si->size);
+
+      if (si->imm_size == 1 && (disp < INT8_MIN || disp > INT8_MAX)) {
+         if (splice_debug())
+            notef("splice: decline %s: rel8 overflow at +0x%x",
+                  istr(blob->span->name), si->old_off);
+         return false;
+      }
+
+      si->target = (uint64_t)disp;   // repurposed: resolved displacement
+   }
+
+   // Check pass for tables: every entry must be an instruction start
+   // inside the extent; resolve each to its new offset up front.
+   uint32_t *tbl_newoffs LOCAL = total_entries > 0
+      ? xmalloc_array(total_entries, sizeof(uint32_t)) : NULL;
+   for (unsigned t = 0, e = 0; t < ntables; t++) {
+      const uint64_t *src =
+         (const uint64_t *)(uintptr_t)tables[t].old_addr;
+      for (unsigned i = 0; i < tables[t].nentries; i++, e++) {
+         const uint64_t tgt = src[i];
+         if (tgt < base || tgt >= base + extent) {
+            if (splice_debug())
+               notef("splice: decline %s: table entry %u out of extent",
+                     istr(blob->span->name), i);
+            return false;
+         }
+         const uint32_t tgt_old = (uint32_t)(tgt - base);
+         unsigned lo = 0, hi = count;
+         while (lo < hi) {
+            const unsigned mid = (lo + hi) / 2;
+            if (insns[mid].old_off < tgt_old)
+               lo = mid + 1;
+            else
+               hi = mid;
+         }
+         if (lo == count || insns[lo].old_off != tgt_old) {
+            if (splice_debug())
+               notef("splice: decline %s: table entry %u mid-instruction",
+                     istr(blob->span->name), i);
+            return false;
+         }
+         tbl_newoffs[e] = insns[lo].new_off;
+      }
+   }
+
+   // Emit pass: cannot fail (blob overflow follows the normal
+   // code_blob_emit protocol and is detected at finalise).
+   uint8_t *const copy_base = blob->wptr;
+
+   for (unsigned i = 0; i < count; i++) {
+      const splice_insn_t *si = &(insns[i]);
+
+      if (si->kind == SPLICE_RET) {
+         const int32_t disp = (int32_t)(new_total - (si->new_off + 5));
+         uint8_t jmp[5] = { 0xE9 };
+         memcpy(jmp + 1, &disp, 4);
+         code_blob_emit(blob, jmp, 5);
+         continue;
+      }
+
+      uint8_t buf[16];
+      assert(si->size <= sizeof buf);
+      memcpy(buf, (const uint8_t *)entry + si->old_off, si->size);
+
+      if (si->kind == SPLICE_BRANCH) {
+         if (si->imm_size == 1)
+            buf[si->imm_off] = (uint8_t)(int8_t)(int64_t)si->target;
+         else {
+            const int32_t d32 = (int32_t)(int64_t)si->target;
+            memcpy(buf + si->imm_off, &d32, 4);
+         }
+      }
+      else if (si->kind == SPLICE_TBLBASE) {
+         unsigned t = 0;
+         while (tables[t].old_addr != si->target)
+            t++;
+         const uint64_t new_addr =
+            (uint64_t)(uintptr_t)(copy_base + tables[t].new_off);
+         memcpy(buf + si->imm_off, &new_addr, 8);
+      }
+
+      code_blob_emit(blob, buf, si->size);
+   }
+
+   // Alignment padding, then the rebased tables
+   static const uint8_t zero[8] = { 0 };
+   code_blob_emit(blob, zero, tables_base - new_code_end);
+   for (unsigned t = 0, e = 0; t < ntables; t++) {
+      for (unsigned i = 0; i < tables[t].nentries; i++, e++) {
+         const uint64_t abs =
+            (uint64_t)(uintptr_t)(copy_base + tbl_newoffs[e]);
+         code_blob_emit(blob, (const uint8_t *)&abs, 8);
+      }
+   }
+
+   return true;
+}
+
+size_t code_blob_entry_size(const code_blob_t *blob)
+{
+   return blob->span->entry_size;
+}
+
+#else    // !ARCH_X86_64 || !HAVE_CAPSTONE
+
+bool code_blob_splice(code_blob_t *blob, const void *entry, size_t extent)
+{
+   return false;
+}
+
+size_t code_blob_entry_size(const code_blob_t *blob)
+{
+   return 0;
+}
+
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // Fail-soft validating prepass for persistent-cache objects.  The normal

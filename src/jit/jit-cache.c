@@ -1136,7 +1136,17 @@ jit_cache_status_t jit_cache_load(jit_cache_t *jc, code_cache_t *code,
       code_blob_t *blob = code_blob_new(code, f->name, osize);
       if (blob != NULL) {
          code_load_object(blob, object, osize, jit_cache_resolve, symtab);
+
+         // Same discipline as the fresh path: record the entry extent for
+         // the fused-block splicer, but only if finalise actually swings
+         // the entry to this object's code
+         const size_t entrysz = code_blob_entry_size(blob);
+         const jit_entry_fn_t old_entry = f->entry;
+
          code_blob_finalise(blob, &(f->entry));
+
+         if (f->entry != old_entry)
+            f->entry_size = (uint32_t)entrysz;
 
          relaxed_add(&jc->n_hits, 1);
          status = JIT_CACHE_HIT;

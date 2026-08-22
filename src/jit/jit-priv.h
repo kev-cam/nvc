@@ -360,6 +360,7 @@ typedef struct _jit_func {
    jit_tier_t     *next_tier;
    ffi_spec_t      spec;
    object_t       *object;
+   uint32_t        entry_size;  // native entry fn extent (0 = not native)
 } jit_func_t;
 
 // The code generator knows the layout of this struct
@@ -495,6 +496,16 @@ typedef void (*code_patch_fn_t)(code_blob_t *, jit_label_t, uint8_t *,
 
 code_blob_t *code_blob_new(code_cache_t *code, ident_t name, size_t hint);
 void code_blob_emit(code_blob_t *blob, const uint8_t *bytes, size_t len);
+
+// Copy an already-compiled entry function inline into `blob` (fall-through
+// form: terminal RETs become jumps to the end of the copy).  Returns false
+// WITHOUT touching the blob when the body is outside the splice contract;
+// see the implementation for the admission rules.  x86_64 + capstone only.
+bool code_blob_splice(code_blob_t *blob, const void *entry, size_t extent);
+
+// Extent of the blob's entry function as recorded from the object's symbol
+// table at load; 0 when unknown (non-ELF platforms, hand-emitted blobs)
+size_t code_blob_entry_size(const code_blob_t *blob);
 
 // Entry-publication watch: notify a consumer that has BAKED a copy of
 // *slot (e.g. an immediate direct-call target in an emitted block) whenever

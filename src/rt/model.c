@@ -11606,7 +11606,14 @@ static void reset_scope(rt_model_t *m, rt_scope_t *s)
 
 #ifdef ARCH_X86_64
 
-typedef enum { SITE_PLAIN, SITE_FALLBACK, SITE_DISABLED } fused_site_state_t;
+typedef enum {
+   SITE_PLAIN,      // register setup + patchable SITE A call
+   SITE_SPLICE,     // body copied INLINE (code_blob_splice): no SITE A slot,
+                    // no call/return -- any retarget/demote/evict affecting
+                    // this member dissolves the whole block instead
+   SITE_FALLBACK,
+   SITE_DISABLED,
+} fused_site_state_t;
 
 typedef struct {
    jit_entry_fn_t *slot;     // &func->entry whose value SITE A baked
@@ -11628,8 +11635,25 @@ typedef struct _fused_block {
    unsigned        count;
    model_thread_t *thread;      // baked model-thread pointer
    int             patch_pending;   // set by retarget callback (any thread)
+   int             rebuild_pending; // spliced member invalidated: dissolve
+                                    // at the next dispatch boundary
+   bool            splice_ok;   // build-time: total extent fit the budget
    bool            running;     // dissolve must never happen mid-block
 } fused_block_t;
+
+// NVC_SPLICE=1: copy each plain member's JIT-compiled body INLINE into the
+// fused block (code_blob_splice) instead of emitting a call to it -- the
+// call/return boundary disappears and only the per-member register updates
+// remain between bodies.  Default OFF until gated.
+static bool fused_splice_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *e = getenv("NVC_SPLICE");
+      enabled = (e != NULL && *e == '1');
+   }
+   return enabled;
+}
 
 static bool fused_block_enabled(void)
 {
@@ -11752,7 +11776,12 @@ static void fused_member_unfuse(rt_model_t *m, rt_proc_t *proc)
       if (fb->members[i] != proc)
          continue;
       fused_site_t *s = &(fb->sites[i]);
-      if (s->state == SITE_PLAIN) {
+      if (s->state == SITE_SPLICE)
+         // The body is inline: nothing to patch.  It must not run again
+         // in this form; request a dissolve at the next dispatch boundary
+         // (the block never re-runs before the preamble sees the flag).
+         relaxed_store(&(fb->rebuild_pending), 1);
+      else if (s->state == SITE_PLAIN) {
          s->state = SITE_FALLBACK;
          s->cur_a = m->fused_stub;
          fused_patch_call(fb, s->off_a, (void *)m->fused_stub);
@@ -11806,10 +11835,23 @@ static void fused_apply_pending(rt_model_t *m, fused_block_t *fb)
    for (unsigned i = 0; i < fb->count; i++) {
       fused_site_t *s = &(fb->sites[i]);
       jit_entry_fn_t want = relaxed_load(&(s->want_a));
-      if (want == NULL || want == s->cur_a || s->state != SITE_PLAIN)
+      if (want == NULL || want == s->cur_a)
+         continue;
+      if (s->state == SITE_SPLICE) {
+         // The old body is baked inline: rebuild the whole block
+         relaxed_store(&(fb->rebuild_pending), 1);
+         continue;
+      }
+      if (s->state != SITE_PLAIN)
          continue;
       s->cur_a = want;
       fused_patch_call(fb, s->off_a, (void *)want);
+      // The member is native now: a rebuild can splice its body inline.
+      // (The block is typically built at probation exit, BEFORE most
+      // members reach the tier-up threshold -- without this the splice
+      // would only ever cover bodies that happened to compile early.)
+      if (fb->splice_ok)
+         relaxed_store(&(fb->rebuild_pending), 1);
       if (unlikely(getenv("NVC_FUSED_DEBUG") != NULL))
          notef("fused: tier-up retarget member %u -> %p", i, (void *)want);
    }
@@ -11887,6 +11929,10 @@ static void fused_emit_member(rt_model_t *m, fused_block_t *fb,
       target_a = (void *)load_acquire(s->slot);
       target_b = (void *)fused_member_epilogue;
    }
+   else if (s->state == SITE_DISABLED) {   // evicted member (rebuild)
+      target_a = (void *)m->fused_stub;
+      target_b = (void *)fused_member_skip;
+   }
    else {   // SITE_FALLBACK at build: full generic activation
       target_a = (void *)m->fused_stub;
       target_b = (void *)fused_member_fallback;
@@ -11912,8 +11958,38 @@ static void fused_emit_member(rt_model_t *m, fused_block_t *fb,
    FUSED_EMIT(0x31, 0xF6);                      // xor esi, esi (anchor NULL)
    FUSED_EMIT(0x4C, 0x89, 0xE2);                // mov rdx, r12
 
-   s->off_a = blob->wptr - start;
-   fused_emit_call_slot(blob, target_a);        // SITE A
+   // NVC_SPLICE: copy the member's compiled body inline instead of calling
+   // it.  entry_size > 0 guarantees target_a is a published NATIVE entry
+   // (the size is recorded only when finalise swings the entry).  The
+   // sub/add rsp,8 pair reproduces the stack parity a CALL would have
+   // given the body (SysV: rsp % 16 == 8 at function entry) -- the body's
+   // aligned spills and its own internal calls depend on it.  On decline
+   // code_blob_splice leaves the blob untouched and the ordinary SITE A
+   // call slot is emitted instead.  (Compile-once world: entry/entry_size
+   // publish together; a republish after this point dissolves the block
+   // via fused_apply_pending's SITE_SPLICE path.)
+   bool spliced = false;
+   if (s->state == SITE_PLAIN && fb->splice_ok && func->entry_size > 0) {
+      FUSED_EMIT(0x48, 0x83, 0xEC, 0x08);       // sub rsp, 8
+      if (code_blob_splice(blob, (void *)target_a, func->entry_size)) {
+         FUSED_EMIT(0x48, 0x83, 0xC4, 0x08);    // add rsp, 8
+         s->state = SITE_SPLICE;
+         s->off_a = 0;
+         spliced  = true;
+      }
+      else {
+         if (!blob->overflow)
+            blob->wptr -= 4;                    // roll back the sub rsp,8
+         if (getenv("NVC_FUSED_DEBUG") != NULL)
+            notef("fused: member %s splice declined (extent %u)",
+                  istr(p->name), func->entry_size);
+      }
+   }
+
+   if (!spliced) {
+      s->off_a = blob->wptr - start;
+      fused_emit_call_slot(blob, target_a);     // SITE A
+   }
 
    fused_emit_movabs(blob, 0x48, 0xBF, (uint64_t)(uintptr_t)m);   // rdi
    fused_emit_movabs(blob, 0x48, 0xBE, (uint64_t)(uintptr_t)p);   // rsi
@@ -11952,15 +12028,41 @@ static void fused_block_build(rt_model_t *m)
    }
 
    const unsigned count = m->fastclk_count;
-   const size_t hint = 192 + (size_t)count * 160;   // +64: second prologue
+   size_t hint = 192 + (size_t)count * 160;   // +64: second prologue
    if (hint > 0x300000) {   // one code page (4MB) bounds a blob
       notef("accel-jit: NVC_FUSED_BLOCK — %u members exceed the block size "
             "budget, not fusing", count);
       return;
    }
 
+   // NVC_SPLICE: inline bodies add their extent (+ ~24 bytes of seam
+   // overhead each) to the block.  If the total blows the blob budget,
+   // fall back to the all-call form rather than not fusing at all.
+   bool splice_ok = fused_splice_enabled();
+   if (splice_ok) {
+      size_t body_hint = 0;
+      for (unsigned i = 0; i < count; i++) {
+         rt_proc_t *p = m->fastclk_table[i];
+         if (p->vtable->eval != proc_eval_direct)
+            continue;
+         direct_eval_t *de = (direct_eval_t *)p->vtable;
+         // 2x: rebased jump tables ride along with the body copy and are
+         // not part of the entry extent (the unused tail of the blob is
+         // returned to the free span at finalise)
+         body_hint += (size_t)de->func->entry_size * 2 + 64;
+      }
+      if (hint + body_hint > 0x300000) {
+         notef("accel-jit: NVC_SPLICE — inline bodies exceed the block "
+               "budget (%zu bytes), keeping call form", body_hint);
+         splice_ok = false;
+      }
+      else
+         hint += body_hint;
+   }
+
    fused_block_t *fb = xcalloc(sizeof(fused_block_t));
    fb->count   = count;
+   fb->splice_ok = splice_ok;
    fb->members = xmalloc_array(count, sizeof(rt_proc_t *));
    fb->sites   = xcalloc_array(count, sizeof(fused_site_t));
    fb->argbuf  = xmalloc_array(JIT_MAX_ARGS, sizeof(jit_scalar_t));
@@ -12016,7 +12118,12 @@ static void fused_block_build(rt_model_t *m)
       const bool plain = p->vtable->eval == proc_eval_direct
          && p->wakeable.trigger == NULL
          && p->tlab == NULL;
-      s->state = plain ? SITE_PLAIN : SITE_FALLBACK;
+      if (!p->wakeable.fastclk)
+         // Evicted while a previous block was live (rebuild path): the
+         // table loop skips it, so the block must too
+         s->state = SITE_DISABLED;
+      else
+         s->state = plain ? SITE_PLAIN : SITE_FALLBACK;
       if (!plain && getenv("NVC_FUSED_DEBUG") != NULL)
          notef("fused: member %s falls back: eval=%s trigger=%p tlab=%p",
                istr(p->name),
@@ -12035,6 +12142,8 @@ static void fused_block_build(rt_model_t *m)
    };
    code_blob_emit(blob, outro, sizeof outro);
 
+   const size_t block_bytes = blob->wptr - start;   // blob dies at finalise
+
    code_blob_finalise(blob, &(fb->entry));
 
    if (fb->entry == NULL || (uint8_t *)fb->entry != start) {
@@ -12052,10 +12161,19 @@ static void fused_block_build(rt_model_t *m)
    fb->entry_offedge = (jit_entry_fn_t)(start + off_pb);
 
    m->fused_block = fb;
+
+   unsigned nspliced = 0;
+   for (unsigned i = 0; i < count; i++)
+      nspliced += (fb->sites[i].state == SITE_SPLICE);
+
    notef("accel-jit: NVC_FUSED_BLOCK — fused %u/%u member(s), two-entry "
-         "%u posedge-only + %u every-event%s", nplain, count,
+         "%u posedge-only + %u every-event%s%s", nplain, count,
          ee_start, count - ee_start,
-         nplain == count ? "" : " (rest via generic fallback)");
+         nplain == count ? "" : " (rest via generic fallback)",
+         nspliced > 0 ? " [spliced]" : "");
+   if (nspliced > 0)
+      notef("accel-jit: NVC_SPLICE — %u/%u bodies inline (%zu byte block)",
+            nspliced, nplain, block_bytes);
 }
 
 // Run the fused block for this dispatch (posedge = full table via the
@@ -12090,6 +12208,18 @@ static bool fused_block_dispatch(rt_model_t *m, bool posedge)
    if (unlikely(load_acquire(&(fb->patch_pending))))
       fused_apply_pending(m, fb);
 
+   // A spliced member was invalidated (tier-up republish, evict, TLAB
+   // claim) or a plain member became spliceable: the body bytes are baked
+   // into the block, so dissolve and REBUILD here -- a delta boundary,
+   // never mid-block -- and take the table loop for this dispatch.  The
+   // block is stateless; nothing is lost.  Rebuild count is naturally
+   // bounded: each member tiers up at most once per compile publication.
+   if (unlikely(load_acquire(&(fb->rebuild_pending)))) {
+      fused_block_dissolve(m);
+      fused_block_build(m);
+      return false;
+   }
+
    // Deferred evict patches: a member evicted mid-eval (timed wake, #0
    // wait, wait-set demote) could not patch its own un-executed SITE B;
    // apply here, on the model thread, never mid-block.
@@ -12099,7 +12229,11 @@ static bool fused_block_dispatch(rt_model_t *m, bool posedge)
          if (fb->members[i]->wakeable.fastclk)
             continue;
          fused_site_t *sd = &(fb->sites[i]);
-         if (sd->state != SITE_DISABLED) {
+         if (sd->state == SITE_SPLICE) {
+            // Inline body cannot be skipped by patching: rebuild
+            relaxed_store(&(fb->rebuild_pending), 1);
+         }
+         else if (sd->state != SITE_DISABLED) {
             sd->state = SITE_DISABLED;
             sd->cur_a = m->fused_stub;
             fused_patch_call(fb, sd->off_a, (void *)m->fused_stub);

@@ -4016,8 +4016,19 @@ static void jit_llvm_cgen(jit_t *j, jit_handle_t handle, void *context)
    code_load_object(blob, LLVMGetBufferStart(buf), objsz,
                     symtab != NULL ? jit_cache_resolve : NULL, symtab);
 
+   // Recorded from the entry symbol's st_size: lets the fused-block
+   // splicer bound the body when copying it inline (fresh compiles and
+   // cache replays both pass through here).  Only published if finalise
+   // actually swings f->entry to the new native code -- an overflowed
+   // blob leaves the old entry (and must leave the old extent) in place.
+   const size_t entrysz = code_blob_entry_size(blob);
+   const jit_entry_fn_t old_entry = f->entry;
+
    const size_t size = blob->wptr - base;
    code_blob_finalise(blob, &(f->entry));
+
+   if (f->entry != old_entry)
+      f->entry_size = (uint32_t)entrysz;
 
    if (symtab != NULL)
       shash_free(symtab);
