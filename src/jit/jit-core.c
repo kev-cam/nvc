@@ -354,37 +354,57 @@ static void jit_missing_unit(jit_func_t *f)
    __builtin_unreachable();
 }
 
-void jit_fill_irbuf(jit_func_t *f)
+static bool jit_fill_irbuf_inner(jit_func_t *f, bool fatal_on_missing)
 {
    const func_state_t state = load_acquire(&(f->state));
    switch (state) {
    case JIT_FUNC_READY:
       if (f->irbuf != NULL)
-         return;
+         return true;
       // Fall-through
    case JIT_FUNC_PLACEHOLDER:
       if (atomic_cas(&(f->state), state, JIT_FUNC_COMPILING))
          break;
       // Fall-through
    case JIT_FUNC_COMPILING:
-      // Another thread is compiling this function
-      for (int timeout = 0; load_acquire(&(f->state)) != JIT_FUNC_READY; ) {
+      // Another thread is compiling this function.  Break out on ERROR
+      // too: previously a waiter would spin forever if the compiling
+      // thread marked the function missing (moot when that thread
+      // fataled the process, but the soft path returns instead).
+      for (int timeout = 0; ; ) {
+         const func_state_t now = load_acquire(&(f->state));
+         if (now == JIT_FUNC_READY)
+            return true;
+         else if (now == JIT_FUNC_ERROR) {
+            if (fatal_on_missing)
+               jit_missing_unit(f);
+            return false;
+         }
          if (++timeout % COMPILE_TIMEOUT == 0)
             warnf("waiting for %s to finish compiling", istr(f->name));
          thread_sleep(100);
       }
-      return;
    case JIT_FUNC_ERROR:
-      jit_missing_unit(f);
-      break;
+      if (fatal_on_missing)
+         jit_missing_unit(f);
+      return false;
    default:
       fatal_trace("illegal function state for %s", istr(f->name));
    }
 
    assert(f->irbuf == NULL);
 
+   bool ok = true;
+
 #ifndef USE_EMUTLS
-   jit_thread_local_t *thread = jit_thread_get();
+   // Use the REAL per-thread state, not the jit_thread_get shim: after
+   // jit_thread_install_fast_path the shim returns the MAIN thread's
+   // cached struct on EVERY thread, and this function now also runs on
+   // cgen workers (deterministic inlining) -- transitioning through the
+   // shim there would mutate the simulating thread's state machine
+   // concurrently (observed as thread->jit corruption -> SEGV in
+   // jit_attach_thread).  Fill is cold code; the TLS lookup is fine.
+   jit_thread_local_t *thread = jit_thread_local();
    const jit_state_t oldstate = thread->state;
    jit_transition(thread, f->jit, oldstate, JIT_COMPILING);
 #endif
@@ -406,7 +426,10 @@ void jit_fill_irbuf(jit_func_t *f)
 
    if (mu == NULL) {
       store_release(&(f->state), JIT_FUNC_ERROR);
-      jit_missing_unit(f);
+      if (fatal_on_missing)
+         jit_missing_unit(f);
+      ok = false;
+      goto done;
    }
 
    f->counters = cover_get_counters(f->jit->cover, f->name);
@@ -417,6 +440,32 @@ void jit_fill_irbuf(jit_func_t *f)
 #ifndef USE_EMUTLS
    jit_transition(thread, f->jit, JIT_COMPILING, oldstate);
 #endif
+   return ok;
+}
+
+void jit_fill_irbuf(jit_func_t *f)
+{
+   (void)jit_fill_irbuf_inner(f, true);
+}
+
+// Best-effort fill for speculative consumers on CGEN WORKER threads
+// (deterministic inlining, #33).  Restricted to precompiled-pack
+// functions: the pack path is a pure decode, whereas the MIR/irgen
+// path can cascade into linking other units and even executing code
+// (package initialisers), which is not legal on a worker concurrent
+// with the simulation (observed: a worker without an attached JIT
+// thread-local running LOGIC3D "&" -> mspace_alloc -> SEGV).  A
+// missing body returns false instead of a fatal diagnostic because
+// the call-site being lowered may never execute.
+bool jit_try_fill_irbuf(jit_func_t *f)
+{
+   if (load_acquire(&(f->state)) == JIT_FUNC_READY && f->irbuf != NULL)
+      return true;
+
+   if (f->jit->pack == NULL || !jit_pack_has(f->jit->pack, f->name))
+      return false;
+
+   return jit_fill_irbuf_inner(f, false);
 }
 
 jit_handle_t jit_compile(jit_t *j, ident_t name)

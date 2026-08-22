@@ -460,6 +460,7 @@ jit_thread_local_t *jit_run_region_enter(jit_t *j, jit_state_t *oldstate);
 void jit_run_region_leave(jit_t *j, jit_thread_local_t *thread,
                           jit_state_t oldstate);
 void jit_fill_irbuf(jit_func_t *f);
+bool jit_try_fill_irbuf(jit_func_t *f);
 int32_t *jit_get_cover_ptr(jit_func_t *f, jit_value_t addr);
 jit_entry_fn_t jit_bind_intrinsic(ident_t name);
 jit_thread_local_t *jit_attach_thread(jit_anchor_t *anchor);

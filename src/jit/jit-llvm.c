@@ -1508,16 +1508,33 @@ static void cgen_debug_loc(llvm_obj_t *obj, cgen_func_t *func, const loc_t *loc)
 
 static LLVMValueRef cgen_maybe_inline(llvm_obj_t *obj, jit_func_t *callee)
 {
-   if (load_acquire(&callee->state) != JIT_FUNC_READY) {
-      // Whether the callee HAPPENED to be compiled yet is a race, so the
-      // same design can be emitted with this call inlined on one run and
-      // not on the next -- and an un-inlined module also loses the O1
-      // pipeline (see opt_hint below).  Forcing the IR here would eagerly
-      // lower the whole callee closure and is far more expensive than the
-      // inlining is worth, so instead record that this module came out
-      // WORSE than it might have: jit_cache must not freeze it.
-      obj->inline_raced = true;
-      return NULL;
+   switch (load_acquire(&callee->state)) {
+   case JIT_FUNC_READY:
+      break;
+   case JIT_FUNC_ERROR:
+      return NULL;   // Deterministic decline: the callee has no IR
+   default:
+      // Deterministic inlining (#33): lower the callee NOW instead of
+      // racing on whether its irgen happened to finish.  The lowering
+      // is the same work the callee's own compile needs, so it is
+      // front-loaded rather than wasted, and the emitted module (and
+      // its cache manifest) depend only on static structure.  The old
+      // behaviour -- skip the inline and mark the module inline_raced
+      // so jit_cache refused to freeze it -- made the raced set
+      // recompile at O3 on every run (measured on the ICG2EN VeeR
+      // build: ~1044 raced units, ~38s of a 40s wall clock, cache
+      // permanently cold).  jit_fill_irbuf is idempotent, safe on
+      // cgen workers (already called from jit_llvm_cgen), and briefly
+      // waits out a concurrent irgen of the same callee.
+      if (!jit_try_fill_irbuf(callee)
+          || load_acquire(&callee->state) != JIT_FUNC_READY) {
+         // Non-pack callee or lowering failed: whether it HAPPENED to
+         // be ready remains timing-dependent, so keep the old contract
+         // and stop jit_cache freezing this module
+         obj->inline_raced = true;
+         return NULL;
+      }
+      break;
    }
 
    if (callee->nirs > INLINE_LIMIT)
