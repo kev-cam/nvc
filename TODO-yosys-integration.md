@@ -7,15 +7,34 @@ needed. No Cameron EDA fork of the Yosys repo.
 
 Determine where the current looseness actually is:
 
-- [ ] Confirm whether the existing RTL codegen path is `write_cxxrtl`.
-      If so, the generated C++ depends only on the header-only CXXRTL
-      runtime (`cxxrtl.h`), **not** on libyosys — meaning linking
-      libyosys does not tighten anything, and the real seam is the
-      CXXRTL object boundary (object model, signal naming, who owns the
-      eval loop).
-- [ ] If the seam is CXXRTL: scope getting NVC's scheduler to drive
-      eval, rather than CXXRTL's.
-- [ ] If the seam is the Yosys API: proceed with §1.
+- [x] Confirm whether the existing RTL codegen path is `write_cxxrtl`.
+      **DETERMINED (2026-08-22): it is NOT.**  `gen_statemachine.cpp`
+      already links libyosys IN-PROCESS (`yosys_setup()` +
+      `run_pass("read_verilog …; hierarchy; proc; flatten; opt -keepdc;
+      dffunmap; opt_clean")`) and then walks RTLIL cells itself to emit
+      its own C (the state-machine form).  `write_cxxrtl` exists only
+      as the GSM_CXXRTL A/B side-mode, and `techmap; simplemap;
+      write_json` only feed the scan/certify (ATPG) path.  **No `abc`
+      anywhere** — the §3 ABC concern is moot for sim codegen, as
+      suspected.
+- [x] If the seam is CXXRTL: scope getting NVC's scheduler to drive
+      eval, rather than CXXRTL's.  N/A — NVC's scheduler already owns
+      eval; gsm-generated chunks are `.so`s driven by the accel bridge.
+- [x] If the seam is the Yosys API: proceed with §1.  **The actual
+      seam is neither: it is the NVC ↔ gen_statemachine PROCESS
+      boundary** (model.c fork/execs gsm per chunk/merge, round-
+      tripping emitted Verilog in and generated C out, then gcc →
+      `.so` → dlopen).  §1's remaining work is therefore "move gsm's
+      libyosys usage into the nvc process" — with the caveat that
+      today's process isolation is what makes a yosys `log_error`
+      non-fatal to the simulator: in-process linking makes §3's
+      exit/abort interposition MANDATORY on day one, and §4's
+      threading confinement real (nvc is multithreaded; gsm today is
+      one process, one thread).  "Construct RTLIL::Design directly
+      from NVC's elaborated tree" additionally bypasses vhdl2vlog +
+      read_verilog — note vhdl2vlog carries the Verilator-match
+      translation semantics and width-identity fixes, so that step
+      moves those obligations into the RTLIL builder.
 
 ## 1. In-process Yosys
 
