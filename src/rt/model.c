@@ -2720,6 +2720,13 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    // active-process context (run_process does not — only the default JIT eval
    // does, and the bridge needs it for deposit_signal()/AJ_OUT), run the chunk.
    aj_chunk_t *chunk = (aj_chunk_t *)proc->vtable;
+   if (unlikely(getenv("NVC_ACCEL_CKSUB_DBG") != NULL)) {
+      static uint64_t _n = 0;
+      if (_n++ < 8)
+         notef("accel-jit: aj_proc_eval wake #%"PRIu64" chunk=%s t=%"PRIu64
+               " delta=%u", _n, chunk->rs_top ? chunk->rs_top : "?",
+               (uint64_t)m->now, (unsigned)m->iteration);
+   }
    // Per-delta dedup: EVERY rerouted proc of the chunk wakes on a boundary
    // event and would re-eval the whole chunk — hundreds of identical evals
    // per delta for a whole-core chunk, each paying the full input scan
@@ -9125,6 +9132,18 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    //    baked bridge (builds the chunk's deferred-output table) and compile.
    aj_chunk_t *chunk = aj_chunk_new(m);
    chunk->scope   = scope;
+   // TRANSLATED-DESIGN WAKE HOLE: iverilog-emitted flop processes are
+   // wait-at-bottom (dynamic sensitivity) — after reroute the `wait on`
+   // never re-executes, so the proc drops off every pending list after
+   // its FIRST wake and the chunk never evaluates again (glue2b: q
+   // frozen at init while the interp side ran on).  Native-VHDL
+   // processes have static sensitivity lists that survive rerouting,
+   // which is why the accelbench designs never exposed this, and merged
+   // wrappers were already covered by the ck_sigs subscription.  Give
+   // SINGLE chunks the same static subscription on their clock.
+   if (have_clk && clk.sig != NULL
+       && chunk->n_ck_sigs < (int)ARRAY_LEN(chunk->ck_sigs))
+      chunk->ck_sigs[chunk->n_ck_sigs++] = clk.sig;
    // Named BEFORE the bridge is emitted: the emitted X/Z sighting message bakes
    // the chunk name in as a literal (it used to read "accel chunk" because
    // rs_top was only filled in after the dlopen below).
