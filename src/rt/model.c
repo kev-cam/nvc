@@ -11639,6 +11639,7 @@ typedef struct _fused_block {
                                     // at the next dispatch boundary
    bool            splice_ok;   // build-time: splicing enabled for this block
    size_t          splice_budget;   // remaining bytes for inline bodies
+   uint8_t        *splice_deny; // member i: body too widely shared to copy
    bool            running;     // dissolve must never happen mid-block
 } fused_block_t;
 
@@ -11654,6 +11655,21 @@ static bool fused_splice_enabled(void)
       enabled = (e != NULL && *e == '1');
    }
    return enabled;
+}
+
+// NVC_SPLICE_MAXSHARE: a jit_func shared by more than this many fused
+// members keeps its CALL sites instead of being copied per instance --
+// the call form re-executes the shared body from hot I-cache (and the
+// RSB predicts its returns perfectly), while per-instance copies made
+// the VeeR block stream 2.16MB of instructions per posedge.  Default 2.
+static unsigned fused_splice_maxshare(void)
+{
+   static int val = -1;
+   if (val < 0) {
+      const char *e = getenv("NVC_SPLICE_MAXSHARE");
+      val = (e != NULL) ? MAX(atoi(e), 0) : 2;
+   }
+   return (unsigned)val;
 }
 
 static bool fused_block_enabled(void)
@@ -11971,6 +11987,7 @@ static void fused_emit_member(rt_model_t *m, fused_block_t *fb,
    // via fused_apply_pending's SITE_SPLICE path.)
    bool spliced = false;
    if (s->state == SITE_PLAIN && fb->splice_ok && func->entry_size > 0
+       && !fb->splice_deny[s - fb->sites]
        && (size_t)func->entry_size * 2 + 64 <= fb->splice_budget) {
       uint8_t *const before = blob->wptr;
       FUSED_EMIT(0x48, 0x83, 0xEC, 0x08);       // sub rsp, 8
@@ -12049,14 +12066,29 @@ static void fused_block_build(rt_model_t *m)
    // returned to the free span at finalise.
    bool splice_ok = fused_splice_enabled();
    size_t splice_budget = 0;
+   uint8_t *splice_deny = NULL;
    if (splice_ok) {
-      size_t body_hint = 0;
+      // Share census: members whose jit_func appears more than MAXSHARE
+      // times keep their call sites (see fused_splice_maxshare)
+      splice_deny = xcalloc_array(count, 1);
+      jit_func_t **funcs LOCAL = xcalloc_array(count, sizeof(jit_func_t *));
       for (unsigned i = 0; i < count; i++) {
          rt_proc_t *p = m->fastclk_table[i];
-         if (p->vtable->eval != proc_eval_direct)
+         funcs[i] = p->vtable->eval == proc_eval_direct
+            ? ((direct_eval_t *)p->vtable)->func : NULL;
+      }
+      const unsigned maxshare = fused_splice_maxshare();
+      size_t body_hint = 0;
+      for (unsigned i = 0; i < count; i++) {
+         if (funcs[i] == NULL)
             continue;
-         direct_eval_t *de = (direct_eval_t *)p->vtable;
-         body_hint += (size_t)de->func->entry_size * 2 + 64;
+         unsigned share = 0;
+         for (unsigned j = 0; j < count; j++)
+            share += (funcs[j] == funcs[i]);
+         if (maxshare > 0 && share > maxshare)
+            splice_deny[i] = 1;
+         else
+            body_hint += (size_t)funcs[i]->entry_size * 2 + 64;
       }
       splice_budget = MIN(body_hint, (size_t)0x2F0000 - hint);
       hint += splice_budget;
@@ -12066,6 +12098,7 @@ static void fused_block_build(rt_model_t *m)
    fb->count   = count;
    fb->splice_ok = splice_ok;
    fb->splice_budget = splice_budget;
+   fb->splice_deny = splice_deny;
    fb->members = xmalloc_array(count, sizeof(rt_proc_t *));
    fb->sites   = xcalloc_array(count, sizeof(fused_site_t));
    fb->argbuf  = xmalloc_array(JIT_MAX_ARGS, sizeof(jit_scalar_t));
@@ -12156,6 +12189,7 @@ static void fused_block_build(rt_model_t *m)
       free(fb->members);
       free(fb->sites);
       free(fb->argbuf);
+      free(fb->splice_deny);
       free(fb);
       warnf("NVC_FUSED_BLOCK: block emission failed (%u members)", count);
       return;
@@ -12287,6 +12321,7 @@ static void fused_block_dissolve(rt_model_t *m)
    free(fb->members);
    free(fb->sites);
    free(fb->argbuf);
+   free(fb->splice_deny);
    free(fb);
 }
 
