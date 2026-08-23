@@ -174,6 +174,7 @@ typedef struct _rt_model {
    // clocked RTL). Built once at accel install; off unless the env is set and
    // at least one clk-only proc survives the filter.
    bool               fastclk_on;
+   bool               have_implicit;  // any 'ACTIVE-class implicit signal exists
    bool               fastclk_hit;     // a clk-only proc woke this delta
    rt_proc_t        **fastclk_table;
    unsigned           fastclk_count;
@@ -14995,6 +14996,24 @@ static inline bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
    return already_scheduled;
 }
 
+// A same-value driver assignment's only observables are the empty delta
+// cycle and the 'ACTIVE marks; when the design cannot observe those (no
+// implicit 'ACTIVE/'QUIET-class signal anywhere, no effective-value or
+// force machinery on the nexus) the whole update can be elided at the
+// source.  Port of upstream 86612201c, widened to the queue + delta.
+// NVC_ELIDE_ACTIVE=0 restores the old behaviour.
+static inline bool sched_elide_active(rt_model_t *m, rt_nexus_t *n)
+{
+   static int elide = -1;
+   if (unlikely(elide < 0)) {
+      const char *e = getenv("NVC_ELIDE_ACTIVE");
+      elide = (e == NULL || *e != '0');
+   }
+   return elide && !m->have_implicit
+      && likely(m->fastclk_probe_member < 0)   // probation counts deltas
+      && !(n->flags & (NET_F_EFFECTIVE | NET_F_FORCED));
+}
+
 static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
                          uint64_t reject, const void *value, rt_proc_t *proc)
 {
@@ -15043,6 +15062,17 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
             m->fastclk_comb[m->fastclk_probe_member] = 1;
       }
       else if (cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size)) {
+         // Same value: the update itself is already elided; the ONLY
+         // observables this branch produces are the forced empty delta
+         // cycle and the 'ACTIVE marks.  When nothing in the design can
+         // observe those (no implicit 'ACTIVE/'QUIET-class signal
+         // anywhere, no effective-value or force machinery on the
+         // nexus) skip them entirely -- an unchanged register write no
+         // longer costs a delta round.  Port of upstream 86612201c
+         // ("elide driver updates in more cases"), widened to the empty
+         // delta.  NVC_ELIDE_ACTIVE=0 restores the old behaviour.
+         if (likely(sched_elide_active(m, n)))
+            return;
          m->next_is_delta = true;
          d->was_active = (n->active_delta == m->iteration);
          n->active_delta = m->iteration + 1;
@@ -20563,6 +20593,7 @@ sig_shared_t *x_implicit_signal(uint32_t count, uint32_t size, tree_t where,
    imp->closure = *closure;
    imp->delay = delay;
    wakeable_set_kind(&imp->wakeable, W_IMPLICIT);
+   m->have_implicit = true;   // 'ACTIVE marks become observable: see sched_driver
 
    deferq_do(&m->implicitq, async_update_implicit_signal, imp);
    set_pending(m, &(imp->wakeable));
