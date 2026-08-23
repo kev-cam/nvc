@@ -11510,6 +11510,77 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
    }
 }
 
+// NVC_EVAL_RESIDENCY=1: measure how much of the run "bounces from eval
+// to eval" versus doing something else.  rdtsc brackets around every
+// eval LEAF (generic process activation, the fused block, accel chunk
+// eval); everything outside the brackets -- scheduler, wake delivery,
+// queues, publication, allocation -- is by definition "something else".
+// ~2 rdtsc per activation: noise against any real run.
+#ifdef ARCH_X86_64
+static uint64_t g_resid_eval_tsc = 0;
+static uint64_t g_resid_eval_n   = 0;
+static uint64_t g_resid_run_tsc  = 0;
+static int      g_resid_depth    = 0;   // nested-eval accounting: only the
+static uint64_t g_resid_nested   = 0;   // outermost bracket accumulates
+
+static void resid_report(void);
+
+static inline bool resid_on(void)
+{
+   static int on = -1;
+   if (unlikely(on < 0)) {
+      on = getenv("NVC_EVAL_RESIDENCY") != NULL;
+      if (on)
+         atexit(resid_report);
+   }
+   return on;
+}
+
+static inline uint64_t resid_tsc(void)
+{
+   uint32_t lo, hi;
+   __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+   return ((uint64_t)hi << 32) | lo;
+}
+
+#define RESID_EVAL_BEGIN() \
+   uint64_t __resid_t0 = 0; \
+   do { \
+      if (resid_on()) { \
+         if (g_resid_depth++ == 0) \
+            __resid_t0 = resid_tsc(); \
+         else \
+            g_resid_nested++; \
+      } \
+   } while (0)
+#define RESID_EVAL_END() do { \
+      if (resid_on()) { \
+         g_resid_depth--; \
+         if (__resid_t0 != 0) { \
+            g_resid_eval_tsc += resid_tsc() - __resid_t0; \
+            g_resid_eval_n++; \
+         } \
+      } \
+   } while (0)
+
+static void resid_report(void)
+{
+   if (g_resid_run_tsc == 0)
+      return;
+   const double pct = 100.0 * g_resid_eval_tsc / g_resid_run_tsc;
+   notef("eval-residency: %.1f%% eval / %.1f%% other "
+         "(%"PRIu64" activations, %"PRIu64" nested, avg %"PRIu64" tsc, "
+         "run %"PRIu64" Mtsc)",
+         pct, 100.0 - pct, g_resid_eval_n, g_resid_nested,
+         g_resid_eval_n ? g_resid_eval_tsc / g_resid_eval_n : 0,
+         g_resid_run_tsc / 1000000);
+}
+#else
+#define RESID_EVAL_BEGIN() do { } while (0)
+#define RESID_EVAL_END()   do { } while (0)
+static void resid_report(void) { }
+#endif
+
 static void run_process(rt_model_t *m, rt_proc_t *proc)
 {
    TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
@@ -11520,7 +11591,9 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
    if (obj->trigger != NULL && !run_trigger(m, obj->trigger))
       return;   // Filtered
 
+   RESID_EVAL_BEGIN();
    proc->vtable->eval(m, proc);
+   RESID_EVAL_END();
 
    proc_static_wait_finalize(m, proc);
 }
@@ -12292,7 +12365,9 @@ static bool fused_block_dispatch(rt_model_t *m, bool posedge)
       return false;
 
    fb->running = true;
+   RESID_EVAL_BEGIN();
    (*entry)(NULL, NULL, NULL, NULL);
+   RESID_EVAL_END();
    fb->running = false;
 
    return true;
@@ -17957,6 +18032,10 @@ void model_run(rt_model_t *m, uint64_t stop_time)
 {
    MODEL_ENTRY(m);
 
+#ifdef ARCH_X86_64
+   const uint64_t __resid_run_t0 = resid_on() ? resid_tsc() : 0;
+#endif
+
    if (m->force_stop)
       return;   // Was error during intialisation
 
@@ -18010,6 +18089,11 @@ void model_run(rt_model_t *m, uint64_t stop_time)
 
    if (m->liveness)
       check_liveness_properties(m, m->root);
+
+#ifdef ARCH_X86_64
+   if (__resid_run_t0 != 0)
+      g_resid_run_tsc += resid_tsc() - __resid_run_t0;
+#endif
 }
 
 bool model_step(rt_model_t *m)
