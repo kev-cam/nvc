@@ -761,7 +761,14 @@ static void emit_expr(FILE *f, tree_t e)
          else if (bn[0] == '\'' && bn[1] != '\0' && bn[2] == '\''
                   && bn[3] == '\0'
                   && strchr("UXZW-", toupper((unsigned char)bn[1])) != NULL) {
-            DECLINE("std_logic-metavalue");
+            // NVC_V2V_META0: accept the X->0 mapping instead of declining.
+            // Sanctioned by the Verilator-match translation doctrine (2-state
+            // Verilator reads X as 0) for whole-subtree V2V dumps; the accel
+            // bridge keeps the decline so interp retains X fidelity there.
+            static int meta0 = -1;
+            if (meta0 < 0) meta0 = getenv("NVC_V2V_META0") != NULL;
+            if (!meta0)
+               DECLINE("std_logic-metavalue");
             fprintf(f, "/*meta %s*/0", bn);
          }
          else {

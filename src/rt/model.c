@@ -18028,9 +18028,98 @@ static void check_liveness_properties(rt_model_t *m, rt_scope_t *s)
       check_liveness_properties(m, s->children.items[i]);
 }
 
+// NVC_V2V_DUMP=<hierarchical scope path>: emit that scope's whole subtree
+// as one 2-state Verilog file (vhdl2vlog, same helper the accel bridge
+// uses) and continue.  NVC_V2V_DUMP_FILE names the output (default
+// v2v_dump.v).  Feeds gen_statemachine for whole-core 2-phase models of
+// designs whose original SV yosys cannot parse.
+static rt_scope_t *v2v_find_scope(rt_scope_t *s, const char *path)
+{
+   if (s == NULL)
+      return NULL;
+   if (s->name != NULL && strcmp(istr(s->name), path) == 0)
+      return s;
+   for (int i = 0; i < s->children.count; i++) {
+      rt_scope_t *r = v2v_find_scope(s->children.items[i], path);
+      if (r != NULL)
+         return r;
+   }
+   return NULL;
+}
+
+// Tolerant variant of emit_subtree_v for the dump: keep going past a
+// module that vhdl2vlog cannot translate, name every failure, emit the
+// rest.  (emit_subtree_v aborts at the first failure by design -- right
+// for the accel bridge's all-or-nothing install, wrong for a survey.)
+static int v2v_walk(rt_scope_t *scope, FILE *f, ident_t *seen, int *nseen,
+                    int maxseen)
+{
+   int fails = 0;
+   if (scope->kind == SCOPE_INSTANCE && scope->where != NULL) {
+      tree_t r = aj_scope_ref(scope);
+      if (r != NULL) {
+         tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
+         char mod[320];
+         snprintf(mod, sizeof mod, "%s",
+                  vhdl2vlog_variant_name(tree_ident(ent), scope->where));
+         ident_t key = ident_new(mod);
+         bool dup = false;
+         for (int i = 0; i < *nseen; i++)
+            if (seen[i] == key) { dup = true; break; }
+         if (!dup) {
+            if (*nseen < maxseen) seen[(*nseen)++] = key;
+            if (!vhdl2vlog_module(f, scope->where, mod)) {
+               warnf("NVC_V2V_DUMP: module %s NOT TRANSLATABLE", mod);
+               fails++;
+            }
+         }
+      }
+   }
+   for (int ci = 0; ci < scope->children.count; ci++)
+      fails += v2v_walk(scope->children.items[ci], f, seen, nseen, maxseen);
+   return fails;
+}
+
+static void v2v_dump(rt_model_t *m, const char *path)
+{
+   rt_scope_t *s = v2v_find_scope(m->root, path);
+   if (s == NULL) {
+      warnf("NVC_V2V_DUMP: scope %s not found; top-level scopes are:", path);
+      for (int i = 0; m->root != NULL && i < m->root->children.count; i++) {
+         rt_scope_t *c = m->root->children.items[i];
+         warnf("  %s", c->name ? istr(c->name) : "?");
+         for (int j = 0; j < c->children.count && j < 40; j++) {
+            rt_scope_t *g = c->children.items[j];
+            warnf("    %s", g->name ? istr(g->name) : "?");
+         }
+      }
+      return;
+   }
+   const char *out = getenv("NVC_V2V_DUMP_FILE");
+   if (out == NULL)
+      out = "v2v_dump.v";
+   FILE *f = fopen(out, "w");
+   if (f == NULL) {
+      warnf("NVC_V2V_DUMP: cannot open %s", out);
+      return;
+   }
+   static ident_t seen[4096];
+   int nseen = 0;
+   const int fails = v2v_walk(s, f, seen, &nseen, 4096);
+   fclose(f);
+   notef("NVC_V2V_DUMP: %s -> %s (%d modules, %d untranslatable)",
+         path, out, nseen, fails);
+}
+
 void model_run(rt_model_t *m, uint64_t stop_time)
 {
    MODEL_ENTRY(m);
+
+   {
+      const char *v2v = getenv("NVC_V2V_DUMP");
+      if (unlikely(v2v != NULL))
+         v2v_dump(m, v2v);
+   }
 
 #ifdef ARCH_X86_64
    const uint64_t __resid_run_t0 = resid_on() ? resid_tsc() : 0;
