@@ -11637,7 +11637,8 @@ typedef struct _fused_block {
    int             patch_pending;   // set by retarget callback (any thread)
    int             rebuild_pending; // spliced member invalidated: dissolve
                                     // at the next dispatch boundary
-   bool            splice_ok;   // build-time: total extent fit the budget
+   bool            splice_ok;   // build-time: splicing enabled for this block
+   size_t          splice_budget;   // remaining bytes for inline bodies
    bool            running;     // dissolve must never happen mid-block
 } fused_block_t;
 
@@ -11969,13 +11970,17 @@ static void fused_emit_member(rt_model_t *m, fused_block_t *fb,
    // publish together; a republish after this point dissolves the block
    // via fused_apply_pending's SITE_SPLICE path.)
    bool spliced = false;
-   if (s->state == SITE_PLAIN && fb->splice_ok && func->entry_size > 0) {
+   if (s->state == SITE_PLAIN && fb->splice_ok && func->entry_size > 0
+       && (size_t)func->entry_size * 2 + 64 <= fb->splice_budget) {
+      uint8_t *const before = blob->wptr;
       FUSED_EMIT(0x48, 0x83, 0xEC, 0x08);       // sub rsp, 8
       if (code_blob_splice(blob, (void *)target_a, func->entry_size)) {
          FUSED_EMIT(0x48, 0x83, 0xC4, 0x08);    // add rsp, 8
          s->state = SITE_SPLICE;
          s->off_a = 0;
          spliced  = true;
+         const size_t used = blob->wptr - before;
+         fb->splice_budget -= MIN(fb->splice_budget, used);
       }
       else {
          if (!blob->overflow)
@@ -12035,10 +12040,15 @@ static void fused_block_build(rt_model_t *m)
       return;
    }
 
-   // NVC_SPLICE: inline bodies add their extent (+ ~24 bytes of seam
-   // overhead each) to the block.  If the total blows the blob budget,
-   // fall back to the all-call form rather than not fusing at all.
+   // NVC_SPLICE: inline bodies add their extent (+ rebased jump tables,
+   // which are not part of the entry extent -- 2x margin) to the block.
+   // The blob is bounded by one code page, so on big designs only a
+   // PREFIX of the members gets its body inlined: a running budget is
+   // spent per member (priority queue, not admission gate) and the rest
+   // keep the ordinary call form.  The unused tail of the reservation is
+   // returned to the free span at finalise.
    bool splice_ok = fused_splice_enabled();
+   size_t splice_budget = 0;
    if (splice_ok) {
       size_t body_hint = 0;
       for (unsigned i = 0; i < count; i++) {
@@ -12046,23 +12056,16 @@ static void fused_block_build(rt_model_t *m)
          if (p->vtable->eval != proc_eval_direct)
             continue;
          direct_eval_t *de = (direct_eval_t *)p->vtable;
-         // 2x: rebased jump tables ride along with the body copy and are
-         // not part of the entry extent (the unused tail of the blob is
-         // returned to the free span at finalise)
          body_hint += (size_t)de->func->entry_size * 2 + 64;
       }
-      if (hint + body_hint > 0x300000) {
-         notef("accel-jit: NVC_SPLICE — inline bodies exceed the block "
-               "budget (%zu bytes), keeping call form", body_hint);
-         splice_ok = false;
-      }
-      else
-         hint += body_hint;
+      splice_budget = MIN(body_hint, (size_t)0x2F0000 - hint);
+      hint += splice_budget;
    }
 
    fused_block_t *fb = xcalloc(sizeof(fused_block_t));
    fb->count   = count;
    fb->splice_ok = splice_ok;
+   fb->splice_budget = splice_budget;
    fb->members = xmalloc_array(count, sizeof(rt_proc_t *));
    fb->sites   = xcalloc_array(count, sizeof(fused_site_t));
    fb->argbuf  = xmalloc_array(JIT_MAX_ARGS, sizeof(jit_scalar_t));
