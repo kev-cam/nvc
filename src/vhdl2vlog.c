@@ -315,6 +315,99 @@ static void emit_range(FILE *f, type_t type)
 static tree_t g_mem_sigs[MAX_MEM_SIGS];
 static int    g_n_mem_sigs = 0;
 
+// NBA-shadow memory pairs.  sv2vhdl's wake-shadow idiom (`v := sig; ...
+// v(idx) := d; ...; sig <= v`) reads and writes the WHOLE array through a
+// shadow variable, which breaks the refs==indexed qualification above even
+// though every real access is single-index — the VeeR icache RAM primitives
+// flattened to 8704-bit vectors this way, and every access became a
+// whole-width barrel shift (272 limbs per access in the farm codegen).
+// A qualified pair elides the copy and the writeback, rewrites each
+// `v(idx) := d` into a direct NBA memory write `sig[idx] <= d`, and
+// suppresses the shadow declaration.  Qualification demands exactly one
+// copy and one writeback, no other whole references of either side, and
+// no indexed READS of the shadow (writes only), so the elision cannot
+// change read-after-write visibility.
+#define MAX_MEM_SHADOWS 64
+static tree_t g_shadow_var[MAX_MEM_SHADOWS];
+static tree_t g_shadow_sigd[MAX_MEM_SHADOWS];
+static int    g_n_shadows = 0;
+
+static tree_t shadow_sig_of(tree_t vdecl)
+{
+   for (int i = 0; i < g_n_shadows; i++)
+      if (g_shadow_var[i] == vdecl) return g_shadow_sigd[i];
+   return NULL;
+}
+
+static bool sig_has_shadow(tree_t sdecl)
+{
+   for (int i = 0; i < g_n_shadows; i++)
+      if (g_shadow_sigd[i] == sdecl) return true;
+   return false;
+}
+
+typedef struct { tree_t sig; tree_t var; } shadow_find_t;
+
+static void shadow_find_cb(tree_t t, void *ctx)
+{
+   shadow_find_t *sf = (shadow_find_t *)ctx;
+   if (sf->var != NULL || tree_kind(t) != T_VAR_ASSIGN) return;
+   tree_t tg = tree_target(t), v = tree_value(t);
+   if (tree_kind(tg) != T_REF || !tree_has_ref(tg)) return;
+   if (tree_kind(v) != T_REF || !tree_has_ref(v)) return;
+   if (tree_ref(v) != sf->sig) return;
+   if (tree_kind(tree_ref(tg)) != T_VAR_DECL) return;
+   sf->var = tree_ref(tg);
+}
+
+typedef struct {
+   tree_t sig, var;
+   int ncopy, nwb, nwrite;          // v:=sig / sig<=v / v(idx):=e statements
+   int v_ref, v_arr, s_ref, s_arr;  // raw reference counts
+} shadow_scan_t;
+
+static void shadow_scan_cb(tree_t t, void *ctx)
+{
+   shadow_scan_t *sc = (shadow_scan_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k == T_REF && tree_has_ref(t)) {
+      if (tree_ref(t) == sc->var) sc->v_ref++;
+      if (tree_ref(t) == sc->sig) sc->s_ref++;
+   }
+   else if (k == T_ARRAY_REF && tree_params(t) == 1) {
+      tree_t base = tree_value(t);
+      if (tree_kind(base) == T_REF && tree_has_ref(base)) {
+         if (tree_ref(base) == sc->var) sc->v_arr++;
+         if (tree_ref(base) == sc->sig) sc->s_arr++;
+      }
+   }
+   else if (k == T_VAR_ASSIGN) {
+      tree_t tg = tree_target(t), v = tree_value(t);
+      if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+          && tree_ref(tg) == sc->var
+          && tree_kind(v) == T_REF && tree_has_ref(v)
+          && tree_ref(v) == sc->sig)
+         sc->ncopy++;
+      else if (tree_kind(tg) == T_ARRAY_REF && tree_params(tg) == 1) {
+         tree_t base = tree_value(tg);
+         if (tree_kind(base) == T_REF && tree_has_ref(base)
+             && tree_ref(base) == sc->var)
+            sc->nwrite++;
+      }
+   }
+   else if (k == T_SIGNAL_ASSIGN) {
+      tree_t tg = tree_target(t);
+      if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+          && tree_ref(tg) == sc->sig && tree_waveforms(t) > 0
+          && tree_has_value(tree_waveform(t, 0))) {
+         tree_t v = tree_value(tree_waveform(t, 0));
+         if (tree_kind(v) == T_REF && tree_has_ref(v)
+             && tree_ref(v) == sc->var)
+            sc->nwb++;
+      }
+   }
+}
+
 // Hoisted process-locals / loop indices whose name collides with a module
 // signal or port get a __lp suffix; references follow by DECL IDENTITY (the
 // T_REF resolves to the loop/var decl, so no name ambiguity). VeeR's
@@ -1499,6 +1592,34 @@ static void emit_seq(FILE *f, tree_t s, int ind)
    case T_SIGNAL_ASSIGN:
    case T_VAR_ASSIGN:
       {
+         // NBA-shadow memory pair rewrites (see g_shadow_var):
+         //   v := sig      -> elided
+         //   sig <= v      -> elided
+         //   v(idx) := e   -> sig[idx] <= e   (direct NBA memory write)
+         tree_t tg0 = tree_target(s);
+         if (tree_kind(s) == T_VAR_ASSIGN) {
+            if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
+                && shadow_sig_of(tree_ref(tg0)) != NULL)
+               break;                              // the whole-array copy
+            if (tree_kind(tg0) == T_ARRAY_REF && tree_params(tg0) == 1) {
+               tree_t base = tree_value(tg0);
+               if (tree_kind(base) == T_REF && tree_has_ref(base)) {
+                  tree_t sig = shadow_sig_of(tree_ref(base));
+                  if (sig != NULL) {
+                     tab(f, ind);
+                     fprintf(f, "%s[", vid(tree_ident(sig)));
+                     emit_expr(f, tree_value(tree_param(tg0, 0)));
+                     fputs("] <= ", f);
+                     emit_expr(f, tree_value(s));
+                     fputs(";\n", f);
+                     break;
+                  }
+               }
+            }
+         }
+         else if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
+                  && sig_has_shadow(tree_ref(tg0)))
+            break;                                 // the whole-array writeback
          tab(f, ind);
          emit_expr(f, tree_target(s));
          // VHDL variables update immediately (Verilog blocking '='); signals are
@@ -2462,6 +2583,7 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
       for (int i = 0; i < tree_decls(s); i++) {
          tree_t d = tree_decl(s, i);
          if (tree_kind(d) != T_VAR_DECL) continue;
+         if (shadow_sig_of(d) != NULL) continue;  // NBA-shadow of a memory: elided
          const char *nm = vid(tree_ident(d));
          // A variable whose name collides with a signal/port OR was already
          // hoisted from ANOTHER process gets a unique per-module suffix.
@@ -2602,6 +2724,7 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    // use adds an unmatched T_REF and disqualifies)
    const int ndecls = tree_decls(block);
    g_n_mem_sigs = 0;
+   g_n_shadows = 0;
    for (int i = 0; i < ndecls && g_n_mem_sigs < MAX_MEM_SIGS; i++) {
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) != T_SIGNAL_DECL) continue;
@@ -2610,8 +2733,26 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       if (!is_reg(block, d)) continue;   // memory must be process-driven (reg)
       mem_scan_t sc = { .decl = d, .refs = 0, .indexed = 0 };
       tree_visit(block, mem_scan_cb, &sc);
-      if (sc.refs > 0 && sc.refs == sc.indexed)
+      if (sc.refs > 0 && sc.refs == sc.indexed) {
          g_mem_sigs[g_n_mem_sigs++] = d;
+         continue;
+      }
+      // strict form failed: try the NBA-shadow idiom (see g_shadow_var)
+      if (sc.refs > 0 && g_n_shadows < MAX_MEM_SHADOWS) {
+         shadow_find_t sf = { .sig = d, .var = NULL };
+         tree_visit(block, shadow_find_cb, &sf);
+         if (sf.var == NULL) continue;
+         shadow_scan_t ss = { .sig = d, .var = sf.var };
+         tree_visit(block, shadow_scan_cb, &ss);
+         if (ss.ncopy == 1 && ss.nwb == 1
+             && ss.v_ref == 2 + ss.v_arr && ss.v_arr == ss.nwrite
+             && ss.s_ref == 2 + ss.s_arr) {
+            g_mem_sigs[g_n_mem_sigs++] = d;
+            g_shadow_var[g_n_shadows] = sf.var;
+            g_shadow_sigd[g_n_shadows] = d;
+            g_n_shadows++;
+         }
+      }
    }
 
    // signal declarations (skip ports and hier markers)
