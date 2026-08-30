@@ -1725,6 +1725,58 @@ typedef struct {
    char        so_path[512];
 } accel_bg_t;
 
+// In-process generator: libgsm.so is the library form of the gen_statemachine
+// CLI (same source — see sv2ghdl yosys/Makefile), exporting gsm_generate().
+// Probed once per process.  NVC_ACCEL_NO_GSMLIB=1 forces the CLI everywhere;
+// NVC_GSM_LIB overrides the library location; GEN_STATEMACHINE (an explicit
+// alternative generator BINARY) is honored by callers by not using the
+// library at all.
+typedef int (*gsm_generate_fn)(int, const char *const *, const char *);
+
+static gsm_generate_fn accel_gsm_probe(const char **libfile)
+{
+   static gsm_generate_fn fn = NULL;
+   static char file[PATH_MAX];
+   static int checked = 0;
+   if (!checked) {
+      if (getenv("NVC_ACCEL_NO_GSMLIB") == NULL) {
+         const char *libs[] = {
+            getenv("NVC_GSM_LIB"),   // may be NULL — skipped below
+            "/usr/local/src/sv2ghdl/yosys/libgsm.so",
+            "libgsm.so",
+         };
+         for (const char **p = libs; p < libs + ARRAY_LEN(libs); p++) {
+            if (*p == NULL) continue;
+            void *dl = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
+            if (dl != NULL) {
+               fn = (gsm_generate_fn)dlsym(dl, "gsm_generate");
+               if (fn != NULL) {
+                  // Resolved path of the loaded library: the synth cache
+                  // keys on the generator's mtime, so it must stat what
+                  // actually runs, not a candidate string.
+                  Dl_info di;
+                  if (dladdr((void *)fn, &di) && di.dli_fname != NULL)
+                     snprintf(file, sizeof file, "%s", di.dli_fname);
+                  else
+                     snprintf(file, sizeof file, "%s", *p);
+                  break;
+               }
+               dlclose(dl);
+            }
+         }
+      }
+      checked = 1;
+   }
+   if (libfile != NULL)
+      *libfile = file[0] != '\0' ? file : NULL;
+   return fn;
+}
+
+static gsm_generate_fn accel_gsm_fn(void)
+{
+   return accel_gsm_probe(NULL);
+}
+
 static void *accel_bg_thread(void *arg)
 {
    accel_bg_t *bg = arg;
@@ -1755,28 +1807,8 @@ static void *accel_bg_thread(void *arg)
    // 2 = abnormal (contained yosys error — retry via the CLI as a safety
    // net).  NVC_ACCEL_NO_GSMLIB=1 forces the CLI path; NVC_GSM_LIB overrides
    // the library location.
-   typedef int (*gsm_generate_fn)(int, const char *const *, const char *);
-   static gsm_generate_fn gsm_fn = NULL;
-   static int gsm_lib_checked = 0;
-   if (!gsm_lib_checked) {
-      if (getenv("NVC_ACCEL_NO_GSMLIB") == NULL) {
-         const char *libs[] = {
-            getenv("NVC_GSM_LIB"),   // may be NULL — skipped below
-            "/usr/local/src/sv2ghdl/yosys/libgsm.so",
-            "libgsm.so",
-         };
-         for (const char **p = libs; p < libs + ARRAY_LEN(libs); p++) {
-            if (*p == NULL) continue;
-            void *dl = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
-            if (dl != NULL) {
-               gsm_fn = (gsm_generate_fn)dlsym(dl, "gsm_generate");
-               if (gsm_fn != NULL) break;
-               dlclose(dl);
-            }
-         }
-      }
-      gsm_lib_checked = 1;
-   }
+   const gsm_generate_fn gsm_fn =
+      getenv("GEN_STATEMACHINE") != NULL ? NULL : accel_gsm_fn();
 
    int rc = -1;
    if (gsm_fn != NULL) {
@@ -8153,7 +8185,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 static bool aj_synth_timed_out(int status)
 {
    if (status == -1) return false;
-   if (WIFSIGNALED(status)) return WTERMSIG(status) == SIGKILL;
+   if (WIFSIGNALED(status))   // SIGALRM = the fork-worker child's own deadline
+      return WTERMSIG(status) == SIGKILL || WTERMSIG(status) == SIGALRM;
    if (!WIFEXITED(status)) return false;
    const int ec = WEXITSTATUS(status);
    return ec == 124 || ec == 137;
@@ -8170,6 +8203,83 @@ static const char *aj_gen_sm(void)
       if (access(*p, X_OK) == 0)
          return *p;
    return "gen_statemachine";   // last resort: hope it's on PATH
+}
+
+// The generator whose mtime keys the synth cache: the loaded libgsm.so in
+// fork-worker mode, the CLI binary otherwise.  A stale generator silently
+// reused already cost one withdrawn measurement — the cache MUST change key
+// when the tool that actually runs changes.
+static const char *aj_synth_tool(void)
+{
+   const char *libfile = NULL;
+   if (getenv("GEN_STATEMACHINE") == NULL
+       && accel_gsm_probe(&libfile) != NULL && libfile != NULL)
+      return libfile;
+   return aj_gen_sm();
+}
+
+// Fork-without-exec synthesis worker: the child calls gsm_generate() (the
+// in-process generator) and performs the same write-then-rename the CLI
+// command line encoded, then _exit()s.  The deadline is the CHILD'S OWN
+// alarm(): SIGALRM's default action terminates even a compute-bound yosys
+// pass — the property that made the exec boundary load-bearing — and the
+// parent needs no watchdog: single-chunk callers just waitpid(), and the
+// merge pool's blocking reap loop works unchanged.  Each child gets its own
+// copy-on-write yosys, so parallel group synths don't serialize on the
+// facade mutex (they run in sibling processes exactly as the exec'd CLIs
+// did).  If some other thread was inside gsm_generate() at fork time the
+// child's copy of the facade mutex is held forever — the alarm reaps that
+// too, and the caller sees an ordinary timeout decline.
+// GSM_TEST_SLEEP=<s> makes the child sleep first: the gate's hook for
+// proving the deadline kills a genuinely hung in-process synth.
+static pid_t aj_gsm_spawn(const char *dir, int nargs, const char *const *args,
+                          const char *dutc, int tmo_s)
+{
+   gsm_generate_fn fn = accel_gsm_fn();
+   if (fn == NULL)
+      return -1;
+   fflush(stdout);   // the child _exit()s: inherited buffers must be empty,
+   fflush(stderr);   // or their contents print twice
+   const pid_t pid = fork();
+   if (pid != 0)
+      return pid;
+
+   // ---- child (no exec) ----
+   signal(SIGALRM, SIG_DFL);      // an inherited handler or blocked mask
+   sigset_t ss;                   // must not swallow the deadline
+   sigemptyset(&ss);
+   sigaddset(&ss, SIGALRM);
+   pthread_sigmask(SIG_UNBLOCK, &ss, NULL);
+   if (tmo_s > 0)
+      alarm(tmo_s);
+   if (getenv("GSM_TEST_SLEEP") != NULL)
+      sleep(atoi(getenv("GSM_TEST_SLEEP")));
+   if (dir != NULL && chdir(dir) != 0)
+      _exit(2);
+
+   // Write-then-rename with OUR pid (the CLI command line used the shell's):
+   // a half-written output must never appear under the cache key.
+   char base[600], tmpc[620], nvctmp[630];
+   snprintf(base, sizeof base, "%.*s", (int)strlen(dutc) - 2, dutc);
+   snprintf(tmpc, sizeof tmpc, "%s_g%d.c", base, (int)getpid());
+   snprintf(nvctmp, sizeof nvctmp, "%s_g%d_nvc.c", base, (int)getpid());
+
+   const char *av[160];
+   int n = 0;
+   for (; n < nargs && n < 158; n++)
+      av[n] = args[n];
+   av[n++] = tmpc;
+
+   int rc = fn(n, av, NULL);
+   if (rc == 0 && rename(tmpc, dutc) != 0)
+      rc = 2;
+   if (rc == 0) {
+      char nvcfinal[620];
+      snprintf(nvcfinal, sizeof nvcfinal, "%s_nvc.c", base);
+      if (rename(nvctmp, nvcfinal) != 0)
+         { /* byproduct — absence must not fail the synth */ }
+   }
+   _exit(rc & 0xff);
 }
 
 // mkdir -p: create each component of path (best effort; ignore EEXIST).
@@ -8933,7 +9043,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // Mix gen_statemachine's mtime so a synth-tool change invalidates the cache
    // (the cached dutc/.so are the synth output; a stale one would miscompile).
    { struct stat gst;
-     if (stat(aj_gen_sm(), &gst) == 0)
+     if (stat(aj_synth_tool(), &gst) == 0)
         vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
    // GSM_ICG2EN changes gsm's emitted netlist for the SAME sources: fold it
    // into the key so toggling the env cannot serve the other config's cache.
@@ -9058,7 +9168,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // Re-synthesize with the elaboration's actual generics (width/depth/...).
       // The vhdl2vlog path emits already-elaborated modules (generics baked in),
       // so passing them would chparam a non-existent defparam and error.
-      char params[256];
+      char params[256] = "";
       if (!getenv("NVC_ACCEL_FROM_VHDL")
           && accel_verilog_params(ref, params, sizeof params) && params[0]) {
          off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
@@ -9078,8 +9188,48 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                       (int)getpid(), dutc, dutcbase, (int)getpid(), dutcbase);
       notef("accel-jit: synth '%s' (top module '%s') from %d source(s)",
             top, top_mod, nsrc);
-      const int src = system(cmd);
-      if (aj_synth_timed_out(src) && tmo_s > 0 && have_timeout)
+
+      // Fork-worker: run the in-process generator in a fork()ed child
+      // instead of exec'ing the CLI command built above.  The child's own
+      // alarm() is the wall-clock cap (SIGALRM -> aj_synth_timed_out), so
+      // the timeout contract holds without /usr/bin/timeout.  An explicit
+      // GEN_STATEMACHINE (alternative generator binary) or a missing
+      // libgsm.so uses the CLI command instead.
+      int src = -1;
+      bool forked = false;
+      if (getenv("GEN_STATEMACHINE") == NULL && accel_gsm_fn() != NULL) {
+         static char spawn_src[64][600];
+         static char pbuf[256];
+         const char *av[160];
+         int n = 0;
+         for (int i = 0; i < nsrc && i < 64; i++) {
+            if (staged)
+               aj_staged_path(spawn_src[i], sizeof spawn_src[i], accel_dir,
+                              top, vhash, i);
+            else
+               snprintf(spawn_src[i], sizeof spawn_src[i], "%s", srcs[i]);
+            av[n++] = spawn_src[i];
+         }
+         if (params[0] != '\0') {   // same tokens the shell split for the CLI
+            snprintf(pbuf, sizeof pbuf, "%s", params);
+            char *sp = NULL;
+            for (char *t = strtok_r(pbuf, " ", &sp);
+                 t != NULL && n < 150; t = strtok_r(NULL, " ", &sp))
+               av[n++] = t;
+         }
+         av[n++] = top_mod;
+         const pid_t pid = aj_gsm_spawn(dir, n, av, dutc, tmo_s);
+         if (pid > 0) {
+            forked = true;
+            notef("accel-jit: synth '%s' running as in-process fork (pid %d)",
+                  top, (int)pid);
+            while (waitpid(pid, &src, 0) < 0 && errno == EINTR)
+               ;
+         }
+      }
+      if (!forked)
+         src = system(cmd);
+      if (aj_synth_timed_out(src) && tmo_s > 0 && (forked || have_timeout))
          notef("accel-jit: synth for '%s' exceeded %ds — leaving in nvc "
                "(raise NVC_ACCEL_SYNTH_TIMEOUT to allow longer)", top, tmo_s);
       if (src != 0 || access(dutc, F_OK) != 0) {
@@ -9541,6 +9691,9 @@ typedef struct {
    char      wname[64];
    char      dutc[600], bridge[600], so[600];
    char     *cmd;               // synth command (NULL = cached)
+   char    **argv;              // fork-worker argv (srcs..., wname);
+   int       argc;              //  NULL = exec the CLI cmd instead
+   int       tmo_s;             // synth deadline (child alarm / timeout(1))
    pid_t     pid;
    int       rc;
 } aj_mgrp_t;
@@ -9969,7 +10122,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       uint64_t vhash = 1469598103934665603ULL;
       vhash = (vhash ^ 3u) * 1099511628211ULL;
       { struct stat gst;
-        if (stat(aj_gen_sm(), &gst) == 0)
+        if (stat(aj_synth_tool(), &gst) == 0)
            vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
       // Same GSM_ICG2EN key fold as the per-chunk path (toggle safety).
       { const char *icg = getenv("GSM_ICG2EN");
@@ -10069,6 +10222,25 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                             (int)getpid(), dutc, dutcbase, (int)getpid(),
                             dutcbase);
             gr->cmd = xstrdup(cmd);
+            gr->tmo_s = tmo_s;
+            if (getenv("GEN_STATEMACHINE") == NULL && accel_gsm_fn() != NULL) {
+               // Fork-worker form: phase 2 forks WITHOUT exec and the child
+               // runs the in-process generator, so keep the argv it needs.
+               // gr->cmd stays as the needs-synth sentinel and CLI fallback.
+               gr->argv = xmalloc_array(nsrc + 2, sizeof(char *));
+               int an = 0;
+               for (int s = 0; s < nsrc; s++) {
+                  char sp2[600];
+                  if (mstaged)
+                     aj_staged_path(sp2, sizeof sp2, accel_dir, wname, vhash,
+                                    s);
+                  else
+                     snprintf(sp2, sizeof sp2, "%s", srcs[s]);
+                  gr->argv[an++] = xstrdup(sp2);
+               }
+               gr->argv[an++] = xstrdup(wname);
+               gr->argc = an;
+            }
          }
          continue;   // synthesis (parallel) + install run after the loop
       }
@@ -10168,10 +10340,19 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             notef("accel-jit: MERGE synth '%s' launching (%d members, %d "
                   "internal edges, %d external pins)", gr->wname, gr->nmem,
                   gr->n_internal, gr->nmp);
-            pid_t pid = fork();
-            if (pid == 0) {
-               execl("/bin/sh", "sh", "-c", gr->cmd, (char *)NULL);
-               _exit(127);
+            pid_t pid;
+            if (gr->argv != NULL)
+               // Fork-worker: same job pool, no exec — the child runs the
+               // in-process generator under its own alarm() deadline.
+               pid = aj_gsm_spawn(accel_dir, gr->argc,
+                                  (const char *const *)gr->argv, gr->dutc,
+                                  gr->tmo_s);
+            else {
+               pid = fork();
+               if (pid == 0) {
+                  execl("/bin/sh", "sh", "-c", gr->cmd, (char *)NULL);
+                  _exit(127);
+               }
             }
             if (pid < 0) { gr->rc = -1; continue; }
             gr->pid = pid; running++;
@@ -10203,9 +10384,20 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       bool ok = true;
       if (gr->cmd != NULL) {
          free(gr->cmd);
+         if (gr->argv != NULL) {
+            for (int a = 0; a < gr->argc; a++)
+               free(gr->argv[a]);
+            free(gr->argv);
+         }
          if (access(gr->dutc, F_OK) != 0) {
-            notef("accel-jit: MERGE synth failed for '%s' — falling back to "
-                  "per-chunk installs", gr->wname);
+            if (aj_synth_timed_out(gr->rc))
+               notef("accel-jit: MERGE synth for '%s' exceeded %ds — falling "
+                     "back to per-chunk installs (raise "
+                     "NVC_ACCEL_SYNTH_TIMEOUT to allow longer)", gr->wname,
+                     gr->tmo_s);
+            else
+               notef("accel-jit: MERGE synth failed for '%s' — falling back "
+                     "to per-chunk installs", gr->wname);
             ok = false;
          }
       }

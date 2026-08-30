@@ -64,23 +64,31 @@ Determine where the current looseness actually is:
       in-process and `NVC_ACCEL_NO_GSMLIB=1` CLI variants (identical
       logs, rc=0).  The shipping config is the aj path; consider
       deleting the legacy path when aj converts.
-- [ ] **The accel-jit paths (model.c ~9040, ~10040) stay CLI, for two
-      load-bearing reasons — solve these before converting them:**
-      1. *The exec boundary is the watchdog.*  `/usr/bin/timeout -k 5`
-         is the shipped fix for the proc_dlatch 37-hour hang; a hung
-         yosys pass in-process cannot be killed (and would hold the
-         facade mutex forever).  Needs a cooperative interrupt in the
-         pass loop (or a fork()-without-exec worker) first.
-      2. *Parallel group synth vs one-global-yosys.*  Merged-group
-         commands run as parallel processes today; yosys global state
-         forces in-process calls to serialize on the facade mutex.
-         Parallelism REQUIRES processes until yosys instances are
-         isolatable — this constrains the direct-RTLIL endgame too
-         (likely shape: dedicated synth worker process(es) fed
-         RTLIL-construction commands, not N in-process threads).
-      Also: aj cache freshness stats `aj_gen_sm()` (the CLI binary)
-      at ~8936/~9972 — an in-process conversion must re-key on
-      libgsm.so's mtime.
+- [x] **(2026-08-30, same day) The accel-jit paths converted via the
+      fork()-without-exec worker** (`aj_gsm_spawn`), which resolves
+      both constraints at once:
+      1. *Watchdog:* the CHILD arms its own `alarm()` (SIG_DFL,
+         unblocked) — SIGALRM terminates even a compute-bound yosys
+         pass, `aj_synth_timed_out()` counts SIGALRM as a timeout, so
+         the `exceeded Nds` degrade-to-decline contract survives
+         without `/usr/bin/timeout`.  Proven: `GSM_TEST_SLEEP` hangs
+         killed at the 2s deadline (opt_asserts check 8b gates it).
+      2. *Parallelism:* the merge pool keeps its fork-per-group shape
+         (spawn returns a pid; the blocking `waitpid(-1)` reap loop is
+         unchanged) — each child gets its own copy-on-write yosys, so
+         nothing serializes on the facade mutex.  The parent-side
+         mutex is NOT taken; a child forked while another thread held
+         it deadlocks its copy and the alarm reaps it (self-healing).
+      `GEN_STATEMACHINE` (an explicit generator binary) forces the
+      exec'd CLI everywhere — that env now means "use this binary",
+      and it is what the sleepy gate test exercises.  Cache freshness
+      re-keyed: `aj_synth_tool()` stats the dladdr'd libgsm.so path in
+      fork mode, the CLI binary otherwise.
+      *Residue for direct-RTLIL:* a child can inherit parent-constructed
+      RTLIL by fork, so the fork-worker shape stays valid when the
+      vhdl2vlog round-trip goes away — but anything the parent wants
+      BACK from synthesis must come through files or a pipe, not
+      memory.
 - [ ] Construct `RTLIL::Design` directly from NVC's elaborated tree.
       No Frontend/Pass plugin required — that machinery only exists to
       add `read_*` commands to the yosys CLI. NVC is the host process.
