@@ -462,6 +462,19 @@ static bool mem_shape(type_t t, unsigned *nwords, unsigned *elemw)
    if (!type_is_array(t) || !type_const_bounds(t) || dimension_of(t) != 1)
       return false;
    type_t et = type_elem(t);
+   if (type_is_integer(et) && !type_is_logic3d(et)) {
+      // Array of constrained integers (ITC b12 RAM, b15 InstQueue): a real
+      // Verilog memory of 32-bit words — the same signed [31:0] convention
+      // every scalar integer in this translator uses, so indexed reads and
+      // writes line up with integer expressions without any conversion.
+      int64_t low, high;
+      if (!folded_bounds(range_of(t, 0), &low, &high)) return false;
+      const int64_t n = high - low + 1;
+      if (n < 2 || n > 65536 || low != 0) return false;
+      *nwords = (unsigned)n;
+      *elemw  = 32;
+      return true;
+   }
    if (!type_is_array(et) || !type_const_bounds(et)) return false;
    const unsigned ew = type_width(et);
    if (ew < 2 || ew > 64) return false;   // >64: accel memory codegen declines
@@ -472,12 +485,27 @@ static bool mem_shape(type_t t, unsigned *nwords, unsigned *elemw)
    return true;
 }
 
-typedef struct { tree_t decl; int refs; int indexed; } mem_scan_t;
+typedef struct { tree_t decl; int refs; int indexed; int agg; } mem_scan_t;
 
 static void mem_scan_cb(tree_t t, void *ctx)
 {
    mem_scan_t *sc = (mem_scan_t *)ctx;
    const tree_kind_t k = tree_kind(t);
+   if (k == T_VAR_ASSIGN || k == T_SIGNAL_ASSIGN) {
+      // a whole-array := (positional aggregate) is representable (it expands
+      // to per-word writes at emission) -- count it so it does not read as a
+      // disqualifying bare ref (ITC b15's InstQueue reset)
+      tree_t tg = tree_target(t);
+      if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+          && tree_ref(tg) == sc->decl
+          && tree_kind(tree_value(t)) == T_AGGREGATE) {
+         bool allpos = true;
+         for (int i = 0; i < tree_assocs(tree_value(t)); i++)
+            if (tree_subkind(tree_assoc(tree_value(t), i)) != A_POS)
+               allpos = false;
+         if (allpos) sc->agg++;
+      }
+   }
    if (k == T_REF) {
       if (tree_has_ref(t) && tree_ref(t) == sc->decl) sc->refs++;
    }
@@ -499,6 +527,14 @@ static const char *vlog_op(const char *fn)
       {"\"=\"","=="}, {"\"/=\"","!="}, {"\"<\"","<"}, {"\">\"",">"},
       {"\"<=\"","<="}, {"\">=\"",">="},
       {"\"sll\"","<<"}, {"\"srl\"",">>"},
+      // Integer division truncates toward zero in BOTH VHDL and (signed)
+      // Verilog, and this translator declares every integer signed [31:0],
+      // so "/" maps directly; numeric_std unsigned vectors likewise (plain
+      // regs -> unsigned division).  "rem" is exactly Verilog "%" (result
+      // sign follows the DIVIDEND in both).  VHDL "mod" is NOT "%" for
+      // negative operands (sign follows the DIVISOR) -- it keeps only the
+      // positive-power-of-2 mask special case and declines otherwise.
+      {"\"/\"","/"}, {"\"rem\"","%"},
       {NULL,NULL}
    };
    for (int i = 0; map[i].v; i++)
@@ -840,6 +876,15 @@ static void emit_expr(FILE *f, tree_t e)
          // so they are ordinary constants here.
          else if (strcmp(bn, "'L'") == 0) fputs("1'b0", f);
          else if (strcmp(bn, "'H'") == 0) fputs("1'b1", f);
+         // BOOLEAN literals: without these, TRUE/FALSE reached the bare-name
+         // fallthrough and emitted `true`/`false` -- identifiers declared
+         // nowhere, which yosys reads as fresh undriven wires (constant 0)
+         // and reports NOTHING: every `sig <= Pending` in ITC b15 silently
+         // deasserted and the FSM walked a different path (b17 first
+         // divergence at cycle 18).  The names are reserved words in VHDL,
+         // so the basename alone identifies the standard literals.
+         else if (strcasecmp(bn, "true") == 0)  fputs("1'b1", f);
+         else if (strcasecmp(bn, "false") == 0) fputs("1'b0", f);
          // 'U' 'X' 'Z' 'W' '-' have NO value-plane representation.  Without
          // this they reached the bare-name fallthrough below, where vid()
          // renders them as _u_ / _x_ / _z_ / _w_ / _-_ -- identifiers that are
@@ -1620,6 +1665,39 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          else if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
                   && sig_has_shadow(tree_ref(tg0)))
             break;                                 // the whole-array writeback
+         // Whole-array assignment to a memory-qualified decl: a memory has
+         // no aggregate l-value in Verilog (the naive emission was
+         // `instqueue = {0,...}` -- yosys-undefined).  A positional
+         // CONSTANT aggregate (ITC b15's InstQueue reset) expands to one
+         // word write per element, leftmost element = LEFT bound (VHDL
+         // positional order); anything fancier declines loudly.
+         if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
+             && sig_is_mem(tree_ref(tg0))) {
+            unsigned mnw, mew;
+            tree_t v0 = tree_value(s);
+            if (mem_shape(tree_type(tree_ref(tg0)), &mnw, &mew)
+                && tree_kind(v0) == T_AGGREGATE
+                && (unsigned)tree_assocs(v0) == mnw) {
+               bool allpos = true;
+               for (int i = 0; i < tree_assocs(v0); i++)
+                  if (tree_subkind(tree_assoc(v0, i)) != A_POS)
+                     allpos = false;
+               if (allpos) {
+                  const bool nba = tree_kind(s) == T_SIGNAL_ASSIGN;
+                  for (unsigned i = 0; i < mnw; i++) {
+                     tab(f, ind);
+                     fprintf(f, "%s[%u] %s ", vid(tree_ident(tg0)),
+                             mnw - 1 - i, nba ? "<=" : "=");
+                     emit_expr(f, tree_value(tree_assoc(v0, i)));
+                     fputs(";\n", f);
+                  }
+                  break;
+               }
+            }
+            DECLINE("memory-whole-array-assign");
+            fprintf(f, "  /*?memagg*/\n");
+            break;
+         }
          tab(f, ind);
          emit_expr(f, tree_target(s));
          // VHDL variables update immediately (Verilog blocking '='); signals are
@@ -2553,6 +2631,10 @@ static bool block_types_synth(tree_t block)
       }
    for (int i = 0; i < tree_decls(block); i++)
       if (!decl_type_synth(tree_decl(block, i))) {
+         unsigned mnw, mew;
+         if (tree_kind(tree_decl(block, i)) == T_SIGNAL_DECL
+             && mem_shape(tree_type(tree_decl(block, i)), &mnw, &mew))
+            continue;   // representable as a Verilog memory
          if (getenv("GSM_LOG"))
             fprintf(stderr, "block_types_synth: decl %s (kind %d) rejected\n",
                     istr(tree_ident(tree_decl(block, i))),
@@ -2569,6 +2651,10 @@ static bool block_types_synth(tree_t block)
       if (tree_kind(s) != T_PROCESS) continue;
       for (int j = 0; j < tree_decls(s); j++)
          if (!decl_type_synth(tree_decl(s, j))) {
+            unsigned mnw, mew;
+            if (tree_kind(tree_decl(s, j)) == T_VAR_DECL
+                && mem_shape(tree_type(tree_decl(s, j)), &mnw, &mew))
+               continue;   // representable as a Verilog memory (hoisted)
             if (getenv("GSM_LOG"))
                fprintf(stderr, "block_types_synth: process %s decl %s (kind %d) "
                        "rejected\n", istr(tree_ident(s)),
@@ -2600,6 +2686,28 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
          tree_t d = tree_decl(s, i);
          if (tree_kind(d) != T_VAR_DECL) continue;
          if (shadow_sig_of(d) != NULL) continue;  // NBA-shadow of a memory: elided
+         {  unsigned mnw, mew;
+            if (!sig_is_mem(d) && mem_shape(tree_type(d), &mnw, &mew)
+                && type_is_integer(type_elem(tree_type(d)))) {
+               // memory-shaped but unqualified (slice/whole-array use the
+               // expansion cannot represent): the flat path would collapse
+               // each element to ONE BIT -- the silent-wrong class the old
+               // type rejection existed to prevent.  Decline loudly.
+               DECLINE("integer-array-unqualified");
+               fprintf(f, "  /*?intmem %s*/\n", vid(tree_ident(d)));
+               continue;
+            }
+            if (sig_is_mem(d) && mem_shape(tree_type(d), &mnw, &mew)) {
+               // memory-qualified variable: hoist as a true Verilog memory;
+               // integer elements keep the translator's signed convention
+               const bool isint = type_is_integer(type_elem(tree_type(d)));
+               fprintf(f, "  reg %s[%u:0] %s [0:%u];\n",
+                       isint ? "signed " : "", mew - 1,
+                       vid(tree_ident(d)), mnw - 1);
+               local_seen(seen, nseen, vid(tree_ident(d)));
+               continue;
+            }
+         }
          const char *nm = vid(tree_ident(d));
          // A variable whose name collides with a signal/port OR was already
          // hoisted from ANOTHER process gets a unique per-module suffix.
@@ -2794,7 +2902,7 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       if (!is_reg(block, d)) continue;   // memory must be process-driven (reg)
       mem_scan_t sc = { .decl = d, .refs = 0, .indexed = 0 };
       tree_visit(block, mem_scan_cb, &sc);
-      if (sc.refs > 0 && sc.refs == sc.indexed) {
+      if (sc.refs > 0 && sc.refs == sc.indexed + sc.agg) {
          g_mem_sigs[g_n_mem_sigs++] = d;
          continue;
       }
@@ -2816,14 +2924,44 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       }
    }
 
+   // qualify memory-shaped PROCESS VARIABLES the same way (b15 InstQueue,
+   // b12's RAM-as-variable): every reference inside the owning process a
+   // plain single-index.  They join g_mem_sigs -- the set is keyed by tree
+   // identity, so sig_is_mem() and the indexed-access emission just work;
+   // emit_proc_locals hoists them as true Verilog memories.
+   for (int si = 0; si < tree_stmts(block)
+           && g_n_mem_sigs < MAX_MEM_SIGS; si++) {
+      tree_t ps = tree_stmt(block, si);
+      if (tree_kind(ps) != T_PROCESS) continue;
+      for (int j = 0; j < tree_decls(ps)
+              && g_n_mem_sigs < MAX_MEM_SIGS; j++) {
+         tree_t vd = tree_decl(ps, j);
+         if (tree_kind(vd) != T_VAR_DECL) continue;
+         unsigned vnw, vew;
+         if (!mem_shape(tree_type(vd), &vnw, &vew)) continue;
+         mem_scan_t vsc = { .decl = vd, .refs = 0, .indexed = 0 };
+         tree_visit(ps, mem_scan_cb, &vsc);
+         if (vsc.refs > 0 && vsc.refs == vsc.indexed + vsc.agg)
+            g_mem_sigs[g_n_mem_sigs++] = vd;
+      }
+   }
+
    // signal declarations (skip ports and hier markers)
    for (int i = 0; i < ndecls; i++) {
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) != T_SIGNAL_DECL) continue;
       unsigned nw, ew;
       if (sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)) {
-         fprintf(f, "  reg [%u:0] %s [0:%u];\n", ew - 1,
-                 vid(tree_ident(d)), nw - 1);
+         const bool isint = type_is_integer(type_elem(tree_type(d)));
+         fprintf(f, "  reg %s[%u:0] %s [0:%u];\n", isint ? "signed " : "",
+                 ew - 1, vid(tree_ident(d)), nw - 1);
+         continue;
+      }
+      if (!sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)
+          && type_is_integer(type_elem(tree_type(d)))) {
+         // see the hoist-path twin: never emit the one-bit collapse
+         DECLINE("integer-array-unqualified");
+         fprintf(f, "  /*?intmem %s*/\n", vid(tree_ident(d)));
          continue;
       }
       const bool is_r = is_reg(block, d);
