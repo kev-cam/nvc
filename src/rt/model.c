@@ -1742,38 +1742,82 @@ static void *accel_bg_thread(void *arg)
    snprintf(nvc_path, sizeof(nvc_path), "%.*s_nvc.c",
             (int)(strlen(bg->so_path) - 3), bg->so_path);
 
-   // Step 1: Run gen_statemachine (Yosys synthesis + C codegen)
-   // Look for gen_statemachine in common locations
-   const char *gen_sm = getenv("GEN_STATEMACHINE");
-   if (!gen_sm || access(gen_sm, X_OK) != 0) {
-      const char *paths[] = {
-         "gen_statemachine",
-         "/usr/local/src/sv2ghdl/yosys/gen_statemachine",
-         NULL
-      };
-      gen_sm = NULL;
-      for (const char **p = paths; *p; p++) {
-         if (access(*p, X_OK) == 0) { gen_sm = *p; break; }
-      }
-      if (!gen_sm) {
-         // Try PATH
-         gen_sm = "gen_statemachine";
-      }
-   }
-
    // Log file for compile output
    char log_path[512];
    snprintf(log_path, sizeof(log_path), "%.*s.log",
             (int)(strlen(bg->so_path) - 3), bg->so_path);
 
-   char cmd[2048];
-   snprintf(cmd, sizeof(cmd),
-            "%s '%s' '%s' '%s' >>'%s' 2>&1",
-            gen_sm, bg->src_file, bg->module, c_path, log_path);
+   // Step 1: Yosys synthesis + C codegen.  Preferred path is IN-PROCESS via
+   // libgsm.so (gsm_generate() — same source as the gen_statemachine CLI, so
+   // they cannot drift): no fork/exec, no shell, and diagnostics land in the
+   // same per-chunk log.  rc contract: 0 = generated, 1 = clean decline
+   // (deterministic — the CLI would decline identically, so don't retry),
+   // 2 = abnormal (contained yosys error — retry via the CLI as a safety
+   // net).  NVC_ACCEL_NO_GSMLIB=1 forces the CLI path; NVC_GSM_LIB overrides
+   // the library location.
+   typedef int (*gsm_generate_fn)(int, const char *const *, const char *);
+   static gsm_generate_fn gsm_fn = NULL;
+   static int gsm_lib_checked = 0;
+   if (!gsm_lib_checked) {
+      if (getenv("NVC_ACCEL_NO_GSMLIB") == NULL) {
+         const char *libs[] = {
+            getenv("NVC_GSM_LIB"),   // may be NULL — skipped below
+            "/usr/local/src/sv2ghdl/yosys/libgsm.so",
+            "libgsm.so",
+         };
+         for (const char **p = libs; p < libs + ARRAY_LEN(libs); p++) {
+            if (*p == NULL) continue;
+            void *dl = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
+            if (dl != NULL) {
+               gsm_fn = (gsm_generate_fn)dlsym(dl, "gsm_generate");
+               if (gsm_fn != NULL) break;
+               dlclose(dl);
+            }
+         }
+      }
+      gsm_lib_checked = 1;
+   }
 
-   notef("accel: compiling %s (log: %s)", bg->module, log_path);
+   int rc = -1;
+   if (gsm_fn != NULL) {
+      notef("accel: compiling %s in-process (log: %s)", bg->module, log_path);
+      const char *args[3] = { bg->src_file, bg->module, c_path };
+      rc = gsm_fn(3, args, log_path);
+      if (rc == 2)
+         notef("accel: in-process synthesis error for %s — retrying via CLI",
+               bg->module);
+   }
 
-   int rc = system(cmd);
+   if (rc != 0 && rc != 1) {
+      // CLI path: no library, forced via NVC_ACCEL_NO_GSMLIB, or abnormal
+      // in-process failure.  Look for gen_statemachine in common locations.
+      const char *gen_sm = getenv("GEN_STATEMACHINE");
+      if (!gen_sm || access(gen_sm, X_OK) != 0) {
+         const char *paths[] = {
+            "gen_statemachine",
+            "/usr/local/src/sv2ghdl/yosys/gen_statemachine",
+            NULL
+         };
+         gen_sm = NULL;
+         for (const char **p = paths; *p; p++) {
+            if (access(*p, X_OK) == 0) { gen_sm = *p; break; }
+         }
+         if (!gen_sm) {
+            // Try PATH
+            gen_sm = "gen_statemachine";
+         }
+      }
+
+      char cmd[2048];
+      snprintf(cmd, sizeof(cmd),
+               "%s '%s' '%s' '%s' >>'%s' 2>&1",
+               gen_sm, bg->src_file, bg->module, c_path, log_path);
+
+      notef("accel: compiling %s (log: %s)", bg->module, log_path);
+
+      rc = system(cmd);
+   }
+
    if (rc != 0) {
       warnf("accel: synthesis failed for %s (see %s)", bg->module, log_path);
       free(bg);
@@ -1793,6 +1837,7 @@ static void *accel_bg_thread(void *arg)
    // nets) so the bridge can dump the accel model's internal state in the REAL
    // sim (see aj_emit_bridge). Clear ~/.cache/nvc/accel when toggling it.
    const char *smdump = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
+   char cmd[2048];
    snprintf(cmd, sizeof(cmd),
             "%s %s -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
             accel_cc, smdump, bg->so_path, nvc_path, log_path);
