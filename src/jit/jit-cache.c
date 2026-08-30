@@ -1333,6 +1333,26 @@ static int gc_mtime_compare(const void *a, const void *b)
 static void jit_cache_gc(jit_cache_t *jc)
 {
    const time_t now = time(NULL);
+
+   // Amortize: the sweep lstat()s EVERY cached file, and it ran at every
+   // process open — at the 2GB cap that is ~500k stat calls, measured as
+   // ~1s of sys time added to EVERY nvc run (the vhdl_perf "regression"
+   // of 2026-08-29 was mostly this).  A cache a few hours stale against
+   // its cap or dead-generation age loses nothing, so run the full sweep
+   // at most once per interval, tracked by a stamp file in the root.
+   // NVC_JIT_CACHE_GC_INTERVAL=<seconds> overrides; 0 sweeps every open.
+   uint64_t interval = 6 * 3600;
+   const char *iv = getenv("NVC_JIT_CACHE_GC_INTERVAL");
+   if (iv != NULL)
+      interval = strtoull(iv, NULL, 10);
+   char *stamp LOCAL = xasprintf("%s/.gc-stamp", jc->root);
+   if (interval > 0) {
+      struct stat st;
+      if (stat(stamp, &st) == 0 && now >= st.st_mtime
+          && (uint64_t)(now - st.st_mtime) < interval)
+         return;
+   }
+
    const char *gen_name = strrchr(jc->gendir, '/');
    assert(gen_name != NULL);
    gen_name++;
@@ -1392,6 +1412,12 @@ static void jit_cache_gc(jit_cache_t *jc)
    for (unsigned i = 0; i < nfiles; i++)
       free(files[i].path);
    free(files);
+
+   // Mark the sweep done (content unused; mtime is the clock).  Failure is
+   // harmless — the next open just sweeps again.
+   FILE *sf = fopen(stamp, "w");
+   if (sf != NULL)
+      fclose(sf);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
