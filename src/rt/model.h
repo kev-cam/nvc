@@ -97,7 +97,6 @@ void get_path_name(rt_scope_t *s, text_buf_t *tb);
 typedef struct _rt_proc_vtable rt_proc_vtable_t;
 void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt);
 void proc_reset_vtable(rt_proc_t *proc);
-bool accel_load(rt_model_t *m, const char *so_path);
 void accel_auto(rt_model_t *m);
 void accel_levelize(rt_model_t *m);
 void accel_banked_init(rt_model_t *m);

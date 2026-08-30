@@ -1591,7 +1591,7 @@ void proc_set_vtable(rt_proc_t *proc, const rt_proc_vtable_t *vt)
 // proc->vtable at zero cost (established accel/lazy/chunk pattern). The
 // wrapper is only ever installed OVER the default vtable, and is removed at
 // the 1 -> 2 wait-state demotion and in reset_process; anything else that
-// swaps vtables (accel_load, aj_reroute) replaces the pointer wholesale and
+// swaps vtables (aj_reroute) replaces the pointer wholesale and
 // never chains through it, so a concurrent replacement merely orphans the
 // wrapper. Gated by NVC_DIRECT_EVAL (default ON; set 0 to disable for A/B).
 
@@ -1701,29 +1701,10 @@ static void direct_eval_uninstall(rt_proc_t *proc)
    }
 }
 
-// Load a compiled state machine .so and swap a process vtable.
-// The .so must export:
-//   sm_init_mapped(uint8_t **ptrs, int *widths, int n)
-//   sm_eval_mapped(void)
-//   sm_n_regs (int)
-//   sm_reg_names (const char *[])
-// Signal pointers are taken from the process scope's signals.
 #include <dlfcn.h>
-
-typedef void (*accel_eval_fn)(void);
-typedef void (*accel_init_fn)(uint8_t **, int *, int);
-
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
-
-// Background compile state
-typedef struct {
-   rt_model_t *model;
-   char        module[256];
-   char        src_file[512];
-   char        so_path[512];
-} accel_bg_t;
 
 // In-process generator: libgsm.so is the library form of the gen_statemachine
 // CLI (same source — see sv2ghdl yosys/Makefile), exporting gsm_generate().
@@ -1775,300 +1756,6 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
 static gsm_generate_fn accel_gsm_fn(void)
 {
    return accel_gsm_probe(NULL);
-}
-
-static void *accel_bg_thread(void *arg)
-{
-   accel_bg_t *bg = arg;
-
-   // Ensure cache directory exists
-   char *dir = xstrdup(bg->so_path);
-   char *slash = strrchr(dir, '/');
-   if (slash) { *slash = '\0'; mkdir(dir, 0755); }
-   free(dir);
-
-   // Build paths for intermediate files
-   char c_path[512], nvc_path[512];
-   snprintf(c_path, sizeof(c_path), "%.*s.c",
-            (int)(strlen(bg->so_path) - 3), bg->so_path);
-   snprintf(nvc_path, sizeof(nvc_path), "%.*s_nvc.c",
-            (int)(strlen(bg->so_path) - 3), bg->so_path);
-
-   // Log file for compile output
-   char log_path[512];
-   snprintf(log_path, sizeof(log_path), "%.*s.log",
-            (int)(strlen(bg->so_path) - 3), bg->so_path);
-
-   // Step 1: Yosys synthesis + C codegen.  Preferred path is IN-PROCESS via
-   // libgsm.so (gsm_generate() — same source as the gen_statemachine CLI, so
-   // they cannot drift): no fork/exec, no shell, and diagnostics land in the
-   // same per-chunk log.  rc contract: 0 = generated, 1 = clean decline
-   // (deterministic — the CLI would decline identically, so don't retry),
-   // 2 = abnormal (contained yosys error — retry via the CLI as a safety
-   // net).  NVC_ACCEL_NO_GSMLIB=1 forces the CLI path; NVC_GSM_LIB overrides
-   // the library location.
-   const gsm_generate_fn gsm_fn =
-      getenv("GEN_STATEMACHINE") != NULL ? NULL : accel_gsm_fn();
-
-   int rc = -1;
-   if (gsm_fn != NULL) {
-      notef("accel: compiling %s in-process (log: %s)", bg->module, log_path);
-      const char *args[3] = { bg->src_file, bg->module, c_path };
-      rc = gsm_fn(3, args, log_path);
-      if (rc == 2)
-         notef("accel: in-process synthesis error for %s — retrying via CLI",
-               bg->module);
-   }
-
-   if (rc != 0 && rc != 1) {
-      // CLI path: no library, forced via NVC_ACCEL_NO_GSMLIB, or abnormal
-      // in-process failure.  Look for gen_statemachine in common locations.
-      const char *gen_sm = getenv("GEN_STATEMACHINE");
-      if (!gen_sm || access(gen_sm, X_OK) != 0) {
-         const char *paths[] = {
-            "gen_statemachine",
-            "/usr/local/src/sv2ghdl/yosys/gen_statemachine",
-            NULL
-         };
-         gen_sm = NULL;
-         for (const char **p = paths; *p; p++) {
-            if (access(*p, X_OK) == 0) { gen_sm = *p; break; }
-         }
-         if (!gen_sm) {
-            // Try PATH
-            gen_sm = "gen_statemachine";
-         }
-      }
-
-      char cmd[2048];
-      snprintf(cmd, sizeof(cmd),
-               "%s '%s' '%s' '%s' >>'%s' 2>&1",
-               gen_sm, bg->src_file, bg->module, c_path, log_path);
-
-      notef("accel: compiling %s (log: %s)", bg->module, log_path);
-
-      rc = system(cmd);
-   }
-
-   if (rc != 0) {
-      warnf("accel: synthesis failed for %s (see %s)", bg->module, log_path);
-      free(bg);
-      return NULL;
-   }
-
-   // Step 2: Compile .so from the NVC-mapped version
-   if (access(nvc_path, F_OK) != 0) {
-      warnf("accel: no NVC-mapped file generated for %s", bg->module);
-      free(bg);
-      return NULL;
-   }
-
-   const char *accel_cc = getenv("NVC_ACCEL_CC");
-   if (!accel_cc) accel_cc = "gcc -g -O3";
-   // NVC_ACCEL_SMDUMP: compile in gen_statemachine's sm_dump_comb (all internal
-   // nets) so the bridge can dump the accel model's internal state in the REAL
-   // sim (see aj_emit_bridge). Clear ~/.cache/nvc/accel when toggling it.
-   const char *smdump = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
-   char cmd[2048];
-   snprintf(cmd, sizeof(cmd),
-            "%s %s -shared -fPIC -o '%s' '%s' >>'%s' 2>&1",
-            accel_cc, smdump, bg->so_path, nvc_path, log_path);
-
-   rc = system(cmd);
-   if (rc != 0) {
-      warnf("accel: gcc failed for %s (rc=%d)", bg->module, rc);
-      free(bg);
-      return NULL;
-   }
-
-   notef("accel: compiled %s — loading", bg->so_path);
-
-   // Step 3: Load and swap vtable
-   accel_load(bg->model, bg->so_path);
-
-   free(bg);
-   return NULL;
-}
-
-static void accel_bg_compile(rt_model_t *m, const char *module,
-                             const char *src_file, const char *so_path)
-{
-   accel_bg_t *bg = xcalloc(sizeof(accel_bg_t));
-   bg->model = m;
-   snprintf(bg->module, sizeof(bg->module), "%s", module);
-   snprintf(bg->src_file, sizeof(bg->src_file), "%s", src_file);
-   snprintf(bg->so_path, sizeof(bg->so_path), "%s", so_path);
-
-   // Try smak for background build, fall back to synchronous
-   typedef int (*smak_find_fn)(void);
-   typedef int (*smak_connect_fn)(int);
-   typedef int (*smak_submit_fn)(int, const char*, const char*, const char*);
-   typedef void (*smak_disconnect_fn)(int);
-
-   static void *smak_lib = NULL;
-   static int smak_checked = 0;
-   if (!smak_checked) {
-      smak_lib = dlopen("libsmak-client.so", RTLD_NOW);
-      if (!smak_lib)
-         smak_lib = dlopen("/usr/local/src/smak/libsmak-client.so", RTLD_NOW);
-      smak_checked = 1;
-   }
-
-   if (smak_lib) {
-      smak_find_fn find = dlsym(smak_lib, "smak_find_server");
-      smak_connect_fn conn = dlsym(smak_lib, "smak_connect");
-      smak_submit_fn submit = dlsym(smak_lib, "smak_submit");
-      smak_disconnect_fn disc = dlsym(smak_lib, "smak_disconnect");
-
-      if (find && conn && submit && disc) {
-         int port = find();
-         if (port > 0) {
-            int fd = conn(port);
-            if (fd >= 0) {
-               // Build the full command as a single shell command
-               char cmd[2048];
-               snprintf(cmd, sizeof(cmd),
-                        "cd '%s' && gen_statemachine '%s' '%s' '%s' && "
-                        "gcc -O2 -shared -fPIC -o '%s' '%s_nvc.c'",
-                        getenv("HOME"),
-                        bg->src_file, bg->module,
-                        bg->so_path,
-                        bg->so_path,
-                        bg->so_path);
-               // Remove .so suffix from the _nvc.c path
-               // Actually the path is already correct from gen_statemachine
-
-               submit(fd, bg->so_path, cmd, getenv("HOME"));
-               notef("accel: submitted '%s' to smak (port %d)", module, port);
-               disc(fd);
-               free(bg);
-               return;
-            }
-         }
-      }
-   }
-
-   // Fallback: synchronous compile
-   notef("accel: compiling module '%s' from %s (synchronous)", module, src_file);
-   accel_bg_thread(bg);
-}
-
-// Per-process acceleration binding
-typedef struct {
-   rt_proc_vtable_t vtable;
-   accel_eval_fn    eval;
-   void            *dl_handle;
-} accel_binding_t;
-
-static void proc_eval_accel(rt_model_t *m, rt_proc_t *proc)
-{
-   // The vtable is the first field of accel_binding_t, so we can
-   // recover the binding from the vtable pointer
-   const accel_binding_t *binding =
-      (const accel_binding_t *)proc->vtable;
-   binding->eval();
-}
-
-bool accel_load(rt_model_t *m, const char *so_path)
-{
-   void *dl = dlopen(so_path, RTLD_NOW);
-   if (!dl) {
-      warnf("accel: cannot load %s: %s", so_path, dlerror());
-      return false;
-   }
-
-   accel_eval_fn eval = dlsym(dl, "sm_eval_mapped");
-   accel_init_fn init = dlsym(dl, "sm_init_mapped");
-   int *n_regs = dlsym(dl, "sm_n_regs");
-   const char **reg_names = dlsym(dl, "sm_reg_names");
-
-   if (!eval || !init || !n_regs || !reg_names) {
-      warnf("accel: %s missing sm_eval_mapped/sm_init_mapped/sm_n_regs/sm_reg_names",
-            so_path);
-      dlclose(dl);
-      return false;
-   }
-
-   notef("accel: loaded %s (%d registers)", so_path, *n_regs);
-
-   // A module that synthesised to zero sequential state has nothing to
-   // accelerate (it is pure wiring / structural). Activating it would just
-   // swap out an arbitrary process for a no-op eval — historically this grabbed
-   // the testbench clock generator and stalled the whole run at time 0. Decline.
-   if (*n_regs == 0) {
-      notef("accel: %s has no registers — nothing to accelerate, staying in nvc",
-            so_path);
-      dlclose(dl);
-      return false;
-   }
-
-   // Map signals: walk the scope tree, match register names to signals
-   rt_scope_t *root = root_scope(m);
-   uint8_t **ptrs = xcalloc_array(*n_regs, sizeof(uint8_t *));
-   int *widths = xcalloc_array(*n_regs, sizeof(int));
-   int mapped = 0;
-
-   // Walk all scopes and their signals
-   for (int ci = 0; ci < root->children.count; ci++) {
-      rt_scope_t *child = root->children.items[ci];
-      for (int si = 0; si < child->signals.count; si++) {
-         rt_signal_t *sig = child->signals.items[si];
-         const char *sname = istr(tree_ident(sig->where));
-         for (int r = 0; r < *n_regs; r++) {
-            if (ptrs[r]) continue;
-            const char *rn = reg_names[r];
-            while (*rn == '_') rn++;
-            if (sname && strcasestr(sname, rn)) {
-               ptrs[r] = (uint8_t *)sig->shared.data;
-               widths[r] = sig->nexus.width;
-               mapped++;
-               notef("accel:   %s -> %s (%d bits)", reg_names[r], sname, widths[r]);
-            }
-         }
-      }
-   }
-
-   if (mapped < *n_regs) {
-      warnf("accel: only %d/%d registers mapped — not activating", mapped, *n_regs);
-      free(ptrs);
-      free(widths);
-      dlclose(dl);
-      return false;
-   }
-
-   init(ptrs, widths, *n_regs);
-
-   // Find the process to swap — use the first always/assign process
-   rt_proc_t *target = NULL;
-   for (int ci = 0; ci < root->children.count && !target; ci++) {
-      rt_scope_t *child = root->children.items[ci];
-      for (int pi = 0; pi < child->procs.count; pi++) {
-         rt_proc_t *p = child->procs.items[pi];
-         if (p->wakeable.kind == W_PROC || p->wakeable.kind == W_ASSIGN) {
-            target = p;
-            break;
-         }
-      }
-   }
-
-   if (target) {
-      accel_binding_t *binding = xcalloc(sizeof(accel_binding_t));
-      binding->vtable.eval  = proc_eval_accel;
-      binding->vtable.reset = proc_reset_default;
-      binding->vtable.on_abort = proc_on_abort_default;
-      binding->eval         = eval;
-      binding->dl_handle    = dl;
-
-      proc_set_vtable(target, &binding->vtable);
-      notef("accel: swapped process %s — acceleration ACTIVE", istr(target->name));
-   }
-   else {
-      warnf("accel: no process found to swap");
-   }
-
-   free(ptrs);
-   free(widths);
-   return target != NULL;
 }
 
 // Recover the original Verilog source path from the nvc_verilog_src attribute
@@ -2178,7 +1865,7 @@ static bool accel_verilog_params(tree_t unit, char *out, size_t outsz)
 }
 
 // ===================================================================
-// JIT subtree acceleration  (NVC_ACCEL_JIT=1)
+// JIT subtree acceleration  (the --accel engine)
 //
 // cxxrtl-style: synthesize a whole RTL subtree (flattened) to native code
 // via gen_statemachine, then reroute that subtree's process evaluation to it.
@@ -2196,7 +1883,7 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
 
 // One accel model per run is enough for the bet; rerouted procs all call this.
 // One installed accel subtree. The vtable is the FIRST field so a rerouted proc
-// recovers its chunk via (aj_chunk_t *)proc->vtable (the accel_binding_t
+// recovers its chunk via (aj_chunk_t *)proc->vtable (the vtable-first
 // pattern). Each chunk has its own compiled eval/state/reset and its own
 // deferred-output table, so multiple chunks can be live at once.
 typedef struct {
@@ -10522,153 +10209,41 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
               return;
            }
      } }
-   // JIT subtree path: work down from the top, accelerate the first
-   // synthesizable subtree that compiles, and don't recurse into it.
-   if (getenv("NVC_ACCEL_JIT") != NULL) {
-      // NVC_ACCEL_PER_INSTANCE: install each LEAF instance (one with no instance
-      // children) as its own chunk, so siblings become separate cacheable .so's
-      // (finest-grained in-place rebuild) and the inter-instance signals become
-      // chunk-to-chunk boundaries — instead of flattening the whole subtree into
-      // one chunk. Default (whole-subtree) installs the largest synth subtree.
-      const bool per_inst = getenv("NVC_ACCEL_PER_INSTANCE") != NULL;
-      if (scope->kind == SCOPE_INSTANCE) {
-         bool leaf = true;
-         if (per_inst)
-            for (int ci = 0; ci < scope->children.count; ci++)
-               if (scope->children.items[ci]->kind == SCOPE_INSTANCE) {
-                  leaf = false; break;
-               }
-         tree_t r = aj_scope_ref(scope);
-         char tmp[512];
-         // NVC_ACCEL_FROM_VHDL emits the subtree via vhdl2vlog (not the original
-         // SV), so the SV-source gate doesn't apply -- plain VHDL has no
-         // nvc_verilog_src attr either.
-         if ((!per_inst || leaf) && r != NULL
-             && (getenv("NVC_ACCEL_FROM_VHDL")
-                 || accel_verilog_src(r, tmp, sizeof tmp))
-             && accel_install_subtree(m, scope, r, accel_dir)
-             && !per_inst)
-            return;   // whole subtree accelerated; don't recurse into it
-      }
-      for (int ci = 0; ci < scope->children.count; ci++)
-         accel_scan_scope(m, scope->children.items[ci], accel_dir);
-      return;
+   // Work down from the top, accelerate the first synthesizable subtree that
+   // compiles, and don't recurse into it.  (This JIT/aj engine is the ONLY
+   // path since 2026-08-30: the pre-JIT vtable-swap flow — accel_bg_compile /
+   // accel_load on sm_init_mapped .so's — rotted unused and was deleted, so
+   // NVC_ACCEL_JIT no longer gates anything.)
+   //
+   // NVC_ACCEL_PER_INSTANCE: install each LEAF instance (one with no instance
+   // children) as its own chunk, so siblings become separate cacheable .so's
+   // (finest-grained in-place rebuild) and the inter-instance signals become
+   // chunk-to-chunk boundaries — instead of flattening the whole subtree into
+   // one chunk. Default (whole-subtree) installs the largest synth subtree.
+   const bool per_inst = getenv("NVC_ACCEL_PER_INSTANCE") != NULL;
+   if (scope->kind == SCOPE_INSTANCE) {
+      bool leaf = true;
+      if (per_inst)
+         for (int ci = 0; ci < scope->children.count; ci++)
+            if (scope->children.items[ci]->kind == SCOPE_INSTANCE) {
+               leaf = false; break;
+            }
+      tree_t r = aj_scope_ref(scope);
+      char tmp[512];
+      // NVC_ACCEL_FROM_VHDL emits the subtree via vhdl2vlog (not the original
+      // SV), so the SV-source gate doesn't apply -- plain VHDL has no
+      // nvc_verilog_src attr either.
+      if ((!per_inst || leaf) && r != NULL
+          && (getenv("NVC_ACCEL_FROM_VHDL")
+              || accel_verilog_src(r, tmp, sizeof tmp))
+          && accel_install_subtree(m, scope, r, accel_dir)
+          && !per_inst)
+         return;   // whole subtree accelerated; don't recurse into it
    }
-
-   if (scope->kind == SCOPE_INSTANCE && scope->where != NULL
-       && tree_decls(scope->where) > 0) {
-      tree_t hier = tree_decl(scope->where, 0);
-      if (tree_kind(hier) == T_HIER) {
-         // hier ref points to the original entity/block
-         tree_t ref = tree_ref(hier);
-         const char *entity = istr(tree_ident(ref));
-
-         // Strip library prefix (e.g. "WORK.COUNTER8" -> "COUNTER8")
-         const char *dot = strrchr(entity, '.');
-         const char *modname = dot ? dot + 1 : entity;
-
-         char mod_lower[256];
-         snprintf(mod_lower, sizeof(mod_lower), "%s", modname);
-         for (char *p = mod_lower; *p; p++) {
-            char c = tolower((unsigned char)*p);
-            *p = (isalnum((unsigned char)c) || c == '_') ? c : '_';   // valid Verilog id
-         }
-
-         char so_path[512];
-         snprintf(so_path, sizeof(so_path),
-                  "%s/accel-mod_%s-arch_from_verilog.so",
-                  accel_dir, mod_lower);
-
-         if (access(so_path, F_OK) == 0)
-            accel_load(m, so_path);
-         else {
-            // No cached .so — try to compile in background.
-            // Prefer the original Verilog source recovered from the
-            // nvc_verilog_src attribute (Mode 1); fall back to the elaborated
-            // unit's location otherwise.
-            char vsrc_buf[600];
-            const char *src_file;
-            // synth_top is the module name handed to gen_statemachine. For the
-            // VHDL-emitted path it is mod_lower (vhdl2vlog names the module so).
-            // For recovered Verilog it must be the ORIGINAL Verilog module name
-            // (the entity, without the "-FROM_VERILOG" arch suffix), not the
-            // entity-arch combined name that mod_lower encodes.
-            const char *synth_top = mod_lower;
-            char vlog_top[256];
-            // NVC_ACCEL_FROM_VHDL forces the vhdl2vlog path (emit clean
-            // Verilog from the elaborated tree) instead of recovering the
-            // original source, which for sv2ghdl designs is heavy SV that
-            // yosys's read_verilog can't parse (structs/typedefs/imports).
-            if (!getenv("NVC_ACCEL_FROM_VHDL")
-                && accel_verilog_src(ref, vsrc_buf, sizeof(vsrc_buf))) {
-               src_file = vsrc_buf;
-               tree_t ent = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
-               const char *ename = istr(tree_ident(ent));
-               const char *edot = strrchr(ename, '.');
-               snprintf(vlog_top, sizeof(vlog_top), "%s", edot ? edot + 1 : ename);
-               for (char *p = vlog_top; *p; p++) {
-                  char c = tolower((unsigned char)*p);
-                  *p = (isalnum((unsigned char)c) || c == '_') ? c : '_';
-               }
-               synth_top = vlog_top;
-            }
-            else
-               src_file = loc_file_str(tree_loc(ref));
-            // If the source is not Verilog (VHDL, or SV via sv2ghdl), emit
-            // synthesizable Verilog from the elaborated tree so gen_statemachine
-            // has something to read. This makes --accel work for VHDL too.
-            const char *ext = src_file ? strrchr(src_file, '.') : NULL;
-            bool is_vlog = ext != NULL
-               && (strcmp(ext, ".v") == 0 || strcmp(ext, ".sv") == 0
-                   || strcmp(ext, ".vh") == 0 || strcmp(ext, ".svh") == 0);
-            char emitted[600];
-            if (!is_vlog) {
-               // Only attempt LEAF instances: vhdl2vlog emits a single module,
-               // so a hierarchy node's child instances wouldn't be defined.
-               // Children are accelerated on their own via the recursion below.
-               int child_insts = 0;
-               for (int ci = 0; ci < scope->children.count; ci++)
-                  if (scope->children.items[ci]->kind == SCOPE_INSTANCE)
-                     child_insts++;
-
-               if (child_insts > 0) {
-                  src_file = NULL;   // not a leaf — leave to its children / nvc
-               }
-               else {
-                  snprintf(emitted, sizeof(emitted), "%s/%s_from_vhdl.v",
-                           accel_dir, mod_lower);
-                  // Best-effort: only accelerate if FULLY translatable. A wrong
-                  // but parseable model would silently corrupt results, so on any
-                  // unhandled construct we decline and the leaf stays in nvc.
-                  if (vhdl2vlog(scope->where, mod_lower, emitted)) {
-                     notef("accel: emitted Verilog for leaf '%s' -> %s",
-                           mod_lower, emitted);
-                     src_file = emitted;
-                  }
-                  else {
-                     notef("accel: '%s' not fully translatable — staying in nvc sim",
-                           mod_lower);
-                     src_file = NULL;
-                  }
-               }
-            }
-            if (src_file != NULL) {
-               accel_bg_compile(m, synth_top, src_file, so_path);
-            }
-            else {
-               notef("accel: no .so for module '%s' and no source",
-                     mod_lower);
-            }
-         }
-      }
-   }
-
    for (int ci = 0; ci < scope->children.count; ci++)
       accel_scan_scope(m, scope->children.items[ci], accel_dir);
 }
 
-// Auto-discover and load acceleration .so files.
-// Naming: ~/.cache/nvc/accel/accel-mod_<entity>-arch_<arch>.so
 // ---- Task #62: STATIC comb levelization -----------------------------------
 // Delta-level glitches are simulation artifacts (user doctrine 2026-08-04):
 // interp comb settle exposes transient values that mid-cascade gated-clock
@@ -15218,12 +14793,6 @@ void model_reset(rt_model_t *m)
    // threads (each needs its own per-thread JIT state via jit_thread_local).
    if (getenv("NVC_PARALLEL_PROCS") == NULL)
       jit_thread_install_fast_path();
-
-   // Load compiled acceleration if available via environment
-   // (--accel command line option is handled in nvc.c after model_reset)
-   const char *accel_env = getenv("NVC_USE_ACCEL");
-   if (accel_env != NULL)
-      accel_load(m, accel_env);
 
    // Phase D S2a: arm the partition map.  It is built at the END of the
    // first simulation cycle so that processes with a DYNAMIC wait have

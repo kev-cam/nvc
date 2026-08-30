@@ -57,13 +57,19 @@ Determine where the current looseness actually is:
       2=contained yosys error (CLI retried as a safety net).
       `NVC_ACCEL_NO_GSMLIB=1` forces the CLI; `NVC_GSM_LIB` overrides
       the .so path.
-      **Caveat found while testing (2026-08-30): this legacy non-JIT
-      path is rotted independently of the conversion** — wide_n8w256
+      **Caveat found while testing (2026-08-30): the legacy non-JIT
+      path was rotted independently of the conversion** — wide_n8w256
       under `NVC_ACCEL=1 NVC_ACCEL_FROM_VHDL=1` (no `NVC_ACCEL_JIT`)
-      installs its chunk and then the sim produces no Y= in BOTH the
-      in-process and `NVC_ACCEL_NO_GSMLIB=1` CLI variants (identical
-      logs, rc=0).  The shipping config is the aj path; consider
-      deleting the legacy path when aj converts.
+      installed its chunk and then produced no Y= in both variants.
+      **DELETED later the same day** (~440 lines: accel_bg_thread /
+      accel_bg_compile with its smak submission leg / accel_load /
+      accel_binding_t / the sm_init_mapped .so contract / the
+      NVC_USE_ACCEL prebuilt-.so load).  `NVC_ACCEL=1` alone now runs
+      the aj engine (`NVC_ACCEL_JIT` is a harmless no-op), and the
+      formerly-dead config produces correct values through aj.  This
+      also removed the bg-compile in-process call site — its purpose
+      (proving the facade) was served; the aj fork-worker is the sole
+      client now.
 - [x] **(2026-08-30, same day) The accel-jit paths converted via the
       fork()-without-exec worker** (`aj_gsm_spawn`), which resolves
       both constraints at once:
