@@ -98,6 +98,26 @@ Determine where the current looseness actually is:
 - [ ] Construct `RTLIL::Design` directly from NVC's elaborated tree.
       No Frontend/Pass plugin required — that machinery only exists to
       add `read_*` commands to the yosys CLI. NVC is the host process.
+      **STARTED (2026-08-30): the construction facade exists** —
+      `gsm_rtlil_*` in gen_statemachine.cpp (begin/module/wire/
+      cell_bin/cell_un/cell_mux/connect/proc/sync/sync_assign/
+      content_hash/synth/abort; string sigspecs, typed-helper widths).
+      Sessions hold the facade mutex begin→synth; errors poison the
+      session instead of unwinding into the host; synth reuses gsm_run
+      with read_verilog/chparam skipped.  PROVEN on the rtoy fixture
+      (yosys/rtlil-selftest/, wired into accel-gate): in-process
+      two-session byte determinism (a builder-mode canonicalization
+      renames pass-invented `$auto`/autoidx names — the read_verilog
+      path structurally cannot offer this), and 64-cycle driven
+      behavioral equality with the text path.  Key learnings: async
+      reset is a LEVEL sync (ST0/ST1) paired with one edge sync, NOT a
+      second edge; `gsm_rtlil_content_hash` (FNV over the call stream)
+      replaces the .v file bytes in the vhash cache key.  NEXT: the
+      nvc-side walker backend (vhdl2vlog's walk, second emitter —
+      client pre-lowers process muxes to named $mux cells so `proc`
+      invents nothing), then the aj fork-child integration (walker
+      runs IN the child on the CoW-inherited tree), then memories via
+      $mem_v2.
 - [x] Drive passes via `run_pass()` instead of shelling out and
       round-tripping files.  Done for the converted path; the C-out →
       gcc → .so → dlopen leg is inherent (it IS the product) and
