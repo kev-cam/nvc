@@ -316,8 +316,10 @@ static void defer_driving_update(rt_model_t *m, rt_nexus_t *n);
 static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset);
 static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value);
 static void put_effective_impl(rt_model_t *m, rt_nexus_t *n, const void *value);
-static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n);
-static void notify_event_default(rt_model_t *m, rt_nexus_t *n);
+__attribute__((always_inline))
+inline static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n);
+__attribute__((always_inline))
+inline static void notify_event_default(rt_model_t *m, rt_nexus_t *n);
 static void notify_event(rt_model_t *m, rt_nexus_t *n);
 
 // Dispatch deposit through vtable — defined after inline helpers
@@ -10494,6 +10496,7 @@ static void aj_lv_hold_drv(rt_nexus_t *n)
    g_lv_helddrv[g_lv_helddrvn++] = n;
 }
 
+__attribute__((noinline, cold))
 static int aj_lv_idx(rt_wakeable_t *w)
 {
    if (g_lv_idx == NULL) return -1;
@@ -10501,6 +10504,7 @@ static int aj_lv_idx(rt_wakeable_t *w)
    return v == NULL ? -1 : (int)(uintptr_t)v - 1;
 }
 
+__attribute__((noinline, cold))
 static void aj_lv_wv_push(rt_wakeable_t *w)
 {
    if (g_lv_wvn == g_lv_wvcap) {
@@ -10515,6 +10519,7 @@ static int       g_lv_nproc = 0;
 
 // Divert driver-update tasks enqueued by a clocked proc's run into the
 // wave-held queue (released at wave end).
+__attribute__((noinline, cold))
 static void aj_lv_hold_from(rt_model_t *m, unsigned mark)
 {
    static int nohold = -1, dbg = -1;
@@ -10543,6 +10548,7 @@ static int         g_lv_evnxn = 0;
 // (direct pending, or via triggers up to 2 levels).  Wait-style procs
 // subscribe only after their first suspension, so this runs again at the
 // first wave past 1 ns.
+__attribute__((noinline, cold))
 static void aj_evsens_scan(rt_model_t *m)
 {
    const char *es = getenv("AJ_EVSENS");
@@ -11644,7 +11650,8 @@ static void resid_report(void)
 static void resid_report(void) { }
 #endif
 
-static void run_process(rt_model_t *m, rt_proc_t *proc)
+__attribute__((always_inline))
+inline static void run_process(rt_model_t *m, rt_proc_t *proc)
 {
    TRACE("run %sprocess %s", *mptr_get(proc->privdata) ? "" :  "stateless ",
          istr(proc->name));
@@ -16828,6 +16835,7 @@ static inline void run_procq(rt_model_t *m, deferq_t *dq)
 // the following delta) sample fully settled values — the glitch-free
 // semantics the user's doctrine calls for.  Non-comb / unleveled tasks run
 // FIFO exactly as before.
+__attribute__((noinline, cold))
 static void aj_sweep_flush(rt_model_t *m)
 {
    extern int g_aj_phase;
@@ -16858,6 +16866,7 @@ static void aj_sweep_flush(rt_model_t *m)
    m->trigger_epoch++;
 }
 
+__attribute__((noinline, cold))
 static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
 {
    // t=0 settles via the classic delta machinery: the initial X-resolve of
@@ -17126,7 +17135,8 @@ static void aj_sweep_run(rt_model_t *m, deferq_t *dq)
 // maturation, driving/effective heaps, implicit signals, banked flip,
 // trigger filtering).  Runs inline by default; under NVC_TWO_PHASE=2 it
 // runs on the dedicated U thread pinned to a different physical core.
-static void update_phase(rt_model_t *m)
+__attribute__((always_inline))
+inline static void update_phase(rt_model_t *m)
 {
    { extern int g_aj_phase; g_aj_phase = 1; }
    if (m->driverq.count > 0) {
@@ -17913,7 +17923,10 @@ fastclk_done:;
       const unsigned depth = m->next_procq.count;
       const int b = prof_bucket(depth);
       const uint64_t t0 = get_timestamp_ns();
-      aj_sweep_run(m, &m->next_procq);
+      if (likely(!g_lv_sweep))
+         run_procq(m, &m->next_procq);
+      else
+         aj_sweep_run(m, &m->next_procq);
       const uint64_t dt = get_timestamp_ns() - t0;
       m->prof_deltas++;
       m->prof_activations += depth;
@@ -17921,6 +17934,8 @@ fastclk_done:;
       m->prof_depth_hist[b]++;
       m->prof_depth_ns[b] += dt;
    }
+   else if (likely(!g_lv_sweep))
+      run_procq(m, &m->next_procq);
    else
       aj_sweep_run(m, &m->next_procq);
 
