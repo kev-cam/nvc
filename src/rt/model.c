@@ -15812,7 +15812,11 @@ static void notify_event_default(rt_model_t *m, rt_nexus_t *n)
    wakeup_all(m, &(n->pending));
 }
 
-static void notify_event(rt_model_t *m, rt_nexus_t *n)
+// notify_event's debug hooks (AJ_EVDBG watch list + AJ_EVNX pointer match),
+// OUTLINED: their statics and stack frame taxed every event even with both
+// features off — part of the 0fb34b0c9 inline-budget regression.
+__attribute__((noinline, cold))
+static void notify_event_debug(rt_model_t *m, rt_nexus_t *n)
 {
    // AJ_EVDBG=<substr>: print signal events (name, time, delta, first value
    // byte) for names containing <substr> — the delta-census diagnostic that
@@ -15843,6 +15847,16 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
                    db != NULL ? (unsigned)db[0] : 999);
         }
      } }
+}
+
+static int g_aj_evnx_env = -1;   // AJ_EVNX set? (checked once)
+
+static void notify_event(rt_model_t *m, rt_nexus_t *n)
+{
+   if (unlikely(g_aj_evnx_env < 0))
+      g_aj_evnx_env = getenv("AJ_EVNX") != NULL;
+   if (unlikely(g_lv_evnxn != 0 || g_aj_evnx_env))
+      notify_event_debug(m, n);
    { static const char *_ev = NULL; static int _evi = -1;
      if (_evi < 0) { _ev = getenv("AJ_EVDBG"); _evi = _ev ? 1 : 0; }
      if (_evi && n->signal != NULL && n->signal->where != NULL) {
@@ -15888,10 +15902,13 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    if (n->flags & NET_F_CACHE_EVENT)
       n->signal->shared.flags |= SIG_F_EVENT_FLAG;
 
-   extern rt_nexus_t *g_aj_notify_nexus;
-   g_aj_notify_nexus = n;
+   { extern rt_nexus_t *g_aj_notify_nexus;
+     static int _wd = -1;
+     if (unlikely(_wd < 0)) _wd = getenv("AJ_WAKEDBG") != NULL;
+     if (unlikely(_wd)) g_aj_notify_nexus = n; }
    n->vtable->notify(m, n);
-   g_aj_notify_nexus = NULL;
+   { extern rt_nexus_t *g_aj_notify_nexus;
+     g_aj_notify_nexus = NULL; }
 }
 rt_nexus_t *g_aj_notify_nexus = NULL;
 // Engine phase at notify time (diagnostic): 1=boundary driverq,
@@ -16179,15 +16196,16 @@ static void update_driving(rt_model_t *m, rt_nexus_t *n, bool safe)
       const bool update_outputs = !!(n->flags & NET_F_EFFECTIVE)
          || (n->event_delta == m->iteration && n->last_event == m->now);
 
-      for (int _k = 0; _k < g_lv_evnxn; _k++) {
-         if (g_lv_evnx[_k] != n) continue;
-         fprintf(stderr, "#UO %s t=%llu d=%u gate=%d nouts=%d\n",
-                 (n->signal != NULL && n->signal->where != NULL)
-                    ? istr(tree_ident(n->signal->where)) : "?",
-                 (unsigned long long)m->now, m->iteration,
-                 (int)update_outputs, n->outputs != NULL);
-         break;
-      }
+      if (unlikely(g_lv_evnxn != 0))
+         for (int _k = 0; _k < g_lv_evnxn; _k++) {
+            if (g_lv_evnx[_k] != n) continue;
+            fprintf(stderr, "#UO %s t=%llu d=%u gate=%d nouts=%d\n",
+                    (n->signal != NULL && n->signal->where != NULL)
+                       ? istr(tree_ident(n->signal->where)) : "?",
+                    (unsigned long long)m->now, m->iteration,
+                    (int)update_outputs, n->outputs != NULL);
+            break;
+         }
 
       if (update_outputs) {
          for (rt_source_t *o = n->outputs; o; o = o->chain_output) {
