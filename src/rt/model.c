@@ -8148,6 +8148,17 @@ static bool emit_subtree_v(rt_scope_t *scope, FILE *f,
 {
    if (scope->kind == SCOPE_INSTANCE && scope->where != NULL) {
       tree_t r = aj_scope_ref(scope);
+      tree_t vblock = scope->where;
+      if (r != NULL && tree_kind(r) != T_ARCH) {
+         // Component wrapper scope: name and emit via the bound arch
+         // (vhdl2vlog_comp_inner — the module emitter makes the same
+         // substitution, and the instance site emits the same name).
+         tree_t cin = vhdl2vlog_comp_inner(scope->where);
+         if (cin != NULL) {
+            r = tree_ref(tree_decl(cin, 0));
+            vblock = cin;
+         }
+      }
       if (r != NULL) {
          tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
          // Dedup by the per-(entity,generics) VARIANT name, not the entity ident,
@@ -8155,7 +8166,7 @@ static bool emit_subtree_v(rt_scope_t *scope, FILE *f,
          // PER width (matching what emit_stmt instantiates from the same block).
          char mod[320];
          snprintf(mod, sizeof mod, "%s",
-                  vhdl2vlog_variant_name(tree_ident(ent), scope->where));
+                  vhdl2vlog_variant_name(tree_ident(ent), vblock));
          ident_t key = ident_new(mod);
          bool dup = false;
          for (int i = 0; i < *nseen; i++)
@@ -18135,11 +18146,22 @@ static int v2v_walk(rt_scope_t *scope, FILE *f, ident_t *seen, int *nseen,
    int fails = 0;
    if (scope->kind == SCOPE_INSTANCE && scope->where != NULL) {
       tree_t r = aj_scope_ref(scope);
+      tree_t vblock = scope->where;
+      if (r != NULL && tree_kind(r) != T_ARCH) {
+         // Component wrapper scope: name and emit via the bound arch
+         // (vhdl2vlog_comp_inner — the module emitter makes the same
+         // substitution, and the instance site emits the same name).
+         tree_t cin = vhdl2vlog_comp_inner(scope->where);
+         if (cin != NULL) {
+            r = tree_ref(tree_decl(cin, 0));
+            vblock = cin;
+         }
+      }
       if (r != NULL) {
          tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
          char mod[320];
          snprintf(mod, sizeof mod, "%s",
-                  vhdl2vlog_variant_name(tree_ident(ent), scope->where));
+                  vhdl2vlog_variant_name(tree_ident(ent), vblock));
          ident_t key = ident_new(mod);
          bool dup = false;
          for (int i = 0; i < *nseen; i++)

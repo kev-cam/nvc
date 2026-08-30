@@ -2070,6 +2070,22 @@ static void emit_stmt(FILE *f, tree_t s)
          tree_t ref  = (hier != NULL && tree_kind(hier) == T_HIER)
                        ? tree_ref(hier) : NULL;
          if (ref == NULL || tree_kind(ref) != T_ARCH) {
+            // Component wrapper: look through to the bound arch and emit the
+            // instance directly.  Positional actuals come from THIS block's
+            // params (component-port order); vhdl2vlog_comp_inner guarantees
+            // the entity's port order matches, and vhdl2vlog_module names/
+            // emits the same inner block, so the flatten resolves.
+            tree_t cin = vhdl2vlog_comp_inner(s);
+            if (cin != NULL) {
+               tree_t cih = tree_decl(cin, 0);
+               tree_t cent = tree_primary(tree_ref(cih));
+               fprintf(f, "  %s %s ",
+                       vhdl2vlog_variant_name(tree_ident(cent), cin),
+                       vid(tree_ident(s)));
+               emit_portmap(f, s);
+               fputs(";\n", f);
+               break;
+            }
             // The marker below prints tree_kind(hier), which is ALWAYS T_HIER,
             // so it cannot say WHICH construct declined -- component
             // instantiation, for-generate, if-generate, case-generate and a
@@ -2663,9 +2679,54 @@ static void emit_proc_locals(FILE *f, tree_t s, char seen[][64], int *nseen)
 // per-(entity,generics) name emit_subtree_v gives the child's definition, so
 // width-variants stay distinct and the flatten resolves. (vid() = instance LABEL
 // only, not the module reference.)
+tree_t vhdl2vlog_comp_inner(tree_t block)
+{
+   if (tree_kind(block) != T_BLOCK || tree_decls(block) == 0)
+      return NULL;
+   tree_t hier = tree_decl(block, 0);
+   if (tree_kind(hier) != T_HIER)
+      return NULL;
+   tree_t comp = tree_ref(hier);
+   if (comp == NULL || tree_kind(comp) != T_COMPONENT)
+      return NULL;
+   if (tree_stmts(block) != 1)
+      return NULL;
+   tree_t inner = tree_stmt(block, 0);
+   if (tree_kind(inner) != T_BLOCK || tree_decls(inner) == 0)
+      return NULL;
+   tree_t ih = tree_decl(inner, 0);
+   if (tree_kind(ih) != T_HIER)
+      return NULL;
+   tree_t ref = tree_ref(ih);
+   if (ref == NULL || tree_kind(ref) != T_ARCH)
+      return NULL;
+   // Positional-connection soundness: instances emit POSITIONAL actuals in
+   // the outer (component-port) order, and the module emits the entity's
+   // ports — the two orders must correspond.  Default binding is by NAME,
+   // so require the same names in the same order; anything else declines
+   // back to the old behaviour.
+   tree_t ent = tree_primary(ref);
+   if (tree_ports(comp) != tree_ports(ent))
+      return NULL;
+   for (int i = 0; i < tree_ports(comp); i++)
+      if (tree_ident(tree_port(comp, i)) != tree_ident(tree_port(ent, i)))
+         return NULL;
+   return inner;
+}
+
 bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
 {
    g_unhandled = 0;
+
+   // A component wrapper block is transparent: translate the bound arch.
+   // Without this the wrapper emitted as a module whose only statement was
+   // an instance of ITSELF (ports+hoisted regs, no logic) and the arch body
+   // was never emitted at all (ITC b17/b22, any component+configuration
+   // design).
+   {  tree_t inner = vhdl2vlog_comp_inner(block);
+      if (inner != NULL)
+         block = inner;
+   }
 
    // Decline non-synthesizable modules up front (see block_types_synth): a wrong
    // but parseable model would silently corrupt results.
