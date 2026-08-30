@@ -2179,6 +2179,12 @@ struct _aj_chunk {
    uint64_t         ck_flip_now;     // timestep whose fall already flipped (+1)
    rt_signal_t     *primary_ck;      // bindtab[4] clock's signal (edge arming)
    const uint8_t   *rst_data;        // NVC_ACCEL_RST_HOLD: reset pin live bytes
+   rt_signal_t     *rst_sig;         //   reset signal (root if found) — the
+                                     //   chunk SUBSCRIBES to it like a clock:
+                                     //   an async-reset assert between edges
+                                     //   must wake the chunk or reset-cleared
+                                     //   outputs stay stale for a full cycle
+                                     //   (b06 cc_mux, TB rst re-pulse at 513)
    bool             rst_low;         //   active-low (pin name ends _l/_n/_b)
    bool             rst_released;    //   sticky: deassert seen, pass-through
    void           (*set_clklast)(void *, unsigned char);
@@ -2722,8 +2728,10 @@ static void aj_proc_eval(rt_model_t *m, rt_proc_t *proc)
    // does, and the bridge needs it for deposit_signal()/AJ_OUT), run the chunk.
    aj_chunk_t *chunk = (aj_chunk_t *)proc->vtable;
    if (unlikely(getenv("NVC_ACCEL_CKSUB_DBG") != NULL)) {
-      static uint64_t _n = 0;
-      if (_n++ < 8)
+      static uint64_t _n = 0, _max = 0;
+      if (_max == 0)
+         _max = MAX(8, atoll(getenv("NVC_ACCEL_CKSUB_DBG")));
+      if (_n++ < _max)
          notef("accel-jit: aj_proc_eval wake #%"PRIu64" chunk=%s t=%"PRIu64
                " delta=%u", _n, chunk->rs_top ? chunk->rs_top : "?",
                (uint64_t)m->now, (unsigned)m->iteration);
@@ -3537,6 +3545,27 @@ static void aj_out(int ord, void *sigp, const void *buf, int width, int posedge)
          for (int k = 0; k < aj_npub; k++) {
             if (_st2) aj_stage2_cancel(aj_pub[k]);  // newer value wins
             deposit_signal(m, aj_pub[k], buf, 0, width);
+            // Newer value wins for the NBA channel too: an edge push from an
+            // EARLIER delta of this timestep may sit queued as a nonblock
+            // pseudo-source that commits at the END of the timestep — AFTER
+            // this immediate deposit — resurrecting the pre-reset value
+            // (b06 rst re-pulse: edge captures 11 at d1 via NBA, the async
+            // reset clear deposits 00 at d2, the NBA commit re-publishes 11).
+            // Interp's own driver sequence supersedes within the timestep;
+            // mirror that by refreshing any QUEUED deposit source's value in
+            // place (never queueing a new one).
+            {  rt_nexus_t *n2 = &(aj_pub[k]->nexus);
+               const char *vp = buf;
+               for (size_t left = width; left > 0 && n2 != NULL;
+                    n2 = n2->chain) {
+                  left -= n2->width;
+                  for (rt_source_t *s2 = &(n2->sources); s2 != NULL;
+                       s2 = s2->chain_input)
+                     if (s2->tag == SOURCE_DEPOSIT && s2->pseudoqueued)
+                        copy_value_ptr(n2, &(s2->u.pseudo.value), vp);
+                  vp += (size_t)n2->width * n2->size;
+               }
+            }
          }
       }
    }
@@ -3901,10 +3930,30 @@ static void aj_subscribe_clocks(rt_model_t *m, aj_chunk_t *chunk)
    // one of them runs aj_proc_eval for this chunk.
    rt_wakeable_t *obj = &(chunk->rr_saved[0].proc->wakeable);
    if (getenv("NVC_ACCEL_CKSUB_DBG") != NULL)
-      notef("accel-jit: cksub '%s': %d clock sig(s)",
-            chunk->rs_top != NULL ? chunk->rs_top : "?", chunk->n_ck_sigs);
-   for (int k = 0; k < chunk->n_ck_sigs; k++) {
-      rt_signal_t *sig = chunk->ck_sigs[k];
+      notef("accel-jit: cksub '%s': %d clock sig(s)%s",
+            chunk->rs_top != NULL ? chunk->rs_top : "?", chunk->n_ck_sigs,
+            chunk->rst_sig != NULL ? " +rst" : "");
+   // Clocks, plus the identified reset pin: an ASYNC reset assert between
+   // clock edges must wake the chunk — the netlist's $adff arst branch only
+   // clears state when an eval actually runs.  Without this the reset-time
+   // publication is missing and every reset-cleared output holds its
+   // edge-captured value for a full cycle (b06: interp cc_mux=00 vs accel 11
+   // at the sample after the TB's rst re-pulse; VERIFY clean, DRIVING wrong).
+   // Reset transitions are rare, so the extra wakes cost nothing; the
+   // per-delta dedup and output change-detection make them idempotent.
+   //
+   // The subscribed wakeable must be able to take a QUEUED wake: fastclk
+   // members short-circuit in wakeup_one (latched for the posedge table,
+   // which only dispatches on clock activity), so a reset-event wake on a
+   // fastclk member is silently swallowed — evict it from fastclk first
+   // (correctness-preserving; the chunk merely loses one member's table
+   // dispatch, and only when an async-reset pin was identified).
+   if (chunk->rst_sig != NULL)
+      aj_fastclk_evict(m, obj, "async-reset subscription");
+   const int nsub = chunk->n_ck_sigs + (chunk->rst_sig != NULL ? 1 : 0);
+   for (int k = 0; k < nsub; k++) {
+      rt_signal_t *sig = k < chunk->n_ck_sigs ? chunk->ck_sigs[k]
+                                              : chunk->rst_sig;
       rt_nexus_t *n = &(sig->nexus);
       for (unsigned nx = 0; nx < sig->n_nexus; nx++, n = n->chain) {
          sched_event(m, &(n->pending), obj);
@@ -7085,6 +7134,13 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                   rr = aj_rst_root_find(m->root, "reset", chunk->rst_low, 3);
                chunk->rst_data = rr != NULL
                   ? (const uint8_t *)rr->shared.data : pins[i].data;
+               // Subscribe the PIN-side signal, not the root: the bridge's
+               // input repack reads the pin rim, whose bytes land one port-
+               // propagation delta AFTER the root's event — a root wake
+               // arrives in the same delta as the clock wake (dedup eats it)
+               // and the eval reads a stale rim. The subscription helper
+               // chases rim->root itself, so both sides are covered.
+               chunk->rst_sig = pins[i].sig != NULL ? pins[i].sig : rr;
                if (aj_rst_hold())
                   notef("accel-jit: RST_HOLD arm pin '%s' (%s) anchor=%s",
                         pins[i].name, chunk->rst_low ? "low" : "high",
@@ -9241,6 +9297,13 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // that installed and drove perfectly was still scored as "declined".
       notef("accel-jit: ACTIVE — '%s' subtree rerouted to native model "
             "(accel installed)", top);
+      // The quench/driver-sync pass at model_run start saw ZERO chunks in the
+      // lazy-JIT flow (this install runs later), so out_drv was never built:
+      // an off-edge publication (async reset clear — the b06 rst re-pulse)
+      // deposits effective bytes the output-port hop never reads, and the
+      // consumer holds the edge value for a full cycle.  Run the pass now —
+      // it is one-shot-guarded and returns early when it already ran.
+      aj_quench_rerouted_drivers(m);
       // Dead-output pruning: an output whose consumer-visible nexus has NO
       // readers (empty pending list — wave watchers and processes both live
       // there — and no downstream port) is never observed; clear its bit in
