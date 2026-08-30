@@ -496,12 +496,21 @@ static void mem_scan_cb(tree_t t, void *ctx)
       // to per-word writes at emission) -- count it so it does not read as a
       // disqualifying bare ref (ITC b15's InstQueue reset)
       tree_t tg = tree_target(t);
-      if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+      // T_SIGNAL_ASSIGN keeps its value inside a waveform — tree_value()
+      // directly on it is a FATAL object lookup, and this scan runs as a
+      // translatability PROBE, which must decline, never kill the sim (the
+      // NBA-shadow commit `mem <= v_nba_mem` walked straight into this).
+      tree_t val = NULL;
+      if (k == T_VAR_ASSIGN)
+         val = tree_value(t);
+      else if (tree_waveforms(t) > 0 && tree_has_value(tree_waveform(t, 0)))
+         val = tree_value(tree_waveform(t, 0));
+      if (val != NULL && tree_kind(tg) == T_REF && tree_has_ref(tg)
           && tree_ref(tg) == sc->decl
-          && tree_kind(tree_value(t)) == T_AGGREGATE) {
+          && tree_kind(val) == T_AGGREGATE) {
          bool allpos = true;
-         for (int i = 0; i < tree_assocs(tree_value(t)); i++)
-            if (tree_subkind(tree_assoc(tree_value(t), i)) != A_POS)
+         for (int i = 0; i < tree_assocs(val); i++)
+            if (tree_subkind(tree_assoc(val, i)) != A_POS)
                allpos = false;
          if (allpos) sc->agg++;
       }
@@ -1674,7 +1683,19 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
              && sig_is_mem(tree_ref(tg0))) {
             unsigned mnw, mew;
-            tree_t v0 = tree_value(s);
+            // signal assigns keep the value in a waveform; tree_value(s)
+            // directly is a FATAL object lookup (same class as mem_scan_cb)
+            tree_t v0 = NULL;
+            if (tree_kind(s) == T_VAR_ASSIGN)
+               v0 = tree_value(s);
+            else if (tree_waveforms(s) > 0
+                     && tree_has_value(tree_waveform(s, 0)))
+               v0 = tree_value(tree_waveform(s, 0));
+            if (v0 == NULL) {
+               DECLINE("memory-whole-array-assign");
+               fprintf(f, "  /*?memagg*/\n");
+               break;
+            }
             if (mem_shape(tree_type(tree_ref(tg0)), &mnw, &mew)
                 && tree_kind(v0) == T_AGGREGATE
                 && (unsigned)tree_assocs(v0) == mnw) {
