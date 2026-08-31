@@ -19,6 +19,7 @@ typedef struct {
                   const char *y, int is_signed);
    int (*cell_mux)(const char *name, const char *a, const char *b,
                    const char *s, const char *y);
+   int (*cell_inst)(const char *type, const char *name, const char *conns);
    int (*proc)(const char *name);
    int (*sync)(const char *edge, const char *sig);
    int (*sync_assign)(const char *lhs, const char *rhs);

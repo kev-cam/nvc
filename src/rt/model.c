@@ -1758,6 +1758,7 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
                   a->cell_bin     = dlsym(dl, "gsm_rtlil_cell_bin");
                   a->cell_un      = dlsym(dl, "gsm_rtlil_cell_un");
                   a->cell_mux     = dlsym(dl, "gsm_rtlil_cell_mux");
+                  a->cell_inst    = dlsym(dl, "gsm_rtlil_cell_inst");
                   a->proc         = dlsym(dl, "gsm_rtlil_proc");
                   a->sync         = dlsym(dl, "gsm_rtlil_sync");
                   a->sync_assign  = dlsym(dl, "gsm_rtlil_sync_assign");
@@ -1771,7 +1772,8 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
                   a->abort_session = dlsym(dl, "gsm_rtlil_abort");
                   g_gsm_rtlil_ok = a->begin && a->module && a->wire
                      && a->connect && a->cell_bin && a->cell_un
-                     && a->cell_mux && a->proc && a->sync && a->sync_assign
+                     && a->cell_mux && a->cell_inst
+                     && a->proc && a->sync && a->sync_assign
                      && a->case_assign && a->switch_begin && a->case_begin
                      && a->case_end && a->switch_end && a->content_hash
                      && a->synth && a->abort_session;
@@ -8069,6 +8071,104 @@ static bool emit_subtree_v(rt_scope_t *scope, FILE *f,
    return true;
 }
 
+// Direct-RTLIL twin of emit_subtree_v: same walk, same variant naming and
+// dedup, but each module is CONSTRUCTED through the gsm_rtlil_* builder
+// instead of emitted as Verilog text.  false = some module declined (the
+// caller falls back to the text path for the whole subtree).
+static bool aj_rtlil_subtree(const gsm_rtlil_api_t *api, rt_scope_t *scope,
+                             ident_t *seen, int *nseen, int maxseen)
+{
+   if (scope->kind == SCOPE_INSTANCE && scope->where != NULL) {
+      tree_t r = aj_scope_ref(scope);
+      tree_t vblock = scope->where;
+      if (r != NULL && tree_kind(r) != T_ARCH) {
+         tree_t cin = vhdl2vlog_comp_inner(scope->where);
+         if (cin != NULL) {
+            r = tree_ref(tree_decl(cin, 0));
+            vblock = cin;
+         }
+      }
+      if (r != NULL) {
+         tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
+         char mod[320];
+         snprintf(mod, sizeof mod, "%s",
+                  vhdl2vlog_variant_name(tree_ident(ent), vblock));
+         ident_t key = ident_new(mod);
+         bool dup = false;
+         for (int i = 0; i < *nseen; i++)
+            if (seen[i] == key) { dup = true; break; }
+         if (!dup) {
+            if (*nseen < maxseen) seen[(*nseen)++] = key;
+            if (!vhdl2rtlil_module(api, scope->where, mod))
+               return false;
+         }
+      }
+   }
+   for (int ci = 0; ci < scope->children.count; ci++)
+      if (!aj_rtlil_subtree(api, scope->children.items[ci], seen, nseen,
+                            maxseen))
+         return false;
+   return true;
+}
+
+// Fork-worker for the direct-RTLIL path: the CHILD walks the subtree on the
+// CoW-inherited elaborated tree, constructs the design through the builder
+// facade and synthesizes it — no Verilog parse.  Same deadline discipline as
+// aj_gsm_spawn (the child's own alarm).  Child exit codes: 0 = dutc written,
+// 3 = the walker declined (caller uses the text path), else as gsm.
+static pid_t aj_rtlil_spawn(rt_scope_t *scope, const char *dir,
+                            const char *top_mod, const char *dutc, int tmo_s)
+{
+   const gsm_rtlil_api_t *api = accel_gsm_rtlil_api();
+   if (api == NULL)
+      return -1;
+   fflush(stdout);
+   fflush(stderr);
+   const pid_t pid = fork();
+   if (pid != 0)
+      return pid;
+
+   // ---- child (no exec) ----
+   signal(SIGALRM, SIG_DFL);
+   sigset_t ss;
+   sigemptyset(&ss);
+   sigaddset(&ss, SIGALRM);
+   pthread_sigmask(SIG_UNBLOCK, &ss, NULL);
+   if (tmo_s > 0)
+      alarm(tmo_s);
+   if (getenv("GSM_TEST_SLEEP") != NULL)
+      sleep(atoi(getenv("GSM_TEST_SLEEP")));
+   if (dir != NULL && chdir(dir) != 0)
+      _exit(2);
+
+   if (api->begin(NULL) != 0)
+      _exit(2);
+   static ident_t seen[512];
+   int nseen = 0;
+   if (!aj_rtlil_subtree(api, scope, seen, &nseen, 512)) {
+      api->abort_session();
+      _exit(3);
+   }
+
+   char base[600], tmpc[620], nvctmp[630], label[340];
+   snprintf(base, sizeof base, "%.*s", (int)strlen(dutc) - 2, dutc);
+   snprintf(tmpc, sizeof tmpc, "%s_g%d.c", base, (int)getpid());
+   snprintf(nvctmp, sizeof nvctmp, "%s_g%d_nvc.c", base, (int)getpid());
+   snprintf(label, sizeof label, "rtlil:%s.v", top_mod);   // header label only
+
+   const char *args[3] = { label, top_mod, tmpc };
+   int rc = api->synth(3, args);
+   if (rc == 0 && rename(tmpc, dutc) != 0)
+      rc = 2;
+   if (rc == 0) {
+      char nvcfinal[620];
+      snprintf(nvcfinal, sizeof nvcfinal, "%s_nvc.c", base);
+      if (rename(nvctmp, nvcfinal) != 0)
+         { /* byproduct — absence must not fail the synth */ }
+   }
+   _exit(rc & 0xff);
+}
+
 // Cheap recursive instance count for a subtree (no translation). Used as a
 // PRE-gate before the expensive emit: instance count >= unique-module count
 // (nseen), so instances < min_mod implies the subtree is "too small" anyway.
@@ -8775,6 +8875,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    { struct stat gst;
      if (stat(aj_synth_tool(), &gst) == 0)
         vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
+   // NVC_ACCEL_RTLIL builds the netlist through the rtlil builder — the C
+   // is behaviorally equal but not byte-equal to the text path's, so keep
+   // the two configs in separate cache namespaces.
+   if (getenv("NVC_ACCEL_RTLIL") != NULL)
+      for (const char *p = "+rtlil"; *p; p++)
+         { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    // GSM_ICG2EN changes gsm's emitted netlist for the SAME sources: fold it
    // into the key so toggling the env cannot serve the other config's cache.
    { const char *icg = getenv("GSM_ICG2EN");
@@ -8927,7 +9033,42 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // libgsm.so uses the CLI command instead.
       int src = -1;
       bool forked = false;
-      if (getenv("GEN_STATEMACHINE") == NULL && accel_gsm_fn() != NULL) {
+
+      // NVC_ACCEL_RTLIL=1: try the direct-RTLIL builder first — the child
+      // walks the subtree and CONSTRUCTS the design (no Verilog parse).  A
+      // walker decline (exit 3) or failure falls back to the text path
+      // below; the text emission remains the cache key either way (the
+      // .v was already staged and hashed above).
+      if (getenv("NVC_ACCEL_RTLIL") != NULL
+          && getenv("GEN_STATEMACHINE") == NULL
+          && accel_gsm_rtlil_api() != NULL) {
+         const pid_t rp = aj_rtlil_spawn(scope, dir, top_mod, dutc, tmo_s);
+         if (rp > 0) {
+            notef("accel-jit: synth '%s' via rtlil builder (pid %d)",
+                  top, (int)rp);
+            int rst = 0;
+            while (waitpid(rp, &rst, 0) < 0 && errno == EINTR)
+               ;
+            if (WIFEXITED(rst) && WEXITSTATUS(rst) == 0
+                && access(dutc, F_OK) == 0) {
+               src = 0;
+               forked = true;
+            }
+            else if (WIFEXITED(rst) && WEXITSTATUS(rst) == 3)
+               notef("accel-jit: rtlil builder declined '%s' — text path",
+                     top);
+            else if (aj_synth_timed_out(rst)) {
+               src = rst;      // timeout: same degrade contract as the others
+               forked = true;
+            }
+            else
+               notef("accel-jit: rtlil builder failed for '%s' (status %d) — "
+                     "text path", top, rst);
+         }
+      }
+
+      if (!forked && getenv("GEN_STATEMACHINE") == NULL
+          && accel_gsm_fn() != NULL) {
          static char spawn_src[64][600];
          static char pbuf[256];
          const char *av[160];

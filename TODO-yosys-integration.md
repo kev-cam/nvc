@@ -122,7 +122,26 @@ Determine where the current looseness actually is:
       **Increment B plumbing (same session):** `src/gsm_rtlil.h`
       function-table header + model.c `accel_gsm_rtlil_api()` (probe
       resolves the full surface or returns NULL → text fallback).
-      **NEXT SESSION — the walker (`vhdl2rtlil_module`)**, planned:
+      **WALKER LANDED (same session, v1 subset): `vhdl2rtlil_module`**
+      in vhdl2vlog.c + `aj_rtlil_subtree`/`aj_rtlil_spawn` in model.c
+      behind `NVC_ACCEL_RTLIL=1` (folded into vhash — separate cache
+      namespace).  The fork child walks the CoW tree, constructs via
+      the builder, synthesizes — NO Verilog parse; any walker decline
+      exits 3 and the parent falls back to the text path.  **wide and
+      deep synthesize FULLY through the builder with checksums equal
+      to interp and byte-deterministic output across runs**; fsm
+      (T_CASE), arst (reset-value extraction), regf (indexed targets)
+      decline safely — those are the next construct increments, then
+      comb-of-clocked NBA idiom, functions, memories/$mem_v2.
+      Elaboration traps learned: concurrent assigns arrive as
+      one-assign PROCESSES (mirror the text path's lone-assign→assign
+      conversion); `&`-chains fold into A_CONCAT AGGREGATES; operator
+      FCALL result types are UNCONSTRAINED (derive width from
+      operands); folded_int on enum refs yields the enum POSITION
+      ('0'=2!) — decode literal idents, never trust the low bit; and
+      sigspec buffers must hold one char per BIT for wide literals.
+      opt_asserts check 12 gates full-coverage engagement on wide.
+      **Original walker plan (for the residual constructs):**
       lives in vhdl2vlog.c sharing its analysis helpers
       (build_reg_set/is_reg, clock_of/areset_of/edges_of, type_width,
       emitted_width, comp_inner, block_types_synth); the emission

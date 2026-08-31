@@ -3046,3 +3046,925 @@ bool vhdl2vlog(tree_t block, const char *modname, const char *path)
    fclose(f);
    return ok;
 }
+
+// ===========================================================================
+// vhdl2rtlil — the direct-RTLIL backend of the SAME tree walk
+// (TODO-yosys-integration.md §1; subset — anything it cannot express
+// declines the module and the caller falls back to the text path above.
+// It shares this file's analysis: build_reg_set/is_reg, clock_of/areset_of,
+// mem_shape/sig_is_mem, type_width/emitted_width, vid, comp_inner.)
+// ===========================================================================
+#include "gsm_rtlil.h"
+
+static const gsm_rtlil_api_t *g_r2 = NULL;   // active builder api
+static int  g_r2_tmp;                        // rx<N> expression temps
+static int  g_r2_fail;                       // decline counter
+static char g_r2_why[128];                   // first decline reason
+static const char *g_r2_site = "?";          // breadcrumb for declines
+
+#define R2_DECLINE(why) do {                                   \
+      if (g_r2_fail++ == 0)                                    \
+         snprintf(g_r2_why, sizeof g_r2_why, "%s@%s", (why),   \
+                  g_r2_site);                                  \
+   } while (0)
+
+// Expression sigspec strings: names, selects, sized constants, temp wire
+// names, or concats of those.  Binary literals spell one char per BIT, so
+// this bounds the widest expressible constant/concat; wider declines.
+#define R2_SPEC 4096
+
+static int r2_width(tree_t e)
+{
+   const int ew = emitted_width(e, 0);
+   if (ew > 0)
+      return ew;
+   type_t t = tree_type(e);
+   return type_const_bounds(t) ? (int)type_width(t) : -1;
+}
+
+// Constant expression -> sized sigspec literal ("8'd42" / "4'b01xz").
+static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
+{
+   // scalar enum bits FIRST: folded_int on a std_logic ref returns the enum
+   // POSITION, whose low bit coincidentally matches for 0/1/L/H but silently
+   // aliases X and Z — decode the literal character instead
+   if (tree_kind(e) == T_REF) {
+      const ident_t id = tree_has_ref(e) ? tree_ident(tree_ref(e))
+                                         : tree_ident(e);
+      const char c = ident_char(id, 1);
+      const char c0 = ident_char(id, 0);
+      if (c0 == '\'') {
+         if (c == '0' || c == 'L') { snprintf(out, sz, "1'b0"); return true; }
+         if (c == '1' || c == 'H') { snprintf(out, sz, "1'b1"); return true; }
+         return false;   // metavalue: same decline policy as the text path
+      }
+   }
+   int64_t iv;
+   if (folded_int(e, &iv)) {
+      int w = want_w > 0 ? want_w : r2_width(e);
+      if (w <= 0)
+         w = 32;
+      if (iv < 0) {   // two's complement within the width
+         if (w > 63)
+            return false;
+         iv &= (((int64_t)1 << w) - 1);
+      }
+      snprintf(out, sz, "%d'd%lld", w, (long long)iv);
+      return true;
+   }
+   if (tree_kind(e) == T_STRING) {
+      const int n = tree_chars(e);
+      if (n <= 0 || (size_t)n + 8 > sz)
+         return false;
+      char *p = out + snprintf(out, sz, "%d'b", n);
+      for (int i = 0; i < n; i++) {
+         const char c = ident_char(tree_ident(tree_ref(tree_char(e, i))), 1);
+         switch (c) {
+         case '0': case 'L': *p++ = '0'; break;
+         case '1': case 'H': *p++ = '1'; break;
+         default: return false;   // metavalues: same policy as the text path
+         }
+      }
+      *p = '\0';
+      return true;
+   }
+   if (tree_kind(e) == T_AGGREGATE && tree_assocs(e) > 1) {
+      // all-positional aggregate of constant bits (how elaboration renders
+      // hex/bit-string literals in some positions) -> sized binary literal
+      const int n = tree_assocs(e);
+      if ((size_t)n + 8 > sz)
+         return false;
+      char *p = out + snprintf(out, sz, "%d'b", n);
+      for (int i = 0; i < n; i++) {
+         tree_t a = tree_assoc(e, i);
+         if (tree_subkind(a) != A_POS)
+            return false;
+         tree_t v = tree_value(a);
+         // ident decode FIRST: folded_int on a std_logic ref returns the
+         // ENUM POSITION ('0'=2, '1'=3), not the bit value
+         char c = 0;
+         if (tree_kind(v) == T_REF)
+            c = ident_char(tree_has_ref(v) ? tree_ident(tree_ref(v))
+                                           : tree_ident(v), 1);
+         int64_t bit;
+         if (c == '0' || c == 'L') *p++ = '0';
+         else if (c == '1' || c == 'H') *p++ = '1';
+         else if (c == 0 && folded_int(v, &bit) && (bit == 0 || bit == 1))
+            *p++ = bit ? '1' : '0';
+         else
+            return false;
+      }
+      *p = '\0';
+      return true;
+   }
+   if (tree_kind(e) == T_AGGREGATE && tree_assocs(e) == 1) {
+      tree_t a = tree_assoc(e, 0);
+      if (tree_subkind(a) == A_OTHERS) {
+         int64_t bit;
+         const int w = want_w > 0 ? want_w : r2_width(e);
+         if (w <= 0)
+            return false;
+         tree_t v = tree_value(a);
+         char cb, c = 0;
+         if (tree_kind(v) == T_REF)
+            c = ident_char(tree_has_ref(v) ? tree_ident(tree_ref(v))
+                                           : tree_ident(v), 1);
+         if (c == '0' || c == 'L') cb = '0';
+         else if (c == '1' || c == 'H') cb = '1';
+         else if (c == 0 && folded_int(v, &bit) && (bit == 0 || bit == 1))
+            cb = bit ? '1' : '0';
+         else {
+            if (getenv("NVC_RTLIL_DEBUG") != NULL && tree_kind(v) == T_REF)
+               fprintf(stderr, "r2 others-ref ident='%s' hasref=%d refid='%s'\n",
+                       istr(tree_ident(v)), tree_has_ref(v),
+                       tree_has_ref(v) ? istr(tree_ident(tree_ref(v))) : "-");
+            return false;
+         }
+         if ((size_t)w + 8 > sz)
+            return false;
+         char *p = out + snprintf(out, sz, "%d'b", w);
+         for (int i = 0; i < w; i++)
+            *p++ = cb;
+         *p = '\0';
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool r2_expr(tree_t e, char *out, size_t sz);
+
+// Make a fresh temp wire of `width` bits; returns its name in out.
+static bool r2_temp(int width, char *out, size_t sz)
+{
+   if (width <= 0) {
+      R2_DECLINE("temp-width");
+      return false;
+   }
+   snprintf(out, sz, "rx%d", g_r2_tmp++);
+   return g_r2->wire(out, width, 0, NULL) == 0;
+}
+
+// Map the text path's Verilog operator string to a builder cell op.
+static const char *r2_binop(const char *vop)
+{
+   static const struct { const char *v, *b; } map[] = {
+      {"+","add"}, {"-","sub"}, {"*","mul"}, {"/","div"}, {"%","mod"},
+      {"&","and"}, {"|","or"}, {"^","xor"}, {"~^","xnor"},
+      {"==","eq"}, {"!=","ne"}, {"<","lt"}, {">","gt"},
+      {"<=","le"}, {">=","ge"}, {"<<","shl"}, {">>","shr"},
+      {NULL, NULL}
+   };
+   for (int i = 0; map[i].v != NULL; i++)
+      if (strcmp(map[i].v, vop) == 0)
+         return map[i].b;
+   return NULL;
+}
+
+static bool r2_is_onebit_op(const char *b)
+{
+   return strcmp(b, "eq") == 0 || strcmp(b, "ne") == 0
+      || strcmp(b, "lt") == 0 || strcmp(b, "gt") == 0
+      || strcmp(b, "le") == 0 || strcmp(b, "ge") == 0;
+}
+
+static bool r2_expr(tree_t e, char *out, size_t sz)
+{
+   if (g_r2_fail > 0)
+      return false;
+
+   switch (tree_kind(e)) {
+   case T_REF:
+      {
+         tree_t d = tree_has_ref(e) ? tree_ref(e) : NULL;
+         if (d != NULL && tree_kind(d) == T_CONST_DECL) {
+            if (tree_has_value(d) && r2_const(tree_value(d), out, sz, -1))
+               return true;
+            if (tree_has_value(d))
+               return r2_expr(tree_value(d), out, sz);
+            R2_DECLINE("const-ref");
+            return false;
+         }
+         if (r2_const(e, out, sz, -1))   // enum literals ('0','1',true,...)
+            return true;
+         if (d != NULL && (tree_kind(d) == T_SIGNAL_DECL
+                           || tree_kind(d) == T_PORT_DECL)) {
+            snprintf(out, sz, "%s", vid(tree_ident(e)));
+            return true;
+         }
+         R2_DECLINE("ref");
+         return false;
+      }
+
+   case T_LITERAL:
+   case T_STRING:
+   case T_AGGREGATE:
+      if (r2_const(e, out, sz, -1))
+         return true;
+      if (tree_kind(e) == T_AGGREGATE && tree_assocs(e) > 0) {
+         // elaboration folds `&` chains into concat-aggregates: build the
+         // verilog-order concat {e0, e1, ...} (first assoc = MSB end)
+         bool concat = true;
+         const int n = tree_assocs(e);
+         for (int i = 0; i < n; i++) {
+            const assoc_kind_t sk = tree_subkind(tree_assoc(e, i));
+            if (sk != A_CONCAT && sk != A_POS) {
+               concat = false;
+               break;
+            }
+         }
+         if (concat) {
+            size_t len = 0;
+            out[len++] = '{';
+            for (int i = 0; i < n; i++) {
+               char el[R2_SPEC];
+               if (!r2_expr(tree_value(tree_assoc(e, i)), el, sizeof el))
+                  return false;
+               const size_t need = strlen(el) + 2;
+               if (len + need + 2 >= sz) {
+                  R2_DECLINE("concat-size");
+                  return false;
+               }
+               if (i > 0)
+                  out[len++] = ',';
+               memcpy(out + len, el, strlen(el));
+               len += strlen(el);
+            }
+            out[len++] = '}';
+            out[len] = '\0';
+            return true;
+         }
+      }
+      {
+         char why[80];
+         if (tree_kind(e) == T_STRING && tree_chars(e) > 0)
+            snprintf(why, sizeof why, "literal(str n=%d c0=%c)",
+                     tree_chars(e),
+                     ident_char(tree_ident(tree_ref(tree_char(e, 0))), 1));
+         else if (tree_kind(e) == T_AGGREGATE && tree_assocs(e) > 0)
+            snprintf(why, sizeof why, "literal(agg n=%d sk0=%d vk0=%d)",
+                     tree_assocs(e),
+                     (int)tree_subkind(tree_assoc(e, 0)),
+                     (int)tree_kind(tree_value(tree_assoc(e, 0))));
+         else
+            snprintf(why, sizeof why, "literal(k=%d w=%d)",
+                     (int)tree_kind(e), r2_width(e));
+         R2_DECLINE(why);
+      }
+      return false;
+
+   case T_TYPE_CONV:
+   case T_QUALIFIED:
+   case T_INERTIAL:
+      return r2_expr(tree_value(e), out, sz);
+
+   case T_ARRAY_SLICE:
+      {
+         tree_t base = tree_value(e);
+         if (tree_kind(base) != T_REF) {
+            R2_DECLINE("slice-base");
+            return false;
+         }
+         tree_t r = tree_range(e, 0);
+         int64_t left, right;
+         if (!folded_int(tree_left(r), &left)
+             || !folded_int(tree_right(r), &right)) {
+            R2_DECLINE("slice-bounds");
+            return false;
+         }
+         const int64_t hi = left > right ? left : right;
+         const int64_t lo = left > right ? right : left;
+         snprintf(out, sz, "%s[%lld:%lld]", vid(tree_ident(base)),
+                  (long long)hi, (long long)lo);
+         return true;
+      }
+
+   case T_ARRAY_REF:
+      {
+         tree_t base = tree_value(e);
+         int64_t idx;
+         if (tree_kind(base) != T_REF || tree_params(e) != 1
+             || !folded_int(tree_value(tree_param(e, 0)), &idx)) {
+            R2_DECLINE("array-ref");
+            return false;
+         }
+         snprintf(out, sz, "%s[%lld]", vid(tree_ident(base)),
+                  (long long)idx);
+         return true;
+      }
+
+   case T_FCALL:
+      {
+         const char *fn = istr(tree_ident(e));
+         const int np = tree_params(e);
+
+         // transparent numeric_std/library identities (same set the text
+         // path prints verbatim)
+         if (np >= 1 && (strstr(fn, "UNSIGNED") || strstr(fn, "SIGNED")
+                         || strstr(fn, "STD_LOGIC_VECTOR")
+                         || strstr(fn, "TO_STDLOGICVECTOR")
+                         || strstr(fn, "unsigned")
+                         || strstr(fn, "std_logic_vector"))
+             && vlog_op(fn) == NULL && np == 1)
+            return r2_expr(tree_value(tree_param(e, 0)), out, sz);
+
+         // to_unsigned(<const>, <width>) -> sized literal
+         if (np == 2 && (strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned"))) {
+            int64_t v, w;
+            if (folded_int(tree_value(tree_param(e, 0)), &v)
+                && folded_int(tree_value(tree_param(e, 1)), &w)
+                && w > 0 && v >= 0) {
+               snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+               return true;
+            }
+            R2_DECLINE("to_unsigned");
+            return false;
+         }
+
+         const char *vop = vlog_op(fn);
+         if (vop != NULL && np == 2) {
+            if (strcmp(vop, "&") == 0 && !type_is_array(tree_type(e))) {
+               // scalar AND — fall through to cell path below
+            }
+            // VHDL "&" on arrays is CONCATENATION
+            if (strcmp(vop, "&") == 0 && type_is_array(tree_type(e))
+                && !type_is_array(tree_type(tree_value(tree_param(e, 0))))) {
+               // 1-bit & vector or similar odd shapes: decline for now
+            }
+         }
+         if (fn[0] == '"' && strcmp(fn, "\"&\"") == 0) {
+            // concatenation: {a, b}
+            char a[R2_SPEC], b[R2_SPEC];
+            if (!r2_expr(tree_value(tree_param(e, 0)), a, sizeof a)
+                || !r2_expr(tree_value(tree_param(e, 1)), b, sizeof b))
+               return false;
+            snprintf(out, sz, "{%s,%s}", a, b);
+            return true;
+         }
+         if (vop != NULL && np == 2) {
+            const char *bop = r2_binop(vop);
+            if (bop == NULL) {
+               R2_DECLINE("binop");
+               return false;
+            }
+            tree_t ea = tree_value(tree_param(e, 0));
+            tree_t eb = tree_value(tree_param(e, 1));
+            char a[R2_SPEC], b[R2_SPEC];
+            if (!r2_expr(ea, a, sizeof a) || !r2_expr(eb, b, sizeof b))
+               return false;
+            int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
+            if (w <= 0)
+               w = r2_width(ea);   // operator return types are unconstrained;
+            if (w <= 0)            // same-width operands carry the real width
+               w = r2_width(eb);
+            char y[R2_SPEC], cn[R2_SPEC + 8];
+            if (!r2_temp(w, y, sizeof y))
+               return false;
+            const int sg = type_is_signed(tree_type(ea))
+               || type_is_signed(tree_type(eb));
+            snprintf(cn, sizeof cn, "c%s", y);
+            if (g_r2->cell_bin(bop, cn, a, b, y, sg) != 0) {
+               R2_DECLINE("cell_bin");
+               return false;
+            }
+            snprintf(out, sz, "%s", y);
+            return true;
+         }
+         if (vop != NULL && np == 1) {
+            const char *uop = strcmp(vop, "~") == 0 ? "not"
+               : strcmp(vop, "-") == 0 ? "neg" : NULL;
+            if (uop == NULL) {
+               R2_DECLINE("unop");
+               return false;
+            }
+            char a[R2_SPEC];
+            tree_t ea = tree_value(tree_param(e, 0));
+            if (!r2_expr(ea, a, sizeof a))
+               return false;
+            int w = r2_width(e);
+            if (w <= 0)
+               w = r2_width(ea);
+            char y[R2_SPEC], cn[R2_SPEC + 8];
+            if (!r2_temp(w, y, sizeof y))
+               return false;
+            snprintf(cn, sizeof cn, "c%s", y);
+            if (g_r2->cell_un(uop, cn, a, y, 0) != 0) {
+               R2_DECLINE("cell_un");
+               return false;
+            }
+            snprintf(out, sz, "%s", y);
+            return true;
+         }
+         R2_DECLINE("fcall");
+         return false;
+      }
+
+   default:
+      R2_DECLINE("expr-kind");
+      return false;
+   }
+}
+
+// A 1-bit condition sigspec for `if`/ternary tests.
+static bool r2_cond(tree_t e, char *out, size_t sz)
+{
+   return r2_expr(e, out, sz);
+}
+
+// ---- process bodies as decision trees --------------------------------------
+
+typedef struct {
+   ident_t name;        // target signal ident
+   char    g0[80];      // hold-temp wire
+   char    spec[80];    // target sigspec (vid)
+   int     width;
+} r2_target_t;
+
+typedef struct {
+   r2_target_t t[64];
+   int         n;
+} r2_targets_t;
+
+static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
+{
+   for (int i = 0; i < ts->n; i++)
+      if (ts->t[i].name == id)
+         return &ts->t[i];
+   return NULL;
+}
+
+static void r2_collect_cb(tree_t t, void *ctx)
+{
+   r2_targets_t *ts = (r2_targets_t *)ctx;
+   if (tree_kind(t) != T_SIGNAL_ASSIGN)
+      return;
+   tree_t tg = tree_target(t);
+   if (tree_kind(tg) != T_REF || !tree_has_ref(tg))
+      return;
+   if (ts->n >= 64)
+      return;
+   ident_t id = tree_ident(tg);
+   if (r2_target(ts, id) != NULL)
+      return;
+   r2_target_t *n = &ts->t[ts->n++];
+   n->name = id;
+   snprintf(n->spec, sizeof n->spec, "%s", vid(id));
+   snprintf(n->g0, sizeof n->g0, "g0_%s", vid(id));
+   type_t ty = tree_type(tree_ref(tg));
+   n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
+}
+
+static bool r2_seq(tree_t list_of, r2_targets_t *ts);
+
+static bool r2_seq_one(tree_t s, r2_targets_t *ts)
+{
+   switch (tree_kind(s)) {
+   case T_WAIT:
+      return true;
+   case T_SIGNAL_ASSIGN:
+      {
+         tree_t tg = tree_target(s);
+         if (tree_kind(tg) != T_REF || !tree_has_ref(tg)) {
+            R2_DECLINE("assign-target");
+            return false;
+         }
+         r2_target_t *t = r2_target(ts, tree_ident(tg));
+         if (t == NULL) {
+            R2_DECLINE("target-miss");
+            return false;
+         }
+         if (tree_waveforms(s) < 1 || !tree_has_value(tree_waveform(s, 0))) {
+            R2_DECLINE("null-wave");
+            return false;
+         }
+         // constants first WITH the target's width for context (an
+         // others-aggregate has no self-width)
+         char v[R2_SPEC];
+         tree_t val = tree_value(tree_waveform(s, 0));
+         g_r2_site = "seq-assign";
+         if (!r2_const(val, v, sizeof v, t->width)
+             && !r2_expr(val, v, sizeof v))
+            return false;
+         return g_r2->case_assign(t->g0, v) == 0;
+      }
+   case T_IF:
+      {
+         // conds chain: nvc T_IF has conditions with values; mirror the text
+         // path's if/else-if chain as nested switches
+         const int nc = tree_conds(s);
+         int depth = 0;
+         bool ok = true;
+         for (int i = 0; i < nc && ok; i++) {
+            tree_t c = tree_cond(s, i);
+            if (tree_has_value(c)) {
+               char cs[R2_SPEC];
+               g_r2_site = "if-cond";
+               if (!r2_cond(tree_value(c), cs, sizeof cs)) { ok = false; break; }
+               if (g_r2->switch_begin(cs) != 0
+                   || g_r2->case_begin("1'b1") != 0) { ok = false; break; }
+               ok = r2_seq(c, ts);
+               if (!ok) break;
+               if (g_r2->case_end() != 0
+                   || g_r2->case_begin(NULL) != 0) { ok = false; break; }
+               depth++;
+            }
+            else {
+               // else arm: statements into the current default case
+               ok = r2_seq(c, ts);
+            }
+         }
+         for (int i = 0; i < depth; i++) {
+            if (g_r2->case_end() != 0 || g_r2->switch_end() != 0)
+               ok = false;
+         }
+         return ok && g_r2_fail == 0;
+      }
+   default:
+      R2_DECLINE("stmt-kind");
+      return false;
+   }
+}
+
+static bool r2_seq(tree_t list_of, r2_targets_t *ts)
+{
+   const int n = tree_stmts(list_of);
+   for (int i = 0; i < n; i++)
+      if (!r2_seq_one(tree_stmt(list_of, i), ts))
+         return false;
+   return true;
+}
+
+static bool r2_process(tree_t p0, int pidx)
+{
+   tree_t p = proc_body(p0);
+   tree_t body_if = NULL, sig[8], ifstmt = NULL;
+   bool pe[8];
+   int ne = 0;
+   tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
+   (void)clk;
+
+   if (clk == NULL) {
+      // The lone-signal-assign process is a CONTINUOUS assign (the same
+      // conversion the text path makes, keeping the target a wire).
+      tree_t only = NULL;
+      int cnt = 0;
+      const int nst = tree_stmts(p);
+      for (int i = 0; i < nst; i++) {
+         tree_t s = tree_stmt(p, i);
+         if (tree_kind(s) == T_WAIT)
+            continue;
+         only = s;
+         cnt++;
+      }
+      if (cnt == 1 && tree_kind(only) == T_SIGNAL_ASSIGN) {
+         tree_t tg = tree_target(only);
+         if (tree_kind(tg) != T_REF || !tree_has_ref(tg)
+             || tree_waveforms(only) < 1
+             || !tree_has_value(tree_waveform(only, 0))) {
+            R2_DECLINE("cont-assign");
+            return false;
+         }
+         type_t tty = tree_type(tree_ref(tg));
+         const int tw = type_const_bounds(tty) ? (int)type_width(tty) : -1;
+         char v[R2_SPEC];
+         tree_t val = tree_value(tree_waveform(only, 0));
+         if (!r2_const(val, v, sizeof v, tw)
+             && !r2_expr(val, v, sizeof v))
+            return false;
+         return g_r2->connect(vid(tree_ident(tg)), v) == 0;
+      }
+      // general comb process: decision tree + `always` sync.  The root
+      // action g0 = target mirrors read_verilog's $0 self-init: complete
+      // assignment optimizes the self arm away; incomplete assignment
+      // infers the same latch the text path would (and gsm declines it).
+      r2_targets_t cts = { .n = 0 };
+      tree_visit(p, r2_collect_cb, &cts);
+      if (cts.n == 0) {
+         R2_DECLINE("comb-empty");
+         return false;
+      }
+      char cpn[64];
+      snprintf(cpn, sizeof cpn, "p%d", pidx);
+      if (g_r2->proc(cpn) != 0)
+         return false;
+      for (int i = 0; i < cts.n; i++) {
+         if (cts.t[i].width <= 0) {
+            R2_DECLINE("target-width");
+            return false;
+         }
+         if (g_r2->wire(cts.t[i].g0, cts.t[i].width, 0, NULL) != 0
+             || g_r2->case_assign(cts.t[i].g0, cts.t[i].spec) != 0)
+            return false;
+      }
+      bool cok = r2_seq(p, &cts);
+      if (cok)
+         cok = g_r2->sync("always", NULL) == 0;
+      for (int i = 0; cok && i < cts.n; i++)
+         cok = g_r2->sync_assign(cts.t[i].spec, cts.t[i].g0) == 0;
+      return cok && g_r2_fail == 0;
+   }
+   if (ne != 1) {
+      R2_DECLINE("multi-edge");
+      return false;
+   }
+   tree_t rsig = NULL; bool rpe = false, rbefore = false;
+   tree_t rcond = (ifstmt != NULL)
+      ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
+   if (rcond != NULL && !rbefore) {
+      R2_DECLINE("reset-clk-priority");
+      return false;
+   }
+   // the tgt-vhdl NBA idiom (statements around the edge-if) is not in the
+   // subset yet — require the edge-if to be the only non-wait statement
+   {
+      const int np = tree_stmts(p);
+      for (int i = 0; i < np; i++) {
+         tree_t s = tree_stmt(p, i);
+         if (s != ifstmt && tree_kind(s) != T_WAIT) {
+            R2_DECLINE("proc-extra-stmt");
+            return false;
+         }
+      }
+   }
+
+   r2_targets_t ts = { .n = 0 };
+   tree_visit(p, r2_collect_cb, &ts);
+   if (ts.n == 0 || g_r2_fail > 0)
+      return g_r2_fail == 0;
+
+   char pn[64];
+   snprintf(pn, sizeof pn, "p%d", pidx);
+   if (g_r2->proc(pn) != 0)
+      return false;
+
+   for (int i = 0; i < ts.n; i++) {
+      if (ts.t[i].width <= 0) {
+         R2_DECLINE("target-width");
+         return false;
+      }
+      if (g_r2->wire(ts.t[i].g0, ts.t[i].width, 0, NULL) != 0
+          || g_r2->case_assign(ts.t[i].g0, ts.t[i].spec) != 0)
+         return false;
+   }
+
+   bool ok;
+   if (rcond != NULL) {
+      // async-reset form: level sync carries the reset values; the body
+      // branch builds the tree.  Reset branch must be const assigns.
+      ok = r2_seq(body_if, &ts);
+      if (ok) {
+         char es[R2_SPEC];
+         ok = r2_expr(sig[0], es, sizeof es)
+            && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
+         for (int i = 0; ok && i < ts.n; i++)
+            ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+      }
+      if (ok) {
+         char rs[R2_SPEC];
+         ok = r2_expr(rsig, rs, sizeof rs)
+            && g_r2->sync(rpe ? "level1" : "level0", rs) == 0;
+      }
+      if (ok) {
+         const int nr = tree_stmts(rcond);
+         for (int i = 0; ok && i < nr; i++) {
+            tree_t s = tree_stmt(rcond, i);
+            if (tree_kind(s) != T_SIGNAL_ASSIGN) { ok = false; break; }
+            tree_t tg = tree_target(s);
+            r2_target_t *t = (tree_kind(tg) == T_REF && tree_has_ref(tg))
+               ? r2_target(&ts, tree_ident(tg)) : NULL;
+            char v[R2_SPEC];
+            if (t == NULL || tree_waveforms(s) < 1
+                || !tree_has_value(tree_waveform(s, 0))
+                || !r2_const(tree_value(tree_waveform(s, 0)), v, sizeof v,
+                             t->width)) {
+               R2_DECLINE("arst-value");
+               ok = false;
+               break;
+            }
+            ok = g_r2->sync_assign(t->spec, v) == 0;
+         }
+      }
+   }
+   else {
+      ok = r2_seq(body_if, &ts);
+      if (ok) {
+         char es[R2_SPEC];
+         ok = r2_expr(sig[0], es, sizeof es)
+            && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
+         for (int i = 0; ok && i < ts.n; i++)
+            ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+      }
+   }
+   return ok && g_r2_fail == 0;
+}
+
+// ---- the module walk -------------------------------------------------------
+
+bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
+{
+   const gsm_rtlil_api_t *api = (const gsm_rtlil_api_t *)api_;
+   g_r2 = api;
+   g_r2_tmp = 0;
+   g_r2_fail = 0;
+   g_r2_why[0] = '\0';
+
+   {  tree_t inner = vhdl2vlog_comp_inner(block);
+      if (inner != NULL)
+         block = inner;
+   }
+   if (!block_types_synth(block))
+      return false;
+
+   build_reg_set(block);
+
+   // subset guards: no design functions, no hoisted process variables,
+   // no memory-shaped signals
+   const int ndecls = tree_decls(block);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) == T_FUNC_BODY && !fn_is_builtin(istr(tree_ident(d)))) {
+         R2_DECLINE("function");
+         return false;
+      }
+      if (tree_kind(d) == T_SIGNAL_DECL) {
+         unsigned nw, ew;
+         if (mem_shape(tree_type(d), &nw, &ew)) {
+            R2_DECLINE("memory");
+            return false;
+         }
+      }
+   }
+
+   if (api->module(modname) != 0)
+      return false;
+
+   // ports
+   const int nports = tree_ports(block);
+   for (int i = 0; i < nports; i++) {
+      tree_t pt = tree_port(block, i);
+      const port_mode_t mode = tree_subkind(pt);
+      const int dir = (mode == PORT_OUT || mode == PORT_INOUT
+                       || mode == PORT_BUFFER) ? 2 : 1;
+      type_t ty = tree_type(pt);
+      if (!type_const_bounds(ty)) {
+         R2_DECLINE("port-width");
+         return false;
+      }
+      if (api->wire(vid(tree_ident(pt)), (int)type_width(ty), dir, NULL) != 0)
+         return false;
+   }
+
+   // signals (with reg power-on init); undriven-initialized wires become
+   // connects of their initializer
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(block, i);
+      if (tree_kind(d) != T_SIGNAL_DECL)
+         continue;
+      type_t ty = tree_type(d);
+      if (!type_const_bounds(ty)) {
+         R2_DECLINE("sig-width");
+         return false;
+      }
+      const int w = (int)type_width(ty);
+      const bool is_r = is_reg(block, d);
+      char init[R2_SPEC];
+      const char *initbits = NULL;
+      char bits[R2_SPEC];
+      if (is_r && tree_has_value(d)) {
+         if (!r2_const(tree_value(d), init, sizeof init, w)) {
+            R2_DECLINE("reg-init");
+            return false;
+         }
+         const char *tick = strchr(init, '\'');
+         if (tick != NULL && tick[1] == 'b')
+            initbits = tick + 2;
+         else if (tick != NULL && tick[1] == 'd') {
+            // decimal init: render as binary MSB-first
+            long long v = atoll(tick + 2);
+            if (w > 63) { R2_DECLINE("init-wide"); return false; }
+            for (int b = 0; b < w; b++)
+               bits[b] = ((v >> (w - 1 - b)) & 1) ? '1' : '0';
+            bits[w] = '\0';
+            initbits = bits;
+         }
+      }
+      if (api->wire(vid(tree_ident(d)), w, 0, initbits) != 0)
+         return false;
+
+      const bool driven =
+         (g_reg_set  != NULL && hset_contains(g_reg_set,  tree_ident(d)))
+         || (g_conc_set != NULL && hset_contains(g_conc_set, tree_ident(d)));
+      if (!is_r && !driven && tree_has_value(d)) {
+         char v[R2_SPEC];
+         if (!r2_const(tree_value(d), v, sizeof v, w)) {
+            R2_DECLINE("wire-init");
+            return false;
+         }
+         if (api->connect(vid(tree_ident(d)), v) != 0)
+            return false;
+      }
+   }
+
+   // concurrent statements
+   const int nstmts = tree_stmts(block);
+   int pidx = 0;
+   for (int i = 0; i < nstmts && g_r2_fail == 0; i++) {
+      tree_t s = tree_stmt(block, i);
+      switch (tree_kind(s)) {
+      case T_SIGNAL_ASSIGN:
+         {
+            tree_t tg = tree_target(s);
+            if (tree_kind(tg) != T_REF || !tree_has_ref(tg)
+                || tree_waveforms(s) < 1
+                || !tree_has_value(tree_waveform(s, 0))) {
+               R2_DECLINE("conc-assign");
+               break;
+            }
+            type_t tty = tree_type(tree_ref(tg));
+            const int tw = type_const_bounds(tty) ? (int)type_width(tty) : -1;
+            char v[R2_SPEC];
+            tree_t val = tree_value(tree_waveform(s, 0));
+            if (!r2_const(val, v, sizeof v, tw)
+                && !r2_expr(val, v, sizeof v))
+               break;
+            if (api->connect(vid(tree_ident(tg)), v) != 0)
+               R2_DECLINE("connect");
+            break;
+         }
+      case T_PROCESS:
+         if (!r2_process(s, pidx++))
+            R2_DECLINE("process");
+         break;
+      case T_BLOCK:
+         {
+            // elaborated child instance — named actuals only (v1)
+            tree_t hier = tree_decls(s) > 0 ? tree_decl(s, 0) : NULL;
+            tree_t ref  = (hier != NULL && tree_kind(hier) == T_HIER)
+                          ? tree_ref(hier) : NULL;
+            if (ref == NULL || tree_kind(ref) != T_ARCH) {
+               R2_DECLINE("block-ref");
+               break;
+            }
+            tree_t ent = tree_primary(ref);
+            char conns[4096];
+            size_t cl = 0;
+            conns[0] = '\0';
+            const int nparams = tree_params(s);
+            bool ok = true;
+            for (int j = 0; j < nparams && ok; j++) {
+               tree_t pp = tree_param(s, j);
+               const char *formal = NULL;
+               if (tree_subkind(pp) == P_NAMED) {
+                  tree_t nm = tree_name(pp);
+                  if (tree_kind(nm) != T_REF) {
+                     R2_DECLINE("portmap-name");
+                     ok = false;
+                     break;
+                  }
+                  formal = vid(tree_ident(nm));
+               }
+               else {
+                  // positional (elaboration normalizes to this): the formal
+                  // is the child entity's port at this position
+                  if (j >= tree_ports(ent)) {
+                     R2_DECLINE("portmap-pos");
+                     ok = false;
+                     break;
+                  }
+                  formal = vid(tree_ident(tree_port(ent, j)));
+               }
+               tree_t v = tree_value(pp);
+               if (v == NULL || tree_kind(v) == T_OPEN)
+                  continue;
+               char av[R2_SPEC];
+               if (!r2_expr(v, av, sizeof av)) {
+                  ok = false;
+                  break;
+               }
+               cl += snprintf(conns + cl, sizeof conns - cl, "%s%s=%s",
+                              cl > 0 ? "," : "", formal, av);
+               if (cl >= sizeof conns - 1) {
+                  R2_DECLINE("portmap-size");
+                  ok = false;
+                  break;
+               }
+            }
+            if (ok && api->cell_inst(
+                   vhdl2vlog_variant_name(tree_ident(ent), s),
+                   vid(tree_ident(s)), conns) != 0)
+               R2_DECLINE("cell_inst");
+            break;
+         }
+      default:
+         R2_DECLINE("conc-kind");
+         break;
+      }
+   }
+
+   if (g_r2_fail > 0) {
+      warnf("vhdl2rtlil: '%s' declined (%s) — using the text path",
+            modname, g_r2_why);
+      return false;
+   }
+   return true;
+}

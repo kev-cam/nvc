@@ -9,6 +9,10 @@ bool vhdl2vlog(tree_t block, const char *modname, const char *path);
 // vhdl2vlog_variant_name() (per-(entity,generics)) so a subtree flatten resolves
 // and generic width-variants stay distinct.
 bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname);
+// direct-RTLIL backend of the same walk; api is a const gsm_rtlil_api_t*
+// (void* keeps this header free of gsm_rtlil.h).  false = declined —
+// fall back to the text path.
+bool vhdl2rtlil_module(const void *api, tree_t block, const char *modname);
 
 // Component-instantiation wrappers: elaboration wraps a bound entity in a
 // block whose T_HIER ref is the T_COMPONENT, with the entity's own block as
