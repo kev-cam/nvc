@@ -9061,6 +9061,15 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                src = 0;
                forked = true;
             }
+            else if (WIFEXITED(rst) && WEXITSTATUS(rst) == 1) {
+               // the WALK succeeded and gsm itself declined the chunk
+               // (comb-only, unhandled cell, ...) — deterministic: the text
+               // path would rebuild the equivalent design and decline
+               // identically, so don't pay for a second synth.  (On EH1a
+               // this was 17,717 wasted text forks per cold run.)
+               src = rst;
+               forked = true;
+            }
             else if (WIFEXITED(rst) && WEXITSTATUS(rst) == 3)
                notef("accel-jit: rtlil builder declined '%s' — text path",
                      top);

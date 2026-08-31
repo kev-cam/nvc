@@ -166,9 +166,29 @@ Determine where the current looseness actually is:
       value plane — a folded literal renders as (v&1), exactly the
       text path's emit_lit; metavalue init bits render 0 ({N{1'b0}}
       parity).  translated.sh asserts bchunk walks decline-free under
-      NVC_ACCEL_RTLIL=1.  Next: VeeR EH1a under the walker (the
-      census says 98.5% trivial-comb + this idiom = the register
-      story), dynamic vector part-select writes, latch declines stay.
+      NVC_ACCEL_RTLIL=1.  **VeeR EH1a CENSUS RUN (2026-08-31, whole-subtree admission,
+      SRAM-skip): TEST_PASSED cycles=1113 with the walker in the loop
+      — correctness invariant held at 19,093 subtree attempts.**
+      92.8% walked clean; the walked-clean chunks then hit gsm's OWN
+      admission declines (17,717 × rc=1, overwhelmingly sv_* comb-only
+      glue — correct), and a wasted text retry per clean decline was
+      removed (rc==1 from the rtlil child is FINAL — deterministic).
+      ZERO rtlil installs yet, and the census shows why in one number:
+      1,177 of 1,376 walker declines are `var-assign@if-cond` — the
+      rvclkhdr-family LATCH shape.  Every register-bearing subtree
+      contains a clock header, so THE unlock for VeeR is the
+      **persistent-variable/latch increment**: VHDL process variables
+      persist across activations, so a branch-written variable is
+      latch STATE — encode it as a pseudo-target (own wire + hold
+      temp + `always` sync → proc infers $dlatch exactly as
+      read_verilog does), with the trailing `sig <= var` copy becoming
+      sync_assign(sig, g0_var) (the hold temp IS the post-tree value).
+      That also puts walker-built designs in reach of GSM_ICG2EN's
+      latch→enable rewrite (shared pipeline) — the proven whole-core
+      path.  Remaining census tail: 135 multi-edge areset_of misses,
+      29+6 unfunneled process declines, 19 odd OTHERS literals
+      (T_REF via constant decls?), 3 portmap-size (grow conns
+      buffer), dynamic vector part-select writes.
       **FINDING (pre-existing, both paths): chunks whose bridge has 0
       inputs (clk-only designs like memagg/memrf) never install — the
       flow stops silently between bridge emission and the .so compile.
