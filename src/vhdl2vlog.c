@@ -3533,6 +3533,10 @@ static void r2_collect_cb(tree_t t, void *ctx)
    if (tree_kind(t) != T_SIGNAL_ASSIGN)
       return;
    tree_t tg = tree_target(t);
+   // a slice/indexed target contributes its BASE signal (the hold temp
+   // covers the whole vector; the branch assigns into a slice of it)
+   while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF)
+      tg = tree_value(tg);
    if (tree_kind(tg) != T_REF || !tree_has_ref(tg))
       return;
    if (ts->n >= 64)
@@ -3554,10 +3558,35 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
 {
    switch (tree_kind(s)) {
    case T_WAIT:
+   case T_NULL:
       return true;
    case T_SIGNAL_ASSIGN:
       {
          tree_t tg = tree_target(s);
+         // constant slice / bit target: assign into the hold temp's range
+         int64_t hi = -1, lo = -1;
+         if (tree_kind(tg) == T_ARRAY_SLICE) {
+            tree_t r = tree_range(tg, 0);
+            int64_t left, right;
+            if (!folded_int(tree_left(r), &left)
+                || !folded_int(tree_right(r), &right)) {
+               R2_DECLINE("target-slice-bounds");
+               return false;
+            }
+            hi = left > right ? left : right;
+            lo = left > right ? right : left;
+            tg = tree_value(tg);
+         }
+         else if (tree_kind(tg) == T_ARRAY_REF) {
+            int64_t idx;
+            if (tree_params(tg) != 1
+                || !folded_int(tree_value(tree_param(tg, 0)), &idx)) {
+               R2_DECLINE("target-index");
+               return false;
+            }
+            hi = lo = idx;
+            tg = tree_value(tg);
+         }
          if (tree_kind(tg) != T_REF || !tree_has_ref(tg)) {
             R2_DECLINE("assign-target");
             return false;
@@ -3567,6 +3596,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             R2_DECLINE("target-miss");
             return false;
          }
+         char lhs[96];
+         int vw = t->width;
+         if (hi >= 0) {
+            if (hi >= t->width) {
+               R2_DECLINE("target-range");
+               return false;
+            }
+            snprintf(lhs, sizeof lhs, "%s[%lld:%lld]", t->g0,
+                     (long long)hi, (long long)lo);
+            vw = (int)(hi - lo + 1);
+         }
+         else
+            snprintf(lhs, sizeof lhs, "%s", t->g0);
          if (tree_waveforms(s) < 1 || !tree_has_value(tree_waveform(s, 0))) {
             R2_DECLINE("null-wave");
             return false;
@@ -3576,10 +3618,10 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          char v[R2_SPEC];
          tree_t val = tree_value(tree_waveform(s, 0));
          g_r2_site = "seq-assign";
-         if (!r2_const(val, v, sizeof v, t->width)
+         if (!r2_const(val, v, sizeof v, vw)
              && !r2_expr(val, v, sizeof v))
             return false;
-         return g_r2->case_assign(t->g0, v) == 0;
+         return g_r2->case_assign(lhs, v) == 0;
       }
    case T_IF:
       {

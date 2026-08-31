@@ -133,9 +133,12 @@ Determine where the current looseness actually is:
       arst joined them the next day (T_CASE via multi-compare
       switch cases; conversion-stripping in the const extractor —
       reset values arrive as std_logic_vector(to_unsigned(C,W))).
-      regf declines on dynamic indexing = the $mem_v2 increment.
-      4 of 5 suite shapes now FULLY parse-free; next: the
-      comb-of-clocked NBA idiom (VeeR), functions, $mem_v2.
+      regf turned out to be constant SLICE
+      targets + `when others => null` (its 512-bit vector is flat, not
+      an array) — landed next: slice/bit lhs on the hold temp, T_NULL.
+      **ALL 5 suite shapes now FULLY parse-free.**  Next: the
+      comb-of-clocked NBA idiom (VeeR entry), functions, $mem_v2
+      (true array memories — the memagg fixture is the vehicle).
       Elaboration traps learned: concurrent assigns arrive as
       one-assign PROCESSES (mirror the text path's lone-assign→assign
       conversion); `&`-chains fold into A_CONCAT AGGREGATES; operator
