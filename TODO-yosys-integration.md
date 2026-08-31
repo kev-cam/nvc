@@ -129,10 +129,13 @@ Determine where the current looseness actually is:
       the builder, synthesizes — NO Verilog parse; any walker decline
       exits 3 and the parent falls back to the text path.  **wide and
       deep synthesize FULLY through the builder with checksums equal
-      to interp and byte-deterministic output across runs**; fsm
-      (T_CASE), arst (reset-value extraction), regf (indexed targets)
-      decline safely — those are the next construct increments, then
-      comb-of-clocked NBA idiom, functions, memories/$mem_v2.
+      to interp and byte-deterministic output across runs**; fsm and
+      arst joined them the next day (T_CASE via multi-compare
+      switch cases; conversion-stripping in the const extractor —
+      reset values arrive as std_logic_vector(to_unsigned(C,W))).
+      regf declines on dynamic indexing = the $mem_v2 increment.
+      4 of 5 suite shapes now FULLY parse-free; next: the
+      comb-of-clocked NBA idiom (VeeR), functions, $mem_v2.
       Elaboration traps learned: concurrent assigns arrive as
       one-assign PROCESSES (mirror the text path's lone-assign→assign
       conversion); `&`-chains fold into A_CONCAT AGGREGATES; operator

@@ -3085,6 +3085,40 @@ static int r2_width(tree_t e)
 // Constant expression -> sized sigspec literal ("8'd42" / "4'b01xz").
 static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
 {
+   // strip conversion wrappers: constants arrive as
+   // std_logic_vector(to_unsigned(<folded>, W)) and friends
+   for (;;) {
+      const tree_kind_t k = tree_kind(e);
+      if (k == T_TYPE_CONV || k == T_QUALIFIED || k == T_INERTIAL) {
+         e = tree_value(e);
+         continue;
+      }
+      if (k == T_FCALL) {
+         const char *fn = istr(tree_ident(e));
+         if (tree_params(e) == 2
+             && (strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned")
+                 || strstr(fn, "TO_SIGNED") || strstr(fn, "to_signed"))) {
+            int64_t v, w;
+            if (folded_int(tree_value(tree_param(e, 0)), &v)
+                && folded_int(tree_value(tree_param(e, 1)), &w)
+                && w > 0 && v >= 0) {
+               snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+               return true;
+            }
+            return false;
+         }
+         if (tree_params(e) == 1 && vlog_op(fn) == NULL
+             && (strstr(fn, "UNSIGNED") || strstr(fn, "SIGNED")
+                 || strstr(fn, "STD_LOGIC_VECTOR")
+                 || strstr(fn, "TO_STDLOGICVECTOR")
+                 || strstr(fn, "unsigned")
+                 || strstr(fn, "std_logic_vector"))) {
+            e = tree_value(tree_param(e, 0));
+            continue;
+         }
+      }
+      break;
+   }
    // scalar enum bits FIRST: folded_int on a std_logic ref returns the enum
    // POSITION, whose low bit coincidentally matches for 0/1/L/H but silently
    // aliases X and Z — decode the literal character instead
@@ -3577,6 +3611,66 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             if (g_r2->case_end() != 0 || g_r2->switch_end() != 0)
                ok = false;
          }
+         return ok && g_r2_fail == 0;
+      }
+   case T_CASE:
+      {
+         char sw[R2_SPEC];
+         tree_t cv = tree_value(s);
+         g_r2_site = "case-value";
+         if (!r2_expr(cv, sw, sizeof sw))
+            return false;
+         const int cw = r2_width(cv);
+         if (g_r2->switch_begin(sw) != 0)
+            return false;
+         const int nalt = tree_stmts(s);
+         bool ok = true;
+         for (int i = 0; i < nalt && ok; i++) {
+            tree_t alt = tree_stmt(s, i);
+            const int nch = tree_choices(alt);
+            char cmp[R2_SPEC];
+            size_t cl = 0;
+            bool others = false;
+            cmp[0] = '\0';
+            for (int j = 0; j < nch && ok; j++) {
+               tree_t c = tree_choice(alt, j);
+               if (tree_ranges(c) > 0) {
+                  R2_DECLINE("range-choice");
+                  ok = false;
+                  break;
+               }
+               if (!tree_has_name(c)) {   // `others`
+                  others = true;
+                  continue;
+               }
+               char one[R2_SPEC];
+               g_r2_site = "case-choice";
+               if (!r2_const(tree_name(c), one, sizeof one, cw)
+                   && !r2_expr(tree_name(c), one, sizeof one)) {
+                  ok = false;
+                  break;
+               }
+               cl += snprintf(cmp + cl, sizeof cmp - cl, "%s%s",
+                              cl > 0 ? ";" : "", one);
+               if (cl >= sizeof cmp - 1) {
+                  R2_DECLINE("choice-size");
+                  ok = false;
+                  break;
+               }
+            }
+            if (!ok)
+               break;
+            // an alternative that mixes values with `others` is just the
+            // default from the builder's perspective (matches text path's
+            // "<v>, default:")
+            const char *cc = (others || cl == 0) ? NULL : cmp;
+            if (g_r2->case_begin(cc) != 0) { ok = false; break; }
+            ok = r2_seq(alt, ts);
+            if (g_r2->case_end() != 0)
+               ok = false;
+         }
+         if (g_r2->switch_end() != 0)
+            ok = false;
          return ok && g_r2_fail == 0;
       }
    default:
