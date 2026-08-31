@@ -148,9 +148,27 @@ Determine where the current looseness actually is:
       real traffic) and opt_asserts 13's memrf fixture — where the
       oracle is a 100-cycle HARNESS DIFF of the two paths' generated C
       (clk-only chunks do not install into the sim: a pre-existing
-      quiet stop after bridge emission, see finding below).  Next: the
-      comb-of-clocked NBA idiom (VeeR entry), functions, dynamic
-      part-selects.
+      quiet stop after bridge emission, see finding below).  **NBA IDIOM LANDED (2026-08-31):** the tgt-vhdl register form
+      (shadow pre-copy / edge-if / wait-for-0 / commit / trailing
+      wait) walks parse-free — the shadow var is an ALIAS for the
+      hold temp (pre-copy IS the root action, commit IS the sync
+      assign, both elided); reset-edge sensitivity (falling_edge(rst)
+      or rising_edge(clk)) resolves via areset_of with the reset edge
+      subsumed by the level sync.  With it landed: T_DEPOSIT (comb
+      deposits), straight-line process-local variables by PURE
+      EXPRESSION SUBSTITUTION (the read_verilog technique; branch
+      writes decline), constant-range T_FOR unrolling with the index
+      substituted per iteration (sv_and's reduction loop walks), the
+      l3d vocabulary via the text path's own vlog_l3d_op table (+
+      l3d_bit_read/part_read as shr+select, ternary_*→mux, signed
+      relationals), cell_inst brace-aware conns (concat actuals), and
+      LOGIC3D CONSTANT DECODE: logic3d is natural 0..7 with bit0 =
+      value plane — a folded literal renders as (v&1), exactly the
+      text path's emit_lit; metavalue init bits render 0 ({N{1'b0}}
+      parity).  translated.sh asserts bchunk walks decline-free under
+      NVC_ACCEL_RTLIL=1.  Next: VeeR EH1a under the walker (the
+      census says 98.5% trivial-comb + this idiom = the register
+      story), dynamic vector part-select writes, latch declines stay.
       **FINDING (pre-existing, both paths): chunks whose bridge has 0
       inputs (clk-only designs like memagg/memrf) never install — the
       flow stops silently between bridge emission and the .so compile.

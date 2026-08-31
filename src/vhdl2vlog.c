@@ -3086,12 +3086,83 @@ static r2_mem_t *r2_mem_of(ident_t id)
    return NULL;
 }
 
+// Decode an enum-literal ident to '0'/'1'/'x' (or 0 = not a bit literal).
+// Two namings: character literals '0'/'1'/'L'/'H'/... and logic3d's NAMED
+// literals L3D_0/L3D_1/L3D_X/...
+static char r2_bit_of_ident(ident_t id)
+{
+   const char *n = istr(id);
+   char c = 0;
+   if (n[0] == '\'' && n[1] != '\0')
+      c = n[1];
+   else if (strncmp(n, "L3D_", 4) == 0)
+      c = n[4];
+   if (c == '0' || c == 'L') return '0';
+   if (c == '1' || c == 'H') return '1';
+   if (c == 'X' || c == 'U' || c == 'W' || c == '-' || c == 'Z') return 'x';
+   return 0;
+}
+
 static int r2_clog2(int n)
 {
    int b = 0;
    while ((1 << b) < n)
       b++;
    return b > 0 ? b : 1;
+}
+
+// NBA-shadow aliases for the CURRENT process (tgt-vhdl idiom): the shadow
+// variable v_nba_<r> is an alias for <r>'s hold temp — the pre-copy IS the
+// root action, the commit IS the sync assign, both elided.
+typedef struct { ident_t var; ident_t sig; tree_t sigdecl; bool committed; }
+   r2_alias_t;
+static r2_alias_t g_r2_alias[16];
+static int        g_r2_nalias;
+
+// straight-line process-local variables: pure expression SUBSTITUTION —
+// a write records the value's sigspec, a read returns it (the read_verilog
+// technique, flat only: writes inside a switch scope decline)
+typedef struct { ident_t var; char *spec; } r2_subst_t;
+static r2_subst_t g_r2_subst[32];
+static int        g_r2_nsubst;
+static int        g_r2_case_depth;   // >0 while inside any switch case
+
+static r2_subst_t *r2_subst_of(ident_t var)
+{
+   for (int i = 0; i < g_r2_nsubst; i++)
+      if (g_r2_subst[i].var == var)
+         return &g_r2_subst[i];
+   return NULL;
+}
+
+static void r2_subst_reset(void)
+{
+   for (int i = 0; i < g_r2_nsubst; i++)
+      free(g_r2_subst[i].spec);
+   g_r2_nsubst = 0;
+}
+
+static bool r2_subst_set(ident_t var, const char *spec)
+{
+   r2_subst_t *e = r2_subst_of(var);
+   if (e == NULL) {
+      if (g_r2_nsubst >= 32)
+         return false;
+      e = &g_r2_subst[g_r2_nsubst++];
+      e->var = var;
+      e->spec = NULL;
+   }
+   free(e->spec);
+   e->spec = xstrdup(spec);
+   return true;
+}
+
+static r2_alias_t *r2_alias_of(ident_t var)
+{
+   for (int i = 0; i < g_r2_nalias; i++)
+      if (g_r2_alias[i].var == var)
+         return &g_r2_alias[i];
+   return NULL;
 }
 
 static int r2_width(tree_t e)
@@ -3146,13 +3217,11 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
    if (tree_kind(e) == T_REF) {
       const ident_t id = tree_has_ref(e) ? tree_ident(tree_ref(e))
                                          : tree_ident(e);
-      const char c = ident_char(id, 1);
-      const char c0 = ident_char(id, 0);
-      if (c0 == '\'') {
-         if (c == '0' || c == 'L') { snprintf(out, sz, "1'b0"); return true; }
-         if (c == '1' || c == 'H') { snprintf(out, sz, "1'b1"); return true; }
-         return false;   // metavalue: same decline policy as the text path
-      }
+      const char b = r2_bit_of_ident(id);
+      if (b == '0') { snprintf(out, sz, "1'b0"); return true; }
+      if (b == '1') { snprintf(out, sz, "1'b1"); return true; }
+      if (b == 'x')
+         return false;   // metavalue in an EXPRESSION: decline (text parity)
    }
    int64_t iv;
    if (folded_int(e, &iv)) {
@@ -3173,11 +3242,13 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
          return false;
       char *p = out + snprintf(out, sz, "%d'b", n);
       for (int i = 0; i < n; i++) {
-         const char c = ident_char(tree_ident(tree_ref(tree_char(e, i))), 1);
+         const char c =
+            r2_bit_of_ident(tree_ident(tree_ref(tree_char(e, i))));
          switch (c) {
-         case '0': case 'L': *p++ = '0'; break;
-         case '1': case 'H': *p++ = '1'; break;
-         default: return false;   // metavalues: same policy as the text path
+         case '0': *p++ = '0'; break;
+         case '1': *p++ = '1'; break;
+         case 'x': *p++ = '0'; break;   // metavalue: text path renders 0
+         default: return false;
          }
       }
       *p = '\0';
@@ -3199,13 +3270,15 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
          // ENUM POSITION ('0'=2, '1'=3), not the bit value
          char c = 0;
          if (tree_kind(v) == T_REF)
-            c = ident_char(tree_has_ref(v) ? tree_ident(tree_ref(v))
-                                           : tree_ident(v), 1);
+            c = r2_bit_of_ident(tree_has_ref(v) ? tree_ident(tree_ref(v))
+                                                : tree_ident(v));
          int64_t bit;
-         if (c == '0' || c == 'L') *p++ = '0';
-         else if (c == '1' || c == 'H') *p++ = '1';
-         else if (c == 0 && folded_int(v, &bit) && (bit == 0 || bit == 1))
-            *p++ = bit ? '1' : '0';
+         if (c == '0') *p++ = '0';
+         else if (c == '1') *p++ = '1';
+         else if (c == 'x')
+            *p++ = '0';   // metavalue: text path renders 0
+         else if (c == 0 && folded_int(v, &bit) && bit >= 0 && bit <= 7)
+            *p++ = (bit & 1) ? '1' : '0';   // logic3d encoding: bit0 = value
          else
             return false;
       }
@@ -3222,12 +3295,14 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
          tree_t v = tree_value(a);
          char cb, c = 0;
          if (tree_kind(v) == T_REF)
-            c = ident_char(tree_has_ref(v) ? tree_ident(tree_ref(v))
-                                           : tree_ident(v), 1);
-         if (c == '0' || c == 'L') cb = '0';
-         else if (c == '1' || c == 'H') cb = '1';
-         else if (c == 0 && folded_int(v, &bit) && (bit == 0 || bit == 1))
-            cb = bit ? '1' : '0';
+            c = r2_bit_of_ident(tree_has_ref(v) ? tree_ident(tree_ref(v))
+                                                : tree_ident(v));
+         if (c == '0') cb = '0';
+         else if (c == '1') cb = '1';
+         else if (c == 'x')
+            cb = '0';   // metavalue init: the text path renders {N{1'b0}}
+         else if (c == 0 && folded_int(v, &bit) && bit >= 0 && bit <= 7)
+            cb = (bit & 1) ? '1' : '0';   // logic3d encoding: bit0 = value
          else {
             if (getenv("NVC_RTLIL_DEBUG") != NULL && tree_kind(v) == T_REF)
                fprintf(stderr, "r2 others-ref ident='%s' hasref=%d refid='%s'\n",
@@ -3291,6 +3366,12 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
    switch (tree_kind(e)) {
    case T_REF:
       {
+         {  r2_subst_t *sb = r2_subst_of(tree_ident(e));
+            if (sb != NULL && sb->spec != NULL) {
+               snprintf(out, sz, "%s", sb->spec);
+               return true;
+            }
+         }
          tree_t d = tree_has_ref(e) ? tree_ref(e) : NULL;
          if (d != NULL && tree_kind(d) == T_CONST_DECL) {
             if (tree_has_value(d) && r2_const(tree_value(d), out, sz, -1))
@@ -3417,8 +3498,20 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                return true;
             }
          }
-         if (tree_kind(base) != T_REF || tree_params(e) != 1
-             || !folded_int(tree_value(tree_param(e, 0)), &idx)) {
+         bool have_idx = tree_kind(base) == T_REF && tree_params(e) == 1
+            && folded_int(tree_value(tree_param(e, 0)), &idx);
+         if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
+            // a substituted loop index folds through its sigspec ("N'dK")
+            char is[R2_SPEC];
+            if (r2_expr(tree_value(tree_param(e, 0)), is, sizeof is)) {
+               const char *tick = strchr(is, 39);
+               if (tick != NULL && tick[1] == 'd') {
+                  idx = atoll(tick + 2);
+                  have_idx = true;
+               }
+            }
+         }
+         if (!have_idx) {
             R2_DECLINE("array-ref");
             return false;
          }
@@ -3455,6 +3548,183 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             }
             R2_DECLINE("to_unsigned");
             return false;
+         }
+
+         // l3d vocabulary — the text path's own table (kind 0 binary,
+         // 1 unary, 2 identity, 3 reduction)
+         {
+            int lk = -1;
+            const char *lop = vlog_l3d_op(fn, &lk);
+            const char *base = id_base(fn);
+            if (lop == NULL && np >= 1
+                && (strcasecmp(base, "l3d_index") == 0
+                    || strcasecmp(base, "l3d_resize_s") == 0))
+               return r2_expr(tree_value(tree_param(e, 0)), out, sz);
+            if (lop != NULL && lk == 2 && np >= 1)
+               return r2_expr(tree_value(tree_param(e, 0)), out, sz);
+            if (lop != NULL && lk == 1 && np == 1) {
+               char a[R2_SPEC];
+               tree_t ea = tree_value(tree_param(e, 0));
+               if (!r2_expr(ea, a, sizeof a))
+                  return false;
+               int w = r2_width(e);
+               if (w <= 0)
+                  w = r2_width(ea);
+               char y[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(w, y, sizeof y))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", y);
+               if (g_r2->cell_un("not", cn, a, y, 0) != 0) {
+                  R2_DECLINE("l3d-not");
+                  return false;
+               }
+               snprintf(out, sz, "%s", y);
+               return true;
+            }
+            if (lop != NULL && lk == 3 && np == 1) {
+               const char *rop = strcmp(lop, "|") == 0 ? "reduce_or"
+                  : strcmp(lop, "&") == 0 ? "reduce_and" : "reduce_xor";
+               char a[R2_SPEC];
+               if (!r2_expr(tree_value(tree_param(e, 0)), a, sizeof a))
+                  return false;
+               char y[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(1, y, sizeof y))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", y);
+               if (g_r2->cell_un(rop, cn, a, y, 0) != 0) {
+                  R2_DECLINE("l3d-reduce");
+                  return false;
+               }
+               snprintf(out, sz, "%s", y);
+               return true;
+            }
+            if (lop != NULL && lk == 0 && np == 2) {
+               const char *bop = strcmp(lop, "&") == 0 ? "and"
+                  : strcmp(lop, "|") == 0 ? "or"
+                  : strcmp(lop, "^") == 0 ? "xor"
+                  : strcmp(lop, "~^") == 0 ? "xnor"
+                  : strcmp(lop, "==") == 0 ? "eq"
+                  : strcmp(lop, "!=") == 0 ? "ne" : NULL;
+               if (bop == NULL) {
+                  R2_DECLINE("l3d-binop");
+                  return false;
+               }
+               tree_t ea = tree_value(tree_param(e, 0));
+               tree_t eb = tree_value(tree_param(e, 1));
+               char a[R2_SPEC], b[R2_SPEC];
+               if (!r2_expr(ea, a, sizeof a) || !r2_expr(eb, b, sizeof b))
+                  return false;
+               int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
+               if (w <= 0)
+                  w = r2_width(ea);
+               if (w <= 0)
+                  w = r2_width(eb);
+               char y[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(w, y, sizeof y))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", y);
+               if (g_r2->cell_bin(bop, cn, a, b, y, 0) != 0) {
+                  R2_DECLINE("l3d-bin");
+                  return false;
+               }
+               snprintf(out, sz, "%s", y);
+               return true;
+            }
+            // signed relationals (l3d_lt_s family)
+            if (np == 2 && strncasecmp(base, "l3d_", 4) == 0) {
+               const char *rel = strcasecmp(base, "l3d_lt_s") == 0 ? "lt"
+                  : strcasecmp(base, "l3d_gt_s") == 0 ? "gt"
+                  : strcasecmp(base, "l3d_le_s") == 0 ? "le"
+                  : strcasecmp(base, "l3d_ge_s") == 0 ? "ge" : NULL;
+               if (rel != NULL) {
+                  char a[R2_SPEC], b[R2_SPEC];
+                  if (!r2_expr(tree_value(tree_param(e, 0)), a, sizeof a)
+                      || !r2_expr(tree_value(tree_param(e, 1)), b, sizeof b))
+                     return false;
+                  char y[R2_SPEC], cn[R2_SPEC + 8];
+                  if (!r2_temp(1, y, sizeof y))
+                     return false;
+                  snprintf(cn, sizeof cn, "c%s", y);
+                  if (g_r2->cell_bin(rel, cn, a, b, y, 1) != 0) {
+                     R2_DECLINE("l3d-rel");
+                     return false;
+                  }
+                  snprintf(out, sz, "%s", y);
+                  return true;
+               }
+            }
+            // l3d_bit_read(a, i): (a >> i)[0]
+            if (np == 2 && strcasecmp(base, "l3d_bit_read") == 0) {
+               char a[R2_SPEC], b[R2_SPEC];
+               tree_t ea = tree_value(tree_param(e, 0));
+               if (!r2_expr(ea, a, sizeof a)
+                   || !r2_expr(tree_value(tree_param(e, 1)), b, sizeof b))
+                  return false;
+               const int aw = r2_width(ea);
+               if (aw <= 0) {
+                  R2_DECLINE("bitread-width");
+                  return false;
+               }
+               char t[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(aw, t, sizeof t))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", t);
+               if (g_r2->cell_bin("shr", cn, a, b, t, 0) != 0) {
+                  R2_DECLINE("bitread-shr");
+                  return false;
+               }
+               snprintf(out, sz, "%s[0]", t);
+               return true;
+            }
+            // l3d_part_read(a, b, W): (a >> b)[W-1:0]
+            if (np >= 3 && strcasecmp(base, "l3d_part_read") == 0) {
+               int64_t pw;
+               if (!folded_int(tree_value(tree_param(e, 2)), &pw) || pw <= 0) {
+                  R2_DECLINE("partread-w");
+                  return false;
+               }
+               char a[R2_SPEC], b[R2_SPEC];
+               tree_t ea = tree_value(tree_param(e, 0));
+               if (!r2_expr(ea, a, sizeof a)
+                   || !r2_expr(tree_value(tree_param(e, 1)), b, sizeof b))
+                  return false;
+               const int aw = r2_width(ea);
+               if (aw <= 0 || pw > aw) {
+                  R2_DECLINE("partread-width");
+                  return false;
+               }
+               char t[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(aw, t, sizeof t))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", t);
+               if (g_r2->cell_bin("shr", cn, a, b, t, 0) != 0) {
+                  R2_DECLINE("partread-shr");
+                  return false;
+               }
+               snprintf(out, sz, "%s[%d:0]", t, (int)pw - 1);
+               return true;
+            }
+            // ternary_*(T, X, Y) -> mux: T ? X : Y
+            if (np == 3 && strncasecmp(base, "ternary_", 8) == 0) {
+               char t[R2_SPEC], x[R2_SPEC], yv[R2_SPEC];
+               if (!r2_expr(tree_value(tree_param(e, 0)), t, sizeof t)
+                   || !r2_expr(tree_value(tree_param(e, 1)), x, sizeof x)
+                   || !r2_expr(tree_value(tree_param(e, 2)), yv, sizeof yv))
+                  return false;
+               int w = r2_width(e);
+               if (w <= 0)
+                  w = r2_width(tree_value(tree_param(e, 1)));
+               char y[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(w, y, sizeof y))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", y);
+               if (g_r2->cell_mux(cn, yv, x, t, y) != 0) {
+                  R2_DECLINE("ternary");
+                  return false;
+               }
+               snprintf(out, sz, "%s", y);
+               return true;
+            }
          }
 
          const char *vop = vlog_op(fn);
@@ -3578,7 +3848,7 @@ static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
 static void r2_collect_cb(tree_t t, void *ctx)
 {
    r2_targets_t *ts = (r2_targets_t *)ctx;
-   if (tree_kind(t) != T_SIGNAL_ASSIGN)
+   if (tree_kind(t) != T_SIGNAL_ASSIGN && tree_kind(t) != T_DEPOSIT)
       return;
    tree_t tg = tree_target(t);
    // a slice/indexed target contributes its BASE signal (the hold temp
@@ -3611,23 +3881,66 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
    case T_NULL:
       return true;
    case T_SIGNAL_ASSIGN:
+   case T_DEPOSIT:
+   case T_VAR_ASSIGN:
       {
          tree_t tg = tree_target(s);
+         // NBA-shadow variables route to the shadowed SIGNAL's hold temp;
+         // any other variable target declines
+         if (tree_kind(s) == T_VAR_ASSIGN) {
+            tree_t vb = tg;
+            while (tree_kind(vb) == T_ARRAY_SLICE
+                   || tree_kind(vb) == T_ARRAY_REF)
+               vb = tree_value(vb);
+            r2_alias_t *al = (tree_kind(vb) == T_REF)
+               ? r2_alias_of(tree_ident(vb)) : NULL;
+            if (al == NULL) {
+               // straight-line local variable: pure substitution (whole
+               // target, outside any switch scope)
+               if (tree_kind(tg) == T_REF && g_r2_case_depth == 0) {
+                  char vs[R2_SPEC];
+                  g_r2_site = "var-subst";
+                  if (!r2_expr(tree_value(s), vs, sizeof vs))
+                     return false;
+                  if (!r2_subst_set(tree_ident(tg), vs)) {
+                     R2_DECLINE("subst-count");
+                     return false;
+                  }
+                  return true;
+               }
+               R2_DECLINE("var-assign");
+               return false;
+            }
+            // rewrite the BASE ident by aliasing: the slice/index structure
+            // stays, target lookup below uses the signal's name
+         }
          // memory writes: only the ENABLE threads the decision tree —
          // addr/data are unconditional comb, gated by EN at the port
          r2_mem_t *mm = NULL;
-         if (tree_kind(tg) == T_ARRAY_REF
-             && tree_kind(tree_value(tg)) == T_REF)
-            mm = r2_mem_of(tree_ident(tree_value(tg)));
-         else if (tree_kind(tg) == T_REF && tree_has_ref(tg))
-            mm = r2_mem_of(tree_ident(tg));
-         if (mm != NULL) {
-            if (tree_waveforms(s) < 1
-                || !tree_has_value(tree_waveform(s, 0))) {
-               R2_DECLINE("mem-null-wave");
-               return false;
+         {
+            tree_t mb = tg;
+            if (tree_kind(mb) == T_ARRAY_REF)
+               mb = tree_value(mb);
+            if (tree_kind(mb) == T_REF) {
+               ident_t mi = tree_ident(mb);
+               r2_alias_t *al = r2_alias_of(mi);
+               if (al != NULL)
+                  mi = al->sig;
+               mm = r2_mem_of(mi);
             }
-            tree_t val = tree_value(tree_waveform(s, 0));
+         }
+         if (mm != NULL) {
+            tree_t val = NULL;
+            if (tree_kind(s) == T_SIGNAL_ASSIGN) {
+               if (tree_waveforms(s) < 1
+                   || !tree_has_value(tree_waveform(s, 0))) {
+                  R2_DECLINE("mem-null-wave");
+                  return false;
+               }
+               val = tree_value(tree_waveform(s, 0));
+            }
+            else
+               val = tree_value(s);   // deposit / shadow-var write
             if (ts->nsites >= 64 || ts->nmw >= 64) {
                R2_DECLINE("mem-sites");
                return false;
@@ -3715,7 +4028,10 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             R2_DECLINE("assign-target");
             return false;
          }
-         r2_target_t *t = r2_target(ts, tree_ident(tg));
+         ident_t ti = tree_ident(tg);
+         { r2_alias_t *al = r2_alias_of(ti);
+           if (al != NULL) ti = al->sig; }
+         r2_target_t *t = r2_target(ts, ti);
          if (t == NULL) {
             R2_DECLINE("target-miss");
             return false;
@@ -3733,14 +4049,20 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          }
          else
             snprintf(lhs, sizeof lhs, "%s", t->g0);
-         if (tree_waveforms(s) < 1 || !tree_has_value(tree_waveform(s, 0))) {
-            R2_DECLINE("null-wave");
-            return false;
+         tree_t val;
+         if (tree_kind(s) == T_SIGNAL_ASSIGN) {
+            if (tree_waveforms(s) < 1
+                || !tree_has_value(tree_waveform(s, 0))) {
+               R2_DECLINE("null-wave");
+               return false;
+            }
+            val = tree_value(tree_waveform(s, 0));
          }
+         else
+            val = tree_value(s);   // deposit / shadow-var write
          // constants first WITH the target's width for context (an
          // others-aggregate has no self-width)
          char v[R2_SPEC];
-         tree_t val = tree_value(tree_waveform(s, 0));
          g_r2_site = "seq-assign";
          if (!r2_const(val, v, sizeof v, vw)
              && !r2_expr(val, v, sizeof v))
@@ -3762,6 +4084,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                if (!r2_cond(tree_value(c), cs, sizeof cs)) { ok = false; break; }
                if (g_r2->switch_begin(cs) != 0
                    || g_r2->case_begin("1'b1") != 0) { ok = false; break; }
+               g_r2_case_depth++;
                ok = r2_seq(c, ts);
                if (!ok) break;
                if (g_r2->case_end() != 0
@@ -3776,8 +4099,47 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          for (int i = 0; i < depth; i++) {
             if (g_r2->case_end() != 0 || g_r2->switch_end() != 0)
                ok = false;
+            g_r2_case_depth--;
          }
          return ok && g_r2_fail == 0;
+      }
+   case T_FOR:
+      {
+         // constant-range unroll: the index becomes a substituted constant
+         // per iteration (post-elaboration bounds are folded)
+         tree_t r = tree_range(s, 0);
+         tree_t idecl = tree_decls(s) > 0 ? tree_decl(s, 0) : NULL;
+         int64_t left, right;
+         if (idecl == NULL || g_r2_case_depth != 0
+             || !folded_int(tree_left(r), &left)
+             || !folded_int(tree_right(r), &right)) {
+            R2_DECLINE("for-range");
+            return false;
+         }
+         const int64_t lo = left < right ? left : right;
+         const int64_t hi = left < right ? right : left;
+         if (hi - lo > 4096) {
+            R2_DECLINE("for-size");
+            return false;
+         }
+         const int step = left <= right ? 1 : -1;
+         for (int64_t iv = left; ; iv += step) {
+            char cs[32];
+            snprintf(cs, sizeof cs, "32'd%lld", (long long)(iv < 0 ? 0 : iv));
+            if (iv < 0) {
+               R2_DECLINE("for-neg");
+               return false;
+            }
+            if (!r2_subst_set(tree_ident(idecl), cs)) {
+               R2_DECLINE("subst-count");
+               return false;
+            }
+            if (!r2_seq(s, ts))
+               return false;
+            if (iv == right)
+               break;
+         }
+         return true;
       }
    case T_CASE:
       {
@@ -3831,7 +4193,9 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             // "<v>, default:")
             const char *cc = (others || cl == 0) ? NULL : cmp;
             if (g_r2->case_begin(cc) != 0) { ok = false; break; }
+            g_r2_case_depth++;
             ok = r2_seq(alt, ts);
+            g_r2_case_depth--;
             if (g_r2->case_end() != 0)
                ok = false;
          }
@@ -3914,6 +4278,8 @@ static bool r2_process(tree_t p0, int pidx)
       // action g0 = target mirrors read_verilog's $0 self-init: complete
       // assignment optimizes the self arm away; incomplete assignment
       // infers the same latch the text path would (and gsm declines it).
+      r2_subst_reset();
+      g_r2_case_depth = 0;
       r2_targets_t cts = { .n = 0 };
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
@@ -3944,10 +4310,8 @@ static bool r2_process(tree_t p0, int pidx)
          cok = g_r2->sync_assign(cts.t[i].spec, cts.t[i].g0) == 0;
       return cok && g_r2_fail == 0;
    }
-   if (ne != 1) {
-      R2_DECLINE("multi-edge");
-      return false;
-   }
+   // (rcond/rsig are derived below from ifstmt; the sensitivity may carry
+   //  the async reset as a SECOND edge — resolved after areset_of runs)
    tree_t rsig = NULL; bool rpe = false, rbefore = false;
    tree_t rcond = (ifstmt != NULL)
       ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
@@ -3955,21 +4319,103 @@ static bool r2_process(tree_t p0, int pidx)
       R2_DECLINE("reset-clk-priority");
       return false;
    }
-   // the tgt-vhdl NBA idiom (statements around the edge-if) is not in the
-   // subset yet — require the edge-if to be the only non-wait statement
+   // pick the clock among the sensitivity edges: with an async reset the
+   // translated form lists BOTH `falling_edge(rst) or rising_edge(clk)`;
+   // the reset's edge is subsumed by the ST0/ST1 level sync
+   int clk_i = 0;
+   if (ne == 2) {
+      if (rcond == NULL || rsig == NULL || tree_kind(rsig) != T_REF) {
+         R2_DECLINE("multi-edge");
+         return false;
+      }
+      if (tree_kind(sig[0]) == T_REF
+          && tree_ident(sig[0]) == tree_ident(rsig))
+         clk_i = 1;
+      else if (tree_kind(sig[1]) == T_REF
+               && tree_ident(sig[1]) == tree_ident(rsig))
+         clk_i = 0;
+      else {
+         R2_DECLINE("multi-edge-rst");
+         return false;
+      }
+   }
+   else if (ne != 1) {
+      R2_DECLINE("multi-edge");
+      return false;
+   }
+   // tgt-vhdl NBA idiom: shadow pre-copies before the edge-if, commits
+   // after it.  The pre-copy IS the g0 root action and the commit IS the
+   // sync assign, so both elide into the existing hold-temp machinery;
+   // the shadow var becomes an alias for the signal inside the tree.
+   g_r2_nalias = 0;
+   r2_subst_reset();
+   g_r2_case_depth = 0;
    {
       const int np = tree_stmts(p);
+      int ifidx = np;
+      for (int i = 0; i < np; i++)
+         if (tree_stmt(p, i) == ifstmt) { ifidx = i; break; }
       for (int i = 0; i < np; i++) {
          tree_t s = tree_stmt(p, i);
-         if (s != ifstmt && tree_kind(s) != T_WAIT) {
-            R2_DECLINE("proc-extra-stmt");
+         if (s == ifstmt || tree_kind(s) == T_WAIT)
+            continue;
+         if (i < ifidx && tree_kind(s) == T_VAR_ASSIGN) {
+            // pre-copy  v_nba_r := r
+            tree_t vt = tree_target(s), vv = tree_value(s);
+            if (tree_kind(vt) == T_REF && tree_kind(vv) == T_REF
+                && tree_has_ref(vv) && g_r2_nalias < 16) {
+               r2_alias_t *al = &g_r2_alias[g_r2_nalias++];
+               al->var = tree_ident(vt);
+               al->sig = tree_ident(vv);
+               al->sigdecl = tree_ref(vv);
+               al->committed = false;
+               continue;
+            }
+            R2_DECLINE("nba-pre");
             return false;
          }
+         if (i > ifidx && tree_kind(s) == T_SIGNAL_ASSIGN) {
+            // commit  r <= v_nba_r
+            tree_t st = tree_target(s);
+            tree_t sv = (tree_waveforms(s) >= 1
+                         && tree_has_value(tree_waveform(s, 0)))
+               ? tree_value(tree_waveform(s, 0)) : NULL;
+            if (st != NULL && sv != NULL && tree_kind(st) == T_REF
+                && tree_kind(sv) == T_REF) {
+               r2_alias_t *al = r2_alias_of(tree_ident(sv));
+               if (al != NULL && al->sig == tree_ident(st)) {
+                  al->committed = true;
+                  continue;
+               }
+            }
+            R2_DECLINE("nba-post");
+            return false;
+         }
+         R2_DECLINE("proc-extra-stmt");
+         return false;
       }
+      for (int i = 0; i < g_r2_nalias; i++)
+         if (!g_r2_alias[i].committed) {
+            R2_DECLINE("nba-pair");
+            return false;
+         }
    }
 
    r2_targets_t ts = { .n = 0 };
    tree_visit(p, r2_collect_cb, &ts);
+   // aliased signals are targets even when the body writes only the shadow
+   for (int i = 0; i < g_r2_nalias; i++) {
+      if (r2_target(&ts, g_r2_alias[i].sig) != NULL
+          || r2_mem_of(g_r2_alias[i].sig) != NULL)
+         continue;
+      if (ts.n >= 64) { R2_DECLINE("targets"); return false; }
+      r2_target_t *n = &ts.t[ts.n++];
+      n->name = g_r2_alias[i].sig;
+      snprintf(n->spec, sizeof n->spec, "%s", vid(n->name));
+      snprintf(n->g0, sizeof n->g0, "g0_%s", vid(n->name));
+      type_t ty = tree_type(g_r2_alias[i].sigdecl);
+      n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
+   }
    if (ts.n == 0 || g_r2_fail > 0)
       return g_r2_fail == 0;
 
@@ -3995,8 +4441,8 @@ static bool r2_process(tree_t p0, int pidx)
       ok = r2_seq(body_if, &ts);
       if (ok) {
          char es[R2_SPEC];
-         ok = r2_expr(sig[0], es, sizeof es)
-            && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
+         ok = r2_expr(sig[clk_i], es, sizeof es)
+            && g_r2->sync(pe[clk_i] ? "posedge" : "negedge", es) == 0;
          for (int i = 0; ok && i < ts.n; i++)
             ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
          if (ok)
@@ -4011,15 +4457,30 @@ static bool r2_process(tree_t p0, int pidx)
          const int nr = tree_stmts(rcond);
          for (int i = 0; ok && i < nr; i++) {
             tree_t s = tree_stmt(rcond, i);
-            if (tree_kind(s) != T_SIGNAL_ASSIGN) { ok = false; break; }
-            tree_t tg = tree_target(s);
-            r2_target_t *t = (tree_kind(tg) == T_REF && tree_has_ref(tg))
-               ? r2_target(&ts, tree_ident(tg)) : NULL;
+            tree_t val = NULL;
+            tree_t tg = NULL;
+            if (tree_kind(s) == T_SIGNAL_ASSIGN
+                && tree_waveforms(s) >= 1
+                && tree_has_value(tree_waveform(s, 0))) {
+               tg = tree_target(s);
+               val = tree_value(tree_waveform(s, 0));
+            }
+            else if (tree_kind(s) == T_VAR_ASSIGN) {
+               tg = tree_target(s);
+               val = tree_value(s);
+            }
+            else { ok = false; break; }
+            ident_t ti2 = (tg != NULL && tree_kind(tg) == T_REF)
+               ? tree_ident(tg) : NULL;
+            if (ti2 != NULL) {
+               r2_alias_t *al = r2_alias_of(ti2);
+               if (al != NULL)
+                  ti2 = al->sig;
+            }
+            r2_target_t *t = ti2 != NULL ? r2_target(&ts, ti2) : NULL;
             char v[R2_SPEC];
-            if (t == NULL || tree_waveforms(s) < 1
-                || !tree_has_value(tree_waveform(s, 0))
-                || !r2_const(tree_value(tree_waveform(s, 0)), v, sizeof v,
-                             t->width)) {
+            if (t == NULL || val == NULL
+                || !r2_const(val, v, sizeof v, t->width)) {
                R2_DECLINE("arst-value");
                ok = false;
                break;
@@ -4032,8 +4493,8 @@ static bool r2_process(tree_t p0, int pidx)
       ok = r2_seq(body_if, &ts);
       if (ok) {
          char es[R2_SPEC];
-         ok = r2_expr(sig[0], es, sizeof es)
-            && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
+         ok = r2_expr(sig[clk_i], es, sizeof es)
+            && g_r2->sync(pe[clk_i] ? "posedge" : "negedge", es) == 0;
          for (int i = 0; ok && i < ts.n; i++)
             ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
          if (ok)
@@ -4145,7 +4606,19 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       char bits[R2_SPEC];
       if (is_r && tree_has_value(d)) {
          if (!r2_const(tree_value(d), init, sizeof init, w)) {
-            R2_DECLINE("reg-init");
+            char why[96];
+            tree_t iv0 = tree_value(d);
+            if (tree_kind(iv0) == T_AGGREGATE && tree_assocs(iv0) > 0) {
+               tree_t a0 = tree_assoc(iv0, 0);
+               snprintf(why, sizeof why,
+                        "reg-init(agg n=%d sk=%d vk=%d)",
+                        tree_assocs(iv0), (int)tree_subkind(a0),
+                        (int)tree_kind(tree_value(a0)));
+            }
+            else
+               snprintf(why, sizeof why, "reg-init(k=%d w=%d)",
+                        (int)tree_kind(iv0), w);
+            R2_DECLINE(why);
             goto declined;
          }
          const char *tick = strchr(init, '\'');
