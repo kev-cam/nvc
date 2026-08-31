@@ -1706,6 +1706,8 @@ static void direct_eval_uninstall(rt_proc_t *proc)
 #include <sys/stat.h>
 #include <sys/utsname.h>
 
+#include "gsm_rtlil.h"
+
 // In-process generator: libgsm.so is the library form of the gen_statemachine
 // CLI (same source — see sv2ghdl yosys/Makefile), exporting gsm_generate().
 // Probed once per process.  NVC_ACCEL_NO_GSMLIB=1 forces the CLI everywhere;
@@ -1713,6 +1715,9 @@ static void direct_eval_uninstall(rt_proc_t *proc)
 // alternative generator BINARY) is honored by callers by not using the
 // library at all.
 typedef int (*gsm_generate_fn)(int, const char *const *, const char *);
+
+static gsm_rtlil_api_t g_gsm_rtlil_api;
+static bool            g_gsm_rtlil_ok = false;
 
 static gsm_generate_fn accel_gsm_probe(const char **libfile)
 {
@@ -1740,6 +1745,36 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
                      snprintf(file, sizeof file, "%s", di.dli_fname);
                   else
                      snprintf(file, sizeof file, "%s", *p);
+
+                  // The direct-RTLIL construction facade rides in the same
+                  // library; the api is usable only if EVERY entry resolves
+                  // (an older libgsm.so leaves it unavailable — callers
+                  // fall back to the text path).
+                  gsm_rtlil_api_t *a = &g_gsm_rtlil_api;
+                  a->begin        = dlsym(dl, "gsm_rtlil_begin");
+                  a->module       = dlsym(dl, "gsm_rtlil_module");
+                  a->wire         = dlsym(dl, "gsm_rtlil_wire");
+                  a->connect      = dlsym(dl, "gsm_rtlil_connect");
+                  a->cell_bin     = dlsym(dl, "gsm_rtlil_cell_bin");
+                  a->cell_un      = dlsym(dl, "gsm_rtlil_cell_un");
+                  a->cell_mux     = dlsym(dl, "gsm_rtlil_cell_mux");
+                  a->proc         = dlsym(dl, "gsm_rtlil_proc");
+                  a->sync         = dlsym(dl, "gsm_rtlil_sync");
+                  a->sync_assign  = dlsym(dl, "gsm_rtlil_sync_assign");
+                  a->case_assign  = dlsym(dl, "gsm_rtlil_case_assign");
+                  a->switch_begin = dlsym(dl, "gsm_rtlil_switch_begin");
+                  a->case_begin   = dlsym(dl, "gsm_rtlil_case_begin");
+                  a->case_end     = dlsym(dl, "gsm_rtlil_case_end");
+                  a->switch_end   = dlsym(dl, "gsm_rtlil_switch_end");
+                  a->content_hash = dlsym(dl, "gsm_rtlil_content_hash");
+                  a->synth        = dlsym(dl, "gsm_rtlil_synth");
+                  a->abort_session = dlsym(dl, "gsm_rtlil_abort");
+                  g_gsm_rtlil_ok = a->begin && a->module && a->wire
+                     && a->connect && a->cell_bin && a->cell_un
+                     && a->cell_mux && a->proc && a->sync && a->sync_assign
+                     && a->case_assign && a->switch_begin && a->case_begin
+                     && a->case_end && a->switch_end && a->content_hash
+                     && a->synth && a->abort_session;
                   break;
                }
                dlclose(dl);
@@ -1751,6 +1786,14 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
    if (libfile != NULL)
       *libfile = file[0] != '\0' ? file : NULL;
    return fn;
+}
+
+// The direct-RTLIL builder api, or NULL when libgsm (or this build of it)
+// doesn't provide the full surface.
+const gsm_rtlil_api_t *accel_gsm_rtlil_api(void)
+{
+   return accel_gsm_probe(NULL) != NULL && g_gsm_rtlil_ok
+      ? &g_gsm_rtlil_api : NULL;
 }
 
 static gsm_generate_fn accel_gsm_fn(void)

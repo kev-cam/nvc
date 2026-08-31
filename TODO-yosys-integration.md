@@ -112,12 +112,34 @@ Determine where the current looseness actually is:
       behavioral equality with the text path.  Key learnings: async
       reset is a LEVEL sync (ST0/ST1) paired with one edge sync, NOT a
       second edge; `gsm_rtlil_content_hash` (FNV over the call stream)
-      replaces the .v file bytes in the vhash cache key.  NEXT: the
-      nvc-side walker backend (vhdl2vlog's walk, second emitter —
-      client pre-lowers process muxes to named $mux cells so `proc`
-      invents nothing), then the aj fork-child integration (walker
-      runs IN the child on the CoW-inherited tree), then memories via
-      $mem_v2.
+      replaces the .v file bytes in the vhash cache key.
+      **Increment A (same session): decision trees** — switch/case
+      API (read_verilog's hold pattern: root action `temp = reg`,
+      branch overrides, sync commits `reg <= temp`); canonicalization
+      means NO client-side mux pre-lowering is needed — `proc` may
+      invent names freely.  Selftest covers an enable-gated hold
+      register through the tree form.
+      **Increment B plumbing (same session):** `src/gsm_rtlil.h`
+      function-table header + model.c `accel_gsm_rtlil_api()` (probe
+      resolves the full surface or returns NULL → text fallback).
+      **NEXT SESSION — the walker (`vhdl2rtlil_module`)**, planned:
+      lives in vhdl2vlog.c sharing its analysis helpers
+      (build_reg_set/is_reg, clock_of/areset_of/edges_of, type_width,
+      emitted_width, comp_inner, block_types_synth); the emission
+      vocabulary to cover is catalogued in the direct-rtlil recon
+      (~60 shapes; expressions are the tail — start with the wide/
+      arst-fixture subset: refs, literals, binary/unary ops via the
+      vlog_op set, ternary→mux, bit-select/slice, concat; DECLINE
+      everything else → per-module text fallback).  Statements: the
+      clocked-process forms via decision trees with `g0_<sig>` hold
+      temps; expression cells use `rx<n>` temp wires (deterministic).
+      Decisions taken: TEXT STAYS THE CACHE KEY + staged evidence for
+      now (the parent needs the key pre-fork; the content_hash switch
+      comes when the text path retires); the builder replaces only the
+      read_verilog leg; differential = the 4-engine gate + an
+      opt_assert running one suite design under NVC_ACCEL_RTLIL=1
+      with an engagement check.  Then: $mem_v2 memories (the
+      icache-monster lever).
 - [x] Drive passes via `run_pass()` instead of shelling out and
       round-tripping files.  Done for the converted path; the C-out →
       gcc → .so → dlopen leg is inherent (it IS the product) and
