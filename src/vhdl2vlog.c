@@ -3829,13 +3829,73 @@ typedef struct {
 typedef struct { char memid[80]; char *addr; char *data; char en[32]; }
    r2_memwr_t;
 
+// promoted persistent variables (VHDL process vars keep their value across
+// activations — a branch-written one is LATCH state): pv wire + hold temp,
+// committed on the process sync; proc then infers the $dlatch exactly as
+// read_verilog would
+typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
+                 bool persistent; } r2_pvar_t;
+
 typedef struct {
    r2_target_t t[64];
    int         n;
    r2_memwr_t  mw[64];   // pending memory writes, flushed after the edge
    int         nmw;      //  sync exists (addr/data are heap copies)
    int         nsites;   // enable-temp counter
+   r2_pvar_t   pv[16];   // promoted persistent variables (latch state)
+   int         npv;
+   bool        comb;     // process kind: only comb processes may promote
 } r2_targets_t;
+
+static r2_pvar_t *r2_pvar_of(r2_targets_t *ts, ident_t id)
+{
+   for (int i = 0; i < ts->npv; i++)
+      if (ts->pv[i].var == id)
+         return &ts->pv[i];
+   return NULL;
+}
+
+// Promote a branch-written process variable to latch state: a persistent
+// pv wire, a hold temp rooted at pv (or at the last straight-line value,
+// which makes it a plain temp, not a latch).
+static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
+{
+   const ident_t id = tree_ident(vdecl);
+   r2_pvar_t *e = r2_pvar_of(ts, id);
+   if (e != NULL)
+      return e;
+   if (!ts->comb || ts->npv >= 16)
+      return NULL;
+   type_t ty = tree_type(vdecl);
+   if (!type_const_bounds(ty))
+      return NULL;
+   const int w = (int)type_width(ty);
+   if (ts->npv >= 16)
+      return NULL;
+   e = &ts->pv[ts->npv];
+   e->var = id;
+   e->width = w;
+   snprintf(e->pv, sizeof e->pv, "pv_%s", vid(id));
+   snprintf(e->g0, sizeof e->g0, "g0pv_%s", vid(id));
+   r2_subst_t *sb = r2_subst_of(id);
+   if (g_r2->wire(e->g0, w, 0, NULL) != 0)
+      return NULL;
+   if (sb != NULL && sb->spec != NULL) {
+      // written straight-line earlier this activation: hold base is that
+      // value — a plain tree temp, nothing persists
+      e->persistent = false;
+      if (g_r2->case_assign_root(e->g0, sb->spec) != 0)
+         return NULL;
+   }
+   else {
+      e->persistent = true;
+      if (g_r2->wire(e->pv, w, 0, NULL) != 0
+          || g_r2->case_assign_root(e->g0, e->pv) != 0)
+         return NULL;
+   }
+   ts->npv++;
+   return e;
+}
 
 static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
 {
@@ -3896,8 +3956,9 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                ? r2_alias_of(tree_ident(vb)) : NULL;
             if (al == NULL) {
                // straight-line local variable: pure substitution (whole
-               // target, outside any switch scope)
-               if (tree_kind(tg) == T_REF && g_r2_case_depth == 0) {
+               // target, outside any switch scope, not yet promoted)
+               if (tree_kind(tg) == T_REF && g_r2_case_depth == 0
+                   && r2_pvar_of(ts, tree_ident(tg)) == NULL) {
                   char vs[R2_SPEC];
                   g_r2_site = "var-subst";
                   if (!r2_expr(tree_value(s), vs, sizeof vs))
@@ -3907,6 +3968,23 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      return false;
                   }
                   return true;
+               }
+               // branch-written variable: LATCH state (VHDL process vars
+               // persist across activations) — promote to a pv/hold pair
+               if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+                   && tree_kind(tree_ref(tg)) == T_VAR_DECL) {
+                  r2_pvar_t *pe = r2_pvar_promote(ts, tree_ref(tg));
+                  if (pe == NULL) {
+                     R2_DECLINE("var-promote");
+                     return false;
+                  }
+                  char vs[R2_SPEC];
+                  g_r2_site = "pvar-assign";
+                  tree_t pval = tree_value(s);
+                  if (!r2_const(pval, vs, sizeof vs, pe->width)
+                      && !r2_expr(pval, vs, sizeof vs))
+                     return false;
+                  return g_r2->case_assign(pe->g0, vs) == 0;
                }
                R2_DECLINE("var-assign");
                return false;
@@ -4060,6 +4138,17 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          }
          else
             val = tree_value(s);   // deposit / shadow-var write
+         // trailing copy `sig <= var` of a PROMOTED variable: the signal's
+         // sync source becomes the var's hold temp (the post-tree muxed
+         // value — a root action here would read the PRE-branch value,
+         // since case actions evaluate before switches)
+         if (hi < 0 && tree_kind(val) == T_REF && g_r2_case_depth == 0) {
+            r2_pvar_t *pe = r2_pvar_of(ts, tree_ident(val));
+            if (pe != NULL) {
+               snprintf(t->g0, sizeof t->g0, "%s", pe->g0);
+               return true;
+            }
+         }
          // constants first WITH the target's width for context (an
          // others-aggregate has no self-width)
          char v[R2_SPEC];
@@ -4280,7 +4369,7 @@ static bool r2_process(tree_t p0, int pidx)
       // infers the same latch the text path would (and gsm declines it).
       r2_subst_reset();
       g_r2_case_depth = 0;
-      r2_targets_t cts = { .n = 0 };
+      r2_targets_t cts = { .n = 0, .comb = true };
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
          R2_DECLINE("comb-empty");
@@ -4308,6 +4397,9 @@ static bool r2_process(tree_t p0, int pidx)
          cok = g_r2->sync("always", NULL) == 0;
       for (int i = 0; cok && i < cts.n; i++)
          cok = g_r2->sync_assign(cts.t[i].spec, cts.t[i].g0) == 0;
+      for (int i = 0; cok && i < cts.npv; i++)
+         if (cts.pv[i].persistent)   // latch state: commit the hold value
+            cok = g_r2->sync_assign(cts.pv[i].pv, cts.pv[i].g0) == 0;
       return cok && g_r2_fail == 0;
    }
    // (rcond/rsig are derived below from ifstmt; the sensitivity may carry

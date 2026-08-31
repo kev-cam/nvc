@@ -185,46 +185,26 @@ Determine where the current looseness actually is:
       sync_assign(sig, g0_var) (the hold temp IS the post-tree value).
       That also puts walker-built designs in reach of GSM_ICG2EN's
       latch→enable rewrite (shared pipeline) — the proven whole-core
-      path.  Remaining census tail: 135 multi-edge areset_of misses,
-      29+6 unfunneled process declines, 19 odd OTHERS literals
-      (T_REF via constant decls?), 3 portmap-size (grow conns
-      buffer), dynamic vector part-select writes.
-      **FINDING (pre-existing, both paths): chunks whose bridge has 0
-      inputs (clk-only designs like memagg/memrf) never install — the
-      flow stops silently between bridge emission and the .so compile.
-      Worth its own investigation; check 11 passes on probe-survival
-      and check 13 on harness diffs, so neither depends on install.**
-      Elaboration traps learned: concurrent assigns arrive as
-      one-assign PROCESSES (mirror the text path's lone-assign→assign
-      conversion); `&`-chains fold into A_CONCAT AGGREGATES; operator
-      FCALL result types are UNCONSTRAINED (derive width from
-      operands); folded_int on enum refs yields the enum POSITION
-      ('0'=2!) — decode literal idents, never trust the low bit; and
-      sigspec buffers must hold one char per BIT for wide literals.
-      opt_asserts check 12 gates full-coverage engagement on wide.
-      **Original walker plan (for the residual constructs):**
-      lives in vhdl2vlog.c sharing its analysis helpers
-      (build_reg_set/is_reg, clock_of/areset_of/edges_of, type_width,
-      emitted_width, comp_inner, block_types_synth); the emission
-      vocabulary to cover is catalogued in the direct-rtlil recon
-      (~60 shapes; expressions are the tail — start with the wide/
-      arst-fixture subset: refs, literals, binary/unary ops via the
-      vlog_op set, ternary→mux, bit-select/slice, concat; DECLINE
-      everything else → per-module text fallback).  Statements: the
-      clocked-process forms via decision trees with `g0_<sig>` hold
-      temps; expression cells use `rx<n>` temp wires (deterministic).
-      Decisions taken: TEXT STAYS THE CACHE KEY + staged evidence for
-      now (the parent needs the key pre-fork; the content_hash switch
-      comes when the text path retires); the builder replaces only the
-      read_verilog leg; differential = the 4-engine gate + an
-      opt_assert running one suite design under NVC_ACCEL_RTLIL=1
-      with an engagement check.  Then: $mem_v2 memories (the
-      icache-monster lever).
-- [x] Drive passes via `run_pass()` instead of shelling out and
-      round-tripping files.  Done for the converted path; the C-out →
-      gcc → .so → dlopen leg is inherent (it IS the product) and
-      stays.
-- [x] Licensing: Yosys is ISC. Linking carries no obligations.
+      path.  **LATCH INCREMENT LANDED (2026-08-31): persistent variables as
+      pseudo-targets** — pv wire + hold temp rooted at pv (or at the
+      last straight-line value when written unconditionally first —
+      then it is a plain temp, nothing persists), branch writes into
+      the hold, always-sync commit → proc infers the $dlatch; the
+      trailing `sig <= var` copy shares the var's hold temp as the
+      signal's SYNC SOURCE (a root action would read the pre-branch
+      value: case actions evaluate before switches).  Results:
+      translated fixture walks with ZERO declines; EH1a walker
+      declines 1,376 → 532; plain census PASSES (cycles=1113) with
+      454 installs, mostly rtlil-built — THE FIRST RTLIL INSTALLS ON
+      VeeR.  Under GSM_ICG2EN the walker and text arms behave
+      IDENTICALLY including an identical watchdog at cycles=99992 —
+      the per-chunk + GSM_ICG2EN composition diverges PRE-EXISTINGLY
+      on the text path too (icg2en shipped via the MERGE flow) —
+      filed as its own item, not a walker defect.
+      Remaining tail: 532 residual walker declines (multi-edge
+      areset_of misses, unfunneled process declines, odd OTHERS
+      literals, portmap-size, remaining var shapes), dynamic vector
+      part-select writes, rtlil for the MERGE pool.
 
 ## 2. ABI containment
 
