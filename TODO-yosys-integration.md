@@ -136,9 +136,26 @@ Determine where the current looseness actually is:
       regf turned out to be constant SLICE
       targets + `when others => null` (its 512-bit vector is flat, not
       an array) — landed next: slice/bit lhs on the hold temp, T_NULL.
-      **ALL 5 suite shapes now FULLY parse-free.**  Next: the
-      comb-of-clocked NBA idiom (VeeR entry), functions, $mem_v2
-      (true array memories — the memagg fixture is the vehicle).
+      **ALL 5 suite shapes now FULLY parse-free.**
+      **$mem_v2 MEMORIES LANDED (2026-08-31):** true array memories
+      construct directly — RTLIL::Memory + async $memrd reads +
+      MemWriteAction writes on the edge sync (only the ENABLE threads
+      the decision tree; addr/data are unconditional comb gated by EN;
+      later same-mem writes get priority — VHDL sequential order).
+      Whole-array positional writes expand per word (element i → word
+      size-1-i, the text path's validated convention).  Proven by the
+      selftest's dynamic write/read memory (64-cycle trace equality,
+      real traffic) and opt_asserts 13's memrf fixture — where the
+      oracle is a 100-cycle HARNESS DIFF of the two paths' generated C
+      (clk-only chunks do not install into the sim: a pre-existing
+      quiet stop after bridge emission, see finding below).  Next: the
+      comb-of-clocked NBA idiom (VeeR entry), functions, dynamic
+      part-selects.
+      **FINDING (pre-existing, both paths): chunks whose bridge has 0
+      inputs (clk-only designs like memagg/memrf) never install — the
+      flow stops silently between bridge emission and the .so compile.
+      Worth its own investigation; check 11 passes on probe-survival
+      and check 13 on harness diffs, so neither depends on install.**
       Elaboration traps learned: concurrent assigns arrive as
       one-assign PROCESSES (mirror the text path's lone-assign→assign
       conversion); `&`-chains fold into A_CONCAT AGGREGATES; operator

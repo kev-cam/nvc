@@ -24,6 +24,12 @@ typedef struct {
    int (*sync)(const char *edge, const char *sig);
    int (*sync_assign)(const char *lhs, const char *rhs);
    int (*case_assign)(const char *lhs, const char *rhs);
+   int (*case_assign_root)(const char *lhs, const char *rhs);
+   int (*memory)(const char *name, int width, int size);
+   int (*memrd)(const char *name, const char *memid, const char *addr,
+                const char *data);
+   int (*sync_memwr)(const char *memid, const char *addr, const char *data,
+                     const char *en);
    int (*switch_begin)(const char *sig);
    int (*case_begin)(const char *compare);
    int (*case_end)(void);

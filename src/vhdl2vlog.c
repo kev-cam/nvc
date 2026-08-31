@@ -3073,6 +3073,27 @@ static const char *g_r2_site = "?";          // breadcrumb for declines
 // this bounds the widest expressible constant/concat; wider declines.
 #define R2_SPEC 4096
 
+// memories qualified for direct construction (per module)
+typedef struct { ident_t id; char vname[80]; int width, size; } r2_mem_t;
+static r2_mem_t g_r2_mems[16];
+static int g_r2_nmems;
+
+static r2_mem_t *r2_mem_of(ident_t id)
+{
+   for (int i = 0; i < g_r2_nmems; i++)
+      if (g_r2_mems[i].id == id)
+         return &g_r2_mems[i];
+   return NULL;
+}
+
+static int r2_clog2(int n)
+{
+   int b = 0;
+   while ((1 << b) < n)
+      b++;
+   return b > 0 ? b : 1;
+}
+
 static int r2_width(tree_t e)
 {
    const int ew = emitted_width(e, 0);
@@ -3377,6 +3398,25 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
       {
          tree_t base = tree_value(e);
          int64_t idx;
+         if (tree_kind(base) == T_REF && tree_params(e) == 1) {
+            r2_mem_t *mm = r2_mem_of(tree_ident(base));
+            if (mm != NULL) {
+               // memory read: an async $memrd port with the index as ADDR
+               char as[R2_SPEC];
+               if (!r2_expr(tree_value(tree_param(e, 0)), as, sizeof as))
+                  return false;
+               char dt[R2_SPEC], cn[R2_SPEC + 8];
+               if (!r2_temp(mm->width, dt, sizeof dt))
+                  return false;
+               snprintf(cn, sizeof cn, "m%s", dt);
+               if (g_r2->memrd(cn, mm->vname, as, dt) != 0) {
+                  R2_DECLINE("memrd");
+                  return false;
+               }
+               snprintf(out, sz, "%s", dt);
+               return true;
+            }
+         }
          if (tree_kind(base) != T_REF || tree_params(e) != 1
              || !folded_int(tree_value(tree_param(e, 0)), &idx)) {
             R2_DECLINE("array-ref");
@@ -3397,7 +3437,9 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          if (np >= 1 && (strstr(fn, "UNSIGNED") || strstr(fn, "SIGNED")
                          || strstr(fn, "STD_LOGIC_VECTOR")
                          || strstr(fn, "TO_STDLOGICVECTOR")
+                         || strstr(fn, "TO_INTEGER")
                          || strstr(fn, "unsigned")
+                         || strstr(fn, "to_integer")
                          || strstr(fn, "std_logic_vector"))
              && vlog_op(fn) == NULL && np == 1)
             return r2_expr(tree_value(tree_param(e, 0)), out, sz);
@@ -3514,9 +3556,15 @@ typedef struct {
    int     width;
 } r2_target_t;
 
+typedef struct { char memid[80]; char *addr; char *data; char en[32]; }
+   r2_memwr_t;
+
 typedef struct {
    r2_target_t t[64];
    int         n;
+   r2_memwr_t  mw[64];   // pending memory writes, flushed after the edge
+   int         nmw;      //  sync exists (addr/data are heap copies)
+   int         nsites;   // enable-temp counter
 } r2_targets_t;
 
 static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
@@ -3538,6 +3586,8 @@ static void r2_collect_cb(tree_t t, void *ctx)
    while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF)
       tg = tree_value(tg);
    if (tree_kind(tg) != T_REF || !tree_has_ref(tg))
+      return;
+   if (r2_mem_of(tree_ident(tg)) != NULL)   // memories write via memwr
       return;
    if (ts->n >= 64)
       return;
@@ -3563,6 +3613,80 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
    case T_SIGNAL_ASSIGN:
       {
          tree_t tg = tree_target(s);
+         // memory writes: only the ENABLE threads the decision tree —
+         // addr/data are unconditional comb, gated by EN at the port
+         r2_mem_t *mm = NULL;
+         if (tree_kind(tg) == T_ARRAY_REF
+             && tree_kind(tree_value(tg)) == T_REF)
+            mm = r2_mem_of(tree_ident(tree_value(tg)));
+         else if (tree_kind(tg) == T_REF && tree_has_ref(tg))
+            mm = r2_mem_of(tree_ident(tg));
+         if (mm != NULL) {
+            if (tree_waveforms(s) < 1
+                || !tree_has_value(tree_waveform(s, 0))) {
+               R2_DECLINE("mem-null-wave");
+               return false;
+            }
+            tree_t val = tree_value(tree_waveform(s, 0));
+            if (ts->nsites >= 64 || ts->nmw >= 64) {
+               R2_DECLINE("mem-sites");
+               return false;
+            }
+            char en[32];
+            snprintf(en, sizeof en, "g0m%d", ts->nsites++);
+            if (g_r2->wire(en, 1, 0, NULL) != 0
+                || g_r2->case_assign_root(en, "1'b0") != 0
+                || g_r2->case_assign(en, "1'b1") != 0)
+               return false;
+            if (tree_kind(tg) == T_ARRAY_REF) {
+               // indexed write
+               char as[R2_SPEC], ds[R2_SPEC];
+               g_r2_site = "memwr-addr";
+               if (!r2_expr(tree_value(tree_param(tg, 0)), as, sizeof as))
+                  return false;
+               g_r2_site = "memwr-data";
+               if (!r2_const(val, ds, sizeof ds, mm->width)
+                   && !r2_expr(val, ds, sizeof ds))
+                  return false;
+               r2_memwr_t *w = &ts->mw[ts->nmw++];
+               snprintf(w->memid, sizeof w->memid, "%s", mm->vname);
+               w->addr = xstrdup(as);
+               w->data = xstrdup(ds);
+               snprintf(w->en, sizeof w->en, "%s", en);
+               return true;
+            }
+            // whole-array positional aggregate: element i -> word
+            // (size-1-i), the text path's (validated) convention
+            if (tree_kind(val) != T_AGGREGATE
+                || tree_assocs(val) != mm->size) {
+               R2_DECLINE("mem-agg");
+               return false;
+            }
+            const int ab = r2_clog2(mm->size);
+            for (int i = 0; i < mm->size; i++) {
+               tree_t a = tree_assoc(val, i);
+               if (tree_subkind(a) != A_POS) {
+                  R2_DECLINE("mem-agg-pos");
+                  return false;
+               }
+               char as[64], ds[R2_SPEC];
+               snprintf(as, sizeof as, "%d'd%d", ab, mm->size - 1 - i);
+               g_r2_site = "memagg-data";
+               if (!r2_const(tree_value(a), ds, sizeof ds, mm->width)
+                   && !r2_expr(tree_value(a), ds, sizeof ds))
+                  return false;
+               if (ts->nmw >= 64) {
+                  R2_DECLINE("mem-sites");
+                  return false;
+               }
+               r2_memwr_t *w = &ts->mw[ts->nmw++];
+               snprintf(w->memid, sizeof w->memid, "%s", mm->vname);
+               w->addr = xstrdup(as);
+               w->data = xstrdup(ds);
+               snprintf(w->en, sizeof w->en, "%s", en);
+            }
+            return true;
+         }
          // constant slice / bit target: assign into the hold temp's range
          int64_t hi = -1, lo = -1;
          if (tree_kind(tg) == T_ARRAY_SLICE) {
@@ -3730,6 +3854,23 @@ static bool r2_seq(tree_t list_of, r2_targets_t *ts)
    return true;
 }
 
+// flush pending memory writes onto the (just created) edge sync
+static bool r2_flush_memwr(r2_targets_t *ts)
+{
+   bool ok = true;
+   for (int i = 0; i < ts->nmw; i++) {
+      if (ok && g_r2->sync_memwr(ts->mw[i].memid, ts->mw[i].addr,
+                                 ts->mw[i].data, ts->mw[i].en) != 0) {
+         R2_DECLINE("sync-memwr");
+         ok = false;
+      }
+      free(ts->mw[i].addr);
+      free(ts->mw[i].data);
+   }
+   ts->nmw = 0;
+   return ok;
+}
+
 static bool r2_process(tree_t p0, int pidx)
 {
    tree_t p = proc_body(p0);
@@ -3793,6 +3934,10 @@ static bool r2_process(tree_t p0, int pidx)
             return false;
       }
       bool cok = r2_seq(p, &cts);
+      if (cok && cts.nmw > 0) {
+         R2_DECLINE("comb-memwr");
+         cok = false;
+      }
       if (cok)
          cok = g_r2->sync("always", NULL) == 0;
       for (int i = 0; cok && i < cts.n; i++)
@@ -3854,6 +3999,8 @@ static bool r2_process(tree_t p0, int pidx)
             && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
          for (int i = 0; ok && i < ts.n; i++)
             ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+         if (ok)
+            ok = r2_flush_memwr(&ts);
       }
       if (ok) {
          char rs[R2_SPEC];
@@ -3889,6 +4036,8 @@ static bool r2_process(tree_t p0, int pidx)
             && g_r2->sync(pe[0] ? "posedge" : "negedge", es) == 0;
          for (int i = 0; ok && i < ts.n; i++)
             ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+         if (ok)
+            ok = r2_flush_memwr(&ts);
       }
    }
    return ok && g_r2_fail == 0;
@@ -3902,6 +4051,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
    g_r2 = api;
    g_r2_tmp = 0;
    g_r2_fail = 0;
+   g_r2_nmems = 0;
    g_r2_why[0] = '\0';
 
    {  tree_t inner = vhdl2vlog_comp_inner(block);
@@ -3920,14 +4070,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) == T_FUNC_BODY && !fn_is_builtin(istr(tree_ident(d)))) {
          R2_DECLINE("function");
-         return false;
-      }
-      if (tree_kind(d) == T_SIGNAL_DECL) {
-         unsigned nw, ew;
-         if (mem_shape(tree_type(d), &nw, &ew)) {
-            R2_DECLINE("memory");
-            return false;
-         }
+         goto declined;
       }
    }
 
@@ -3944,7 +4087,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       type_t ty = tree_type(pt);
       if (!type_const_bounds(ty)) {
          R2_DECLINE("port-width");
-         return false;
+         goto declined;
       }
       if (api->wire(vid(tree_ident(pt)), (int)type_width(ty), dir, NULL) != 0)
          return false;
@@ -3957,9 +4100,43 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       if (tree_kind(d) != T_SIGNAL_DECL)
          continue;
       type_t ty = tree_type(d);
+      unsigned mnw, mew;
+      if (mem_shape(ty, &mnw, &mew)) {
+         // memory-shaped: qualify by USAGE exactly as the text path does
+         // (every reference indexed or a whole-array positional aggregate)
+         if (type_is_integer(type_elem(ty))) {
+            R2_DECLINE("int-mem");
+            goto declined;
+         }
+         if (tree_has_value(d)) {
+            R2_DECLINE("mem-init");
+            goto declined;
+         }
+         mem_scan_t sc = { .decl = d, .refs = 0, .indexed = 0, .agg = 0 };
+         for (int si = 0; si < tree_stmts(block); si++)
+            tree_visit(tree_stmt(block, si), mem_scan_cb, &sc);
+         if (sc.refs == 0 || sc.refs != sc.indexed + sc.agg) {
+            R2_DECLINE("mem-usage");
+            goto declined;
+         }
+         if (g_r2_nmems >= 16) {
+            R2_DECLINE("mem-count");
+            goto declined;
+         }
+         r2_mem_t *mm = &g_r2_mems[g_r2_nmems++];
+         mm->id = tree_ident(d);
+         snprintf(mm->vname, sizeof mm->vname, "%s", vid(tree_ident(d)));
+         mm->width = (int)mew;
+         mm->size = (int)mnw;
+         if (api->memory(mm->vname, mm->width, mm->size) != 0) {
+            R2_DECLINE("memory");
+            goto declined;
+         }
+         continue;   // a Memory, not a wire
+      }
       if (!type_const_bounds(ty)) {
          R2_DECLINE("sig-width");
-         return false;
+         goto declined;
       }
       const int w = (int)type_width(ty);
       const bool is_r = is_reg(block, d);
@@ -3969,7 +4146,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       if (is_r && tree_has_value(d)) {
          if (!r2_const(tree_value(d), init, sizeof init, w)) {
             R2_DECLINE("reg-init");
-            return false;
+            goto declined;
          }
          const char *tick = strchr(init, '\'');
          if (tick != NULL && tick[1] == 'b')
@@ -3994,7 +4171,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
          char v[R2_SPEC];
          if (!r2_const(tree_value(d), v, sizeof v, w)) {
             R2_DECLINE("wire-init");
-            return false;
+            goto declined;
          }
          if (api->connect(vid(tree_ident(d)), v) != 0)
             return false;
@@ -4097,6 +4274,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       }
    }
 
+ declined:
    if (g_r2_fail > 0) {
       warnf("vhdl2rtlil: '%s' declined (%s) — using the text path",
             modname, g_r2_why);

@@ -1763,6 +1763,11 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
                   a->sync         = dlsym(dl, "gsm_rtlil_sync");
                   a->sync_assign  = dlsym(dl, "gsm_rtlil_sync_assign");
                   a->case_assign  = dlsym(dl, "gsm_rtlil_case_assign");
+                  a->case_assign_root
+                                  = dlsym(dl, "gsm_rtlil_case_assign_root");
+                  a->memory       = dlsym(dl, "gsm_rtlil_memory");
+                  a->memrd        = dlsym(dl, "gsm_rtlil_memrd");
+                  a->sync_memwr   = dlsym(dl, "gsm_rtlil_sync_memwr");
                   a->switch_begin = dlsym(dl, "gsm_rtlil_switch_begin");
                   a->case_begin   = dlsym(dl, "gsm_rtlil_case_begin");
                   a->case_end     = dlsym(dl, "gsm_rtlil_case_end");
@@ -1774,7 +1779,9 @@ static gsm_generate_fn accel_gsm_probe(const char **libfile)
                      && a->connect && a->cell_bin && a->cell_un
                      && a->cell_mux && a->cell_inst
                      && a->proc && a->sync && a->sync_assign
-                     && a->case_assign && a->switch_begin && a->case_begin
+                     && a->case_assign && a->case_assign_root
+                     && a->memory && a->memrd && a->sync_memwr
+                     && a->switch_begin && a->case_begin
                      && a->case_end && a->switch_end && a->content_hash
                      && a->synth && a->abort_session;
                   break;
