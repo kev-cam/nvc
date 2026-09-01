@@ -3074,6 +3074,47 @@ static const char *g_r2_site = "?";          // breadcrumb for declines
 #define R2_SPEC 4096
 
 // memories qualified for direct construction (per module)
+// user functions inlinable at call sites: straight-line pure bodies only
+// (var-assigns to plain refs + nulls + one trailing valued return)
+static tree_t g_r2_funcs[8];
+static int    g_r2_nfuncs;
+static int    g_r2_inline_depth;
+
+static bool r2_func_inlinable(tree_t body, char *why, size_t wsz)
+{
+   const int n = tree_stmts(body);
+   if (n < 1) {
+      snprintf(why, wsz, "empty");
+      return false;
+   }
+   for (int i = 0; i < n; i++) {
+      tree_t st = tree_stmt(body, i);
+      const tree_kind_t k = tree_kind(st);
+      if (k == T_NULL)
+         continue;
+      if (k == T_RETURN) {
+         if (i == n - 1 && tree_has_value(st))
+            return true;
+         snprintf(why, wsz, "ret@%d/%d", i, n);
+         return false;
+      }
+      if (k != T_VAR_ASSIGN) {
+         snprintf(why, wsz, "k%d@%d", (int)k, i);
+         return false;
+      }
+      tree_t ft = tree_target(st);
+      if (tree_kind(ft) == T_ARRAY_REF && tree_params(ft) == 1
+          && tree_kind(tree_value(ft)) == T_REF)
+         continue;   // per-bit build of a local: the inliner composes it
+      if (tree_kind(ft) != T_REF) {
+         snprintf(why, wsz, "tgt%d@%d", (int)tree_kind(ft), i);
+         return false;
+      }
+   }
+   snprintf(why, wsz, "noret");
+   return false;
+}
+
 typedef struct { ident_t id; char vname[80]; int width, size; } r2_mem_t;
 static r2_mem_t g_r2_mems[16];
 static int g_r2_nmems;
@@ -3144,8 +3185,12 @@ static int        g_r2_nalias;
 // straight-line process-local variables: pure expression SUBSTITUTION —
 // a write records the value's sigspec, a read returns it (the read_verilog
 // technique, flat only: writes inside a switch scope decline)
+static bool r2_temp(int width, char *out, size_t sz);
+
 typedef struct { ident_t var; char *spec;
-                 bool has_ival; int64_t ival; } r2_subst_t;
+                 bool has_ival; int64_t ival;
+                 int bw;              // >0: var built PER-BIT (bits[] specs)
+                 char *bits[128]; } r2_subst_t;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
 static int        g_r2_case_depth;   // >0 while inside any switch case
@@ -3158,10 +3203,60 @@ static r2_subst_t *r2_subst_of(ident_t var)
    return NULL;
 }
 
+static void r2_subst_clear_bits(r2_subst_t *e)
+{
+   for (int i = 0; i < e->bw && i < 128; i++)
+      free(e->bits[i]);
+   e->bw = 0;
+}
+
+// seed a bit table from a sized-literal spec ("N'dK" / "N'bBB.." / "N'hHH..")
+static bool r2_bits_seed(char **bits, int w, const char *spec)
+{
+   const char *tick = spec ? strchr(spec, 39) : NULL;
+   if (tick == NULL)
+      return false;
+   if (tick[1] == 'd') {
+      if (w > 63)
+         return false;
+      const int64_t v = atoll(tick + 2);
+      for (int i = 0; i < w; i++) {
+         char b[8];
+         snprintf(b, sizeof b, "1'd%d", (int)((v >> i) & 1));
+         bits[i] = xstrdup(b);
+      }
+      return true;
+   }
+   if (tick[1] == 'b' || tick[1] == 'h') {
+      const char *dig = tick + 2;
+      const int nd = (int)strlen(dig);
+      const int bpc = tick[1] == 'b' ? 1 : 4;
+      if (nd * bpc < w)
+         return false;
+      for (int i = 0; i < w; i++) {
+         // bit i counts from the LSB end = last digit backwards
+         const int di = nd - 1 - i / bpc;
+         int dv;
+         const char c = dig[di];
+         if (c >= '0' && c <= '9') dv = c - '0';
+         else if (c >= 'a' && c <= 'f') dv = c - 'a' + 10;
+         else if (c >= 'A' && c <= 'F') dv = c - 'A' + 10;
+         else return false;
+         char b[8];
+         snprintf(b, sizeof b, "1'd%d", (dv >> (i % bpc)) & 1);
+         bits[i] = xstrdup(b);
+      }
+      return true;
+   }
+   return false;
+}
+
 static void r2_subst_reset(void)
 {
-   for (int i = 0; i < g_r2_nsubst; i++)
+   for (int i = 0; i < g_r2_nsubst; i++) {
       free(g_r2_subst[i].spec);
+      r2_subst_clear_bits(&g_r2_subst[i]);
+   }
    g_r2_nsubst = 0;
 }
 
@@ -3174,8 +3269,10 @@ static bool r2_subst_set(ident_t var, const char *spec)
       e = &g_r2_subst[g_r2_nsubst++];
       e->var = var;
       e->spec = NULL;
+      e->bw = 0;
    }
    free(e->spec);
+   r2_subst_clear_bits(e);
    e->spec = xstrdup(spec);
    e->has_ival = false;
    return true;
@@ -3194,8 +3291,10 @@ static bool r2_subst_set_int(ident_t var, int64_t v)
       e = &g_r2_subst[g_r2_nsubst++];
       e->var = var;
       e->spec = NULL;
+      e->bw = 0;
    }
    free(e->spec);
+   r2_subst_clear_bits(e);
    e->spec = NULL;
    if (v >= 0) {
       char b[32];
@@ -3207,6 +3306,84 @@ static bool r2_subst_set_int(ident_t var, int64_t v)
    return true;
 }
 
+// per-bit write to a straight-line local (v(i) := b with const i): the var
+// becomes a bit table; a prior whole CONSTANT value expands into bits so
+// init-then-bit-build sequences merge.  Composition back to a full value
+// happens at read (r2_subst_compose).
+static bool r2_subst_set_bit(ident_t var, int idx, const char *bspec, int w)
+{
+   if (w < 1 || w > 128 || idx < 0 || idx >= w)
+      return false;
+   r2_subst_t *e = r2_subst_of(var);
+   if (e == NULL) {
+      if (g_r2_nsubst >= 32)
+         return false;
+      e = &g_r2_subst[g_r2_nsubst++];
+      e->var = var;
+      e->spec = NULL;
+      e->has_ival = false;
+      e->bw = 0;
+   }
+   if (e->bw == 0) {
+      // convert: a constant whole value (integer OR sized literal spec)
+      // seeds the bits; anything else leaves unwritten bits unset — a
+      // later whole read of an incompletely-built var fails cleanly
+      char *seedspec = e->spec;
+      const bool ivseed = e->has_ival && w <= 63;
+      const int64_t sv = e->ival;
+      memset(e->bits, 0, sizeof e->bits);
+      e->bw = w;
+      if (ivseed)
+         for (int i = 0; i < w; i++) {
+            char b[8];
+            snprintf(b, sizeof b, "1'd%d", (int)((sv >> i) & 1));
+            e->bits[i] = xstrdup(b);
+         }
+      else if (seedspec != NULL && !r2_bits_seed(e->bits, w, seedspec)) {
+         // dynamic whole value: land it on a temp wire and seed each bit
+         // as an index into it — works for any spec shape
+         for (int i = 0; i < w; i++)
+            { free(e->bits[i]); e->bits[i] = NULL; }
+         char t[64];
+         if (r2_temp(w, t, sizeof t)
+             && g_r2->connect(t, seedspec) == 0) {
+            for (int i = 0; i < w; i++) {
+               char b[80];
+               snprintf(b, sizeof b, "%s[%d]", t, i);
+               e->bits[i] = xstrdup(b);
+            }
+         }
+      }
+      free(e->spec);
+      e->spec = NULL;
+      e->has_ival = false;
+   }
+   else if (e->bw != w)
+      return false;
+   free(e->bits[idx]);
+   e->bits[idx] = xstrdup(bspec);
+   return true;
+}
+
+static bool r2_subst_compose(const r2_subst_t *e, char *out, size_t sz)
+{
+   if (e->bw < 1)
+      return false;
+   size_t len = 0;
+   out[len++] = '{';
+   for (int i = e->bw - 1; i >= 0; i--) {
+      if (e->bits[i] == NULL || len + strlen(e->bits[i]) + 3 >= sz)
+         return false;
+      if (i != e->bw - 1)
+         out[len++] = ',';
+      memcpy(out + len, e->bits[i], strlen(e->bits[i]));
+      len += strlen(e->bits[i]);
+   }
+   out[len++] = '}';
+   out[len] = '\0';
+   return true;
+}
+
 // Walker-side constant interpreter: evaluate an expression to an integer
 // under the current substitution environment.  Pure TRY — returns false on
 // anything unknown, never declines.  Powers while-loop unrolling, static-if
@@ -3215,6 +3392,8 @@ static bool r2_subst_set_int(ident_t var, int64_t v)
 // folded_int cannot see through).  logic3d const vectors decode by the
 // value plane (bit0), MSB first, SIGN-EXTENDED by their width (the loop
 // machinery compares with l3d_lt_s and friends — signed).
+static int r2_width(tree_t e);
+
 static bool r2_eval_int(tree_t e, int64_t *out)
 {
    if (folded_int(e, out))
@@ -3243,6 +3422,22 @@ static bool r2_eval_int(tree_t e, int64_t *out)
    case T_STRING:
    case T_AGGREGATE:
       {
+         // uniform (others => bit) with a constrained width evaluates
+         if (tree_kind(e) == T_AGGREGATE && tree_assocs(e) == 1
+             && tree_subkind(tree_assoc(e, 0)) == A_OTHERS) {
+            const int w = r2_width(e);
+            const char b = r2_bit_of_tree(tree_value(tree_assoc(e, 0)));
+            if (w >= 1 && w <= 63 && b != 0) {
+               uint64_t v = (b == '1') ? ((w == 63) ? ~0ULL >> 1
+                                                    : (1ULL << w) - 1) : 0;
+               int64_t sv = (int64_t)v;
+               if (b == '1')
+                  sv = -1;   // all-ones is -1 at any width, signed
+               *out = sv;
+               return true;
+            }
+            return false;
+         }
          // constant logic3d / std_logic vector: value plane, MSB first
          uint64_t v = 0;
          int n = 0;
@@ -3343,6 +3538,33 @@ static bool r2_eval_int(tree_t e, int64_t *out)
    default:
       return false;
    }
+}
+
+// Snapshot/restore of the whole substitution table, for user-function
+// inlining: bindings and body-local writes must not leak into (or clobber)
+// the calling process's substitutions — generated code reuses names like
+// i/j across scopes.
+typedef struct {
+   int n;
+   r2_subst_t e[32];   // specs are OWNED copies
+} r2_subst_snap_t;
+
+static void r2_subst_save(r2_subst_snap_t *sn)
+{
+   sn->n = g_r2_nsubst;
+   for (int i = 0; i < g_r2_nsubst; i++) {
+      sn->e[i] = g_r2_subst[i];
+      sn->e[i].spec = g_r2_subst[i].spec ? xstrdup(g_r2_subst[i].spec) : NULL;
+   }
+}
+
+static void r2_subst_restore(r2_subst_snap_t *sn)
+{
+   for (int i = 0; i < g_r2_nsubst; i++)
+      free(g_r2_subst[i].spec);
+   for (int i = 0; i < sn->n; i++)
+      g_r2_subst[i] = sn->e[i];
+   g_r2_nsubst = sn->n;
 }
 
 static r2_alias_t *r2_alias_of(ident_t var)
@@ -3503,10 +3725,38 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
 static bool r2_expr(tree_t e, char *out, size_t sz);
 
 // Make a fresh temp wire of `width` bits; returns its name in out.
+// width for a cell result: the expression's own width, falling back to
+// the widest operand when the result type is unconstrained (operator FCALL
+// results carry no bounds — verilog self-determination is the text-path
+// semantics being mirrored)
+static int r2_width_or_operands(tree_t e)
+{
+   const int w = r2_width(e);
+   if (w > 0)
+      return w;
+   if (tree_kind(e) == T_FCALL) {
+      // recurse: chains of unconstrained operator results (l3d_or of
+      // l3d_and of resize of ...) carry their width arbitrarily deep
+      int mx = -1;
+      const int np = tree_params(e);
+      for (int i = 0; i < np; i++) {
+         const int pw = r2_width_or_operands(tree_value(tree_param(e, i)));
+         if (pw > mx)
+            mx = pw;
+      }
+      return mx;
+   }
+   if (tree_kind(e) == T_QUALIFIED || tree_kind(e) == T_TYPE_CONV)
+      return r2_width_or_operands(tree_value(e));
+   return w;
+}
+
 static bool r2_temp(int width, char *out, size_t sz)
 {
    if (width <= 0) {
-      R2_DECLINE("temp-width");
+      char why[32];
+      snprintf(why, sizeof why, "temp-width %d", width);
+      R2_DECLINE(why);
       return false;
    }
    snprintf(out, sz, "rx%d", g_r2_tmp++);
@@ -3548,6 +3798,12 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             if (sb != NULL && sb->spec != NULL) {
                snprintf(out, sz, "%s", sb->spec);
                return true;
+            }
+            if (sb != NULL && sb->bw > 0) {
+               if (r2_subst_compose(sb, out, sz))
+                  return true;
+               R2_DECLINE("bits-partial");
+               return false;
             }
          }
          tree_t d = tree_has_ref(e) ? tree_ref(e) : NULL;
@@ -3673,7 +3929,11 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
               && !r2_eval_int(tree_left(r), &left))
              || (!folded_int(tree_right(r), &right)
                  && !r2_eval_int(tree_right(r), &right))) {
-            R2_DECLINE("slice-bounds");
+            char why[48];
+            snprintf(why, sizeof why, "slice-bounds k%d/k%d",
+                     (int)tree_kind(tree_left(r)),
+                     (int)tree_kind(tree_right(r)));
+            R2_DECLINE(why);
             return false;
          }
          if (left < 0 || right < 0) {
@@ -3713,6 +3973,20 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          bool have_idx = tree_kind(base) == T_REF && tree_params(e) == 1
             && folded_int(tree_value(tree_param(e, 0)), &idx);
          if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
+            int64_t bidx;
+            r2_subst_t *sb = r2_subst_of(tree_ident(base));
+            if (sb != NULL && sb->bw > 0
+                && r2_eval_int(tree_value(tree_param(e, 0)), &bidx)
+                && bidx >= 0 && bidx < sb->bw) {
+               if (sb->bits[bidx] == NULL) {
+                  R2_DECLINE("bits-unset");
+                  return false;
+               }
+               snprintf(out, sz, "%s", sb->bits[bidx]);
+               return true;
+            }
+         }
+         if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
             // arithmetic over substituted loop indices evaluates directly
             int64_t ev;
             if (r2_eval_int(tree_value(tree_param(e, 0)), &ev) && ev >= 0) {
@@ -3729,6 +4003,31 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                   idx = atoll(tick + 2);
                   have_idx = true;
                }
+            }
+         }
+         if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
+            // DYNAMIC single-bit read of a plain vector: shr + [0], the
+            // same lowering l3d_bit_read gets (the base is not a memory —
+            // that path returned above)
+            tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
+            type_t bt = bd != NULL ? tree_type(bd) : NULL;
+            const int bw = (bt != NULL && type_const_bounds(bt))
+               ? (int)type_width(bt) : -1;
+            char is2[R2_SPEC];
+            if (bw >= 1 && bw <= 4000
+                && (tree_kind(bd) == T_SIGNAL_DECL
+                    || tree_kind(bd) == T_PORT_DECL)
+                && r2_expr(tree_value(tree_param(e, 0)), is2, sizeof is2)) {
+               char dt[R2_SPEC], cn[R2_SPEC + 8], bspec[R2_SPEC];
+               if (!r2_expr(base, bspec, sizeof bspec))
+                  return false;
+               if (!r2_temp(bw, dt, sizeof dt))
+                  return false;
+               snprintf(cn, sizeof cn, "c%s", dt);
+               if (g_r2->cell_bin("shr", cn, bspec, is2, dt, 0) != 0)
+                  return false;
+               snprintf(out, sz, "%s[0]", dt);
+               return true;
             }
          }
          if (!have_idx) {
@@ -3836,9 +4135,9 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                   return false;
                int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
                if (w <= 0)
-                  w = r2_width(ea);
+                  w = r2_width_or_operands(ea);
                if (w <= 0)
-                  w = r2_width(eb);
+                  w = r2_width_or_operands(eb);
                char y[R2_SPEC], cn[R2_SPEC + 8];
                if (!r2_temp(w, y, sizeof y))
                   return false;
@@ -3980,9 +4279,9 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                return false;
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
             if (w <= 0)
-               w = r2_width(ea);   // operator return types are unconstrained;
-            if (w <= 0)            // same-width operands carry the real width
-               w = r2_width(eb);
+               w = r2_width_or_operands(ea);   // operator returns are
+            if (w <= 0)                        // unconstrained; recurse the
+               w = r2_width_or_operands(eb);   // operand chain for width
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
                return false;
@@ -4021,6 +4320,148 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             snprintf(out, sz, "%s", y);
             return true;
          }
+         // user-function inlining: bind params as substitutions, walk the
+         // straight-line body, render the return value.  The whole table
+         // is snapshotted around the call — generated code reuses local
+         // names (i, j) across scopes, and bindings must not leak.
+         if (g_r2_inline_depth == 0) {
+            tree_t fb = NULL;
+            const char *cb = id_base(fn);
+            for (int i = 0; i < g_r2_nfuncs; i++)
+               if (strcasecmp(id_base(istr(tree_ident(g_r2_funcs[i]))),
+                              cb) == 0) {
+                  fb = g_r2_funcs[i];
+                  break;
+               }
+            if (fb != NULL && tree_ports(fb) == np) {
+               r2_subst_snap_t sn;
+               r2_subst_save(&sn);
+               g_r2_inline_depth++;
+               bool iok = true;
+               for (int i = 0; iok && i < np; i++) {
+                  tree_t av = tree_value(tree_param(e, i));
+                  ident_t pi = tree_ident(tree_port(fb, i));
+                  int64_t cv;
+                  if (r2_eval_int(av, &cv))
+                     iok = r2_subst_set_int(pi, cv);
+                  else {
+                     char as[R2_SPEC];
+                     iok = r2_expr(av, as, sizeof as)
+                        && r2_subst_set(pi, as);
+                  }
+               }
+               // locals written PER-BIT compose into a concat on first
+               // whole read (f_Enc8to3 builds its 3-bit result that way)
+               struct { ident_t var; int w; char *b[64]; } bm[4];
+               int nbm = 0;
+               const int nfs = tree_stmts(fb);
+               for (int i = 0; iok && i < nfs; i++) {
+                  tree_t st = tree_stmt(fb, i);
+                  if (tree_kind(st) == T_NULL)
+                     continue;
+                  tree_t vv = NULL, ft = NULL;
+                  if (tree_kind(st) == T_RETURN)
+                     vv = tree_value(st);
+                  else {
+                     vv = tree_value(st);
+                     ft = tree_target(st);
+                  }
+                  // compose a bit-mapped var read {b[w-1],...,b[0]}
+                  char comp[R2_SPEC];
+                  const char *vspec = NULL;
+                  if (tree_kind(vv) == T_REF) {
+                     for (int m = 0; m < nbm; m++)
+                        if (bm[m].var == tree_ident(vv)) {
+                           size_t cl = 0;
+                           comp[cl++] = '{';
+                           for (int bi = bm[m].w - 1; bi >= 0; bi--) {
+                              if (bm[m].b[bi] == NULL
+                                  || cl + strlen(bm[m].b[bi]) + 3 >= sizeof comp)
+                                 { iok = false; break; }
+                              if (bi != bm[m].w - 1)
+                                 comp[cl++] = ',';
+                              memcpy(comp + cl, bm[m].b[bi],
+                                     strlen(bm[m].b[bi]));
+                              cl += strlen(bm[m].b[bi]);
+                           }
+                           comp[cl++] = '}';
+                           comp[cl] = '\0';
+                           vspec = comp;
+                           break;
+                        }
+                  }
+                  if (!iok)
+                     break;
+                  if (tree_kind(st) == T_RETURN) {
+                     if (vspec != NULL) {
+                        snprintf(out, sz, "%s", vspec);
+                        iok = true;
+                     }
+                     else
+                        iok = r2_expr(vv, out, sz);
+                     break;
+                  }
+                  if (ft != NULL && tree_kind(ft) == T_ARRAY_REF) {
+                     // per-bit write: record the bit's spec
+                     int64_t bidx;
+                     ident_t bv = tree_ident(tree_value(ft));
+                     if (!r2_eval_int(tree_value(tree_param(ft, 0)), &bidx)
+                         || bidx < 0 || bidx >= 64) {
+                        iok = false;
+                        break;
+                     }
+                     int m;
+                     for (m = 0; m < nbm; m++)
+                        if (bm[m].var == bv)
+                           break;
+                     if (m == nbm) {
+                        if (nbm >= 4) { iok = false; break; }
+                        tree_t bd = tree_ref(tree_value(ft));
+                        type_t bt = tree_type(bd);
+                        const int bw = type_const_bounds(bt)
+                           ? (int)type_width(bt) : -1;
+                        if (bw < 1 || bw > 64) { iok = false; break; }
+                        bm[nbm].var = bv;
+                        bm[nbm].w = bw;
+                        memset(bm[nbm].b, 0, sizeof bm[nbm].b);
+                        nbm++;
+                     }
+                     if (bidx >= bm[m].w) { iok = false; break; }
+                     char bs[R2_SPEC];
+                     int64_t bcv;
+                     if (r2_eval_int(vv, &bcv))
+                        snprintf(bs, sizeof bs, "1'd%d", bcv ? 1 : 0);
+                     else if (!r2_expr(vv, bs, sizeof bs)) {
+                        iok = false;
+                        break;
+                     }
+                     free(bm[m].b[bidx]);
+                     bm[m].b[bidx] = xstrdup(bs);
+                     continue;
+                  }
+                  // whole var-assign
+                  ident_t ti = tree_ident(ft);
+                  int64_t cv;
+                  if (vspec != NULL)
+                     iok = r2_subst_set(ti, vspec);
+                  else if (r2_eval_int(vv, &cv))
+                     iok = r2_subst_set_int(ti, cv);
+                  else {
+                     char vs[R2_SPEC];
+                     iok = r2_expr(vv, vs, sizeof vs)
+                        && r2_subst_set(ti, vs);
+                  }
+               }
+               for (int m = 0; m < nbm; m++)
+                  for (int bi = 0; bi < 64; bi++)
+                     free(bm[m].b[bi]);
+               g_r2_inline_depth--;
+               r2_subst_restore(&sn);
+               if (iok)
+                  return true;
+               return false;
+            }
+         }
          R2_DECLINE("fcall");
          return false;
       }
@@ -4046,6 +4487,12 @@ typedef struct {
    int     width;
 } r2_target_t;
 
+// backing store for the per-process target table: the giant decode/tlu
+// control modules carry thousands of tmp_ivl deposit targets — far past
+// any sane stack array (this is ~700KB, static in the fork child)
+#define R2_MAX_TARGETS 4096
+static r2_target_t g_r2_tgt[R2_MAX_TARGETS];
+
 typedef struct { char memid[80]; char *addr; char *data; char en[32]; }
    r2_memwr_t;
 
@@ -4057,7 +4504,9 @@ typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
                  bool persistent; } r2_pvar_t;
 
 typedef struct {
-   r2_target_t t[256];
+   r2_target_t *t;        // points at g_r2_tgt (walker is child-single-
+                          // threaded; one process walks at a time)
+   bool        capped;    // collection hit the cap: target-miss is a LIE
    int         n;
    r2_memwr_t  mw[64];   // pending memory writes, flushed after the edge
    int         nmw;      //  sync exists (addr/data are heap copies)
@@ -4141,8 +4590,10 @@ static void r2_collect_cb(tree_t t, void *ctx)
       return;
    if (r2_mem_of(tree_ident(tg)) != NULL)   // memories write via memwr
       return;
-   if (ts->n >= 256)
+   if (ts->n >= R2_MAX_TARGETS) {
+      ts->capped = true;
       return;
+   }
    ident_t id = tree_ident(tg);
    if (r2_target(ts, id) != NULL)
       return;
@@ -4176,6 +4627,98 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                vb = tree_value(vb);
             r2_alias_t *al = (tree_kind(vb) == T_REF)
                ? r2_alias_of(tree_ident(vb)) : NULL;
+            if (al == NULL
+                && (tree_kind(tg) == T_ARRAY_REF
+                    || tree_kind(tg) == T_ARRAY_SLICE)
+                && tree_kind(tree_value(tg)) == T_REF
+                && tree_has_ref(tree_value(tg))
+                && tree_kind(tree_ref(tree_value(tg))) == T_VAR_DECL
+                && g_r2_case_depth == 0
+                && r2_pvar_of(ts, tree_ident(tree_value(tg))) == NULL
+                && r2_mem_of(tree_ident(tree_value(tg))) == NULL) {
+               // per-bit / per-slice build of a straight-line local vector
+               int64_t blo = -1, bhi = -1;
+               tree_t bd = tree_ref(tree_value(tg));
+               type_t bt = tree_type(bd);
+               const int bw = type_const_bounds(bt)
+                  ? (int)type_width(bt) : -1;
+               g_r2_site = "bit-build";
+               bool brange = false;
+               if (tree_kind(tg) == T_ARRAY_REF && tree_params(tg) == 1) {
+                  if (r2_eval_int(tree_value(tree_param(tg, 0)), &blo)) {
+                     bhi = blo;
+                     brange = true;
+                  }
+               }
+               else if (tree_kind(tg) == T_ARRAY_SLICE) {
+                  tree_t r = tree_range(tg, 0);
+                  int64_t l2, r2v;
+                  if ((folded_int(tree_left(r), &l2)
+                       || r2_eval_int(tree_left(r), &l2))
+                      && (folded_int(tree_right(r), &r2v)
+                          || r2_eval_int(tree_right(r), &r2v))) {
+                     bhi = l2 > r2v ? l2 : r2v;
+                     blo = l2 > r2v ? r2v : l2;
+                     brange = true;
+                  }
+               }
+               if (bw >= 1 && bw <= 128 && brange
+                   && blo >= 0 && bhi < bw) {
+                  const int sw = (int)(bhi - blo + 1);
+                  char bs[R2_SPEC];
+                  int64_t bcv;
+                  ident_t bvi = tree_ident(tree_value(tg));
+                  if (r2_eval_int(tree_value(s), &bcv)) {
+                     bool bok = true;
+                     for (int k = 0; bok && k < sw; k++) {
+                        char b1[8];
+                        snprintf(b1, sizeof b1, "1'd%d",
+                                 (int)((bcv >> k) & 1));
+                        bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
+                     }
+                     if (!bok) {
+                        R2_DECLINE("bit-build");
+                        return false;
+                     }
+                     return true;
+                  }
+                  if (!r2_expr(tree_value(s), bs, sizeof bs))
+                     return false;
+                  if (sw == 1) {
+                     if (!r2_subst_set_bit(bvi, (int)blo, bs, bw)) {
+                        R2_DECLINE("bit-build");
+                        return false;
+                     }
+                     return true;
+                  }
+                  // multi-bit slice: land the value on a temp and seed
+                  // each covered bit as an index into it
+                  char t[64];
+                  if (!r2_temp(sw, t, sizeof t)
+                      || g_r2->connect(t, bs) != 0) {
+                     R2_DECLINE("bit-build-temp");
+                     return false;
+                  }
+                  bool bok = true;
+                  for (int k = 0; bok && k < sw; k++) {
+                     char b1[80];
+                     snprintf(b1, sizeof b1, "%s[%d]", t, k);
+                     bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
+                  }
+                  if (!bok) {
+                     R2_DECLINE("bit-build");
+                     return false;
+                  }
+                  return true;
+               }
+               {
+                  char why[64];
+                  snprintf(why, sizeof why, "bit-build w%d r%d", bw,
+                           (int)brange);
+                  R2_DECLINE(why);
+                  return false;
+               }
+            }
             if (al == NULL) {
                // straight-line local variable: pure substitution (whole
                // target, outside any switch scope, not yet promoted)
@@ -4219,7 +4762,12 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      return false;
                   return g_r2->case_assign(pe->g0, vs) == 0;
                }
-               R2_DECLINE("var-assign");
+               {
+                  char why[48];
+                  snprintf(why, sizeof why, "var-assign k%d d%d",
+                           (int)tree_kind(tg), g_r2_case_depth);
+                  R2_DECLINE(why);
+               }
                return false;
             }
             // rewrite the BASE ident by aliasing: the slice/index structure
@@ -4435,7 +4983,8 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          r2_target_t *t = r2_target(ts, ti);
          if (t == NULL) {
             char why[96];
-            snprintf(why, sizeof why, "target-miss %s", istr(ti));
+            snprintf(why, sizeof why, "%s %s",
+                     ts->capped ? "target-cap" : "target-miss", istr(ti));
             R2_DECLINE(why);
             return false;
          }
@@ -4796,7 +5345,7 @@ static bool r2_process(tree_t p0, int pidx)
       // infers the same latch the text path would (and gsm declines it).
       r2_subst_reset();
       g_r2_case_depth = 0;
-      r2_targets_t cts = { .n = 0, .comb = true };
+      r2_targets_t cts = { .n = 0, .comb = true, .t = g_r2_tgt };
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
          R2_DECLINE("comb-empty");
@@ -4931,7 +5480,7 @@ static bool r2_process(tree_t p0, int pidx)
          }
    }
 
-   r2_targets_t ts = { .n = 0 };
+   r2_targets_t ts = { .n = 0, .t = g_r2_tgt };
    tree_visit(p, r2_collect_cb, &ts);
    // aliased signals are targets even when the body writes only the shadow
    for (int i = 0; i < g_r2_nalias; i++) {
@@ -5067,10 +5616,24 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
    // subset guards: no design functions, no hoisted process variables,
    // no memory-shaped signals
    const int ndecls = tree_decls(block);
+   g_r2_nfuncs = 0;
+   g_r2_inline_depth = 0;
    for (int i = 0; i < ndecls; i++) {
       tree_t d = tree_decl(block, i);
       if (tree_kind(d) == T_FUNC_BODY && !fn_is_builtin(istr(tree_ident(d)))) {
-         R2_DECLINE("function");
+         // a straight-line pure body INLINES at its call sites; anything
+         // else still declines the module
+         char fw[32];
+         if (r2_func_inlinable(d, fw, sizeof fw) && g_r2_nfuncs < 8) {
+            g_r2_funcs[g_r2_nfuncs++] = d;
+            continue;
+         }
+         {
+            char why[96];
+            snprintf(why, sizeof why, "function %s %s",
+                     id_base(istr(tree_ident(d))), fw);
+            R2_DECLINE(why);
+         }
          goto declined;
       }
    }

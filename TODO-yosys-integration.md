@@ -313,6 +313,29 @@ Determine where the current looseness actually is:
       FUNCTIONS (lsu_bus_buffer f_Enc8to3/Ternary_*), shared-variable
       tmp_ivl targets (target-miss class), indexed writes to local
       vector variables (var-assign class), + singles.
+      **RESIDUE SWEEP 2 (2026-09-01): declines 16 → 9 (99.95% of
+      19,093 walks).**  Landed: USER-FUNCTION INLINING (straight-line
+      pure bodies — var-assigns + one trailing valued return — bind
+      params as substitutions, walk, render the return; per-bit
+      result builds compose via a bit table; whole subst table
+      snapshot/restored around the call since generated code reuses
+      i/j across scopes); DYNAMIC BIT-READS of plain vectors lower to
+      shr + [0] (the l3d_bit_read lowering, now for direct indexing);
+      BITS-MODE SUBSTITUTIONS (a local vector built per-bit/per-slice
+      becomes a bit table; constant whole values seed it, dynamic
+      whole values land on a temp wire and seed as indexes; reads
+      compose an MSB-first concat); RECURSIVE operand-width fallback
+      (unconstrained operator chains carry width arbitrarily deep);
+      target table now 4096 entries in a static backing store (the
+      giant decode/tlu modules carry THOUSANDS of tmp_ivl deposit
+      targets — the cap surfaced as target-miss until named).
+      Remaining 9 (6 modules): lsu_bus_buffer 256-wide bit-built
+      locals (>128 cap; compose would also breach R2_SPEC),
+      per-bit OOB signal writes needing width coercion at
+      case_assign (dec_gpr g0[0:0] vs 32-bit rhs), unconstrained
+      target widths (dec_decode g0_cam_in), dynamic part-select
+      slice bounds (dma_ctrl k3/k3), two l3d-bin poisons downstream
+      of the same shapes.  All decline→text, correctness unaffected.
 
 ## 2. ABI containment
 
