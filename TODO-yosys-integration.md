@@ -240,6 +240,29 @@ Determine where the current looseness actually is:
       interp on the dynw fixture, now opt_asserts check 14) and
       EH1a census 6 TEST_PASSED 1113 with declines steady at 64 —
       the VeeR dynamic sites live inside already-walked processes.
+      **ICACHE FRONTIER CLEARED (2026-08-31):** probing ic_data/ic_tag
+      (the 8704-bit way_data monster — text synth FAILS on these, so
+      the walker is the only viable acceleration route) peeled six
+      stacked blockers, each a generality win: (1) `(others => ref)`
+      replication expands to a literal concat of total/element copies;
+      (2) continuous assigns to slice / const-indexed targets connect
+      via the target's sigspec (RTLIL connections take any LHS);
+      (3) the libgsm sigspec parser now splits concats at DEPTH-0
+      commas and recurses — nested `{{a,b},c}` used to shear into
+      garbage names (`tmp_ivl_182}`) and poison the session; (4)
+      uniform `(others => ...)` memory initializers DROP, matching the
+      text path's bare-reg-array emission; (5) the walker target table
+      grew 64→256 (the cap silently skipped collection → target-miss);
+      (6) memories qualified through the NBA-SHADOW idiom on the text
+      path's exact census (shadow_find/shadow_scan) — the walker's
+      alias machinery already routed shadow writes to memwr, only the
+      qualifier refused.  Both icache chunks now walk CLEAN end to
+      end; the remaining blocker is the gsm derived-clock protocol
+      (rvclkhdr gated clocks internal to the chunk — same decline on
+      both backends, owned by the merge/GSM_GATED flow, not the
+      walker).  EH1a census 7: declines 64 → 20 (99.9% of 19,093
+      walks), TEST_PASSED 1113.  Residue now: 9 stmt-kind@var-subst,
+      6 target-miss TMP_IVL_* (named funnels), 3 array-ref, 2 misc.
 
 ## 2. ABI containment
 

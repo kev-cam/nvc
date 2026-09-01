@@ -3442,6 +3442,34 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             out[len] = '\0';
             return true;
          }
+         if (tree_assocs(e) == 1
+             && tree_subkind(tree_assoc(e, 0)) == A_OTHERS) {
+            // (others => x) with NON-constant x: replication.  The sigspec
+            // grammar has no {n{x}} form, so expand to a literal concat of
+            // total/element copies (multi-bit elements replicate whole).
+            const int w = r2_width(e);
+            tree_t v0 = tree_value(tree_assoc(e, 0));
+            const int wel = r2_width(v0);
+            char el[R2_SPEC];
+            if (w > 0 && wel >= 1 && w % wel == 0 && w / wel <= 256
+                && r2_expr(v0, el, sizeof el)) {
+               const int reps = w / wel;
+               const size_t elen = strlen(el);
+               if ((elen + 1) * (size_t)reps + 3 < sz) {
+                  size_t len = 0;
+                  out[len++] = '{';
+                  for (int i = 0; i < reps; i++) {
+                     if (i > 0)
+                        out[len++] = ',';
+                     memcpy(out + len, el, elen);
+                     len += elen;
+                  }
+                  out[len++] = '}';
+                  out[len] = '\0';
+                  return true;
+               }
+            }
+         }
       }
       {
          char why[80];
@@ -3849,7 +3877,7 @@ typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
                  bool persistent; } r2_pvar_t;
 
 typedef struct {
-   r2_target_t t[64];
+   r2_target_t t[256];
    int         n;
    r2_memwr_t  mw[64];   // pending memory writes, flushed after the edge
    int         nmw;      //  sync exists (addr/data are heap copies)
@@ -3933,7 +3961,7 @@ static void r2_collect_cb(tree_t t, void *ctx)
       return;
    if (r2_mem_of(tree_ident(tg)) != NULL)   // memories write via memwr
       return;
-   if (ts->n >= 64)
+   if (ts->n >= 256)
       return;
    ident_t id = tree_ident(tg);
    if (r2_target(ts, id) != NULL)
@@ -4210,7 +4238,9 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
            if (al != NULL) ti = al->sig; }
          r2_target_t *t = r2_target(ts, ti);
          if (t == NULL) {
-            R2_DECLINE("target-miss");
+            char why[96];
+            snprintf(why, sizeof why, "target-miss %s", istr(ti));
+            R2_DECLINE(why);
             return false;
          }
          char lhs[96];
@@ -4447,20 +4477,48 @@ static bool r2_process(tree_t p0, int pidx)
       }
       if (cnt == 1 && tree_kind(only) == T_SIGNAL_ASSIGN) {
          tree_t tg = tree_target(only);
-         if (tree_kind(tg) != T_REF || !tree_has_ref(tg)
-             || tree_waveforms(only) < 1
+         if (tree_waveforms(only) < 1
              || !tree_has_value(tree_waveform(only, 0))) {
             R2_DECLINE("cont-assign");
             return false;
          }
-         type_t tty = tree_type(tree_ref(tg));
-         const int tw = type_const_bounds(tty) ? (int)type_width(tty) : -1;
+         char lhs[R2_SPEC];
+         int tw = -1;
+         if (tree_kind(tg) == T_REF && tree_has_ref(tg)) {
+            type_t tty = tree_type(tree_ref(tg));
+            tw = type_const_bounds(tty) ? (int)type_width(tty) : -1;
+            snprintf(lhs, sizeof lhs, "%s", vid(tree_ident(tg)));
+         }
+         else if ((tree_kind(tg) == T_ARRAY_SLICE
+                   || tree_kind(tg) == T_ARRAY_REF)
+                  && tree_kind(tree_value(tg)) == T_REF
+                  && r2_mem_of(tree_ident(tree_value(tg))) == NULL) {
+            // slice / const-indexed target: RTLIL connections take any
+            // sigspec LHS, so render the target as its sigspec.  Memory
+            // bases are excluded (r2_expr would build a $memrd — a READ).
+            int64_t dummy;
+            if (tree_kind(tg) == T_ARRAY_REF
+                && (tree_params(tg) != 1
+                    || !folded_int(tree_value(tree_param(tg, 0)), &dummy))) {
+               R2_DECLINE("cont-assign-dynidx");
+               return false;
+            }
+            g_r2_site = "cont-lhs";
+            if (!r2_expr(tg, lhs, sizeof lhs))
+               return false;
+            tw = r2_width(tg);
+         }
+         else {
+            R2_DECLINE("cont-assign-target");
+            return false;
+         }
+         g_r2_site = "cont-rhs";
          char v[R2_SPEC];
          tree_t val = tree_value(tree_waveform(only, 0));
          if (!r2_const(val, v, sizeof v, tw)
              && !r2_expr(val, v, sizeof v))
             return false;
-         return g_r2->connect(vid(tree_ident(tg)), v) == 0;
+         return g_r2->connect(lhs, v) == 0;
       }
       // general comb process: decision tree + `always` sync.  The root
       // action g0 = target mirrors read_verilog's $0 self-init: complete
@@ -4782,15 +4840,42 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
             goto declined;
          }
          if (tree_has_value(d)) {
-            R2_DECLINE("mem-init");
-            goto declined;
+            // the TEXT path drops memory initializers outright (emits the
+            // bare reg array) — match it for a uniform (others => ...)
+            // aggregate; real per-element contents still decline
+            tree_t iv = tree_value(d);
+            if (tree_kind(iv) == T_AGGREGATE && tree_assocs(iv) == 1
+                && tree_subkind(tree_assoc(iv, 0)) == A_OTHERS)
+               ;   // uniform power-on fill: drop, as text does
+            else {
+               R2_DECLINE("mem-init");
+               goto declined;
+            }
          }
          mem_scan_t sc = { .decl = d, .refs = 0, .indexed = 0, .agg = 0 };
          for (int si = 0; si < tree_stmts(block); si++)
             tree_visit(tree_stmt(block, si), mem_scan_cb, &sc);
          if (sc.refs == 0 || sc.refs != sc.indexed + sc.agg) {
-            R2_DECLINE("mem-usage");
-            goto declined;
+            // strict form failed: qualify the NBA-shadow idiom on the SAME
+            // census the text path uses (the walker's alias machinery then
+            // handles the bind/commit and routes shadow writes to memwr)
+            bool shadow_ok = false;
+            if (sc.refs > 0) {
+               shadow_find_t sf = { .sig = d, .var = NULL };
+               tree_visit(block, shadow_find_cb, &sf);
+               if (sf.var != NULL) {
+                  shadow_scan_t ss = { .sig = d, .var = sf.var };
+                  tree_visit(block, shadow_scan_cb, &ss);
+                  shadow_ok = (ss.ncopy == 1 && ss.nwb == 1
+                               && ss.v_ref == 2 + ss.v_arr
+                               && ss.v_arr == ss.nwrite
+                               && ss.s_ref == 2 + ss.s_arr);
+               }
+            }
+            if (!shadow_ok) {
+               R2_DECLINE("mem-usage");
+               goto declined;
+            }
          }
          if (g_r2_nmems >= 16) {
             R2_DECLINE("mem-count");
