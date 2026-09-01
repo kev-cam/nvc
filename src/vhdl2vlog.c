@@ -3089,6 +3089,8 @@ static r2_mem_t *r2_mem_of(ident_t id)
 // Decode an enum-literal ident to '0'/'1'/'x' (or 0 = not a bit literal).
 // Two namings: character literals '0'/'1'/'L'/'H'/... and logic3d's NAMED
 // literals L3D_0/L3D_1/L3D_X/...
+static char r2_bit_of_tree(tree_t v);
+
 static char r2_bit_of_ident(ident_t id)
 {
    const char *n = istr(id);
@@ -3100,6 +3102,26 @@ static char r2_bit_of_ident(ident_t id)
    if (c == '0' || c == 'L') return '0';
    if (c == '1' || c == 'H') return '1';
    if (c == 'X' || c == 'U' || c == 'W' || c == '-' || c == 'Z') return 'x';
+   return 0;
+}
+
+// bit decode over a tree: refs (through named constants), literal encodings
+static char r2_bit_of_tree(tree_t v)
+{
+   if (tree_kind(v) == T_REF) {
+      const char c = r2_bit_of_ident(tree_has_ref(v)
+                                     ? tree_ident(tree_ref(v))
+                                     : tree_ident(v));
+      if (c != 0)
+         return c;
+      if (tree_has_ref(v) && tree_kind(tree_ref(v)) == T_CONST_DECL
+          && tree_has_value(tree_ref(v)))
+         return r2_bit_of_tree(tree_value(tree_ref(v)));
+      return 0;
+   }
+   int64_t bit;
+   if (folded_int(v, &bit) && bit >= 0 && bit <= 7)
+      return (bit & 1) ? '1' : '0';   // logic3d encoding: bit0 = value
    return 0;
 }
 
@@ -3268,17 +3290,11 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
          tree_t v = tree_value(a);
          // ident decode FIRST: folded_int on a std_logic ref returns the
          // ENUM POSITION ('0'=2, '1'=3), not the bit value
-         char c = 0;
-         if (tree_kind(v) == T_REF)
-            c = r2_bit_of_ident(tree_has_ref(v) ? tree_ident(tree_ref(v))
-                                                : tree_ident(v));
-         int64_t bit;
+         const char c = r2_bit_of_tree(v);
          if (c == '0') *p++ = '0';
          else if (c == '1') *p++ = '1';
          else if (c == 'x')
             *p++ = '0';   // metavalue: text path renders 0
-         else if (c == 0 && folded_int(v, &bit) && bit >= 0 && bit <= 7)
-            *p++ = (bit & 1) ? '1' : '0';   // logic3d encoding: bit0 = value
          else
             return false;
       }
@@ -3293,16 +3309,12 @@ static bool r2_const(tree_t e, char *out, size_t sz, int want_w)
          if (w <= 0)
             return false;
          tree_t v = tree_value(a);
-         char cb, c = 0;
-         if (tree_kind(v) == T_REF)
-            c = r2_bit_of_ident(tree_has_ref(v) ? tree_ident(tree_ref(v))
-                                                : tree_ident(v));
+         char cb;
+         const char c = r2_bit_of_tree(v);
          if (c == '0') cb = '0';
          else if (c == '1') cb = '1';
          else if (c == 'x')
             cb = '0';   // metavalue init: the text path renders {N{1'b0}}
-         else if (c == 0 && folded_int(v, &bit) && bit >= 0 && bit <= 7)
-            cb = (bit & 1) ? '1' : '0';   // logic3d encoding: bit0 = value
          else {
             if (getenv("NVC_RTLIL_DEBUG") != NULL && tree_kind(v) == T_REF)
                fprintf(stderr, "r2 others-ref ident='%s' hasref=%d refid='%s'\n",
@@ -4415,12 +4427,23 @@ static bool r2_process(tree_t p0, int pidx)
    // translated form lists BOTH `falling_edge(rst) or rising_edge(clk)`;
    // the reset's edge is subsumed by the ST0/ST1 level sync
    int clk_i = 0;
+   bool both_edges = false;   // read_verilog encoding: emit BOTH edge syncs
    if (ne == 2) {
-      if (rcond == NULL || rsig == NULL || tree_kind(rsig) != T_REF) {
+      if (rcond == NULL) {
+         // the reset-if NESTS INSIDE the two-edge guard (rvdff shape):
+         // mirror read_verilog — both edge syncs carry the actions and
+         // yosys's proc_arst recognizes the inner reset switch.  An
+         // unmatched shape becomes a contained proc_dff error -> rc 2 ->
+         // the text path retries (which meets the same fate) — safe.
+         both_edges = true;
+      }
+      else if (rsig == NULL || tree_kind(rsig) != T_REF) {
          R2_DECLINE("multi-edge");
          return false;
       }
-      if (tree_kind(sig[0]) == T_REF
+      if (both_edges)
+         ;   // no clock/reset split — both syncs emitted below
+      else if (tree_kind(sig[0]) == T_REF
           && tree_ident(sig[0]) == tree_ident(rsig))
          clk_i = 1;
       else if (tree_kind(sig[1]) == T_REF
@@ -4513,8 +4536,10 @@ static bool r2_process(tree_t p0, int pidx)
 
    char pn[64];
    snprintf(pn, sizeof pn, "p%d", pidx);
-   if (g_r2->proc(pn) != 0)
+   if (g_r2->proc(pn) != 0) {
+      R2_DECLINE("api-proc");
       return false;
+   }
 
    for (int i = 0; i < ts.n; i++) {
       if (ts.t[i].width <= 0) {
@@ -4583,14 +4608,22 @@ static bool r2_process(tree_t p0, int pidx)
    }
    else {
       ok = r2_seq(body_if, &ts);
+      if (ok && both_edges && ts.nmw > 0) {
+         R2_DECLINE("both-edges-memwr");
+         ok = false;
+      }
       if (ok) {
-         char es[R2_SPEC];
-         ok = r2_expr(sig[clk_i], es, sizeof es)
-            && g_r2->sync(pe[clk_i] ? "posedge" : "negedge", es) == 0;
-         for (int i = 0; ok && i < ts.n; i++)
-            ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
-         if (ok)
-            ok = r2_flush_memwr(&ts);
+         const int e0 = both_edges ? 0 : clk_i;
+         const int e1 = both_edges ? 1 : clk_i;
+         for (int e = e0; ok && e <= e1; e++) {
+            char es[R2_SPEC];
+            ok = r2_expr(sig[e], es, sizeof es)
+               && g_r2->sync(pe[e] ? "posedge" : "negedge", es) == 0;
+            for (int i = 0; ok && i < ts.n; i++)
+               ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+            if (ok && e == e0)
+               ok = r2_flush_memwr(&ts);
+         }
       }
    }
    return ok && g_r2_fail == 0;
@@ -4784,7 +4817,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
                break;
             }
             tree_t ent = tree_primary(ref);
-            char conns[4096];
+            char conns[16384];
             size_t cl = 0;
             conns[0] = '\0';
             const int nparams = tree_params(s);

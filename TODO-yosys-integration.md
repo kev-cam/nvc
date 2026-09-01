@@ -201,10 +201,20 @@ Determine where the current looseness actually is:
       the per-chunk + GSM_ICG2EN composition diverges PRE-EXISTINGLY
       on the text path too (icg2en shipped via the MERGE flow) —
       filed as its own item, not a walker defect.
-      Remaining tail: 532 residual walker declines (multi-edge
-      areset_of misses, unfunneled process declines, odd OTHERS
-      literals, portmap-size, remaining var shapes), dynamic vector
-      part-select writes, rtlil for the MERGE pool.
+      **TAIL SWEEP (2026-08-31 late): walker declines 532 → 64
+      (99.66% of 19,093 EH1a walks clean).**  The 468-strong
+      multi-edge class fell to the READ_VERILOG ENCODING: when the
+      reset-if nests INSIDE the two-edge guard (rvdff shape), emit
+      BOTH edge syncs carrying the same actions and let yosys's
+      proc_arst resolve the inner reset switch — an unmatched shape
+      becomes a contained proc_dff error → rc 2 → text retry (safe).
+      Also: bit decode resolves refs through NAMED CONSTANTS
+      (r2_bit_of_tree); portmap conns buffer 16K; funnel reasons.
+      Remaining 64: 30 process@seq-assign, 19 odd OTHERS literals
+      (still — not const-refs; needs a sample), 6 unfunneled, small
+      residue; dynamic vector part-select writes; rtlil for the
+      MERGE pool (the shipped whole-core config) is the next
+      structural item.
 
 ## 2. ABI containment
 
