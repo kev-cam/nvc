@@ -356,6 +356,19 @@ Determine where the current looseness actually is:
       Remaining 9 (6 modules): comb-process shadow locals read at
       dynamic indices, 256-wide bit tables, dynamic part-selects,
       one unconstrained temp width — all clean named declines.
+      **EH2 GENERALIZATION (2026-09-01):** first walker run on
+      VeeR-EH2 (dual-thread core, fresh nw lib from the standard
+      recipe; interp anchor TEST_PASSED cycles=2519): **7 walker
+      declines against 738 installed chunks, zero poisons** — the
+      decline classes are exactly the EH1 residue (3 slice-bounds
+      k3/k3, 2 var-elem shadow reads, 1 var-assign under case depth,
+      1 concat-size).  The walker generalizes.  Full-core EH2 accel
+      correctness is separately blocked by the PRE-EXISTING (July
+      2026, pre-rtlil) ICG-of-clk divergence — watchdog at
+      cycles=99992 with the core held in reset, identical to the
+      documented text-path behaviour; the unlanded fix is per-group
+      ICG-of-clk detection (veer_eh2_rerun_recipe memory).  Not a
+      walker defect; both backends meet the same fate.
 
 ## 2. ABI containment
 
