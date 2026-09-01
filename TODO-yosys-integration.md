@@ -212,9 +212,23 @@ Determine where the current looseness actually is:
       (r2_bit_of_tree); portmap conns buffer 16K; funnel reasons.
       Remaining 64: 30 process@seq-assign, 19 odd OTHERS literals
       (still — not const-refs; needs a sample), 6 unfunneled, small
-      residue; dynamic vector part-select writes; rtlil for the
-      MERGE pool (the shipped whole-core config) is the next
-      structural item.
+      residue; dynamic vector part-select writes; **MERGE POOL RTLIL LANDED (2026-09-01):** phase 1 captures a
+      wrapper PLAN alongside its text emission (per-member connection
+      lists + internal wire decls — no decision duplication; text
+      stays authoritative), and the merge child walks every member's
+      subtree with shared dedup, constructs the wrapper via
+      cell_inst using the WALKER'S OWN module names (the text path's
+      _h%08x content-hash renames belong to its file dedup), and
+      synthesizes — no Verilog parse for the group.  GALS merged
+      chunk MERGE-ACTIVE with Y==interp; translated merged pass
+      engagement-gated ("via rtlil merge builder"); EH1a MERGE census
+      in FULL PARITY with the fork A/B baseline (TEST_PASSED 1113,
+      2 merges, the known ICG mergefail, 129 installs) with only 21
+      walker declines end to end.  TRAP fixed en route: the plan must
+      be freed AFTER the group stash, not at the ports/body free —
+      stashing freed pointers gave the child CoW garbage.
+      With this, BOTH synthesis paths construct directly; the text
+      round-trip survives as cache key, staged evidence and fallback.
 
 ## 2. ABI containment
 

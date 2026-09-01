@@ -8176,6 +8176,7 @@ static pid_t aj_rtlil_spawn(rt_scope_t *scope, const char *dir,
    _exit(rc & 0xff);
 }
 
+
 // Cheap recursive instance count for a subtree (no translation). Used as a
 // PRE-gate before the expensive emit: instance count >= unique-module count
 // (nseen), so instances < min_mod implies the subtree is "too small" anyway.
@@ -9580,6 +9581,9 @@ typedef struct {
    char     *cmd;               // synth command (NULL = cached)
    char    **argv;              // fork-worker argv (srcs..., wname);
    int       argc;              //  NULL = exec the CLI cmd instead
+   char    **iconns;            // rtlil wrapper plan: per-member connection
+   char     *wires;             //  lists + internal wire decls ("n w;...");
+   int       niconns;           //  NULL = no rtlil merge for this group
    int       tmo_s;             // synth deadline (child alarm / timeout(1))
    pid_t     pid;
    int       rc;
@@ -9587,6 +9591,118 @@ typedef struct {
 
 static aj_mgrp_t *g_mgrps = NULL;
 static int        g_nmgrp = 0, g_mgrpmax = 0;
+
+// rtlil merge worker: the CHILD walks every member's subtree on the CoW
+// tree (shared variant-name dedup), then constructs the wrapper module
+// from the plan phase 1 captured alongside its text emission (ports from
+// gr->mp, internal wires, per-member connection lists) — instantiating
+// the WALKER'S OWN module names, not the text path's content-hash
+// renames.  Exit codes as aj_rtlil_spawn (3 = a member declined).
+static pid_t aj_rtlil_merge_spawn(aj_mgrp_t *gr, const char *accel_dir)
+{
+   const gsm_rtlil_api_t *api = accel_gsm_rtlil_api();
+   if (api == NULL)
+      return -1;
+   fflush(stdout);
+   fflush(stderr);
+   const pid_t pid = fork();
+   if (pid != 0)
+      return pid;
+
+   // ---- child (no exec) ----
+   signal(SIGALRM, SIG_DFL);
+   sigset_t ss;
+   sigemptyset(&ss);
+   sigaddset(&ss, SIGALRM);
+   pthread_sigmask(SIG_UNBLOCK, &ss, NULL);
+   if (gr->tmo_s > 0)
+      alarm(gr->tmo_s);
+   if (getenv("GSM_TEST_SLEEP") != NULL)
+      sleep(atoi(getenv("GSM_TEST_SLEEP")));
+   if (accel_dir != NULL && chdir(accel_dir) != 0)
+      _exit(2);
+
+   if (api->begin(NULL) != 0)
+      _exit(2);
+   static ident_t seen[512];
+   int nseen = 0;
+   static char mtop[64][320];
+   for (int k = 0; k < gr->nmem && k < 64; k++) {
+      aj_mcand_t *c = &g_aj_cands[gr->members[k]];
+      if (c->scope == NULL
+          || !aj_rtlil_subtree(api, c->scope, seen, &nseen, 512)) {
+         api->abort_session();
+         _exit(3);
+      }
+      // the member's top module name AS THE WALKER NAMED IT
+      tree_t r = aj_scope_ref(c->scope);
+      tree_t vblock = c->scope->where;
+      if (r != NULL && tree_kind(r) != T_ARCH) {
+         tree_t cin = vhdl2vlog_comp_inner(c->scope->where);
+         if (cin != NULL) {
+            r = tree_ref(tree_decl(cin, 0));
+            vblock = cin;
+         }
+      }
+      if (r == NULL) {
+         api->abort_session();
+         _exit(3);
+      }
+      tree_t ent = (tree_kind(r) == T_ARCH) ? tree_primary(r) : r;
+      snprintf(mtop[k], sizeof mtop[k], "%s",
+               vhdl2vlog_variant_name(tree_ident(ent), vblock));
+   }
+
+   // wrapper: ports from mp (index 0 = clk, optional rst), internal
+   // wires from the plan, one instance per member
+   bool ok = api->module(gr->wname) == 0;
+   for (int j = 0; ok && j < gr->nmp; j++)
+      ok = api->wire(gr->mp[j].name, gr->mp[j].width > 0 ? gr->mp[j].width : 1,
+                     gr->mp[j].is_output ? 2 : 1, NULL) == 0;
+   if (ok && gr->wires != NULL) {
+      char *wcopy = xstrdup(gr->wires);
+      char *sp = NULL;
+      for (char *tok = strtok_r(wcopy, ";", &sp); ok && tok != NULL;
+           tok = strtok_r(NULL, ";", &sp)) {
+         char wn[96];
+         int ww = 0;
+         if (sscanf(tok, "%95s %d", wn, &ww) == 2 && ww > 0)
+            ok = api->wire(wn, ww, 0, NULL) == 0;
+      }
+      free(wcopy);
+   }
+   for (int k = 0; ok && k < gr->nmem && k < 64; k++) {
+      char iname[16];
+      snprintf(iname, sizeof iname, "u%d", k);
+      if (getenv("NVC_RTLIL_DEBUG") != NULL)
+         fprintf(stderr, "rtlil-merge inst u%d type='%s' conns='%s'\n", k,
+                 mtop[k], gr->iconns[k] != NULL ? gr->iconns[k] : "(null)");
+      ok = api->cell_inst(mtop[k], iname,
+                          gr->iconns[k] != NULL ? gr->iconns[k] : "") == 0;
+   }
+   if (!ok) {
+      api->abort_session();
+      _exit(3);
+   }
+
+   char base[600], tmpc[620], nvctmp[630], label[340];
+   snprintf(base, sizeof base, "%.*s", (int)strlen(gr->dutc) - 2, gr->dutc);
+   snprintf(tmpc, sizeof tmpc, "%s_g%d.c", base, (int)getpid());
+   snprintf(nvctmp, sizeof nvctmp, "%s_g%d_nvc.c", base, (int)getpid());
+   snprintf(label, sizeof label, "rtlil:%s.v", gr->wname);
+
+   const char *args[3] = { label, gr->wname, tmpc };
+   int rc = api->synth(3, args);
+   if (rc == 0 && rename(tmpc, gr->dutc) != 0)
+      rc = 2;
+   if (rc == 0) {
+      char nvcfinal[620];
+      snprintf(nvcfinal, sizeof nvcfinal, "%s_nvc.c", base);
+      if (rename(nvctmp, nvcfinal) != 0)
+         { /* byproduct */ }
+   }
+   _exit(rc & 0xff);
+}
 
 
 // Scan a subtree .v for clkhdr cell instances and collect their OUTPUT net
@@ -9851,6 +9967,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       for (int k = 0; k < nmem; k++) tot += g_aj_cands[members[k]].npins;
       aj_pin_t *mp = xmalloc_array(tot, sizeof(aj_pin_t));
       int nmp = 0;
+      char **plan_iconns = NULL;
+      int plan_n = 0;
       mp[nmp] = g_aj_cands[i].clk;
       snprintf(mp[nmp].name, sizeof mp[nmp].name, "clk"); nmp++;
       if (have_rst) {
@@ -9868,13 +9986,19 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       // interp glue proc stays alive (not rerouted) so every interp-visible
       // net keeps its interp driver/timing/X-epoch semantics; the chunk
       // computes its OWN copy purely for member-cascade correctness.
+      char *pwires = NULL;
+      size_t pwiressz = 0;
+      FILE *wfp = open_memstream(&pwires, &pwiressz);
       for (int k = 0; k < nmem; k++) {
          aj_mcand_t *c = &g_aj_cands[members[k]];
          if (!c->is_glue) continue;
          for (int p = 0; p < c->npins; p++)
-            if (c->pins[p].is_output)
+            if (c->pins[p].is_output) {
                fprintf(bf, "  wire [%d:0] m%d_%s;\n",
                        c->pins[p].width - 1, k, c->pins[p].name);
+               fprintf(wfp, "m%d_%s %d;", k, c->pins[p].name,
+                       c->pins[p].width);
+            }
       }
       for (int k = 0; k < nmem; k++) {
          aj_mcand_t *c = &g_aj_cands[members[k]];
@@ -9892,6 +10016,9 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                     g, k, c->scope != NULL ? istr(c->scope->name) : "?",
                     c->top_mod); }
          fprintf(bf, "  %s u%d(", c->top_mod, k);
+         char *mcs = NULL;
+         size_t mcssz = 0;
+         FILE *cfm = open_memstream(&mcs, &mcssz);
          bool first = true;
          for (int p = 0; p < c->npins; p++) {
             aj_pin_t *pp = &c->pins[p];
@@ -9910,6 +10037,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                // machinery) instead of being silently re-clocked by the
                // seed's signal (measured: re-clocking killed the machine).
                fprintf(bf, "%s.%s(clk)", first ? "" : ", ", pp->name);
+               fprintf(cfm, "%s%s=clk", first ? "" : ",", pp->name);
                first = false;
                continue;
             }
@@ -9934,6 +10062,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                   fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
                           pp->name, pj,
                           g_aj_cands[members[pj]].pins[pq].name);
+                  fprintf(cfm, "%s%s=m%d_%s", first ? "" : ",", pp->name,
+                          pj, g_aj_cands[members[pj]].pins[pq].name);
                   first = false;
                   n_internal++;
                   continue;
@@ -9944,6 +10074,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                // wrapper port, no bridge pin, no publication
                fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
                        pp->name, k, pp->name);
+               fprintf(cfm, "%s%s=m%d_%s", first ? "" : ",", pp->name,
+                       k, pp->name);
                first = false;
                continue;
             }
@@ -9952,6 +10084,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                     pp->width - 1, k, pp->name);
             fprintf(bf, "%s.%s(m%d_%s)", first ? "" : ", ",
                     pp->name, k, pp->name);
+            fprintf(cfm, "%s%s=m%d_%s", first ? "" : ",", pp->name,
+                    k, pp->name);
             first = false;
             mp[nmp] = *pp;
             snprintf(mp[nmp].name, sizeof mp[nmp].name, "m%d_%s", k, pp->name);
@@ -9967,8 +10101,16 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             nmp++;
          }
          fprintf(bf, ");\n");
+         fclose(cfm);
+         // plan slot k: the connection list captured alongside the text
+         if (k == 0) {
+            plan_iconns = xcalloc_array(nmem, sizeof(char *));
+            plan_n = nmem;
+         }
+         plan_iconns[k] = mcs;   // ownership: freed with the group
       }
       fclose(pf); fclose(bf);
+      fclose(wfp);
       bool ok = true;
       if (nmp > AJ_MAX_PINS) {   // bridge tables are AJ_MAX_PINS-static
          notef("accel-jit: MERGE group %d rim too wide (%d pins > %d) — "
@@ -10011,6 +10153,11 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       { struct stat gst;
         if (stat(aj_synth_tool(), &gst) == 0)
            vhash = (vhash ^ (uint64_t)gst.st_mtime) * 1099511628211ULL; }
+      // rtlil-built C is behaviorally equal but not byte-equal: separate
+      // cache namespace (mirror of the per-chunk fold)
+      if (getenv("NVC_ACCEL_RTLIL") != NULL)
+         for (const char *q = "+rtlil"; *q; q++)
+            { vhash ^= (uint8_t)*q; vhash *= 1099511628211ULL; }
       // Same GSM_ICG2EN key fold as the per-chunk path (toggle safety).
       { const char *icg = getenv("GSM_ICG2EN");
         if (icg != NULL)
@@ -10110,6 +10257,16 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                             dutcbase);
             gr->cmd = xstrdup(cmd);
             gr->tmo_s = tmo_s;
+            if (getenv("NVC_ACCEL_RTLIL") != NULL
+                && getenv("GEN_STATEMACHINE") == NULL
+                && accel_gsm_rtlil_api() != NULL && plan_iconns != NULL) {
+               // rtlil merge: the child walks the members and constructs
+               // the wrapper from this captured plan
+               gr->iconns = plan_iconns;
+               gr->niconns = plan_n;
+               gr->wires = xstrdup(pwires != NULL ? pwires : "");
+               plan_iconns = NULL;   // ownership moved
+            }
             if (getenv("GEN_STATEMACHINE") == NULL && accel_gsm_fn() != NULL) {
                // Fork-worker form: phase 2 forks WITHOUT exec and the child
                // runs the in-process generator, so keep the argv it needs.
@@ -10129,6 +10286,14 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                gr->argc = an;
             }
          }
+         if (plan_iconns != NULL) {   // not moved to the group (cached /
+            for (int k = 0; k < plan_n; k++)   // rtlil off): free here
+               free(plan_iconns[k]);
+            free(plan_iconns);
+            plan_iconns = NULL;
+         }
+         free(pwires);
+         pwires = NULL;
          continue;   // synthesis (parallel) + install run after the loop
       }
 
@@ -10228,7 +10393,14 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                   "internal edges, %d external pins)", gr->wname, gr->nmem,
                   gr->n_internal, gr->nmp);
             pid_t pid;
-            if (gr->argv != NULL)
+            if (gr->iconns != NULL) {
+               // rtlil merge: the child walks member scopes and constructs
+               // the wrapper directly — no Verilog parse for the group
+               notef("accel-jit: MERGE '%s' via rtlil merge builder",
+                     gr->wname);
+               pid = aj_rtlil_merge_spawn(gr, accel_dir);
+            }
+            else if (gr->argv != NULL)
                // Fork-worker: same job pool, no exec — the child runs the
                // in-process generator under its own alarm() deadline.
                pid = aj_gsm_spawn(accel_dir, gr->argc,
@@ -10378,6 +10550,12 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                aj_mcand_t *c = &g_aj_cands[members[k]];
                accel_install_subtree(m, c->scope, c->ref, accel_dir);
             }
+      }
+      if (gr->iconns != NULL) {
+         for (int a = 0; a < gr->niconns; a++)
+            free(gr->iconns[a]);
+         free(gr->iconns);
+         free(gr->wires);
       }
       free(gr->mp); free(gr->members);
    }
