@@ -263,6 +263,22 @@ Determine where the current looseness actually is:
       walker).  EH1a census 7: declines 64 → 20 (99.9% of 19,093
       walks), TEST_PASSED 1113.  Residue now: 9 stmt-kind@var-subst,
       6 target-miss TMP_IVL_* (named funnels), 3 array-ref, 2 misc.
+      **ICACHE INSTALLED (2026-09-01):** with `NVC_ACCEL_ICG2EN=
+      ic_data,ic_tag` (NEW: chunk-scoped ICG→enable — child setenv's
+      GSM_ICG2EN under an ONLY-style token match; "+icg2en=scoped"
+      vhash fold keys it apart from plain and global configs; merge
+      groups stay global-only) both icache chunks go ACTIVE inside
+      the full EH1a run: walker-built RTLIL memories + icg2en
+      reclocking flops AND $memwr ports (`mem port reclocked ...
+      en&=`), TEST_PASSED 1113, declines still 20.  Scoping exists
+      because global per-chunk GSM_ICG2EN has the known pre-existing
+      composition watchdog.  MEASUREMENT NOTE: EH1a wall clock is
+      DECLINE-STORM dominated (~57k synth notes vs ~2.2k reuse per
+      run — the ~17k comb-only glue declines re-attempt EVERY run,
+      warm or cold; the 1113-cycle sim is seconds).  The icache
+      kernel-time payoff needs the whole-core / longer-program
+      vehicle; the next pipeline wall-clock lever is NEGATIVE-RESULT
+      CACHING for clean declines (rc=1) keyed on the same vhash.
 
 ## 2. ABI containment
 

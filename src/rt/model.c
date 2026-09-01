@@ -7969,10 +7969,28 @@ static const char *aj_synth_tool(void)
 // did).  If some other thread was inside gsm_generate() at fork time the
 // child's copy of the facade mutex is held forever — the alarm reaps that
 // too, and the caller sees an ordinary timeout decline.
+// NVC_ACCEL_ICG2EN=n1,n2 — enable gsm's ICG->clock-enable rewrite for
+// chunks whose subtree name contains a token (NVC_ACCEL_ONLY matching
+// semantics).  Scoped because GSM_ICG2EN applied globally per-chunk has a
+// known composition divergence; the child setenv's under the match, and the
+// cache key folds the match so toggling cannot serve the other config.
+static bool aj_icg2en_match(const char *name)
+{
+   const char *lst = getenv("NVC_ACCEL_ICG2EN");
+   if (lst == NULL || name == NULL)
+      return false;
+   char buf[512];
+   snprintf(buf, sizeof buf, "%s", lst);
+   for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+      if (t[0] != '\0' && strstr(name, t) != NULL)
+         return true;
+   return false;
+}
+
 // GSM_TEST_SLEEP=<s> makes the child sleep first: the gate's hook for
 // proving the deadline kills a genuinely hung in-process synth.
 static pid_t aj_gsm_spawn(const char *dir, int nargs, const char *const *args,
-                          const char *dutc, int tmo_s)
+                          const char *dutc, int tmo_s, const char *icg_name)
 {
    gsm_generate_fn fn = accel_gsm_fn();
    if (fn == NULL)
@@ -7993,6 +8011,8 @@ static pid_t aj_gsm_spawn(const char *dir, int nargs, const char *const *args,
       alarm(tmo_s);
    if (getenv("GSM_TEST_SLEEP") != NULL)
       sleep(atoi(getenv("GSM_TEST_SLEEP")));
+   if (aj_icg2en_match(icg_name))
+      setenv("GSM_ICG2EN", "1", 1);
    if (dir != NULL && chdir(dir) != 0)
       _exit(2);
 
@@ -8145,6 +8165,8 @@ static pid_t aj_rtlil_spawn(rt_scope_t *scope, const char *dir,
       alarm(tmo_s);
    if (getenv("GSM_TEST_SLEEP") != NULL)
       sleep(atoi(getenv("GSM_TEST_SLEEP")));
+   if (aj_icg2en_match(top_mod))
+      setenv("GSM_ICG2EN", "1", 1);
    if (dir != NULL && chdir(dir) != 0)
       _exit(2);
 
@@ -8897,6 +8919,11 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
            { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
      for (const char *p = icg ? icg : ""; *p; p++)
         { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; } }
+   // scoped NVC_ACCEL_ICG2EN: this chunk's child will run the rewrite —
+   // key it separately from both the plain and the global-icg2en configs
+   if (aj_icg2en_match(top_mod))
+      for (const char *p = "+icg2en=scoped"; *p; p++)
+         { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    char **vtexts = xcalloc_array(nsrc, sizeof(char *));
    for (int i = 0; i < nsrc; i++) {
@@ -9106,7 +9133,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                av[n++] = t;
          }
          av[n++] = top_mod;
-         const pid_t pid = aj_gsm_spawn(dir, n, av, dutc, tmo_s);
+         const pid_t pid = aj_gsm_spawn(dir, n, av, dutc, tmo_s, top_mod);
          if (pid > 0) {
             forked = true;
             notef("accel-jit: synth '%s' running as in-process fork (pid %d)",
@@ -10405,7 +10432,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                // in-process generator under its own alarm() deadline.
                pid = aj_gsm_spawn(accel_dir, gr->argc,
                                   (const char *const *)gr->argv, gr->dutc,
-                                  gr->tmo_s);
+                                  gr->tmo_s, NULL);
             else {
                pid = fork();
                if (pid == 0) {
