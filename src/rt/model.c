@@ -8948,9 +8948,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // NVC_ACCEL_RTLIL builds the netlist through the rtlil builder — the C
    // is behaviorally equal but not byte-equal to the text path's, so keep
    // the two configs in separate cache namespaces.
-   if (getenv("NVC_ACCEL_RTLIL") != NULL)
+   if (getenv("NVC_ACCEL_RTLIL") != NULL) {
       for (const char *p = "+rtlil"; *p; p++)
          { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+      // the WALKER is part of the synth tool in rtlil mode and it lives in
+      // this binary, not libgsm.so — mix our own mtime or a walker fix
+      // would be masked by stale cached synths AND stale decline markers
+      struct stat nst;
+      if (stat("/proc/self/exe", &nst) == 0)
+         vhash = (vhash ^ (uint64_t)nst.st_mtime) * 1099511628211ULL;
+   }
    // GSM_ICG2EN changes gsm's emitted netlist for the SAME sources: fold it
    // into the key so toggling the env cannot serve the other config's cache.
    { const char *icg = getenv("GSM_ICG2EN");

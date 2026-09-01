@@ -3144,7 +3144,8 @@ static int        g_r2_nalias;
 // straight-line process-local variables: pure expression SUBSTITUTION —
 // a write records the value's sigspec, a read returns it (the read_verilog
 // technique, flat only: writes inside a switch scope decline)
-typedef struct { ident_t var; char *spec; } r2_subst_t;
+typedef struct { ident_t var; char *spec;
+                 bool has_ival; int64_t ival; } r2_subst_t;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
 static int        g_r2_case_depth;   // >0 while inside any switch case
@@ -3176,7 +3177,172 @@ static bool r2_subst_set(ident_t var, const char *spec)
    }
    free(e->spec);
    e->spec = xstrdup(spec);
+   e->has_ival = false;
    return true;
+}
+
+// constant-valued substitution: spec doubles as the sigspec when the value
+// is representable there; a NEGATIVE value keeps spec NULL (no sigspec form)
+// but stays evaluable — the OOB-guard idiom computes negative indices whose
+// USES are pruned by statically-false guards, never rendered
+static bool r2_subst_set_int(ident_t var, int64_t v)
+{
+   r2_subst_t *e = r2_subst_of(var);
+   if (e == NULL) {
+      if (g_r2_nsubst >= 32)
+         return false;
+      e = &g_r2_subst[g_r2_nsubst++];
+      e->var = var;
+      e->spec = NULL;
+   }
+   free(e->spec);
+   e->spec = NULL;
+   if (v >= 0) {
+      char b[32];
+      snprintf(b, sizeof b, "32'd%lld", (long long)v);
+      e->spec = xstrdup(b);
+   }
+   e->has_ival = true;
+   e->ival = v;
+   return true;
+}
+
+// Walker-side constant interpreter: evaluate an expression to an integer
+// under the current substitution environment.  Pure TRY — returns false on
+// anything unknown, never declines.  Powers while-loop unrolling, static-if
+// pruning, and arithmetic index/bound folding (the translated-SV counting
+// loops compute indices like To_Integer(i)*992 + (To_Integer(j)-1)*32 that
+// folded_int cannot see through).  logic3d const vectors decode by the
+// value plane (bit0), MSB first, SIGN-EXTENDED by their width (the loop
+// machinery compares with l3d_lt_s and friends — signed).
+static bool r2_eval_int(tree_t e, int64_t *out)
+{
+   if (folded_int(e, out))
+      return true;
+   switch (tree_kind(e)) {
+   case T_QUALIFIED:
+   case T_TYPE_CONV:
+   case T_INERTIAL:
+      return r2_eval_int(tree_value(e), out);
+   case T_REF:
+      {
+         r2_subst_t *sb = r2_subst_of(tree_ident(e));
+         if (sb != NULL && sb->has_ival) {
+            *out = sb->ival;
+            return true;
+         }
+         if (sb != NULL && sb->spec != NULL) {
+            const char *tick = strchr(sb->spec, 39);
+            if (tick != NULL && tick[1] == 'd') {
+               *out = atoll(tick + 2);
+               return true;
+            }
+         }
+         return false;
+      }
+   case T_STRING:
+   case T_AGGREGATE:
+      {
+         // constant logic3d / std_logic vector: value plane, MSB first
+         uint64_t v = 0;
+         int n = 0;
+         if (tree_kind(e) == T_STRING) {
+            n = tree_chars(e);
+            if (n < 1 || n > 63) return false;
+            for (int i = 0; i < n; i++) {
+               const char b = r2_bit_of_tree(tree_char(e, i));
+               if (b == 0) return false;
+               v = (v << 1) | (b == '1' ? 1 : 0);
+            }
+         }
+         else {
+            n = tree_assocs(e);
+            if (n < 1 || n > 63) return false;
+            for (int i = 0; i < n; i++) {
+               tree_t a = tree_assoc(e, i);
+               if (tree_subkind(a) != A_POS) return false;
+               const char b = r2_bit_of_tree(tree_value(a));
+               if (b == 0) return false;
+               v = (v << 1) | (b == '1' ? 1 : 0);
+            }
+         }
+         int64_t sv = (int64_t)v;
+         if (n < 64 && (v & (1ULL << (n - 1))))
+            sv -= (int64_t)(1ULL << n);
+         *out = sv;
+         return true;
+      }
+   case T_FCALL:
+      {
+         const char *fn = istr(tree_ident(e));
+         const char *base = id_base(fn);
+         const int np = tree_params(e);
+         int64_t a = 0, b = 0;
+         if (np == 2) {
+            if (!r2_eval_int(tree_value(tree_param(e, 0)), &a)
+                || !r2_eval_int(tree_value(tree_param(e, 1)), &b)) {
+               // identity-with-width forms take (value, width): retry as unary
+               if (strcasecmp(base, "resize") == 0
+                   || strcasecmp(base, "l3d_resize_s") == 0
+                   || strcasecmp(base, "l3d_index") == 0
+                   || strcasecmp(base, "to_unsigned") == 0
+                   || strcasecmp(base, "to_signed") == 0)
+                  return r2_eval_int(tree_value(tree_param(e, 0)), out);
+               return false;
+            }
+         }
+         else if (np == 1) {
+            if (!r2_eval_int(tree_value(tree_param(e, 0)), &a))
+               return false;
+         }
+         else
+            return false;
+         if (np == 2) {
+            // value-preserving width forms (2nd param is the width)
+            if (strcasecmp(base, "resize") == 0
+                || strcasecmp(base, "l3d_resize_s") == 0
+                || strcasecmp(base, "l3d_index") == 0
+                || strcasecmp(base, "to_unsigned") == 0
+                || strcasecmp(base, "to_signed") == 0)
+               { *out = a; return true; }
+            if (strcasecmp(base, "l3d_lt_s") == 0) { *out = a < b;  return true; }
+            if (strcasecmp(base, "l3d_le_s") == 0) { *out = a <= b; return true; }
+            if (strcasecmp(base, "l3d_gt_s") == 0) { *out = a > b;  return true; }
+            if (strcasecmp(base, "l3d_ge_s") == 0) { *out = a >= b; return true; }
+            if (strcasecmp(base, "l3d_eq1") == 0)  { *out = a == b; return true; }
+            if (strcasecmp(base, "l3d_ne1") == 0)  { *out = a != b; return true; }
+            if (strcmp(fn, "\"+\"") == 0)   { *out = a + b; return true; }
+            if (strcmp(fn, "\"-\"") == 0)   { *out = a - b; return true; }
+            if (strcmp(fn, "\"*\"") == 0)   { *out = a * b; return true; }
+            if (strcmp(fn, "\"/\"") == 0)   { if (b == 0) return false;
+                                            *out = a / b; return true; }
+            if (strcmp(fn, "\"=\"") == 0)   { *out = a == b; return true; }
+            if (strcmp(fn, "\"/=\"") == 0)  { *out = a != b; return true; }
+            if (strcmp(fn, "\"<\"") == 0)   { *out = a < b;  return true; }
+            if (strcmp(fn, "\"<=\"") == 0)  { *out = a <= b; return true; }
+            if (strcmp(fn, "\">\"") == 0)   { *out = a > b;  return true; }
+            if (strcmp(fn, "\">=\"") == 0)  { *out = a >= b; return true; }
+            if (strcmp(fn, "\"and\"") == 0) { *out = (a != 0) && (b != 0); return true; }
+            if (strcmp(fn, "\"or\"") == 0)  { *out = (a != 0) || (b != 0); return true; }
+            return false;
+         }
+         // unary
+         if (strcasecmp(base, "to_integer") == 0
+             || strcasecmp(base, "boolean_to_logic") == 0
+             || strcasecmp(base, "to_l3d") == 0
+             || strcasecmp(base, "unsigned") == 0
+             || strcasecmp(base, "signed") == 0
+             || strcasecmp(base, "std_logic_vector") == 0)
+            { *out = a; return true; }
+         if (strcasecmp(base, "is_one") == 0)  { *out = a == 1; return true; }
+         if (strcasecmp(base, "is_zero") == 0) { *out = a == 0; return true; }
+         if (strcmp(fn, "\"-\"") == 0)   { *out = -a; return true; }
+         if (strcmp(fn, "\"not\"") == 0) { *out = a == 0; return true; }
+         return false;
+      }
+   default:
+      return false;
+   }
 }
 
 static r2_alias_t *r2_alias_of(ident_t var)
@@ -3503,9 +3669,15 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          }
          tree_t r = tree_range(e, 0);
          int64_t left, right;
-         if (!folded_int(tree_left(r), &left)
-             || !folded_int(tree_right(r), &right)) {
+         if ((!folded_int(tree_left(r), &left)
+              && !r2_eval_int(tree_left(r), &left))
+             || (!folded_int(tree_right(r), &right)
+                 && !r2_eval_int(tree_right(r), &right))) {
             R2_DECLINE("slice-bounds");
+            return false;
+         }
+         if (left < 0 || right < 0) {
+            R2_DECLINE("slice-neg");
             return false;
          }
          const int64_t hi = left > right ? left : right;
@@ -3540,6 +3712,14 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          }
          bool have_idx = tree_kind(base) == T_REF && tree_params(e) == 1
             && folded_int(tree_value(tree_param(e, 0)), &idx);
+         if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
+            // arithmetic over substituted loop indices evaluates directly
+            int64_t ev;
+            if (r2_eval_int(tree_value(tree_param(e, 0)), &ev) && ev >= 0) {
+               idx = ev;
+               have_idx = true;
+            }
+         }
          if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
             // a substituted loop index folds through its sigspec ("N'dK")
             char is[R2_SPEC];
@@ -4001,6 +4181,17 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                // target, outside any switch scope, not yet promoted)
                if (tree_kind(tg) == T_REF && g_r2_case_depth == 0
                    && r2_pvar_of(ts, tree_ident(tg)) == NULL) {
+                  int64_t cv;
+                  if (r2_eval_int(tree_value(s), &cv)) {
+                     // constant: store the VALUE — sigspec renders can use
+                     // it and the const interpreter can keep computing with
+                     // it (loop induction, index arithmetic)
+                     if (!r2_subst_set_int(tree_ident(tg), cv)) {
+                        R2_DECLINE("subst-count");
+                        return false;
+                     }
+                     return true;
+                  }
                   char vs[R2_SPEC];
                   g_r2_site = "var-subst";
                   if (!r2_expr(tree_value(s), vs, sizeof vs))
@@ -4125,8 +4316,11 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          if (tree_kind(tg) == T_ARRAY_SLICE) {
             tree_t r = tree_range(tg, 0);
             int64_t left, right;
-            if (!folded_int(tree_left(r), &left)
-                || !folded_int(tree_right(r), &right)) {
+            if ((!folded_int(tree_left(r), &left)
+                 && !r2_eval_int(tree_left(r), &left))
+                || (!folded_int(tree_right(r), &right)
+                    && !r2_eval_int(tree_right(r), &right))
+                || left < 0 || right < 0) {
                R2_DECLINE("target-slice-bounds");
                return false;
             }
@@ -4137,7 +4331,9 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          else if (tree_kind(tg) == T_ARRAY_REF) {
             int64_t idx;
             if (tree_params(tg) == 1
-                && folded_int(tree_value(tree_param(tg, 0)), &idx)) {
+                && (folded_int(tree_value(tree_param(tg, 0)), &idx)
+                    || r2_eval_int(tree_value(tree_param(tg, 0)), &idx))
+                && idx >= 0) {
                hi = lo = idx;
                tg = tree_value(tg);
             }
@@ -4297,6 +4493,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          for (int i = 0; i < nc && ok; i++) {
             tree_t c = tree_cond(s, i);
             if (tree_has_value(c)) {
+               // statically-constant condition (OOB guards around computed
+               // indices, unrolled-loop residue): prune — a true arm walks
+               // inline in the CURRENT case scope and ends the chain, a
+               // false arm vanishes.  This keeps case depth unchanged, so
+               // var substitution stays live through the pruned branch.
+               int64_t scv;
+               if (r2_eval_int(tree_value(c), &scv)) {
+                  if (scv != 0) {
+                     ok = r2_seq(c, ts);
+                     break;
+                  }
+                  continue;
+               }
                char cs[R2_SPEC];
                g_r2_site = "if-cond";
                if (!r2_cond(tree_value(c), cs, sizeof cs)) { ok = false; break; }
@@ -4320,6 +4529,63 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             g_r2_case_depth--;
          }
          return ok && g_r2_fail == 0;
+      }
+   case T_WHILE:
+      {
+         // counting-while unroll: the translated-SV loops are all
+         // `i := K; while l3d_lt_s(i, N) loop ... i := i + 1; end` — the
+         // condition and induction evaluate under the substitution env
+         // (var-subst stores constants as integers), so interpret the loop
+         // at walk time.  yosys read_verilog cannot take these at all
+         // (procedural while is rejected), so this is walker-only ground.
+         if (g_r2_case_depth != 0) {
+            R2_DECLINE("while-depth");
+            return false;
+         }
+         if (!tree_has_value(s)) {
+            R2_DECLINE("while-cond");
+            return false;
+         }
+         for (int iter = 0; ; iter++) {
+            if (iter > 4096) {
+               R2_DECLINE("while-size");
+               return false;
+            }
+            int64_t cv;
+            if (!r2_eval_int(tree_value(s), &cv)) {
+               R2_DECLINE("while-eval");
+               return false;
+            }
+            if (cv == 0)
+               break;
+            if (!r2_seq(s, ts))
+               return false;
+         }
+         return true;
+      }
+   case T_LOOP:
+      {
+         // process-sensitivity loop (`<init>; loop <body>; wait on ...; end
+         // loop`): the TEXT path emits the body INLINE and drops the waits
+         // (yosys sees a flat always body) — mirror that exactly.  A bare
+         // loop without a wait is a real infinite loop: decline.
+         const int n = tree_stmts(s);
+         bool haswait = false;
+         for (int i = 0; i < n; i++)
+            if (tree_kind(tree_stmt(s, i)) == T_WAIT)
+               haswait = true;
+         if (!haswait) {
+            R2_DECLINE("loop-nowait");
+            return false;
+         }
+         for (int i = 0; i < n; i++) {
+            tree_t st = tree_stmt(s, i);
+            if (tree_kind(st) == T_WAIT)
+               continue;
+            if (!r2_seq_one(st, ts))
+               return false;
+         }
+         return true;
       }
    case T_FOR:
       {
@@ -4422,7 +4688,11 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          return ok && g_r2_fail == 0;
       }
    default:
-      R2_DECLINE("stmt-kind");
+      {
+         char why[48];
+         snprintf(why, sizeof why, "stmt-kind %d", (int)tree_kind(s));
+         R2_DECLINE(why);
+      }
       return false;
    }
 }

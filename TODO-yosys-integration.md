@@ -291,6 +291,28 @@ Determine where the current looseness actually is:
       ACTIVE).  opt_asserts 15 gates it: marker fires + honored +
       GSM_ALLOW_COMB bypass re-attempts (comb chunks still don't
       install in-run — the 0-register install stall, pre-existing).
+      **CONST INTERPRETER + LOOP UNROLL (2026-09-01):** the walker
+      gained `r2_eval_int` — a pure-try constant interpreter over the
+      substitution environment (l3dv const vectors decode by value
+      plane, signed by width; To_Integer/resize/l3d_index identity
+      forms; l3d_lt_s-class signed compares; quoted-operator
+      arithmetic).  On it: T_WHILE counting loops UNROLL at walk time
+      (yosys rejects procedural while outright — walker-only ground);
+      T_LOOP sensitivity wrappers (`<init>; loop <body>; wait; end`)
+      splice inline exactly as the text path emits them; var-subst
+      stores constant values as INTEGERS (keeps induction evaluable;
+      negative values keep no sigspec but stay computable — the OOB
+      guard idiom needs exactly that); statically-constant if-conds
+      PRUNE (true arm inline in the current case scope, false arm
+      vanishes); every index/bound fold site takes an eval fallback.
+      Also: the rtlil vhash now mixes /proc/self/exe mtime — the
+      walker lives in the nvc binary, and without the fold a walker
+      fix was MASKED by stale cached synths and decline markers.
+      EH1a census: declines 20 → 16 (pic_ctrl + lsu_bus_intf clear),
+      TEST_PASSED 1113.  Remaining 16 across 10 modules: local
+      FUNCTIONS (lsu_bus_buffer f_Enc8to3/Ternary_*), shared-variable
+      tmp_ivl targets (target-miss class), indexed writes to local
+      vector variables (var-assign class), + singles.
 
 ## 2. ABI containment
 
