@@ -279,6 +279,18 @@ Determine where the current looseness actually is:
       kernel-time payoff needs the whole-core / longer-program
       vehicle; the next pipeline wall-clock lever is NEGATIVE-RESULT
       CACHING for clean declines (rc=1) keyed on the same vhash.
+      **DECLINE CACHE LANDED (2026-09-01):** a clean decline (exit 1)
+      writes `<dutc>.decline` beside the would-be output — same vhash
+      key, so source/tool/env changes invalidate automatically; the
+      marker stores the GSM_ALLOW_COMB value (it flips comb declines
+      but is NOT in the vhash) and a mismatch ignores the marker;
+      timeouts/abnormal exits never write one.  EH1a: cold 758s
+      writes 86 markers; the next run resolves 18,814 decline hits
+      from them with ZERO synth forks — wall 58s, a 13x pipeline
+      improvement, byte-identical outcome (TEST_PASSED 1113, 451
+      ACTIVE).  opt_asserts 15 gates it: marker fires + honored +
+      GSM_ALLOW_COMB bypass re-attempts (comb chunks still don't
+      install in-run — the 0-register install stall, pre-existing).
 
 ## 2. ABI containment
 

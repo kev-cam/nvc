@@ -7987,6 +7987,46 @@ static bool aj_icg2en_match(const char *name)
    return false;
 }
 
+// Negative-result cache: a CLEAN decline (exit 1 — comb-only, unhandled
+// cell, rtlil-final) is as deterministic as the synth output itself, so it
+// is remembered in a marker file next to the would-be dutc (same vhash key
+// -> source/tool/env changes invalidate it automatically).  The marker
+// stores the GSM_ALLOW_COMB value because that env flips comb-only
+// declines but is NOT part of the vhash; a mismatch ignores the marker.
+// Timeouts and abnormal exits never write one (load-dependent/transient).
+static void aj_decline_fingerprint(char *buf, size_t sz)
+{
+   const char *ac = getenv("GSM_ALLOW_COMB");
+   snprintf(buf, sz, "allowcomb=%s\n", ac ? ac : "");
+}
+
+static bool aj_decline_cached(const char *path)
+{
+   FILE *f = fopen(path, "r");
+   if (f == NULL)
+      return false;
+   char have[64] = "", want[64];
+   if (fgets(have, sizeof have, f) == NULL)
+      have[0] = '\0';
+   fclose(f);
+   aj_decline_fingerprint(want, sizeof want);
+   return strcmp(have, want) == 0;
+}
+
+static void aj_decline_remember(const char *path)
+{
+   char tmp[700], fp[64];
+   snprintf(tmp, sizeof tmp, "%s.%d", path, (int)getpid());
+   FILE *f = fopen(tmp, "w");
+   if (f == NULL)
+      return;
+   aj_decline_fingerprint(fp, sizeof fp);
+   fputs(fp, f);
+   fclose(f);
+   if (rename(tmp, path) != 0)
+      unlink(tmp);
+}
+
 // GSM_TEST_SLEEP=<s> makes the child sleep first: the gate's hook for
 // proving the deadline kills a genuinely hung in-process synth.
 static pid_t aj_gsm_spawn(const char *dir, int nargs, const char *const *args,
@@ -8997,8 +9037,14 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    //    the content hash above) is reused as-is for an in-place update; a logic
    //    change yields a new hash -> a fresh synth, recompiling ONLY this chunk.
    char cmd[8192];
+   char dmark[620];
+   snprintf(dmark, sizeof dmark, "%s.decline", dutc);
    if (getenv("NVC_ACCEL_NO_CACHE") == NULL && access(dutc, F_OK) == 0) {
       notef("accel-jit: reusing cached synth for '%s' (logic unchanged)", top);
+   }
+   else if (getenv("NVC_ACCEL_NO_CACHE") == NULL && aj_decline_cached(dmark)) {
+      notef("accel-jit: cached decline for '%s' — leaving in nvc", top);
+      return false;
    }
    else {
       char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
@@ -9148,8 +9194,15 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          notef("accel-jit: synth for '%s' exceeded %ds — leaving in nvc "
                "(raise NVC_ACCEL_SYNTH_TIMEOUT to allow longer)", top, tmo_s);
       if (src != 0 || access(dutc, F_OK) != 0) {
-         if (!aj_synth_timed_out(src))
+         if (!aj_synth_timed_out(src)) {
             notef("accel-jit: synth failed for '%s' — leaving in nvc", top);
+            // exit 1 = the deterministic clean-decline contract: remember it
+            // so the next run skips the fork entirely (the decline storm was
+            // ~17k re-attempted forks per EH1a run, warm or cold)
+            if (WIFEXITED(src) && WEXITSTATUS(src) == 1
+                && access(dutc, F_OK) != 0)
+               aj_decline_remember(dmark);
+         }
          return false;
       }
    }
