@@ -229,6 +229,17 @@ Determine where the current looseness actually is:
       stashing freed pointers gave the child CoW garbage.
       With this, BOTH synthesis paths construct directly; the text
       round-trip survives as cache key, staged evidence and fallback.
+      **DYNAMIC BIT-WRITES (2026-08-31):** a non-constant single-bit
+      index write on a vector signal lowers to a masked whole-target
+      compose from ordinary cells — `g0 = (pre & ~(1<<idx)) |
+      (val<<idx)`.  The compose reads the PRE-activation value (the
+      SIGNAL — reading the post-mux g0 wire from module-level cells
+      is a combinational loop), so a second dynamic write to the same
+      target in one process declines (`dyn-multi`); the NBA-shadow
+      sites are single-write.  Validated three ways (rtlil == text ==
+      interp on the dynw fixture, now opt_asserts check 14) and
+      EH1a census 6 TEST_PASSED 1113 with declines steady at 64 —
+      the VeeR dynamic sites live inside already-walked processes.
 
 ## 2. ABI containment
 

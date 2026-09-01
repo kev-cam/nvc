@@ -3856,6 +3856,8 @@ typedef struct {
    int         nsites;   // enable-temp counter
    r2_pvar_t   pv[16];   // promoted persistent variables (latch state)
    int         npv;
+   ident_t     dynwr[16];   // targets already dyn-composed this process
+   int         ndynwr;      //  (the compose reads the PRE value = the sig)
    bool        comb;     // process kind: only comb processes may promote
 } r2_targets_t;
 
@@ -4106,13 +4108,98 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          }
          else if (tree_kind(tg) == T_ARRAY_REF) {
             int64_t idx;
-            if (tree_params(tg) != 1
-                || !folded_int(tree_value(tree_param(tg, 0)), &idx)) {
+            if (tree_params(tg) == 1
+                && folded_int(tree_value(tree_param(tg, 0)), &idx)) {
+               hi = lo = idx;
+               tg = tree_value(tg);
+            }
+            else if (tree_params(tg) == 1) {
+               // DYNAMIC single-bit write: lower to a masked whole-target
+               // compose — g0 = (g0 & ~(1<<i)) | (bit<<i) — ordinary cells,
+               // so the assignment threads decision trees like any other
+               tree_t tb = tree_value(tg);
+               ident_t bi = (tree_kind(tb) == T_REF && tree_has_ref(tb))
+                  ? tree_ident(tb) : NULL;
+               if (bi != NULL) {
+                  r2_alias_t *al = r2_alias_of(bi);
+                  if (al != NULL)
+                     bi = al->sig;
+               }
+               r2_target_t *t = bi != NULL ? r2_target(ts, bi) : NULL;
+               if (t == NULL || t->width <= 0 || t->width > 4000) {
+                  R2_DECLINE("dyn-target");
+                  return false;
+               }
+               // the compose reads the PRE-activation value (the signal):
+               // a second dynamic write to the same target would clobber
+               // the first — decline (the NBA sites are single-write)
+               for (int dw = 0; dw < ts->ndynwr; dw++)
+                  if (ts->dynwr[dw] == t->name) {
+                     R2_DECLINE("dyn-multi");
+                     return false;
+                  }
+               if (ts->ndynwr >= 16) {
+                  R2_DECLINE("dyn-count");
+                  return false;
+               }
+               ts->dynwr[ts->ndynwr++] = t->name;
+               char is[R2_SPEC];
+               g_r2_site = "dyn-idx";
+               if (!r2_expr(tree_value(tree_param(tg, 0)), is, sizeof is))
+                  return false;
+               tree_t dval;
+               if (tree_kind(s) == T_SIGNAL_ASSIGN) {
+                  if (tree_waveforms(s) < 1
+                      || !tree_has_value(tree_waveform(s, 0))) {
+                     R2_DECLINE("dyn-wave");
+                     return false;
+                  }
+                  dval = tree_value(tree_waveform(s, 0));
+               }
+               else
+                  dval = tree_value(s);
+               char vs[R2_SPEC];
+               g_r2_site = "dyn-val";
+               if (!r2_const(dval, vs, sizeof vs, 1)
+                   && !r2_expr(dval, vs, sizeof vs))
+                  return false;
+               const int w = t->width;
+               char one[64], m1[R2_SPEC], m2[R2_SPEC], m3[R2_SPEC],
+                  m4[R2_SPEC], m5[R2_SPEC], cn[R2_SPEC + 8];
+               snprintf(one, sizeof one, "%d'd1", w);
+               // m1 = 1 << idx
+               if (!r2_temp(w, m1, sizeof m1)) return false;
+               snprintf(cn, sizeof cn, "c%s", m1);
+               if (g_r2->cell_bin("shl", cn, one, is, m1, 0) != 0)
+                  return false;
+               // m2 = ~m1
+               if (!r2_temp(w, m2, sizeof m2)) return false;
+               snprintf(cn, sizeof cn, "c%s", m2);
+               if (g_r2->cell_un("not", cn, m1, m2, 0) != 0)
+                  return false;
+               // m3 = <pre-value> & m2 — the SIGNAL, not g0: reading the
+               // post-mux g0 wire from module-level cells would be a
+               // combinational loop
+               if (!r2_temp(w, m3, sizeof m3)) return false;
+               snprintf(cn, sizeof cn, "c%s", m3);
+               if (g_r2->cell_bin("and", cn, t->spec, m2, m3, 0) != 0)
+                  return false;
+               // m4 = value << idx  (value zero-extends to width w)
+               if (!r2_temp(w, m4, sizeof m4)) return false;
+               snprintf(cn, sizeof cn, "c%s", m4);
+               if (g_r2->cell_bin("shl", cn, vs, is, m4, 0) != 0)
+                  return false;
+               // m5 = m3 | m4
+               if (!r2_temp(w, m5, sizeof m5)) return false;
+               snprintf(cn, sizeof cn, "c%s", m5);
+               if (g_r2->cell_bin("or", cn, m3, m4, m5, 0) != 0)
+                  return false;
+               return g_r2->case_assign(t->g0, m5) == 0;
+            }
+            else {
                R2_DECLINE("target-index");
                return false;
             }
-            hi = lo = idx;
-            tg = tree_value(tg);
          }
          if (tree_kind(tg) != T_REF || !tree_has_ref(tg)) {
             R2_DECLINE("assign-target");
