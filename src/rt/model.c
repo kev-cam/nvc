@@ -6791,9 +6791,15 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // while reproducing the #43 wrong answer).
    if (!spec)   // always: the ordered seed pass (#43 fix) consumes these
       for (int i = 0; i < npins; i++)
-         if (pins[i].is_output && pins[i].sig != NULL)
-            aj_ao4_add_out(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
-                           chunk);
+         if (pins[i].is_output && pins[i].sig != NULL) {
+            // PER NEXUS: a sliced signal spans several nexuses, each with
+            // its own port hops — first-nexus-only registration left the
+            // rest unmapped and the seed back-fill width-skipped them
+            rt_nexus_t *n4 = &pins[i].sig->nexus;
+            for (unsigned nx4 = 0; nx4 < pins[i].sig->n_nexus;
+                 nx4++, n4 = n4->chain)
+               aj_ao4_add_out(aj_ultimate_driver_nexus(n4, 0), chunk);
+         }
    chunk->primary_ck = clk != NULL ? clk->sig : NULL;
    // Slots after the per-pin table (array is sized 6+npins+4):
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
@@ -6974,10 +6980,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          if (strcmp(pins[i].name, extra_clk_field[k]) == 0) is_ck = true;
       if (!spec) {
          chunk->bindtab[6 + bridged_in] = pins[i].data;
-         if (!pins[i].is_output && pins[i].sig != NULL && !is_ck)
-            aj_ao3_add(aj_ultimate_driver_nexus(&pins[i].sig->nexus, 0),
-                       chunk, pins[i].name, pins[i].data,
-                       (size_t)pins[i].width * pins[i].elem);
+         if (!pins[i].is_output && pins[i].sig != NULL && !is_ck) {
+            // PER NEXUS with rim offsets (see the ao4 twin): port sources
+            // are width-aligned per nexus, so each entry's ultimate nexus
+            // matches its rim slice exactly and the back-fill identity
+            // check covers sliced pins
+            rt_nexus_t *n3 = &pins[i].sig->nexus;
+            size_t off3 = 0;
+            for (unsigned nx3 = 0; nx3 < pins[i].sig->n_nexus;
+                 nx3++, n3 = n3->chain) {
+               const size_t nb3 = (size_t)n3->width * n3->size;
+               aj_ao3_add(aj_ultimate_driver_nexus(n3, 0), chunk,
+                          pins[i].name, pins[i].data + off3, nb3);
+               off3 += nb3;
+            }
+         }
          // snapshot slot for the two-phase edge sampling (see struct);
          // mode 3: comb-driven inputs stay LIVE (blocking-assign settle
          // must remain visible same-delta), only clocked/timed sources
@@ -11590,6 +11607,19 @@ void accel_auto(rt_model_t *m)
               seed_order[nord++] = m->aj_chunks[ci];
         free(emitted);
       }
+      // Cyclic remainder fixpoint (#43, third half): the topo sweep cannot
+      // order mutually-dependent chunks (EH2's DEC<->LSU stall/valid mesh —
+      // 36 audited unseeded reads at t=0), so those seed from 'U' on the
+      // first pass regardless of order.  Iterate: after pass 1 every
+      // producer HAS seeded, so pass 2's back-fill hands every consumer
+      // real bytes and the cross-chunk comb state converges.  The back-fill
+      // is a memcpy from producer nexus effective bytes — NOT the July
+      // drain (update_driving recomputes from U drivers and DESTROYS the
+      // deposits; that variant is recorded DOES-NOT-WORK).  Extra passes
+      // re-run only the cheap comb seed eval.
+      const char *spenv = getenv("NVC_ACCEL_SEED_PASSES");
+      const int nseedpass = spenv != NULL ? atoi(spenv) : 3;
+      for (int spass = 0; spass < nseedpass; spass++)
       for (unsigned ci = 0; ci < nord; ci++) {
          aj_chunk_t *c = seed_order[ci];
          if (c->eval == NULL) continue;
@@ -11613,6 +11643,12 @@ void accel_auto(rt_model_t *m)
                     const size_t unb = (size_t)un->width * un->size;
                     if (p != c && p->ao_seeded && unb == g_ao3_map[i].nbytes)
                        memcpy(g_ao3_map[i].dst, nexus_effective(un), unb);
+                    else if (p != c && p->ao_seeded && aj_ao_level() >= 3)
+                       notef("accel-assert: SEED-BACKFILL skip: chunk %s "
+                             "pin '%s' nexus %zuB vs producer %zuB (#43)",
+                             c->scope != NULL && c->scope->where != NULL
+                                ? istr(tree_ident(c->scope->where)) : "?",
+                             g_ao3_map[i].pin, g_ao3_map[i].nbytes, unb);
                     break;
                  }
               }
@@ -11634,7 +11670,7 @@ void accel_auto(rt_model_t *m)
          // seeded still reads 'U' here, and the 2-state value plane
          // latches it as a confident 0 — permanently after the first
          // edge. Report per offending pin; t=0 only, zero steady cost.
-         if (aj_ao_level() >= 3) {
+         if (aj_ao_level() >= 3 && spass == 0) {
             for (unsigned _i = 0; _i < g_ao3_n; _i++) {
                if (g_ao3_map[_i].chunk != c) continue;
                for (unsigned _j = 0; _j < g_ao4_n; _j++) {

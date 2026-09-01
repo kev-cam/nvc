@@ -392,6 +392,31 @@ Determine where the current looseness actually is:
       interp gold cycles=2519; accel currently watchdogs 99992).
       Blanket CK_COINCIDENT measured no-effect on free_l2clk's group
       (July) — the per-group mapping is the fix, not the env.
+      **#43 THIRD+FOURTH HALVES LANDED (2026-09-02):** the t=0 seed
+      now runs a MULTI-PASS FIXPOINT (default 3, NVC_ACCEL_SEED_PASSES
+      knob): the topo sweep cannot order cyclic chunk meshes (EH2
+      DEC↔LSU: 36 audited unseeded t=0 reads), but after pass 1 every
+      producer has seeded, so pass 2's back-fill memcpy hands every
+      consumer real bytes — NOT the July destructive drain.  And both
+      AO maps register PER NEXUS with rim offsets (first-nexus-only
+      registration width-skipped every sliced pin's back-fill; port
+      sources are width-aligned per nexus, so per-nexus entries make
+      the identity check complete).  Gated: opt_asserts 16 — a
+      chunk-level-cyclic bit-acyclic fixture (seedcyc) that NO single
+      seed pass can converge in any install order; SEED_PASSES=1 is
+      the biting negative control.  seedord + all 12 seed-required
+      reproducers pass.  EH2 VERDICT: cycle-0 lsu_arv STILL diverges
+      (2 vs 6) → the remaining defect is NOT chunk→chunk seeding.
+      WORKING THEORY (next EH2 stretch): seed deposits leave no
+      DRIVER, so the first scheduler drain recomputes port hops from
+      'U' and DESTROYS seed values on their way to INTERP readers
+      (the TB reads lsu_arv through interp glue — the memcpy
+      back-fill cannot cover that path; the July correction documents
+      exactly this destructive recompute).  Candidate fixes: seed
+      via a driver-backed deposit (survives update_driving), or
+      re-deposit outputs after the init drain; sequencing is
+      scheduler-delicate.  Diagnose with NVC_ACCEL_OUT_TRACE (seed
+      pass sentinel d=4294967295) on the lsu_arv cone.
 
 ## 2. ABI containment
 
