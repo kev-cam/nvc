@@ -369,6 +369,29 @@ Determine where the current looseness actually is:
       documented text-path behaviour; the unlanded fix is per-group
       ICG-of-clk detection (veer_eh2_rerun_recipe memory).  Not a
       walker defect; both backends meet the same fate.
+      **ICG-OF-CLK AUTO-DETECT — refreshed design (2026-09-01, next
+      opener):** the July line numbers are stale; at HEAD the pieces
+      are: extra-clock decision + input gate at gen_statemachine.cpp
+      ~1776-1808 (extra_clocks[] + clk_group per register); the
+      advance-mode machinery in model.c ~7325-7400 (value-edge
+      default, NVC_ACCEL_CK_COINCIDENT global fold, CK_LATE snapshot
+      commits, ck_last posedge-clear with CK_KEEPLAST escape) — the
+      comment there already names per-group auto-detect as the
+      general landing.  KEY STRUCTURAL FACT: per-chunk extra clocks
+      are boundary INPUTS (internal gated clocks decline), so the
+      consumer chunk CANNOT see the ICG cone — the flag must come
+      from the PRODUCER side.  The icg2en matcher already recognizes
+      both the internal cone (reclock path) and the EXPORTED gated
+      clock ('icg2en: exported gated clock X held via Y', the
+      Moore-ize path) — reuse it in DETECT-ONLY mode: producer gsm
+      emits `sm_icg_clock_outputs[]` naming its exported ICG-of-clk
+      pins; the parent records net→flag at install; consumers get a
+      per-group coincident/late choice at THEIR install by mapping
+      sm_extra_clocks[] pins back to flagged nets.  Validation
+      vehicle ready: /home/claude/eh2_rtlil (warm cache + markers,
+      interp gold cycles=2519; accel currently watchdogs 99992).
+      Blanket CK_COINCIDENT measured no-effect on free_l2clk's group
+      (July) — the per-group mapping is the fix, not the env.
 
 ## 2. ABI containment
 
