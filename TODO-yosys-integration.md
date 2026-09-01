@@ -336,6 +336,26 @@ Determine where the current looseness actually is:
       target widths (dec_decode g0_cam_in), dynamic part-select
       slice bounds (dma_ctrl k3/k3), two l3d-bin poisons downstream
       of the same shapes.  All decline→text, correctness unaffected.
+      **POISON ELIMINATION + ALIAS SOUNDNESS (2026-09-01, same day):**
+      every gsm-session poison is gone (census: 9 declines, 0
+      poisons, TEST_PASSED 1113).  The fixes: (1) locals can NEVER
+      render as bare wire names — an unresolved variable read/element
+      declines cleanly (var-read/var-elem funnels) instead of
+      poisoning the session with 'no wire v_...'; (2) NBA-shadow
+      alias READS are gated on a per-alias `wrote` flag — before any
+      write through the alias the signal IS the value (pure pre-copy
+      semantics) and the read renders as the signal; after a write it
+      must see the WRITTEN value, which the signal does not carry, so
+      it declines (alias-raw).  The unsound render-as-signal-always
+      variant existed for one probe cycle and never landed; walk
+      order makes the flag exact ("any write before this read").
+      (3) slice case_assign values wider than the slice coerce
+      through a temp (connect + low slice); (4) g0/pv hold wires are
+      PROCESS-SCOPED (g0p<idx>_) — two processes driving one signal
+      collided on wire g0_<sig> and poisoned the walk of the second.
+      Remaining 9 (6 modules): comb-process shadow locals read at
+      dynamic indices, 256-wide bit tables, dynamic part-selects,
+      one unconstrained temp width — all clean named declines.
 
 ## 2. ABI containment
 

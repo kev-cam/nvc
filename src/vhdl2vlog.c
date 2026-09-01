@@ -3177,8 +3177,11 @@ static int r2_clog2(int n)
 // NBA-shadow aliases for the CURRENT process (tgt-vhdl idiom): the shadow
 // variable v_nba_<r> is an alias for <r>'s hold temp — the pre-copy IS the
 // root action, the commit IS the sync assign, both elided.
-typedef struct { ident_t var; ident_t sig; tree_t sigdecl; bool committed; }
-   r2_alias_t;
+typedef struct { ident_t var; ident_t sig; tree_t sigdecl; bool committed;
+                 bool wrote;   // any write through the alias so far: a read
+                               // after that must see the WRITTEN value, and
+                               // the signal only carries the pre-edge one
+} r2_alias_t;
 static r2_alias_t g_r2_alias[16];
 static int        g_r2_nalias;
 
@@ -3822,6 +3825,21 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             snprintf(out, sz, "%s", vid(tree_ident(e)));
             return true;
          }
+         if (d != NULL && tree_kind(d) == T_VAR_DECL) {
+            // an NBA-shadow alias read BEFORE any write is the signal's
+            // pre-edge value — exactly what the pre-copy bound it to
+            r2_alias_t *al = r2_alias_of(tree_ident(e));
+            if (al != NULL && !al->wrote) {
+               snprintf(out, sz, "%s", vid(al->sig));
+               return true;
+            }
+            // otherwise: no wire exists for a local — rendering the bare
+            // name poisons the gsm session; decline cleanly
+            char why[96];
+            snprintf(why, sizeof why, "var-read %s", istr(tree_ident(e)));
+            R2_DECLINE(why);
+            return false;
+         }
          R2_DECLINE("ref");
          return false;
       }
@@ -4034,8 +4052,29 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             R2_DECLINE("array-ref");
             return false;
          }
-         snprintf(out, sz, "%s[%lld]", vid(tree_ident(base)),
-                  (long long)idx);
+         {
+            // resolve the BASE like any reference: an NBA-shadow alias
+            // reads its signal; an unresolved local variable has NO wire
+            // (the bare name would poison the gsm session)
+            ident_t bi = tree_ident(base);
+            r2_alias_t *al = r2_alias_of(bi);
+            if (al != NULL && !al->wrote)
+               bi = al->sig;   // pure pre-copy so far: the signal IS it
+            else if (al != NULL) {
+               char why[96];
+               snprintf(why, sizeof why, "alias-raw %s", istr(bi));
+               R2_DECLINE(why);
+               return false;
+            }
+            else if (tree_has_ref(base)
+                     && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               char why[96];
+               snprintf(why, sizeof why, "var-elem %s", istr(bi));
+               R2_DECLINE(why);
+               return false;
+            }
+            snprintf(out, sz, "%s[%lld]", vid(bi), (long long)idx);
+         }
          return true;
       }
 
@@ -4506,6 +4545,9 @@ typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
 typedef struct {
    r2_target_t *t;        // points at g_r2_tgt (walker is child-single-
                           // threaded; one process walks at a time)
+   int         pidx;      // owning process index: scopes g0/pv wire names
+                          // (two processes driving one signal must not
+                          // collide on wire g0_<sig>)
    bool        capped;    // collection hit the cap: target-miss is a LIE
    int         n;
    r2_memwr_t  mw[64];   // pending memory writes, flushed after the edge
@@ -4546,8 +4588,8 @@ static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
    e = &ts->pv[ts->npv];
    e->var = id;
    e->width = w;
-   snprintf(e->pv, sizeof e->pv, "pv_%s", vid(id));
-   snprintf(e->g0, sizeof e->g0, "g0pv_%s", vid(id));
+   snprintf(e->pv, sizeof e->pv, "pv%d_%s", ts->pidx, vid(id));
+   snprintf(e->g0, sizeof e->g0, "g0pv%d_%s", ts->pidx, vid(id));
    r2_subst_t *sb = r2_subst_of(id);
    if (g_r2->wire(e->g0, w, 0, NULL) != 0)
       return NULL;
@@ -4600,7 +4642,7 @@ static void r2_collect_cb(tree_t t, void *ctx)
    r2_target_t *n = &ts->t[ts->n++];
    n->name = id;
    snprintf(n->spec, sizeof n->spec, "%s", vid(id));
-   snprintf(n->g0, sizeof n->g0, "g0_%s", vid(id));
+   snprintf(n->g0, sizeof n->g0, "g0p%d_%s", ts->pidx, vid(id));
    type_t ty = tree_type(tree_ref(tg));
    n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
 }
@@ -4783,8 +4825,10 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             if (tree_kind(mb) == T_REF) {
                ident_t mi = tree_ident(mb);
                r2_alias_t *al = r2_alias_of(mi);
-               if (al != NULL)
+               if (al != NULL) {
                   mi = al->sig;
+                  al->wrote = true;
+               }
                mm = r2_mem_of(mi);
             }
          }
@@ -4894,8 +4938,10 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   ? tree_ident(tb) : NULL;
                if (bi != NULL) {
                   r2_alias_t *al = r2_alias_of(bi);
-                  if (al != NULL)
+                  if (al != NULL) {
                      bi = al->sig;
+                     al->wrote = true;
+                  }
                }
                r2_target_t *t = bi != NULL ? r2_target(ts, bi) : NULL;
                if (t == NULL || t->width <= 0 || t->width > 4000) {
@@ -4979,7 +5025,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          }
          ident_t ti = tree_ident(tg);
          { r2_alias_t *al = r2_alias_of(ti);
-           if (al != NULL) ti = al->sig; }
+           if (al != NULL) { ti = al->sig; al->wrote = true; } }
          r2_target_t *t = r2_target(ts, ti);
          if (t == NULL) {
             char why[96];
@@ -5030,7 +5076,29 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          if (!r2_const(val, v, sizeof v, vw)
              && !r2_expr(val, v, sizeof v))
             return false;
-         return g_r2->case_assign(lhs, v) == 0;
+         if (hi >= 0 && vw > 0) {
+            // slice target: RTLIL assigns need equal widths, but the value
+            // may render wider (unconstrained operator chains, whole-var
+            // reads).  Land it on a temp and take the low slice.
+            const int rw = r2_width_or_operands(val);
+            if (rw > vw) {
+               char ct[64];
+               if (!r2_temp(rw, ct, sizeof ct)
+                   || g_r2->connect(ct, v) != 0) {
+                  R2_DECLINE("coerce");
+                  return false;
+               }
+               if (vw == 1)
+                  snprintf(v, sizeof v, "%s[0]", ct);
+               else
+                  snprintf(v, sizeof v, "%s[%d:0]", ct, vw - 1);
+            }
+         }
+         if (g_r2->case_assign(lhs, v) != 0) {
+            R2_DECLINE("api-case-assign");
+            return false;
+         }
+         return true;
       }
    case T_IF:
       {
@@ -5345,7 +5413,8 @@ static bool r2_process(tree_t p0, int pidx)
       // infers the same latch the text path would (and gsm declines it).
       r2_subst_reset();
       g_r2_case_depth = 0;
-      r2_targets_t cts = { .n = 0, .comb = true, .t = g_r2_tgt };
+      r2_targets_t cts = { .n = 0, .comb = true, .t = g_r2_tgt,
+                           .pidx = pidx };
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
          R2_DECLINE("comb-empty");
@@ -5448,6 +5517,7 @@ static bool r2_process(tree_t p0, int pidx)
                al->sig = tree_ident(vv);
                al->sigdecl = tree_ref(vv);
                al->committed = false;
+               al->wrote = false;
                continue;
             }
             R2_DECLINE("nba-pre");
@@ -5480,7 +5550,7 @@ static bool r2_process(tree_t p0, int pidx)
          }
    }
 
-   r2_targets_t ts = { .n = 0, .t = g_r2_tgt };
+   r2_targets_t ts = { .n = 0, .t = g_r2_tgt, .pidx = pidx };
    tree_visit(p, r2_collect_cb, &ts);
    // aliased signals are targets even when the body writes only the shadow
    for (int i = 0; i < g_r2_nalias; i++) {
