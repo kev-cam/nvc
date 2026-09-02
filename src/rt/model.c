@@ -9414,6 +9414,56 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       aj_accel_teardown(m);
       return false;
    }
+   // CONTENT-keyed .so name: identical bridge+model BYTES under the same
+   // toolchain reuse the compiled object across vhash namespaces.  An nvc
+   // rebuild flips the exe-mtime vhash fold: the synth re-runs and re-emits
+   // byte-identical C, but the vhash-derived .so name still recompiled —
+   // ~40 minutes of gcc per 86MB EH2 model, the dominant iteration tax.
+   // The bridge #includes the dutc BY ITS VHASH-NAMED PATH, so that path is
+   // masked out of the hash (replaced by a fixed token) or nothing would
+   // ever cross-hit.  The vhash-derived name stays the fallback when either
+   // file is unreadable.
+   {
+      char *bt2 = aj_read_file(bridge);
+      char *dt2 = aj_read_file(dutc);
+      if (bt2 != NULL && dt2 != NULL) {
+         uint64_t ch = 14695981039346656037ULL;
+         const size_t dlen = strlen(dutc);
+         for (const char *p2 = bt2; *p2; ) {
+            if (strncmp(p2, dutc, dlen) == 0) {
+               for (const char *q2 = "@DUTC@"; *q2; q2++)
+                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
+               p2 += dlen;
+               continue;
+            }
+            ch ^= (uint8_t)*p2++;
+            ch *= 1099511628211ULL;
+         }
+         for (const char *p2 = dt2; *p2; p2++)
+            { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+         const char *cc2 = getenv("NVC_ACCEL_CC");
+         if (cc2 == NULL) cc2 = "gcc -g -O3";
+         for (const char *p2 = cc2; *p2; p2++)
+            { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+         if (getenv("NVC_ACCEL_SMDUMP") != NULL)
+            ch = (ch ^ 77u) * 1099511628211ULL;
+         struct utsname un2;
+         if (uname(&un2) == 0)
+            for (const char *p2 = un2.machine; *p2; p2++)
+               { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+#if defined(__x86_64__)
+         __builtin_cpu_init();
+         const unsigned isa2 = (__builtin_cpu_supports("avx512f") ? 4u : 0u)
+                             | (__builtin_cpu_supports("avx2")    ? 2u : 0u)
+                             | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
+         ch = (ch ^ isa2) * 1099511628211ULL;
+#endif
+         snprintf(so, sizeof so, "%s/aj_%s_c%016llx.so", accel_dir, top,
+                  (unsigned long long)ch);
+      }
+      free(bt2);
+      free(dt2);
+   }
    // Compile only if this exact (de-baked, content-only) .so is not already
    // cached. A logic change re-hashes -> a fresh .so; unchanged logic skips BOTH
    // synth and compile, leaving just the per-run table bind below.

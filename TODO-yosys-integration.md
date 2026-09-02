@@ -463,6 +463,15 @@ Determine where the current looseness actually is:
       Remaining 4: lsu_stbuf spec-elem (non-literal spec), lsu_bus_
       buffer 256-wide bit tables, ifu_aln var-elem under dynamic
       guards, dec_decode unconstrained temp width.
+      **CONTENT-KEYED .SO TIER (2026-09-02):** the .so name now
+      derives from the bridge+model BYTES (dutc path masked out of
+      the bridge hash — it embeds the vhash) plus toolchain/machine/
+      ISA, so identical generated C reuses its compiled object
+      ACROSS vhash namespaces.  An nvc rebuild used to recompile
+      everything (~40min gcc per 86MB EH2 model — the dominant
+      iteration tax); measured now: touch the binary, rerun EH1a —
+      454/454 .so content-hits, zero compiles, identical result.
+      Rebuild cost is now re-walk only.
 
 ## 2. ABI containment
 
