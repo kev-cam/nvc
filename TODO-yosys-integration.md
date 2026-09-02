@@ -417,6 +417,34 @@ Determine where the current looseness actually is:
       re-deposit outputs after the init drain; sequencing is
       scheduler-delicate.  Diagnose with NVC_ACCEL_OUT_TRACE (seed
       pass sentinel d=4294967295) on the lsu_arv cone.
+      **EH2 DIVERGENCE LOCALIZED (2026-09-02, bisection complete):**
+      the tick "2-vs-6" was a STRENGTH-PLANE artifact (l3d position
+      print; both logic-0) — the t=0 theory was wrong (the #43
+      fixpoint stands on its own reproducers).  Warm-cache ONLY
+      bisection: eh2_exu alone PASSES exactly (2519); eh2_dec alone
+      "passes" at 2450 — a 69-cycle stall-timing SKEW, second defect;
+      **eh2_lsu alone DIVERGES** — the minimal reproducer.  First
+      value-plane diff at CYCLE 400: `lsu_axi_arvalid` NEVER rises
+      under accel (interp issues its first data-side bus read there;
+      accel: zero assertions in 17,500 cycles → the core stalls on
+      its first load forever).  NOT the ck_last/LATE class (CK_LATE=1
+      changes neither unit).  CK_TRACE bookkeeping is textbook: the
+      chunk has THREE gated extra clocks (active_thread_l2clk__b0/
+      __b1 + active_clk); thread clocks rise in the SAME delta as the
+      main posedge detect (mask 0xb), active_clk one delta later
+      (mask 0x4); pend always 0 (late off).  With everything else
+      interpreted, chunk inputs are interp-correct, and VERIFY proves
+      the model computes — so the defect is DELTA-LEVEL SAMPLING
+      SEMANTICS of the gated-group advance (which `in` snapshot the
+      thread-gated flops read at the coincident delta vs interp's
+      NBA at the gated clock's own delta).  Next: dump the chunk's
+      bus-buffer state-machine inputs (lsu_bus_clk_en, lsu_busreq
+      cone) at cycles 395-405 in both arms (NVC_ACCEL_OUT_TRACE_FROM
+      ~3.95ms); compare against interp per-delta.  Vehicle logs:
+      /home/claude/eh2_rtlil/eh2_bis_eh2_lsu.log, eh2_cktrace.log.
+      MERGE-flow experiment queued (the shipped EH1 gated-clock
+      answer — if EH2 passes under MERGE, per-chunk lsu drops in
+      priority and merge becomes the EH2 recipe).
 
 ## 2. ABI containment
 
