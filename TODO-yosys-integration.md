@@ -445,6 +445,24 @@ Determine where the current looseness actually is:
       MERGE-flow experiment queued (the shipped EH1 gated-clock
       answer — if EH2 passes under MERGE, per-chunk lsu drops in
       priority and merge becomes the EH2 recipe).
+      **MERGE VERDICT: also diverges** (14 groups, same
+      arvalid-never-rises signature) — the gated-group sampling
+      defect is FLOW-INDEPENDENT; the delta-sampling fix is the only
+      EH2 path.
+      **RESIDUE SWEEP 3 (2026-09-02): declines 9 → 7, 4 modules.**
+      DYNAMIC PART-SELECT READS land: `sig(x+K downto x)` — bounds
+      dynamic, span constant — recognized structurally (left renders
+      as right + literal K with identical sub-specs) and lowered to
+      shr + [K:0], the l3d_part_read lowering for direct slicing
+      (dma_ctrl clears).  SPEC-ELEMENT READS land: element access of
+      a whole-substituted local indexes the spec — bare wire names
+      directly, sized literals via a width-VERIFIED temp connect
+      (an unverifiable spec width DECLINES: an RTLIL connect width
+      mismatch throws and poisons the session — caught in probe,
+      fixed before landing; poisons stay ZERO) (dec_gpr clears).
+      Remaining 4: lsu_stbuf spec-elem (non-literal spec), lsu_bus_
+      buffer 256-wide bit tables, ifu_aln var-elem under dynamic
+      guards, dec_decode unconstrained temp width.
 
 ## 2. ABI containment
 

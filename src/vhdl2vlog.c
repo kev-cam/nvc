@@ -3947,6 +3947,45 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
               && !r2_eval_int(tree_left(r), &left))
              || (!folded_int(tree_right(r), &right)
                  && !r2_eval_int(tree_right(r), &right))) {
+            // DYNAMIC part-select READ: `sig(x + K downto x)` — the bounds
+            // are dynamic but their span is constant.  Recognize left as
+            // right + K structurally (render both sub-expressions and
+            // compare the sigspecs) and lower to shr + a low slice, the
+            // l3d_part_read lowering for direct slicing.
+            tree_t lt = tree_left(r), rt = tree_right(r);
+            int64_t span = -1;
+            char rs2[R2_SPEC];
+            if (tree_kind(lt) == T_FCALL && tree_params(lt) == 2
+                && strcmp(istr(tree_ident(lt)), "\"+\"") == 0
+                && (folded_int(tree_value(tree_param(lt, 1)), &span)
+                    || r2_eval_int(tree_value(tree_param(lt, 1)), &span))
+                && span > 0 && span < 4000) {
+               char ls2[R2_SPEC];
+               if (r2_expr(tree_value(tree_param(lt, 0)), ls2, sizeof ls2)
+                   && r2_expr(rt, rs2, sizeof rs2)
+                   && strcmp(ls2, rs2) == 0) {
+                  tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
+                  type_t bt = bd != NULL ? tree_type(bd) : NULL;
+                  const int bw = (bt != NULL && type_const_bounds(bt))
+                     ? (int)type_width(bt) : -1;
+                  if (bw >= 1 && bw <= 4000
+                      && (tree_kind(bd) == T_SIGNAL_DECL
+                          || tree_kind(bd) == T_PORT_DECL)) {
+                     char bspec[R2_SPEC], dt[R2_SPEC], cn[R2_SPEC + 8];
+                     if (!r2_expr(base, bspec, sizeof bspec))
+                        return false;
+                     if (!r2_temp(bw, dt, sizeof dt))
+                        return false;
+                     snprintf(cn, sizeof cn, "c%s", dt);
+                     if (g_r2->cell_bin("shr", cn, bspec, rs2, dt, 0) != 0) {
+                        R2_DECLINE("part-shr");
+                        return false;
+                     }
+                     snprintf(out, sz, "%s[%lld:0]", dt, (long long)span);
+                     return true;
+                  }
+               }
+            }
             char why[48];
             snprintf(why, sizeof why, "slice-bounds k%d/k%d",
                      (int)tree_kind(tree_left(r)),
@@ -4002,6 +4041,41 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                }
                snprintf(out, sz, "%s", sb->bits[bidx]);
                return true;
+            }
+            // element read of a WHOLE-substituted var: index the spec — a
+            // bare wire name directly, anything else via a landed temp
+            if (sb != NULL && sb->spec != NULL
+                && r2_eval_int(tree_value(tree_param(e, 0)), &bidx)
+                && bidx >= 0) {
+               bool bare = sb->spec[0] != '\0';
+               for (const char *q = sb->spec; *q && bare; q++)
+                  if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+                     bare = false;
+               if (bare) {
+                  snprintf(out, sz, "%s[%lld]", sb->spec, (long long)bidx);
+                  return true;
+               }
+               tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
+               type_t bt = bd != NULL ? tree_type(bd) : NULL;
+               const int bw2 = (bt != NULL && type_const_bounds(bt))
+                  ? (int)type_width(bt) : -1;
+               // temp-connect needs EQUAL widths (RTLIL connections throw
+               // on mismatch and poison the session): only a sized literal
+               // whose prefix width matches the decl is provably safe here
+               const bool litw = isdigit((unsigned char)sb->spec[0])
+                  && atoi(sb->spec) == bw2;
+               if (litw && bw2 >= 1 && bw2 <= 4000 && bidx < bw2) {
+                  char t2[64];
+                  if (r2_temp(bw2, t2, sizeof t2)
+                      && g_r2->connect(t2, sb->spec) == 0) {
+                     snprintf(out, sz, "%s[%lld]", t2, (long long)bidx);
+                     return true;
+                  }
+                  R2_DECLINE("spec-elem-connect");
+                  return false;
+               }
+               R2_DECLINE("spec-elem");
+               return false;
             }
          }
          if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
