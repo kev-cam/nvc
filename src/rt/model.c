@@ -8733,6 +8733,29 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                return false;
             }
       }
+      // NVC_ACCEL_SKIP_TREE=n1,n2 — HIERARCHICAL skip: tokens matched
+      // against the lowered full scope PATH, so a parent's exclusion covers
+      // per-instance descents into its interior.  Name-based SKIP cannot:
+      // EH2's ic_tag skip let the IC_TAG read-hold flops install under
+      // generic rvdffs5 names and one mistimed SRAM capture killed the
+      // whole-core run (grow-bisection, 2026-09-03).  A separate env
+      // because path-matching the existing short tokens would overreach
+      // ('mem' matches every mem_ctl descendant).
+      const char *skt = getenv("NVC_ACCEL_SKIP_TREE");
+      if (skt != NULL && skt[0] != '\0') {
+         char pbuf[1024];
+         snprintf(pbuf, sizeof pbuf, "%s", istr(scope->name));
+         for (char *q = pbuf; *q; q++)
+            *q = tolower((unsigned char)*q);
+         char buf[512];
+         snprintf(buf, sizeof buf, "%s", skt);
+         for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+            if (t[0] != '\0' && strstr(pbuf, t) != NULL) {
+               notef("accel-jit: subtree '%s' skipped (NVC_ACCEL_SKIP_TREE "
+                     "matched path)", top0);
+               return false;
+            }
+      }
    // NVC_ACCEL_SLICE=<seed>:<pct> — seeded random admission (user
    // directive: regression suites as accel-boundary fuzzers).  Each seed
    // draws a DIFFERENT deterministic accel/interp boundary through the
