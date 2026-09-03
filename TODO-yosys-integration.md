@@ -521,6 +521,26 @@ Determine where the current looseness actually is:
       writeback assumptions; investigate before trusting demote
       there.  dec plan: SMDUMP (no demote) + interp wave of the dec
       scope to ~2.5us, comparator scripts as before.
+      **DEC DEFECT LOCALIZED (2026-09-03):** comparator on the dec
+      pair (250 dumps vs decwin.vcd; 1,288 matched, 31 true scalar
+      regs; 193 names +1-staged): first real divergence t=955ns
+      (de-staged) — `decode_cam_i0_i1_nonblock_load_stall_reg`
+      releases ONE CYCLE EARLY (3-wide vs interp 4-wide); then
+      i0-stall holds LONGER (thread-swapped widths), the whole
+      nbload pipeline walks apart, and the i0/i1 arbiter favor bit
+      sticks 72 cycles (1215–1935) vs interp's 3.  ★ COMB-NET
+      PHANTOMS: sm_dump_comb recomputes comb at the dump point from
+      a half-staged register bank — enable/comb nets in dumps show
+      pulses that never happened; ONLY the *_reg plane is evidence.
+      RULED OUT: input sampling phase — snapshotting all 11
+      lsu_nonblock_* pins via NVC_ACCEL_SNAP_PINS (engaged,
+      snap_nin=11) leaves 2450 unchanged.  NEXT SUSPECT: dec's
+      OUTPUT-side comb-at-edge staging classification — dec's
+      stall/valid outputs reaching the interp LSU a delta early
+      accelerate the round-trip (the staged-entry machinery's exact
+      domain; check whether the relevant outputs are classified
+      Mealy/off-edge and excluded from NBA-region staging).  Also
+      note the demote-unfaithful-on-dec trust boundary.
 
 ## 2. ABI containment
 
