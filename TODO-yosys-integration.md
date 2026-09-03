@@ -473,6 +473,35 @@ Determine where the current looseness actually is:
       454/454 .so content-hits, zero compiles, identical result.
       Rebuild cost is now re-walk only.
 
+      **EH2 LSU DEEP-DIVE (2026-09-02, three fixes landed + precise
+      residue):** the demote-bisection instrument exposed and fixed
+      THREE real defects: (1) DEMOTE RE-ARM — wakeup consumes a
+      dynamic wait's subscription BEFORE vtable dispatch, so a proc
+      woken while rerouted never re-arms; demote-restored procs were
+      permanently deaf (measured: lsu_bus_clk_en_q frozen from t=0,
+      reset-immune).  Fix: every restored proc runs once next delta
+      (spurious runs are semantics-preserving for the translated
+      shapes); lsu/exu demote@0 controls now PASS exactly.  (2) INPUT
+      SUBSCRIPTIONS — the same consumption starves the CHUNK's own
+      data-input wakes one by one until only clock wakes remain;
+      boundary inputs are now subscribed persistently like clocks
+      (NVC_ACCEL_NO_INSUB escape).  (3) UNIVERSAL posedge ck_last
+      clear — was merged-chunks-only; a quiet unmerged chunk jams
+      identically (CK_KEEPLAST escape).  All three validated: EH1a
+      census EXACT (1113, 7 declines, 0 poisons).  RESIDUE (the one
+      remaining EH2 defect, all configs LATE/COINC/fix-combos fail
+      identically): accel completes the non-blocking load READ
+      RESPONSE one cycle early — obuf_rdrsp_pend held 1 cycle vs
+      interp's 2 (first architectural divergence t=995ns; preceded
+      by dc2/3/4 clkenff pulse-width anomalies at 655ns that are
+      dump-staging-ambiguous).  State bisection: good ≤1.1us, dead
+      ≥1.2us.  TOOLKIT READY: comparator scripts in the session
+      scratchpad (compare2/final/verify*.py), SMDUMP recipe, interp
+      wave lsuwin.vcd, demote instrument now TRUSTWORTHY.  Next: the
+      rdrsp_pend cone (axi_rvalid sampling vs bus_clk_en gating in
+      the bit0/bit2 group split — which group commits rdrsp_pend and
+      what does its D-cone read at the coincident delta).
+
 ## 2. ABI containment
 
 - [x] **(2026-08-30)** The facade is libgsm.so's `extern "C"` surface:

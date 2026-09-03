@@ -3800,6 +3800,42 @@ static void aj_subscribe_clocks(rt_model_t *m, aj_chunk_t *chunk)
                   (void *)n, (void *)root, root != n ? " (root-sub)" : "");
       }
    }
+   // EVERY boundary INPUT, not just clocks.  The rerouted procs' dynamic
+   // waits are CONSUMED on their first wake (wakeup clears a dynamic
+   // wait's subscription before the vtable dispatch, and the NOP body
+   // never re-executes the wait to re-arm), so the chunk's data-input
+   // wakes die one by one until only the clock subscriptions above keep
+   // it alive — inputs are then rescanned only at clock-edge evals, and
+   // an input that settles a delta LATER than the clk eval within the
+   // same timestep is sampled pre-settled EVERY cycle.  Measured on
+   // eh2_lsu: lsu_bus_clk_en (computed by interp clk_ctrl after the clk
+   // delta) read stale-low forever — obuf never loaded, lsu_axi_arvalid
+   // never rose, the core hung on its first load.  sched_event entries
+   // are PERSISTENT and dedup by wakeable, and the quiet-skip early
+   // return bounds the cost of the extra wakes to one input scan.
+   if (chunk->rs_pins != NULL && getenv("NVC_ACCEL_NO_INSUB") == NULL) {
+      for (int i = 0; i < chunk->rs_npins; i++) {
+         if (chunk->rs_pins[i].is_output || chunk->rs_pins[i].sig == NULL)
+            continue;
+         rt_signal_t *sig = chunk->rs_pins[i].sig;
+         rt_nexus_t *n = &(sig->nexus);
+         for (unsigned nx = 0; nx < sig->n_nexus; nx++, n = n->chain) {
+            sched_event(m, &(n->pending), obj);
+            rt_nexus_t *root = n;
+            for (int hop = 0; hop < 16; hop++) {
+               rt_source_t *ps = NULL;
+               for (rt_source_t *s2 = &(root->sources); s2 != NULL;
+                    s2 = s2->chain_input)
+                  if (s2->tag == SOURCE_PORT && s2->u.port.input != NULL)
+                     ps = s2;
+               if (ps == NULL) break;
+               root = ps->u.port.input;
+            }
+            if (root != n)
+               sched_event(m, &(root->pending), obj);
+         }
+      }
+   }
 }
 
 // ---- NVC_FAST_CLK posedge-table dispatch -----------------------------------
@@ -4124,6 +4160,19 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
       if (p->vtable == &chunk->vtable) {
          proc_set_vtable(p, chunk->rr_saved[i].vt);
          restored++;
+         // RE-ARM: a wait-at-bottom proc that was WOKEN while rerouted had
+         // its one-shot subscription consumed by the chunk vtable and never
+         // re-armed (the body that would re-execute the wait never ran).
+         // Restoring the vtable alone leaves such a proc deaf FOREVER —
+         // measured on eh2_lsu: lsu_bus_clk_en_q frozen from t=0 after a
+         // demote, freezing the bus-enable cone reset-immune and killing
+         // the run.  Run every restored proc once in the next delta:
+         // executing to its wait re-subscribes it.  A spurious run of the
+         // translated shapes is semantics-preserving (edge guards are
+         // level-checked; NBA shadows copy-through unchanged).
+         if (!p->wakeable.pending && !p->wakeable.delayed
+             && !p->wakeable.postponed)
+            deltaq_insert_proc(m, 0, p);
       }
       // else: something else (reset_process) already replaced it — leave it
    }
@@ -7416,9 +7465,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // clock is by construction LOW at the main posedge, so any remembered
       // high is the previous cycle's — clearing at the posedge re-arms
       // detection for the fresh rise.
-      if (chunk != NULL && chunk->merged && nck > 0)
-         fprintf(f, "  if(posedge) for(int _k=0;_k<%d;_k++)"
-                    " aj_cs->ck_last[_k]=0;\n", nck);
+      // ALL chunks with extra clocks, not just merged: a per-chunk unmerged
+      // chunk that sleeps through the clk-low half-cycle never observes the
+      // gated falls either — ck_last jams at 1 and rises are silently
+      // MISSED (measured on eh2_lsu: the active_clk-group dc2/dc3/dc4
+      // clken staging flops held their pulses one cycle long with rises
+      // aligned — a missed 655ns edge froze the whole bit2 group for a
+      // cycle; interp's staged-clken chain is 1-wide).  An ICG-of-clk
+      // gated clock is by construction LOW at the main posedge, so any
+      // remembered high is the previous cycle's; NVC_ACCEL_CK_KEEPLAST
+      // restores the old behaviour for genuinely-divided clocks.
+      if (chunk != NULL && nck > 0)
+         fprintf(f, "  { static int _kl2=-1; if(_kl2<0)"
+                    " _kl2=getenv(\"NVC_ACCEL_CK_KEEPLAST\")?1:0;"
+                    " if(posedge && !_kl2) for(int _k=0;_k<%d;_k++)"
+                    " aj_cs->ck_last[_k]=0; }\n", nck);
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
       fprintf(f, "  if(!_late && !_coinc){\n");
