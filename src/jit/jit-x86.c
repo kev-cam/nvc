@@ -2444,7 +2444,7 @@ static void jit_x86_gen_tlab_stub(jit_x86_state_t *state)
    MOV(CARG0_REG, __EAX, __DWORD);
    LEA(CARG1_REG, ADDR(__EBP, ANCHOR_OFFSET));
 
-   MOV(__EAX, PTR(__nvc_mspace_alloc), __QWORD);
+   MOV(__EAX, PTR(__nvc_eval_alloc), __QWORD);   // TLAB-lifetime object
    CALL(__EAX);
 
    jit_x86_pop_call_clobbered(blob);

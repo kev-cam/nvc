@@ -291,6 +291,7 @@ code_cache_t *code_cache_new(void)
    shash_put(s, "__nvc_test_event", &__nvc_test_event);
    shash_put(s, "__nvc_last_event", &__nvc_last_event);
    shash_put(s, "__nvc_mspace_alloc", &__nvc_mspace_alloc);
+   shash_put(s, "__nvc_eval_alloc", &__nvc_eval_alloc);
    shash_put(s, "__nvc_putpriv", &__nvc_putpriv);
    shash_put(s, "__nvc_do_exit", &__nvc_do_exit);
    shash_put(s, "__nvc_pack", &__nvc_pack);

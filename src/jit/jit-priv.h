@@ -405,7 +405,7 @@ struct _jit_thread_local {
    jit_jmpbuf_t           abort_env;
    volatile sig_atomic_t  jmp_buf_valid;
    jit_anchor_t          *anchor;
-   eval_arena_t          *eval_arena;   // non-NULL: route __nvc_mspace_alloc here
+   eval_arena_t          *eval_arena;   // non-NULL: route __nvc_eval_alloc here
 };
 
 typedef struct _code_cache code_cache_t;
@@ -585,6 +585,7 @@ DLLEXPORT void __nvc_pack(const uint8_t *src, int32_t size, jit_scalar_t *args);
 DLLEXPORT void __nvc_unpack(jit_scalar_t aval, jit_scalar_t bval,
                             jit_scalar_t *args);
 DLLEXPORT void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor);
+DLLEXPORT void *__nvc_eval_alloc(uintptr_t size, jit_anchor_t *anchor);
 DLLEXPORT void _debug_out(intptr_t val, int32_t reg);
 
 #endif  // _JIT_PRIV_H

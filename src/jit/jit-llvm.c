@@ -3301,9 +3301,19 @@ static void cgen_tlab_alloc_body(llvm_obj_t *obj)
 
    LLVMPositionBuilderAtEnd(obj->builder, slow_bb);
 
+   // TLAB exhausted: eval-lifetime storage (the arena when enabled), never
+   // the persistent-object entry point used by MACRO_GALLOC.  Declared by
+   // name with __nvc_mspace_alloc's signature rather than as an llvm_fn_t
+   // (the helper table is full: the cache manifest's helper_mask is 64
+   // bits); the loader resolves it like every other __nvc_* symbol.
+   (void)llvm_get_fn(obj, LLVM_MSPACE_ALLOC);   // builds the shared fntype
+   LLVMTypeRef evaltype = obj->fntypes[LLVM_MSPACE_ALLOC];
+   LLVMValueRef evalfn = llvm_add_fn(obj, "__nvc_eval_alloc", evaltype);
+   llvm_add_func_attr(obj, evalfn, FUNC_ATTR_NOUNWIND, -1);
+
    LLVMValueRef args[] = { bytes, anchor };
-   LLVMValueRef slow_ptr = llvm_call_fn(obj, LLVM_MSPACE_ALLOC, args,
-                                        ARRAY_LEN(args));
+   LLVMValueRef slow_ptr = LLVMBuildCall2(obj->builder, evaltype, evalfn,
+                                          args, ARRAY_LEN(args), "");
 
    LLVMBuildRet(obj->builder, slow_ptr);
 }
