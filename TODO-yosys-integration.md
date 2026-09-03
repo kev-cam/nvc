@@ -501,6 +501,26 @@ Determine where the current looseness actually is:
       rdrsp_pend cone (axi_rvalid sampling vs bus_clk_en gating in
       the bit0/bit2 group split — which group commits rdrsp_pend and
       what does its D-cone read at the coincident delta).
+      **COINCIDENT BREAKTHROUGH (2026-09-03):** eh2_lsu +
+      CK_COINCIDENT + the wake-fix trio = TEST_PASSED cycles=2519
+      EXACT (the July "COINC has zero effect" predates the wake
+      fixes — they were mutually masking).  EH1a under COINC: 1113
+      EXACT, no regression.  The FPGA-shape translation is single-
+      clock (every gated clock a pass-through), so one-pre-edge-
+      snapshot semantics are exactly right.  rdrsp_pend root cause
+      confirmed structural: it commits group 0 while sibling regs
+      commit groups 1/3 — value-edge mode gives delta-order-
+      dependent cross-group skew that interp's single clock never
+      has.  FULL EH2 under COINC still watchdogs (1849 installed):
+      composition has MORE defects.  Singles: exu 2519 exact; **dec
+      2450 — its 69-cycle-early completion is an INDEPENDENT defect
+      and the next minimal repro.**  ★ INSTRUMENT TRUST BOUNDARY:
+      demote is faithful on lsu/exu (reproduces interp exactly) but
+      NOT on dec (demote@1us→2364, a third trajectory; @500ns
+      breaks) — some dec shape violates the spurious-run-safe or
+      writeback assumptions; investigate before trusting demote
+      there.  dec plan: SMDUMP (no demote) + interp wave of the dec
+      scope to ~2.5us, comparator scripts as before.
 
 ## 2. ABI containment
 
