@@ -3055,6 +3055,9 @@ bool vhdl2vlog(tree_t block, const char *modname, const char *path)
 // mem_shape/sig_is_mem, type_width/emitted_width, vid, comp_inner.)
 // ===========================================================================
 #include "gsm_rtlil.h"
+#include "diag.h"        // loc_t (census: source line of each decline)
+#include <setjmp.h>      // census: a crashing process is tagged, not fatal
+#include <signal.h>
 
 static const gsm_rtlil_api_t *g_r2 = NULL;   // active builder api
 static int  g_r2_tmp;                        // rx<N> expression temps
@@ -3062,11 +3065,115 @@ static int  g_r2_fail;                       // decline counter
 static char g_r2_why[128];                   // first decline reason
 static const char *g_r2_site = "?";          // breadcrumb for declines
 
-#define R2_DECLINE(why) do {                                   \
-      if (g_r2_fail++ == 0)                                    \
-         snprintf(g_r2_why, sizeof g_r2_why, "%s@%s", (why),   \
-                  g_r2_site);                                  \
-   } while (0)
+// ---- census mode (NVC_ACCEL_RTLIL_CENSUS=1) --------------------------------
+// A DRY walk against a null builder that does not stop at the first decline:
+// every decline is streamed (module, process, source line, reason@site) and
+// tallied per module, and the module is always declined afterwards (the
+// caller takes the text path exactly as for a normal decline).  Diagnostic
+// only -- it admits nothing; it exists to catalogue what the walker would
+// need for a design that today declines on its first construct.
+static bool        g_r2_census;
+static const char *g_r2_modname = "?";
+static int         g_r2_pidx = -1;
+static tree_t      g_r2_cur;                 // statement being walked
+static struct { char key[192]; int n; } g_r2_tally[512];
+static int         g_r2_ntally;
+
+static void r2_decline(const char *why)
+{
+   if (g_r2_fail++ == 0)
+      snprintf(g_r2_why, sizeof g_r2_why, "%s@%s", why, g_r2_site);
+   if (!g_r2_census)
+      return;
+   const loc_t *loc = g_r2_cur != NULL ? tree_loc(g_r2_cur) : NULL;
+   notef("vhdl2rtlil-census: %s p%d L%u: %s@%s", g_r2_modname, g_r2_pidx,
+         loc != NULL ? (unsigned)loc->first_line : 0u, why, g_r2_site);
+   char key[192];
+   snprintf(key, sizeof key, "%s@%s", why, g_r2_site);
+   for (int i = 0; i < g_r2_ntally; i++)
+      if (strcmp(g_r2_tally[i].key, key) == 0) {
+         g_r2_tally[i].n++;
+         return;
+      }
+   if (g_r2_ntally < (int)ARRAY_LEN(g_r2_tally)) {
+      snprintf(g_r2_tally[g_r2_ntally].key, sizeof g_r2_tally[0].key,
+               "%s", key);
+      g_r2_tally[g_r2_ntally++].n = 1;
+   }
+}
+
+#define R2_DECLINE(why) r2_decline(why)
+
+// census: a walker crash inside one process (the fork child would die and
+// the whole census with it) is caught, tagged CRASH(sig) on the statement
+// being walked, and the walk goes on with the next process
+static sigjmp_buf g_r2_jmp;
+static volatile sig_atomic_t g_r2_jmp_armed;
+static char g_r2_altstack[1 << 16];
+
+static void r2_census_sig(int sig)
+{
+   if (g_r2_jmp_armed) {
+      g_r2_jmp_armed = 0;
+      siglongjmp(g_r2_jmp, sig);
+   }
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+
+static void r2_census_arm_signals(void)
+{
+   stack_t ss = { .ss_sp = g_r2_altstack, .ss_size = sizeof g_r2_altstack };
+   sigaltstack(&ss, NULL);
+   struct sigaction sa;
+   memset(&sa, 0, sizeof sa);
+   sa.sa_handler = r2_census_sig;
+   sa.sa_flags = SA_ONSTACK | SA_NODEFER;
+   sigemptyset(&sa.sa_mask);
+   sigaction(SIGSEGV, &sa, NULL);
+   sigaction(SIGBUS, &sa, NULL);
+   sigaction(SIGFPE, &sa, NULL);
+   sigaction(SIGABRT, &sa, NULL);
+}
+
+// the null builder: every construction call succeeds and builds nothing
+static int r2n_s(const char *a) { (void)a; return 0; }
+static int r2n_ss(const char *a, const char *b) { (void)a; (void)b; return 0; }
+static int r2n_v(void) { return 0; }
+static int r2n_wire(const char *n, int w, int d, const char *i)
+{ (void)n; (void)w; (void)d; (void)i; return 0; }
+static int r2n_bin(const char *o, const char *n, const char *a,
+                   const char *b, const char *y, int s)
+{ (void)o; (void)n; (void)a; (void)b; (void)y; (void)s; return 0; }
+static int r2n_un(const char *o, const char *n, const char *a,
+                  const char *y, int s)
+{ (void)o; (void)n; (void)a; (void)y; (void)s; return 0; }
+static int r2n_mux(const char *n, const char *a, const char *b,
+                   const char *s, const char *y)
+{ (void)n; (void)a; (void)b; (void)s; (void)y; return 0; }
+static int r2n_inst(const char *t, const char *n, const char *c)
+{ (void)t; (void)n; (void)c; return 0; }
+static int r2n_mem(const char *n, int w, int s)
+{ (void)n; (void)w; (void)s; return 0; }
+static int r2n_memrd(const char *n, const char *m, const char *a,
+                     const char *d)
+{ (void)n; (void)m; (void)a; (void)d; return 0; }
+static int r2n_memwr(const char *m, const char *a, const char *d,
+                     const char *e)
+{ (void)m; (void)a; (void)d; (void)e; return 0; }
+static unsigned long long r2n_hash(void) { return 0; }
+static int r2n_synth(int n, const char *const *a) { (void)n; (void)a; return 1; }
+static void r2n_abort(void) {}
+static const gsm_rtlil_api_t g_r2_null_api = {
+   .begin = r2n_s, .module = r2n_s, .wire = r2n_wire, .connect = r2n_ss,
+   .cell_bin = r2n_bin, .cell_un = r2n_un, .cell_mux = r2n_mux,
+   .cell_inst = r2n_inst, .proc = r2n_s, .sync = r2n_ss,
+   .sync_assign = r2n_ss, .case_assign = r2n_ss, .case_assign_root = r2n_ss,
+   .memory = r2n_mem, .memrd = r2n_memrd, .sync_memwr = r2n_memwr,
+   .switch_begin = r2n_s, .case_begin = r2n_s, .case_end = r2n_v,
+   .switch_end = r2n_v, .content_hash = r2n_hash, .synth = r2n_synth,
+   .abort_session = r2n_abort
+};
 
 // Expression sigspec strings: names, selects, sized constants, temp wire
 // names, or concats of those.  Binary literals spell one char per BIT, so
@@ -3076,7 +3183,7 @@ static const char *g_r2_site = "?";          // breadcrumb for declines
 // memories qualified for direct construction (per module)
 // user functions inlinable at call sites: straight-line pure bodies only
 // (var-assigns to plain refs + nulls + one trailing valued return)
-static tree_t g_r2_funcs[8];
+static tree_t g_r2_funcs[64];                // 8 admitted; 64 in census mode
 static int    g_r2_nfuncs;
 static int    g_r2_inline_depth;
 
@@ -3791,7 +3898,7 @@ static bool r2_is_onebit_op(const char *b)
 
 static bool r2_expr(tree_t e, char *out, size_t sz)
 {
-   if (g_r2_fail > 0)
+   if (g_r2_fail > 0 && !g_r2_census)
       return false;
 
    switch (tree_kind(e)) {
@@ -4308,7 +4415,9 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          if (vop != NULL && np == 2) {
             const char *bop = r2_binop(vop);
             if (bop == NULL) {
-               R2_DECLINE("binop");
+               char why[48];
+               snprintf(why, sizeof why, "binop %s", vop);
+               R2_DECLINE(why);
                return false;
             }
             tree_t ea = tree_value(tree_param(e, 0));
@@ -4338,7 +4447,9 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             const char *uop = strcmp(vop, "~") == 0 ? "not"
                : strcmp(vop, "-") == 0 ? "neg" : NULL;
             if (uop == NULL) {
-               R2_DECLINE("unop");
+               char why[48];
+               snprintf(why, sizeof why, "unop %s", vop);
+               R2_DECLINE(why);
                return false;
             }
             char a[R2_SPEC];
@@ -4501,12 +4612,21 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
                return false;
             }
          }
-         R2_DECLINE("fcall");
+         {
+            char why[96];
+            snprintf(why, sizeof why, "fcall:%s d%d np%d", id_base(fn),
+                     g_r2_inline_depth, np);
+            R2_DECLINE(why);
+         }
          return false;
       }
 
    default:
-      R2_DECLINE("expr-kind");
+      {
+         char why[48];
+         snprintf(why, sizeof why, "expr-kind %d", (int)tree_kind(e));
+         R2_DECLINE(why);
+      }
       return false;
    }
 }
@@ -4651,6 +4771,7 @@ static bool r2_seq(tree_t list_of, r2_targets_t *ts);
 
 static bool r2_seq_one(tree_t s, r2_targets_t *ts)
 {
+   g_r2_cur = s;
    switch (tree_kind(s)) {
    case T_WAIT:
    case T_NULL:
@@ -5145,7 +5266,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                ok = false;
             g_r2_case_depth--;
          }
-         return ok && g_r2_fail == 0;
+         return ok && (g_r2_fail == 0 || g_r2_census);
       }
    case T_WHILE:
       {
@@ -5302,7 +5423,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          }
          if (g_r2->switch_end() != 0)
             ok = false;
-         return ok && g_r2_fail == 0;
+         return ok && (g_r2_fail == 0 || g_r2_census);
       }
    default:
       {
@@ -5317,10 +5438,23 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
 static bool r2_seq(tree_t list_of, r2_targets_t *ts)
 {
    const int n = tree_stmts(list_of);
-   for (int i = 0; i < n; i++)
-      if (!r2_seq_one(tree_stmt(list_of, i), ts))
-         return false;
-   return true;
+   bool ok = true;
+   for (int i = 0; i < n; i++) {
+      const int before = g_r2_fail;
+      tree_t st = tree_stmt(list_of, i);
+      if (!r2_seq_one(st, ts)) {
+         if (!g_r2_census)
+            return false;
+         ok = false;   // census: keep walking the remaining statements
+         if (g_r2_fail == before) {   // a bare `return false` path
+            char why[48];
+            g_r2_cur = st;
+            snprintf(why, sizeof why, "silent-stmt k%d", (int)tree_kind(st));
+            R2_DECLINE(why);
+         }
+      }
+   }
+   return ok;
 }
 
 // flush pending memory writes onto the (just created) edge sync
@@ -5344,6 +5478,13 @@ static bool r2_process(tree_t p0, int pidx)
 {
    tree_t p = proc_body(p0);
    tree_t body_if = NULL, sig[8], ifstmt = NULL;
+   g_r2_pidx = pidx;
+   g_r2_cur = p0;
+   if (g_r2_census) {
+      const loc_t *loc = tree_loc(p0);
+      notef("vhdl2rtlil-census: %s p%d begin L%u", g_r2_modname, pidx,
+            loc != NULL ? (unsigned)loc->first_line : 0u);
+   }
    bool pe[8];
    int ne = 0;
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
@@ -5445,7 +5586,7 @@ static bool r2_process(tree_t p0, int pidx)
       for (int i = 0; cok && i < cts.npv; i++)
          if (cts.pv[i].persistent)   // latch state: commit the hold value
             cok = g_r2->sync_assign(cts.pv[i].pv, cts.pv[i].g0) == 0;
-      return cok && g_r2_fail == 0;
+      return cok && (g_r2_fail == 0 || g_r2_census);
    }
    // (rcond/rsig are derived below from ifstmt; the sensitivity may carry
    //  the async reset as a SECOND edge — resolved after areset_of runs)
@@ -5565,8 +5706,8 @@ static bool r2_process(tree_t p0, int pidx)
       type_t ty = tree_type(g_r2_alias[i].sigdecl);
       n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
    }
-   if (ts.n == 0 || g_r2_fail > 0)
-      return g_r2_fail == 0;
+   if (ts.n == 0 || (g_r2_fail > 0 && !g_r2_census))
+      return g_r2_fail == 0 || g_r2_census;
 
    char pn[64];
    snprintf(pn, sizeof pn, "p%d", pidx);
@@ -5660,7 +5801,7 @@ static bool r2_process(tree_t p0, int pidx)
          }
       }
    }
-   return ok && g_r2_fail == 0;
+   return ok && (g_r2_fail == 0 || g_r2_census);
 }
 
 // ---- the module walk -------------------------------------------------------
@@ -5668,11 +5809,23 @@ static bool r2_process(tree_t p0, int pidx)
 bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
 {
    const gsm_rtlil_api_t *api = (const gsm_rtlil_api_t *)api_;
+   g_r2_census = getenv("NVC_ACCEL_RTLIL_CENSUS") != NULL;
+   if (g_r2_census)
+      api = &g_r2_null_api;   // dry walk: build nothing, decline at the end
    g_r2 = api;
+   g_r2_modname = modname;
+   g_r2_pidx = -1;
+   g_r2_cur = NULL;
+   g_r2_site = "?";
+   g_r2_ntally = 0;
    g_r2_tmp = 0;
    g_r2_fail = 0;
    g_r2_nmems = 0;
    g_r2_why[0] = '\0';
+   if (g_r2_census) {
+      notef("vhdl2rtlil-census: begin %s", modname);
+      r2_census_arm_signals();
+   }
 
    {  tree_t inner = vhdl2vlog_comp_inner(block);
       if (inner != NULL)
@@ -5693,10 +5846,13 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       if (tree_kind(d) == T_FUNC_BODY && !fn_is_builtin(istr(tree_ident(d)))) {
          // a straight-line pure body INLINES at its call sites; anything
          // else still declines the module
-         char fw[32];
-         if (r2_func_inlinable(d, fw, sizeof fw) && g_r2_nfuncs < 8) {
-            g_r2_funcs[g_r2_nfuncs++] = d;
-            continue;
+         char fw[32] = "";
+         if (r2_func_inlinable(d, fw, sizeof fw)) {
+            if (g_r2_nfuncs < (g_r2_census ? 64 : 8)) {
+               g_r2_funcs[g_r2_nfuncs++] = d;
+               continue;
+            }
+            snprintf(fw, sizeof fw, "cap%d", g_r2_nfuncs);
          }
          {
             char why[96];
@@ -5704,6 +5860,8 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
                      id_base(istr(tree_ident(d))), fw);
             R2_DECLINE(why);
          }
+         if (g_r2_census)
+            continue;   // the call sites will report the uninlined calls
          goto declined;
       }
    }
@@ -5854,8 +6012,10 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
    // concurrent statements
    const int nstmts = tree_stmts(block);
    int pidx = 0;
-   for (int i = 0; i < nstmts && g_r2_fail == 0; i++) {
+   for (int i = 0; i < nstmts && (g_r2_fail == 0 || g_r2_census); i++) {
       tree_t s = tree_stmt(block, i);
+      g_r2_cur = s;
+      g_r2_site = "?";
       switch (tree_kind(s)) {
       case T_SIGNAL_ASSIGN:
          {
@@ -5878,8 +6038,34 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
             break;
          }
       case T_PROCESS:
-         if (!r2_process(s, pidx++))
-            R2_DECLINE("process");
+         {
+            const int before = g_r2_fail;
+            bool pok;
+            if (g_r2_census) {
+               int sig;
+               if ((sig = sigsetjmp(g_r2_jmp, 1)) == 0) {
+                  g_r2_jmp_armed = 1;
+                  pok = r2_process(s, pidx);
+                  g_r2_jmp_armed = 0;
+               }
+               else {
+                  char why[48];
+                  snprintf(why, sizeof why, "CRASH(sig%d)", sig);
+                  R2_DECLINE(why);   // g_r2_cur = the statement being walked
+                  g_r2_case_depth = 0;
+                  g_r2_inline_depth = 0;
+                  g_r2_nalias = 0;
+                  pok = false;
+               }
+               pidx++;
+            }
+            else
+               pok = r2_process(s, pidx++);
+            if (!pok) {
+               g_r2_cur = s;
+               R2_DECLINE(g_r2_fail == before ? "process-silent" : "process");
+            }
+         }
          break;
       case T_BLOCK:
          {
@@ -5942,12 +6128,28 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
             break;
          }
       default:
-         R2_DECLINE("conc-kind");
+         {
+            char why[48];
+            snprintf(why, sizeof why, "conc-kind %d", (int)tree_kind(s));
+            R2_DECLINE(why);
+         }
          break;
       }
    }
 
  declined:
+   if (g_r2_census) {
+      int total = 0;
+      for (int i = 0; i < g_r2_ntally; i++) {
+         total += g_r2_tally[i].n;
+         notef("vhdl2rtlil-census: tally %s: %5d x %s", modname,
+               g_r2_tally[i].n, g_r2_tally[i].key);
+      }
+      notef("vhdl2rtlil-census: module %s: %d decline(s), %d distinct, "
+            "%d process(es) — census only, using the text path",
+            modname, total, g_r2_ntally, pidx);
+      return false;
+   }
    if (g_r2_fail > 0) {
       warnf("vhdl2rtlil: '%s' declined (%s) — using the text path",
             modname, g_r2_why);

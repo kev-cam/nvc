@@ -8260,7 +8260,10 @@ static bool aj_rtlil_subtree(const gsm_rtlil_api_t *api, rt_scope_t *scope,
             if (seen[i] == key) { dup = true; break; }
          if (!dup) {
             if (*nseen < maxseen) seen[(*nseen)++] = key;
-            if (!vhdl2rtlil_module(api, scope->where, mod))
+            // census mode (NVC_ACCEL_RTLIL_CENSUS): every module of the
+            // subtree is walked whatever the others did
+            if (!vhdl2rtlil_module(api, scope->where, mod)
+                && getenv("NVC_ACCEL_RTLIL_CENSUS") == NULL)
                return false;
          }
       }
@@ -8308,7 +8311,8 @@ static pid_t aj_rtlil_spawn(rt_scope_t *scope, const char *dir,
       _exit(2);
    static ident_t seen[512];
    int nseen = 0;
-   if (!aj_rtlil_subtree(api, scope, seen, &nseen, 512)) {
+   if (!aj_rtlil_subtree(api, scope, seen, &nseen, 512)
+       || getenv("NVC_ACCEL_RTLIL_CENSUS") != NULL) {   // census: never synth
       api->abort_session();
       _exit(3);
    }
