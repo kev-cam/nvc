@@ -541,6 +541,28 @@ Determine where the current looseness actually is:
       domain; check whether the relevant outputs are classified
       Mealy/off-edge and excluded from NBA-region staging).  Also
       note the demote-unfaithful-on-dec trust boundary.
+      **★★★ FULL-CORE EH2 ACCEL CORRECT (2026-09-03): TEST_PASSED
+      cycles=2519 EXACT — the July blocker is closed.**  RECIPE:
+      NVC_ACCEL_CK_COINCIDENT=1 NVC_ACCEL_NBA=0
+      NVC_ACCEL_MIN_MODULES=8 + the standard SRAM skips, on the
+      wake-fix trio + the unfused-COINC bridge (1461d925d).  11
+      substantial chunks ACTIVE; wall 1327s; EH1a unchanged exact.
+      Final-chapter findings: (1) dec "stall early" DISPROVEN
+      (dump-frame skew); real dec divergence = the BP-training loop;
+      the NBA=0 discriminator == interp EXACT → NBA-region
+      loop-latency semantics are the principled follow-up, now
+      against a working baseline.  (2) The remaining composition
+      breakers were TINY LEAF CHUNKS — per-instance descents into
+      flop-wrapper interiors whose generic names LEAK past
+      NAME-substring skips (rvdffs5__9a17 = EH2_IC_TAG
+      rd_data_hold/tg_data_raw flops, past the ic_tag skip;
+      rvdffs__106d = rvdffe inner dffs; rvdffs__b5c5 = rvarbiter2
+      favor flops + fpga-shell dffs); convicted by grow-bisection
+      with exact-cycle verdicts.  MIN_MODULES=8 excludes the class
+      (design intent per the code comment; note the DEFAULT is
+      still 1).  FOLLOW-UPS: hierarchical skip; the leaf-chunk
+      composition defect (three minimal repros); NBA loop-latency;
+      recipe as FROM_VHDL default after soak.
 
 ## 2. ABI containment
 
