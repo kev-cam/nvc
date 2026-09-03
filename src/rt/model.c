@@ -7514,8 +7514,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  extra_clk_field[k], extra_clk_bit[k], k);
       fprintf(f, "); }\n");
       {
+         // COINCIDENT mode defers the input scan until AFTER the advance,
+         // so the fused single-pass (sm_clock_out computes outputs inside
+         // the advance) would publish outputs from f(S(T), in(T-1)) — a
+         // stale input component for any Mealy-at-edge output cone, pushed
+         // into the NBA region where the mid-timestep correction races the
+         // queued commit (measured: dec's br*_wb_pkt trained the interp
+         // IFU's branch predictor with the previous cycle's history; one
+         // flipped prediction at ~1215ns forked the fetch path and the run
+         // finished 69 cycles off; NBA=0 discriminator run == interp
+         // EXACTLY).  Under _coinc use the unfused advance: the !_fused
+         // sm_comb re-settle after the deferred scan recomputes outputs
+         // from (S(T), in(T)) — interp-exact.
          const char *adv = has_clock_out
-            ? "{ if(!VERIFY){ sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
+            ? "{ if(!VERIFY && !_coinc){"
+              " sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
               " else sm_clock_masked(&S,&in,posedge_mask); }"
             : "sm_clock_masked(&S,&in,posedge_mask);";
          if (rst != NULL) {
