@@ -2843,6 +2843,9 @@ tree_t vhdl2vlog_comp_inner(tree_t block)
    return inner;
 }
 
+// defined below (shared with the direct-RTLIL walker's soundness guard)
+static ident_t r2_multi_driver_array(tree_t block);
+
 bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
 {
    g_unhandled = 0;
@@ -2861,6 +2864,21 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    // but parseable model would silently corrupt results.
    if (!block_types_synth(block))
       return false;
+
+   // Same soundness veto as the direct-RTLIL walker: an array signal written
+   // in disjoint elements by >1 driver renders as a `wire` with mixed
+   // continuous + procedural drivers (invalid Verilog; yosys mis-resolves it),
+   // so decline here too — the subtree then falls through to the interpreter
+   // rather than to a wrong text-path model (mylex r22_ffirst).
+   {
+      ident_t bad = r2_multi_driver_array(block);
+      if (bad != NULL) {
+         char why[64];
+         snprintf(why, sizeof why, "multi-driver-array %s", vid(bad));
+         DECLINE(why);
+         return false;
+      }
+   }
 
    build_reg_set(block);   // one walk; is_reg() is then a set lookup
 
@@ -7797,6 +7815,133 @@ static void r2_wcount_cb(tree_t t, void *ctx)
       wc->n++;
 }
 
+// SOUNDNESS guard: an array/vector signal written by >1 distinct driver
+// (process / concurrent assign) where at least one write is PARTIAL
+// (indexed/slice/field) mis-composes.  Each driver is collected with its OWN
+// whole-array hold temp (g0p<pidx>_<sig>, see r2_collect_cb) and commits the
+// WHOLE wire, so the disjoint element writes CONTEND across drivers instead
+// of composing — r2_sel_nested lowers each write to a correct bit-range
+// WITHIN a process, but the per-process whole-wire commit still collides.
+// It installs but is silently WRONG (mylex r22_ffirst: d_n and s_n each have
+// 7 element-drivers).  A SINGLE driver writing many disjoint elements
+// (mylex r31_shiftvec: one clocked shift over sr(0..3)) composes fine — do
+// NOT decline that.  So the discriminator is: an array base written PARTIALLY
+// somewhere AND written by more than one distinct driver process.  Detect and
+// decline to the text path (soundness first); installing it correctly
+// (per-slice cross-process commit) is a later coverage gap.
+typedef struct { ident_t *ids; int n, cap; bool capped; } r2_pset_t;
+
+static void r2_partial_target_cb(tree_t t, void *ctx)
+{
+   r2_pset_t *ps = (r2_pset_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k != T_SIGNAL_ASSIGN && k != T_DEPOSIT)
+      return;                            // signal drivers only (not variables)
+   tree_t tg = tree_target(t);
+   bool partial = false;
+   while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF
+          || tree_kind(tg) == T_RECORD_REF) {
+      partial = true;
+      tg = tree_value(tg);
+   }
+   if (!partial || tree_kind(tg) != T_REF || !tree_has_ref(tg))
+      return;
+   ident_t id = tree_ident(tg);
+   for (int i = 0; i < ps->n; i++)
+      if (ps->ids[i] == id)
+         return;
+   if (ps->n == ps->cap) {
+      if (ps->cap >= 4096) { ps->capped = true; return; }
+      ps->cap = ps->cap ? ps->cap * 2 : 16;
+      ps->ids = xrealloc_array(ps->ids, ps->cap, sizeof(ident_t));
+   }
+   ps->ids[ps->n++] = id;
+}
+
+// per-process counts, per candidate signal: partial WRITES (assigns whose
+// target base is the signal) and total partial REFS (every indexed/slice/field
+// reference to it — targets and reads alike).  Because tree_visit also lands on
+// each assign target's own array-ref node, a single-index target contributes
+// one ref that exactly offsets its write, so refs > writes iff the process
+// partial-READS the signal in a value position.
+typedef struct { ident_t *ids; int *refs; int *writes; int n; } r2_wr_scan_t;
+
+static void r2_wr_scan_cb(tree_t t, void *ctx)
+{
+   r2_wr_scan_t *w = (r2_wr_scan_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k == T_ARRAY_REF || k == T_ARRAY_SLICE || k == T_RECORD_REF) {
+      tree_t b = t;
+      while (tree_kind(b) == T_ARRAY_SLICE || tree_kind(b) == T_ARRAY_REF
+             || tree_kind(b) == T_RECORD_REF)
+         b = tree_value(b);
+      if (tree_kind(b) == T_REF && tree_has_ref(b)) {
+         ident_t id = tree_ident(b);
+         for (int j = 0; j < w->n; j++)
+            if (w->ids[j] == id) { w->refs[j]++; break; }
+      }
+      return;
+   }
+   if (k == T_SIGNAL_ASSIGN || k == T_DEPOSIT) {
+      tree_t tg = tree_target(t);
+      bool partial = false;
+      while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF
+             || tree_kind(tg) == T_RECORD_REF) { partial = true; tg = tree_value(tg); }
+      if (partial && tree_kind(tg) == T_REF && tree_has_ref(tg)) {
+         ident_t id = tree_ident(tg);
+         for (int j = 0; j < w->n; j++)
+            if (w->ids[j] == id) { w->writes[j]++; break; }
+      }
+   }
+}
+
+// returns the id of an array signal that is partial-written by >1 distinct
+// driver AND partial-READ by at least one of those writing drivers (a
+// combinational chain THROUGH the array across drivers) — the shape that the
+// per-process whole-array hold temp mis-composes.  Disjoint slices with no
+// cross-driver read (mylex r4_slice_arm: two halves, read only in a separate
+// non-writing process) install correctly and are NOT declined; a single driver
+// writing many elements (r31_shiftvec) has only one writer and is NOT declined.
+static ident_t r2_multi_driver_array(tree_t block)
+{
+   r2_pset_t ps = { .ids = NULL, .n = 0, .cap = 0, .capped = false };
+   tree_visit(block, r2_partial_target_cb, &ps);
+   if (ps.capped)                        // pathological: keep today's behavior
+      warnf("vhdl2rtlil: multi-driver guard skipped (>4096 sliced signals)");
+   if (ps.n == 0 || ps.capped) {
+      free(ps.ids);
+      return NULL;
+   }
+   int  *nwriter   = xcalloc_array(ps.n, sizeof(int));
+   bool *crossread = xcalloc_array(ps.n, sizeof(bool));
+   const int nst = tree_stmts(block);
+   for (int i = 0; i < nst; i++) {
+      tree_t st = tree_stmt(block, i);
+      if (tree_kind(st) != T_PROCESS)
+         continue;
+      int *refs   = xcalloc_array(ps.n, sizeof(int));
+      int *writes = xcalloc_array(ps.n, sizeof(int));
+      r2_wr_scan_t w = { .ids = ps.ids, .refs = refs, .writes = writes,
+                         .n = ps.n };
+      tree_visit(st, r2_wr_scan_cb, &w);
+      for (int j = 0; j < ps.n; j++)
+         if (writes[j] > 0) {
+            nwriter[j]++;
+            if (refs[j] > writes[j])       // a value-position partial read
+               crossread[j] = true;
+         }
+      free(refs);
+      free(writes);
+   }
+   ident_t bad = NULL;
+   for (int j = 0; j < ps.n; j++)
+      if (nwriter[j] > 1 && crossread[j]) { bad = ps.ids[j]; break; }
+   free(nwriter);
+   free(crossread);
+   free(ps.ids);
+   return bad;
+}
+
 bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
 {
    const gsm_rtlil_api_t *api = (const gsm_rtlil_api_t *)api_;
@@ -7903,6 +8048,19 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
          if (g_r2_census)
             continue;   // the call sites will report the uninlined calls
          goto declined;
+      }
+   }
+
+   // soundness: disjoint element writes to one array signal from >1 driver
+   // contend through the per-process whole-array hold temp (installs-wrong)
+   {
+      ident_t bad = r2_multi_driver_array(block);
+      if (bad != NULL) {
+         char why[96];
+         snprintf(why, sizeof why, "multi-driver-array %s", vid(bad));
+         R2_DECLINE(why);
+         if (!g_r2_census)
+            goto declined;
       }
    }
 
