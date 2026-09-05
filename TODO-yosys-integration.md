@@ -563,6 +563,28 @@ Determine where the current looseness actually is:
       still 1).  FOLLOW-UPS: hierarchical skip; the leaf-chunk
       composition defect (three minimal repros); NBA loop-latency;
       recipe as FROM_VHDL default after soak.
+      **VAR-VERSIONING (SSA) MACHINERY (2026-09-05):** a write to a
+      process-local now allocates a fresh module-level wire =
+      $mux(pathcond, newvalue, prev-version) — feed-forward SSA, no
+      proc-action ordering, so read-after-write / dynamic part-writes
+      at any depth / slice reads through substitution are all legal.
+      A PATH-CONDITION stack (kept in lockstep with case depth; T_IF
+      pushes cond then !cond for the default arm, T_CASE pushes
+      per-arm eq-ORs and the default's NOT-any-previous) supplies the
+      mux select.  Promote-on-read makes a read-before-write local
+      latch state (pv wire = activation-start), and the pv commits
+      from the final version at edge/always.  HONEST STATUS:
+      gate-clean (EH1a 1113 EXACT, 0 poisons, 451 ACTIVE) and it
+      CLEARS real shapes (dma_ctrl, dec_gpr_ctl, dec_decode's l3d
+      single-bit write) — but INSTALL-NEUTRAL at census scale: the
+      residue modules stay multiply-blocked (lsu_bus_buffer/ifu_aln
+      var-elem const-index reads where promote-on-read returns NULL —
+      likely npv capacity or an already-versioned base with no reachable
+      subst; lsu_stbuf spec-elem; a dec_decode temp-width).  It is the
+      SSA foundation to RETIRE bits-mode (currently additive alongside
+      it).  NEXT: diagnose the var-elem const-index miss (one blocker
+      on two modules — a real +install if cleared), then fold
+      bits-mode into versioning.
       **LEAF-CHUNK INVESTIGATION CONCLUDED (2026-09-04):** the
       rvdffs__b5c5 trio identified via a new install-time scope note:
       **IFU.MEM_CTL.BUS_CMD_FF / BUS_RDY_FF / BUS_RSP_VLD_FF** — the

@@ -3197,6 +3197,32 @@ typedef struct { ident_t var; char *spec;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
 static int        g_r2_case_depth;   // >0 while inside any switch case
+// pv-wire name of a promoted latch var readable at this walk point (NULL
+// if none / already written) — implemented after the pvar machinery
+static const char *r2_pvar_read_pv(ident_t id);
+
+// PATH-CONDITION stack: one 1-bit sigspec per open case level, kept in
+// lockstep with g_r2_case_depth.  Powers VAR VERSIONING: a write to a
+// process-local under branches becomes a module-level $mux(pathcond,
+// value, prev-version) into a fresh wire — pure feed-forward SSA, no
+// proc-action ordering involved, so read-after-write and dynamic
+// part-writes to locals are all legal.
+static char g_r2_conds[24][96];
+static int  g_r2_nconds;
+
+static bool r2_cond_push(const char *cs)
+{
+   if (g_r2_nconds >= 24 || strlen(cs) >= sizeof g_r2_conds[0])
+      return false;
+   snprintf(g_r2_conds[g_r2_nconds++], sizeof g_r2_conds[0], "%s", cs);
+   return true;
+}
+
+static void r2_cond_pop(void)
+{
+   if (g_r2_nconds > 0)
+      g_r2_nconds--;
+}
 
 static r2_subst_t *r2_subst_of(ident_t var)
 {
@@ -3766,6 +3792,173 @@ static bool r2_temp(int width, char *out, size_t sz)
    return g_r2->wire(out, width, 0, NULL) == 0;
 }
 
+// AND-chain of the open path conditions; false = stack too deep/none
+// representable.  Empty stack yields out[0] == '\0' (unconditional).
+static bool r2_path_cond(char *out, size_t sz)
+{
+   if (g_r2_nconds == 0) {
+      out[0] = '\0';
+      return true;
+   }
+   char cur[96];
+   snprintf(cur, sizeof cur, "%s", g_r2_conds[0]);
+   for (int i = 1; i < g_r2_nconds; i++) {
+      char t[64], cn[80];
+      if (!r2_temp(1, t, sizeof t))
+         return false;
+      snprintf(cn, sizeof cn, "c%s", t);
+      if (g_r2->cell_bin("and", cn, cur, g_r2_conds[i], t, 0) != 0)
+         return false;
+      snprintf(cur, sizeof cur, "%s", t);
+   }
+   snprintf(out, sz, "%s", cur);
+   return true;
+}
+
+// Static width of a rendered sigspec, -1 if underivable: bare wires are
+// unknowable (the caller must know), but "w[h:l]"/"w[i]" forms, sized
+// literals, and concats of those all classify.
+static int r2_spec_width(const char *sp)
+{
+   if (sp == NULL || sp[0] == '\0')
+      return -1;
+   if (sp[0] == '{') {
+      int total = 0;
+      const char *q = sp + 1;
+      while (*q && *q != '}') {
+         char el[256];
+         int d2 = 0;
+         size_t n = 0;
+         while (*q && n + 1 < sizeof el) {
+            if (*q == '{') d2++;
+            else if (*q == '}') { if (d2 == 0) break; d2--; }
+            else if (*q == ',' && d2 == 0) break;
+            el[n++] = *q++;
+         }
+         el[n] = '\0';
+         const int ew = r2_spec_width(el);
+         if (ew < 0)
+            return -1;
+         total += ew;
+         if (*q == ',')
+            q++;
+      }
+      return total > 0 ? total : -1;
+   }
+   if (isdigit((unsigned char)sp[0])) {
+      const char *tick = strchr(sp, 39);
+      return tick != NULL ? atoi(sp) : -1;
+   }
+   const char *br = strchr(sp, '[');
+   if (br != NULL) {
+      int h2, l2;
+      if (sscanf(br, "[%d:%d]", &h2, &l2) == 2)
+         return h2 - l2 + 1;
+      if (sscanf(br, "[%d]", &h2) == 1)
+         return 1;
+      return -1;
+   }
+   return -1;   // bare wire: width not in the string
+}
+
+// VERSIONED write to a process-local: new wire vN+1 =
+// $mux(pathcond, newvalue, vN) at module level.  `whole` spans the var;
+// otherwise [hi:lo] of the previous version is replaced (composed via
+// concat).  The subst entry's spec becomes the new wire (bare name, so
+// element reads index it directly).  Requires an existing whole-value
+// spec (a read-before-first-write local is latch state — pvar handles
+// those).
+static bool r2_var_write(ident_t vi, int w, const char *value,
+                         bool whole, int hi, int lo)
+{
+   r2_subst_t *e = r2_subst_of(vi);
+   if (e == NULL || e->spec == NULL || w < 1 || w > 4000) {
+      R2_DECLINE("var-version-base");
+      return false;
+   }
+   // slicing needs a WIRE base: materialize literal/compose specs once
+   bool bare = true;
+   for (const char *q = e->spec; *q && bare; q++)
+      if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+         bare = false;
+   if (!bare) {
+      // connect throws (and poisons the session) on width mismatch —
+      // materialize only when the spec's width derives statically AND
+      // matches the declaration
+      // an integer substitution renders as 32'dK regardless of the decl
+      // width — re-render at the declaration width when the value fits
+      char lit[48];
+      const char *msrc = e->spec;
+      int64_t mival = e->has_ival ? e->ival : -1;
+      // a single-bit var holding an l3d enum POSITION (folded_int on enum
+      // literals yields positions: '0'=2, '1'=3, weak 6/7): value plane
+      if (w == 1 && mival >= 2 && mival <= 7)
+         mival &= 1;
+      if (e->has_ival && mival >= 0
+          && (w >= 63 || mival < ((int64_t)1 << w))) {
+         snprintf(lit, sizeof lit, "%d'd%lld", w, (long long)mival);
+         msrc = lit;
+      }
+      else if (r2_spec_width(e->spec) != w) {
+         char why[96];
+         snprintf(why, sizeof why, "var-version-spec w%d '%.24s'",
+                  w, e->spec);
+         R2_DECLINE(why);
+         return false;
+      }
+      char mt[64];
+      if (!r2_temp(w, mt, sizeof mt) || g_r2->connect(mt, msrc) != 0) {
+         R2_DECLINE("var-version-mat");
+         return false;
+      }
+      if (!r2_subst_set(vi, mt))
+         return false;
+      e = r2_subst_of(vi);
+   }
+   char nv[R2_SPEC];
+   if (whole)
+      snprintf(nv, sizeof nv, "%s", value);
+   else {
+      // compose: {prev[w-1:hi+1], value, prev[lo-1:0]}
+      size_t off = 0;
+      nv[off++] = '{';
+      if (hi < w - 1)
+         off += snprintf(nv + off, sizeof nv - off, "%s[%d:%d],",
+                         e->spec, w - 1, hi + 1);
+      off += snprintf(nv + off, sizeof nv - off, "%s", value);
+      if (lo > 0)
+         off += snprintf(nv + off, sizeof nv - off, ",%s[%d:0]",
+                         e->spec, lo - 1);
+      if (off + 2 >= sizeof nv) {
+         R2_DECLINE("var-version-size");
+         return false;
+      }
+      nv[off++] = '}';
+      nv[off] = '\0';
+   }
+   char pc[96];
+   if (!r2_path_cond(pc, sizeof pc)) {
+      R2_DECLINE("var-version-cond");
+      return false;
+   }
+   char t[64];
+   if (!r2_temp(w, t, sizeof t))
+      return false;
+   bool ok;
+   if (pc[0] == '\0')
+      ok = g_r2->connect(t, nv) == 0;
+   else {
+      char cn[80];
+      snprintf(cn, sizeof cn, "c%s", t);
+      ok = g_r2->cell_mux(cn, e->spec, nv, pc, t) == 0;
+   }
+   if (!ok) {
+      R2_DECLINE("var-version-emit");
+      return false;
+   }
+   return r2_subst_set(vi, t);
+}
+
 // Map the text path's Verilog operator string to a builder cell op.
 static const char *r2_binop(const char *vop)
 {
@@ -3832,6 +4025,15 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             if (al != NULL && !al->wrote) {
                snprintf(out, sz, "%s", vid(al->sig));
                return true;
+            }
+            // a PROMOTED latch var read before any write this activation:
+            // the persistent pv wire IS the activation-start value
+            {
+               const char *pv2 = r2_pvar_read_pv(tree_ident(e));
+               if (pv2 != NULL) {
+                  snprintf(out, sz, "%s", pv2);
+                  return true;
+               }
             }
             // otherwise: no wire exists for a local — rendering the bare
             // name poisons the gsm session; decline cleanly
@@ -3999,6 +4201,33 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
          }
          const int64_t hi = left > right ? left : right;
          const int64_t lo = left > right ? right : left;
+         {
+            // resolve the base like any reference: a substituted local
+            // slices its CURRENT VERSION wire; an unresolved local has no
+            // wire and must decline (bare names poison the session)
+            r2_subst_t *sb2 = r2_subst_of(tree_ident(base));
+            if (sb2 != NULL && sb2->spec != NULL) {
+               bool bare2 = true;
+               for (const char *q = sb2->spec; *q && bare2; q++)
+                  if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+                     bare2 = false;
+               if (!bare2) {
+                  R2_DECLINE("slice-subst");
+                  return false;
+               }
+               snprintf(out, sz, "%s[%lld:%lld]", sb2->spec,
+                        (long long)hi, (long long)lo);
+               return true;
+            }
+            if (tree_has_ref(base)
+                && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               char why[96];
+               snprintf(why, sizeof why, "var-slice %s",
+                        istr(tree_ident(base)));
+               R2_DECLINE(why);
+               return false;
+            }
+         }
          snprintf(out, sz, "%s[%lld:%lld]", vid(tree_ident(base)),
                   (long long)hi, (long long)lo);
          return true;
@@ -4142,9 +4371,27 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
             }
             else if (tree_has_ref(base)
                      && tree_kind(tree_ref(base)) == T_VAR_DECL) {
-               char why[96];
-               snprintf(why, sizeof why, "var-elem %s", istr(bi));
-               R2_DECLINE(why);
+               // read-before-any-write of a local: promote to latch state
+               // and read the persistent pv wire (activation-start value)
+               const char *pv3 = NULL;
+               {
+                  extern const char *r2_pvar_read_or_promote(tree_t);
+                  pv3 = r2_pvar_read_or_promote(tree_ref(base));
+               }
+               if (pv3 != NULL) {
+                  snprintf(out, sz, "%s[%lld]", pv3, (long long)idx);
+                  return true;
+               }
+               {
+                  tree_t bd2 = tree_ref(base);
+                  type_t bt2 = tree_type(bd2);
+                  char why[112];
+                  snprintf(why, sizeof why, "var-elem %s cb%d w%d",
+                           istr(bi), (int)type_const_bounds(bt2),
+                           type_const_bounds(bt2) ? (int)type_width(bt2)
+                                                  : -1);
+                  R2_DECLINE(why);
+               }
                return false;
             }
             snprintf(out, sz, "%s[%lld]", vid(bi), (long long)idx);
@@ -4614,7 +4861,11 @@ typedef struct { char memid[80]; char *addr; char *data; char en[32]; }
 // committed on the process sync; proc then infers the $dlatch exactly as
 // read_verilog would
 typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
-                 bool persistent; } r2_pvar_t;
+                 bool persistent;
+                 bool wrote;   // a write happened this walk: a later read
+                               // must see it — pv (activation-start) reads
+                               // are only sound BEFORE any write
+} r2_pvar_t;
 
 typedef struct {
    r2_target_t *t;        // points at g_r2_tgt (walker is child-single-
@@ -4651,7 +4902,7 @@ static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
    r2_pvar_t *e = r2_pvar_of(ts, id);
    if (e != NULL)
       return e;
-   if (!ts->comb || ts->npv >= 16)
+   if (ts->npv >= 16)
       return NULL;
    type_t ty = tree_type(vdecl);
    if (!type_const_bounds(ty))
@@ -4671,17 +4922,53 @@ static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
       // written straight-line earlier this activation: hold base is that
       // value — a plain tree temp, nothing persists
       e->persistent = false;
+      e->wrote = false;
       if (g_r2->case_assign_root(e->g0, sb->spec) != 0)
          return NULL;
    }
    else {
       e->persistent = true;
+      e->wrote = false;
       if (g_r2->wire(e->pv, w, 0, NULL) != 0
           || g_r2->case_assign_root(e->g0, e->pv) != 0)
          return NULL;
    }
    ts->npv++;
    return e;
+}
+
+static r2_targets_t *g_r2_pvts;   // current process targets (pvar reads)
+
+// promote-on-READ: a local read before any write carries the previous
+// activation's value (latch semantics) — ensure a pv/hold pair exists and
+// return the pv wire, or NULL when promotion is unavailable (clocked
+// process, capacity, unconstrained width, already written this walk).
+const char *r2_pvar_read_or_promote(tree_t vdecl)
+{
+   if (g_r2_pvts == NULL)
+      return NULL;
+   r2_pvar_t *pe = r2_pvar_of(g_r2_pvts, tree_ident(vdecl));
+   if (pe == NULL) {
+      pe = r2_pvar_promote(g_r2_pvts, vdecl);
+      // seed the substitution so later writes VERSION from the pv wire
+      // and the end-of-walk commit (sync_assign pv <= final version)
+      // closes the register loop
+      if (pe != NULL && pe->persistent)
+         r2_subst_set(tree_ident(vdecl), pe->pv);
+   }
+   if (pe != NULL && pe->persistent && !pe->wrote)
+      return pe->pv;
+   return NULL;
+}
+
+static const char *r2_pvar_read_pv(ident_t id)
+{
+   if (g_r2_pvts == NULL)
+      return NULL;
+   r2_pvar_t *pe = r2_pvar_of(g_r2_pvts, id);
+   if (pe != NULL && pe->persistent && !pe->wrote)
+      return pe->pv;
+   return NULL;
 }
 
 static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
@@ -4749,7 +5036,6 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                 && tree_kind(tree_value(tg)) == T_REF
                 && tree_has_ref(tree_value(tg))
                 && tree_kind(tree_ref(tree_value(tg))) == T_VAR_DECL
-                && g_r2_case_depth == 0
                 && r2_pvar_of(ts, tree_ident(tree_value(tg))) == NULL
                 && r2_mem_of(tree_ident(tree_value(tg))) == NULL) {
                // per-bit / per-slice build of a straight-line local vector
@@ -4778,54 +5064,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      brange = true;
                   }
                }
-               if (bw >= 1 && bw <= 128 && brange
+               if (bw >= 1 && bw <= 4000 && brange
                    && blo >= 0 && bhi < bw) {
-                  const int sw = (int)(bhi - blo + 1);
+                  // VERSIONED partial write (any depth): a fresh wire takes
+                  // $mux(pathcond, composed, prev-version)
                   char bs[R2_SPEC];
-                  int64_t bcv;
                   ident_t bvi = tree_ident(tree_value(tg));
-                  if (r2_eval_int(tree_value(s), &bcv)) {
-                     bool bok = true;
-                     for (int k = 0; bok && k < sw; k++) {
-                        char b1[8];
-                        snprintf(b1, sizeof b1, "1'd%d",
-                                 (int)((bcv >> k) & 1));
-                        bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
-                     }
-                     if (!bok) {
-                        R2_DECLINE("bit-build");
-                        return false;
-                     }
-                     return true;
-                  }
-                  if (!r2_expr(tree_value(s), bs, sizeof bs))
+                  g_r2_site = "var-part";
+                  if (!r2_const(tree_value(s), bs, sizeof bs,
+                                (int)(bhi - blo + 1))
+                      && !r2_expr(tree_value(s), bs, sizeof bs))
                      return false;
-                  if (sw == 1) {
-                     if (!r2_subst_set_bit(bvi, (int)blo, bs, bw)) {
-                        R2_DECLINE("bit-build");
-                        return false;
-                     }
-                     return true;
-                  }
-                  // multi-bit slice: land the value on a temp and seed
-                  // each covered bit as an index into it
-                  char t[64];
-                  if (!r2_temp(sw, t, sizeof t)
-                      || g_r2->connect(t, bs) != 0) {
-                     R2_DECLINE("bit-build-temp");
-                     return false;
-                  }
-                  bool bok = true;
-                  for (int k = 0; bok && k < sw; k++) {
-                     char b1[80];
-                     snprintf(b1, sizeof b1, "%s[%d]", t, k);
-                     bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
-                  }
-                  if (!bok) {
-                     R2_DECLINE("bit-build");
-                     return false;
-                  }
-                  return true;
+                  return r2_var_write(bvi, bw, bs, false, (int)bhi,
+                                      (int)blo);
                }
                {
                   char why[64];
@@ -4861,8 +5112,29 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   }
                   return true;
                }
-               // branch-written variable: LATCH state (VHDL process vars
-               // persist across activations) — promote to a pv/hold pair
+               // branch-written variable WITH a current value: VERSION it
+               // (feed-forward mux, correct read-after-write)
+               if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+                   && tree_kind(tree_ref(tg)) == T_VAR_DECL
+                   && g_r2_case_depth > 0) {
+                  r2_subst_t *sv = r2_subst_of(tree_ident(tg));
+                  type_t vt2 = tree_type(tree_ref(tg));
+                  const int vw2 = type_const_bounds(vt2)
+                     ? (int)type_width(vt2) : -1;
+                  if (sv != NULL && sv->spec != NULL
+                      && vw2 >= 1 && vw2 <= 4000) {
+                     char vs2[R2_SPEC];
+                     g_r2_site = "var-vers";
+                     if (!r2_const(tree_value(s), vs2, sizeof vs2, vw2)
+                         && !r2_expr(tree_value(s), vs2, sizeof vs2))
+                        return false;
+                     return r2_var_write(tree_ident(tg), vw2, vs2, true,
+                                         0, 0);
+                  }
+               }
+               // branch-written variable with NO prior value: LATCH state
+               // (VHDL process vars persist across activations) — promote
+               // to a pv/hold pair
                if (tree_kind(tg) == T_REF && tree_has_ref(tg)
                    && tree_kind(tree_ref(tg)) == T_VAR_DECL) {
                   r2_pvar_t *pe = r2_pvar_promote(ts, tree_ref(tg));
@@ -4872,6 +5144,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   }
                   char vs[R2_SPEC];
                   g_r2_site = "pvar-assign";
+                  pe->wrote = true;
                   tree_t pval = tree_value(s);
                   if (!r2_const(pval, vs, sizeof vs, pe->width)
                       && !r2_expr(pval, vs, sizeof vs))
@@ -5203,10 +5476,21 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                if (g_r2->switch_begin(cs) != 0
                    || g_r2->case_begin("1'b1") != 0) { ok = false; break; }
                g_r2_case_depth++;
+               if (!r2_cond_push(cs)) { ok = false; break; }
                ok = r2_seq(c, ts);
                if (!ok) break;
                if (g_r2->case_end() != 0
                    || g_r2->case_begin(NULL) != 0) { ok = false; break; }
+               // entering the default arm: path condition flips to !cs
+               // (subsequent elsifs nest inside this default)
+               r2_cond_pop();
+               {
+                  char nt[64], ncn[80];
+                  if (!r2_temp(1, nt, sizeof nt)) { ok = false; break; }
+                  snprintf(ncn, sizeof ncn, "c%s", nt);
+                  if (g_r2->cell_un("not", ncn, cs, nt, 0) != 0
+                      || !r2_cond_push(nt)) { ok = false; break; }
+               }
                depth++;
             }
             else {
@@ -5218,6 +5502,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             if (g_r2->case_end() != 0 || g_r2->switch_end() != 0)
                ok = false;
             g_r2_case_depth--;
+            r2_cond_pop();
          }
          return ok && g_r2_fail == 0;
       }
@@ -5327,6 +5612,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          if (g_r2->switch_begin(sw) != 0)
             return false;
          const int nalt = tree_stmts(s);
+         char anyprev[96] = "1'b0";   // OR of previous arms' conditions
          bool ok = true;
          for (int i = 0; i < nalt && ok; i++) {
             tree_t alt = tree_stmt(s, i);
@@ -5369,7 +5655,62 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             const char *cc = (others || cl == 0) ? NULL : cmp;
             if (g_r2->case_begin(cc) != 0) { ok = false; break; }
             g_r2_case_depth++;
-            ok = r2_seq(alt, ts);
+            // path condition for this arm: OR of eq(sw, choice) — the
+            // default arm is NOT(any previous arm's condition)
+            {
+               char armc[96];
+               if (cc == NULL) {
+                  char nt[64], ncn[80];
+                  if (!r2_temp(1, nt, sizeof nt)) { ok = false; }
+                  else {
+                     snprintf(ncn, sizeof ncn, "c%s", nt);
+                     if (g_r2->cell_un("not", ncn, anyprev, nt, 0) != 0)
+                        ok = false;
+                     else
+                        snprintf(armc, sizeof armc, "%s", nt);
+                  }
+               }
+               else {
+                  armc[0] = '\0';
+                  char one2[R2_SPEC];
+                  snprintf(one2, sizeof one2, "%s", cmp);
+                  for (char *tk = strtok(one2, ";"); ok && tk != NULL;
+                       tk = strtok(NULL, ";")) {
+                     char eqw[64], eqn[80];
+                     if (!r2_temp(1, eqw, sizeof eqw)) { ok = false; break; }
+                     snprintf(eqn, sizeof eqn, "c%s", eqw);
+                     if (g_r2->cell_bin("eq", eqn, sw, tk, eqw, 0) != 0) {
+                        ok = false;
+                        break;
+                     }
+                     if (armc[0] == '\0')
+                        snprintf(armc, sizeof armc, "%s", eqw);
+                     else {
+                        char orw[64], orn[80];
+                        if (!r2_temp(1, orw, sizeof orw)) { ok = false; break; }
+                        snprintf(orn, sizeof orn, "c%s", orw);
+                        if (g_r2->cell_bin("or", orn, armc, eqw, orw, 0)
+                            != 0) { ok = false; break; }
+                        snprintf(armc, sizeof armc, "%s", orw);
+                     }
+                  }
+                  if (ok) {
+                     // fold into the running any-previous-arm condition
+                     char orw[64], orn[80];
+                     if (!r2_temp(1, orw, sizeof orw)) ok = false;
+                     else {
+                        snprintf(orn, sizeof orn, "c%s", orw);
+                        if (g_r2->cell_bin("or", orn, anyprev, armc, orw, 0)
+                            != 0) ok = false;
+                        else snprintf(anyprev, sizeof anyprev, "%s", orw);
+                     }
+                  }
+               }
+               if (ok && !r2_cond_push(armc)) ok = false;
+            }
+            if (ok)
+               ok = r2_seq(alt, ts);
+            r2_cond_pop();
             g_r2_case_depth--;
             if (g_r2->case_end() != 0)
                ok = false;
@@ -5489,6 +5830,7 @@ static bool r2_process(tree_t p0, int pidx)
       g_r2_case_depth = 0;
       r2_targets_t cts = { .n = 0, .comb = true, .t = g_r2_tgt,
                            .pidx = pidx };
+      g_r2_pvts = &cts;
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
          R2_DECLINE("comb-empty");
@@ -5517,8 +5859,14 @@ static bool r2_process(tree_t p0, int pidx)
       for (int i = 0; cok && i < cts.n; i++)
          cok = g_r2->sync_assign(cts.t[i].spec, cts.t[i].g0) == 0;
       for (int i = 0; cok && i < cts.npv; i++)
-         if (cts.pv[i].persistent)   // latch state: commit the hold value
-            cok = g_r2->sync_assign(cts.pv[i].pv, cts.pv[i].g0) == 0;
+         if (cts.pv[i].persistent) {   // latch state: commit the hold value
+            // versioned flow: the current subst spec IS the final value;
+            // the g0 hold covers the pre-versioning branch-tree flow
+            r2_subst_t *sbp = r2_subst_of(cts.pv[i].var);
+            const char *src = (sbp != NULL && sbp->spec != NULL)
+               ? sbp->spec : cts.pv[i].g0;
+            cok = g_r2->sync_assign(cts.pv[i].pv, src) == 0;
+         }
       return cok && g_r2_fail == 0;
    }
    // (rcond/rsig are derived below from ifstmt; the sensitivity may carry
@@ -5625,6 +5973,7 @@ static bool r2_process(tree_t p0, int pidx)
    }
 
    r2_targets_t ts = { .n = 0, .t = g_r2_tgt, .pidx = pidx };
+   g_r2_pvts = &ts;
    tree_visit(p, r2_collect_cb, &ts);
    // aliased signals are targets even when the body writes only the shadow
    for (int i = 0; i < g_r2_nalias; i++) {
@@ -5729,6 +6078,15 @@ static bool r2_process(tree_t p0, int pidx)
                && g_r2->sync(pe[e] ? "posedge" : "negedge", es) == 0;
             for (int i = 0; ok && i < ts.n; i++)
                ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+            // promoted register-vars (read-before-write locals in clocked
+            // processes): commit the pv wire from the final version
+            for (int i = 0; ok && i < ts.npv; i++)
+               if (ts.pv[i].persistent) {
+                  r2_subst_t *sbp = r2_subst_of(ts.pv[i].var);
+                  const char *src = (sbp != NULL && sbp->spec != NULL)
+                     ? sbp->spec : ts.pv[i].g0;
+                  ok = g_r2->sync_assign(ts.pv[i].pv, src) == 0;
+               }
             if (ok && e == e0)
                ok = r2_flush_memwr(&ts);
          }
