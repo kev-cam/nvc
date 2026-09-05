@@ -563,6 +563,26 @@ Determine where the current looseness actually is:
       still 1).  FOLLOW-UPS: hierarchical skip; the leaf-chunk
       composition defect (three minimal repros); NBA loop-latency;
       recipe as FROM_VHDL default after soak.
+      **LEAF-CHUNK INVESTIGATION CONCLUDED (2026-09-04):** the
+      rvdffs__b5c5 trio identified via a new install-time scope note:
+      **IFU.MEM_CTL.BUS_CMD_FF / BUS_RDY_FF / BUS_RSP_VLD_FF** — the
+      IFU bus-handshake flops, the IFU twin of the LSU bus class.
+      Repro PASSES under SKIP_TREE=mem (the EXISTING 'mem' token,
+      applied hierarchically, covers .MEM_CTL. ancestry — 674 tree
+      skips).  Full composition at MIN_MODULES=1 with the standard
+      tokens hierarchical STILL fails (~80 non-mem leaf flops hold
+      at least one more breaker — the rvdffs__106d rvdffe-dff class,
+      scattered).  PATTERN ESTABLISHED: 1-bit interface/handshake
+      flops as standalone chunks mis-time their protocol at the
+      accel↔interp boundary; per-flop acceleration is pure overhead
+      regardless (the MIN_MODULES comment's design intent), so
+      MIN_MODULES=8 remains the recipe's exclusion of the entire
+      class.  Also this round: the chunk-scope install NOTE (which
+      turned three inference rounds into one grep), and the content
+      .so tier hardened — #line directives embed the vhash-named .v
+      path and defeated every cross-rebuild hit; whole #line lines
+      are now masked from the hash (rebuilds are truly re-walk-only
+      after one population pass).
 
 ## 2. ABI containment
 

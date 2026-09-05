@@ -9502,6 +9502,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // the chunk name in as a literal (it used to read "accel chunk" because
    // rs_top was only filled in after the dlopen below).
    chunk->rs_top  = xstrdup(top);
+   notef("accel-jit: chunk '%s' scope %s", top, istr(scope->name));
    chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 4, sizeof(void *));
    aj_build_fastclk(m, clk.sig, clk.data);
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
@@ -9536,8 +9537,24 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
             ch ^= (uint8_t)*p2++;
             ch *= 1099511628211ULL;
          }
-         for (const char *p2 = dt2; *p2; p2++)
-            { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+         // #line directives embed the vhash-named staged .v path, so a
+         // re-synth after any rebuild yields byte-different C for the SAME
+         // logic and defeated every cross-rebuild content hit (measured:
+         // EH2's giant models recompiled after each binary touch despite
+         // the tier).  They are semantically irrelevant to the .so — mask
+         // whole #line lines out of the hash.
+         for (const char *p2 = dt2; *p2; ) {
+            if ((p2 == dt2 || p2[-1] == '\n')
+                && strncmp(p2, "#line", 5) == 0) {
+               while (*p2 && *p2 != '\n')
+                  p2++;
+               for (const char *q2 = "@L@"; *q2; q2++)
+                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
+               continue;
+            }
+            ch ^= (uint8_t)*p2++;
+            ch *= 1099511628211ULL;
+         }
          const char *cc2 = getenv("NVC_ACCEL_CC");
          if (cc2 == NULL) cc2 = "gcc -g -O3";
          for (const char *p2 = cc2; *p2; p2++)
