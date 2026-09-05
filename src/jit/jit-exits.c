@@ -1365,11 +1365,8 @@ void _debug_dump(const uint8_t *ptr, int32_t len)
    fflush(stdout);
 }
 
-DLLEXPORT
-void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor)
+static inline uintptr_t alloc_check_size(uintptr_t size)
 {
-   jit_thread_local_t *thread = jit_attach_thread(anchor);
-
    if (unlikely(size > UINT32_MAX)) {
       jit_msg(NULL, DIAG_FATAL, "attempting to allocate %zu byte object "
               "which is larger than the maximum supported %u bytes",
@@ -1377,7 +1374,38 @@ void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor)
       __builtin_unreachable();
    }
    else if (size == 0)
-      size = 1;   // Never return a NULL pointer
+      return 1;   // Never return a NULL pointer
+   else
+      return size;
+}
+
+// MACRO_GALLOC: objects that must outlive the process evaluation (`new`,
+// protected type state).  Always the collected heap, exactly as the
+// interpreter's interp_galloc: routing these to the eval arena handed out
+// storage that the next process evaluation reset and reused, so a textio
+// `line` allocated by a compiled readline was overwritten by the next
+// evaluation's transients (see __nvc_eval_alloc).
+DLLEXPORT
+void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   void *ptr = jit_mspace_alloc(alloc_check_size(size));
+
+   thread->anchor = NULL;
+   return ptr;
+}
+
+// MACRO_LALLOC slow path: the TLAB is exhausted, so the object has TLAB
+// (process evaluation) lifetime.  When the eval-lifetime arena is enabled
+// these escaping unconstrained results come from it instead of churning
+// the collected heap.
+DLLEXPORT
+void *__nvc_eval_alloc(uintptr_t size, jit_anchor_t *anchor)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   size = alloc_check_size(size);
 
    void *ptr = thread->eval_arena != NULL
       ? eval_arena_alloc(thread->eval_arena, size)

@@ -83,6 +83,7 @@
   __nvc_get_object;
   __nvc_last_event;
   __nvc_mspace_alloc;
+  __nvc_eval_alloc;
   __nvc_putpriv;
   __nvc_sched_waveform;
   __nvc_sched_process;

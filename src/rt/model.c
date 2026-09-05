@@ -1812,11 +1812,13 @@ static gsm_generate_fn accel_gsm_fn(void)
 
 // Recover the original Verilog source path from the nvc_verilog_src attribute
 // that iverilog's VHDL backend attaches to each translated entity ("file:line").
-// Returns the file path (without the :line suffix) in `out`, or false if the
+// Returns the file path (without the :line suffix) in `out` and, when `line`
+// is non-NULL, the line of the module's `module` keyword, or false if the
 // attribute is absent. Lets --accel feed the original Verilog to yosys rather
 // than regenerating it from the elaborated VHDL.
 // Look for an NVC_VERILOG_SRC attribute spec directly on this unit's decls.
-static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz)
+static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz,
+                                  int *line)
 {
    // Only entity/arch/block carry the NVC_VERILOG_SRC attr and have an I_DECLS
    // item; other scope kinds (e.g. T_COMPONENT) would assert in tree_decls.
@@ -1849,9 +1851,14 @@ static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz)
       }
       out[j] = '\0';
 
+      if (line != NULL)
+         *line = 0;
       char *colon = strrchr(out, ':');   // drop the trailing :line
-      if (colon != NULL)
+      if (colon != NULL) {
+         if (line != NULL)
+            *line = atoi(colon + 1);
          *colon = '\0';
+      }
 
       return j > 0;
    }
@@ -1861,26 +1868,95 @@ static bool accel_verilog_src_one(tree_t unit, char *out, size_t outsz)
 // Recover the original Verilog source file recorded by sv2vhdl as an
 // NVC_VERILOG_SRC attribute.  The attribute is emitted on the entity, but
 // accel sees the architecture, so check the architecture's primary unit too.
-static bool accel_verilog_src(tree_t unit, char *out, size_t outsz)
+static bool accel_verilog_src(tree_t unit, char *out, size_t outsz, int *line)
 {
    if (unit == NULL)
       return false;
 
-   if (accel_verilog_src_one(unit, out, outsz))
+   if (accel_verilog_src_one(unit, out, outsz, line))
       return true;
 
    if (tree_kind(unit) == T_ARCH) {
       tree_t prim = tree_primary(unit);
-      if (prim != NULL && accel_verilog_src_one(prim, out, outsz))
+      if (prim != NULL && accel_verilog_src_one(prim, out, outsz, line))
          return true;
    }
 
    return false;
 }
 
+// The Verilog module this entity was translated from.  tgt-vhdl emits one
+// entity per PARAMETERISATION (VX_pipe_register, VX_pipe_register1, ... —
+// the actuals ride in nvc_verilog_params), and yosys module names are
+// case-sensitive, so the entity name is not the synth top: read `module
+// <name>` at the nvc_verilog_src line instead (ivl_scope_def_lineno is the
+// `module` keyword's line; an (* attribute *) line may precede it).
+static bool accel_verilog_module(tree_t unit, char *out, size_t outsz)
+{
+   char path[512];
+   int line = 0;
+   if (!accel_verilog_src(unit, path, sizeof path, &line) || line <= 0)
+      return false;
+
+   FILE *f = fopen(path, "r");
+   if (f == NULL)
+      return false;
+
+   bool found = false;
+   char buf[4096];
+   // `ln` counts PHYSICAL lines: a chunk that does not end in '\n' is the
+   // head of a longer line (sv2v emits multi-KB packed localparam lines)
+   // and must not advance the count, else the window lands on earlier text.
+   int ln = 1;
+   while (!found && ln <= line + 3 && fgets(buf, sizeof buf, f)) {
+      const size_t len = strlen(buf);
+      const bool eol = len > 0 && buf[len - 1] == '\n';
+      if (ln < line) {
+         if (eol) ln++;
+         continue;
+      }
+      for (const char *p = strstr(buf, "module"); p != NULL;
+           p = strstr(p + 6, "module")) {
+         const bool kw = (p == buf || !(isalnum((unsigned char)p[-1])
+                                        || p[-1] == '_'))
+            && isspace((unsigned char)p[6]);
+         if (!kw)
+            continue;   // endmodule / macromodule / an identifier
+         p += 6;
+         while (isspace((unsigned char)*p))
+            p++;
+         // SV lifetime qualifier: `module automatic foo` / `module static foo`
+         static const char *const lifetime[] = { "automatic", "static" };
+         for (size_t k = 0; k < ARRAY_LEN(lifetime); k++) {
+            const size_t l = strlen(lifetime[k]);
+            if (strncmp(p, lifetime[k], l) == 0
+                && isspace((unsigned char)p[l])) {
+               p += l;
+               while (isspace((unsigned char)*p))
+                  p++;
+            }
+         }
+         size_t n = 0;
+         for (; n + 1 < outsz && (isalnum((unsigned char)p[n]) || p[n] == '_'
+                                  || p[n] == '$'); n++)
+            out[n] = p[n];
+         out[n] = '\0';
+         found = n > 0;
+         break;
+      }
+      if (eol) ln++;
+   }
+   fclose(f);
+   return found;
+}
+
 // Read the NVC_VERILOG_PARAMS attribute ("name=value name=value"), emitted by
 // tgt-vhdl, so --accel re-synthesizes with the elaboration's actual generics.
-static bool accel_verilog_params_one(tree_t unit, char *out, size_t outsz)
+// Returns a malloc'd copy (the caller frees) or NULL: a sv2v-flattened
+// Vortex top carries every package localparam it uses (exec_top: 58 tokens,
+// 1.5 KB), and a fixed buffer truncated that mid-token — the tail "VX_gpu_pk"
+// then had no '=' and gen_statemachine took it for the top module name.
+static char *accel_verilog_params_one(tree_t unit)
 {
    const int ndecls = tree_decls(unit);
    for (int i = 0; i < ndecls; i++) {
@@ -1891,29 +1967,30 @@ static bool accel_verilog_params_one(tree_t unit, char *out, size_t outsz)
          continue;
       tree_t val = tree_value(d);
       if (tree_kind(val) != T_STRING)
-         return false;
+         return NULL;
       const unsigned nchars = tree_chars(val);
-      size_t j = 0;
-      for (unsigned k = 0; k < nchars && j + 1 < outsz; k++)
-         out[j++] = ident_char(tree_ident(tree_ref(tree_char(val, k))), 1);
-      out[j] = '\0';
-      return j > 0;
+      if (nchars == 0)
+         return NULL;
+      char *out = xmalloc(nchars + 1);
+      for (unsigned k = 0; k < nchars; k++)
+         out[k] = ident_char(tree_ident(tree_ref(tree_char(val, k))), 1);
+      out[nchars] = '\0';
+      return out;
    }
-   return false;
+   return NULL;
 }
 
-static bool accel_verilog_params(tree_t unit, char *out, size_t outsz)
+static char *accel_verilog_params(tree_t unit)
 {
    if (unit == NULL)
-      return false;
-   if (accel_verilog_params_one(unit, out, outsz))
-      return true;
-   if (tree_kind(unit) == T_ARCH) {
+      return NULL;
+   char *p = accel_verilog_params_one(unit);
+   if (p == NULL && tree_kind(unit) == T_ARCH) {
       tree_t prim = tree_primary(unit);
-      if (prim != NULL && accel_verilog_params_one(prim, out, outsz))
-         return true;
+      if (prim != NULL)
+         p = accel_verilog_params_one(prim);
    }
-   return false;
+   return p;
 }
 
 // ===================================================================
@@ -3644,7 +3721,7 @@ static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
 {
    tree_t r = aj_scope_ref(scope);
    char buf[512];
-   if (r != NULL && accel_verilog_src(r, buf, sizeof buf)) {
+   if (r != NULL && accel_verilog_src(r, buf, sizeof buf, NULL)) {
       bool dup = false;
       for (int i = 0; i < *nsrc; i++)
          if (strcmp(srcs[i], buf) == 0) { dup = true; break; }
@@ -8154,9 +8231,9 @@ static pid_t aj_gsm_spawn(const char *dir, int nargs, const char *const *args,
    snprintf(tmpc, sizeof tmpc, "%s_g%d.c", base, (int)getpid());
    snprintf(nvctmp, sizeof nvctmp, "%s_g%d_nvc.c", base, (int)getpid());
 
-   const char *av[160];
+   const char **av = xmalloc_array(nargs + 1, sizeof(char *));
    int n = 0;
-   for (; n < nargs && n < 158; n++)
+   for (; n < nargs; n++)
       av[n] = args[n];
    av[n++] = tmpc;
 
@@ -8257,7 +8334,10 @@ static bool aj_rtlil_subtree(const gsm_rtlil_api_t *api, rt_scope_t *scope,
             if (seen[i] == key) { dup = true; break; }
          if (!dup) {
             if (*nseen < maxseen) seen[(*nseen)++] = key;
-            if (!vhdl2rtlil_module(api, scope->where, mod))
+            // census mode (NVC_ACCEL_RTLIL_CENSUS): every module of the
+            // subtree is walked whatever the others did
+            if (!vhdl2rtlil_module(api, scope->where, mod)
+                && getenv("NVC_ACCEL_RTLIL_CENSUS") == NULL)
                return false;
          }
       }
@@ -8267,6 +8347,33 @@ static bool aj_rtlil_subtree(const gsm_rtlil_api_t *api, rt_scope_t *scope,
                             maxseen))
          return false;
    return true;
+}
+
+// NVC_ACCEL_RTLIL: dry-walk the subtree through the walker's null builder
+// in a fork child (a walker crash must not take the simulator down): true
+// when every module is admitted.  Used only where the TEXT emission failed
+// -- that emission is the cache key and the fallback; a subtree the text
+// path cannot express (a while-loop constant function, VX_csa_tree) is
+// carried by the walker alone.
+static bool aj_rtlil_probe(rt_scope_t *scope)
+{
+   const gsm_rtlil_api_t *api =
+      (const gsm_rtlil_api_t *)vhdl2rtlil_null_api();
+   fflush(stdout);
+   fflush(stderr);
+   const pid_t pid = fork();
+   if (pid < 0)
+      return false;
+   if (pid == 0) {
+      static ident_t seen[512];
+      int nseen = 0;
+      setenv("NVC_ACCEL_RTLIL_PROBE", "1", 1);   // a probe: no decline warning
+      _exit(aj_rtlil_subtree(api, scope, seen, &nseen, 512) ? 0 : 3);
+   }
+   int st = 0;
+   while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+      ;
+   return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
 // Fork-worker for the direct-RTLIL path: the CHILD walks the subtree on the
@@ -8305,7 +8412,8 @@ static pid_t aj_rtlil_spawn(rt_scope_t *scope, const char *dir,
       _exit(2);
    static ident_t seen[512];
    int nseen = 0;
-   if (!aj_rtlil_subtree(api, scope, seen, &nseen, 512)) {
+   if (!aj_rtlil_subtree(api, scope, seen, &nseen, 512)
+       || getenv("NVC_ACCEL_RTLIL_CENSUS") != NULL) {   // census: never synth
       api->abort_session();
       _exit(3);
    }
@@ -8806,6 +8914,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // 1. gather the subtree's Verilog sources
    static char srcs[64][512];
    int nsrc = 0;
+   bool walker_only = false;   // admitted on the RTLIL walker's word alone
    // VHDL->Verilog path: emit the whole subtree via vhdl2vlog (logic3d->2-state)
    // into one .v. Used when the original SV won't parse in yosys (sv2ghdl).
    if (getenv("NVC_ACCEL_FROM_VHDL")) {
@@ -8818,9 +8927,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       const bool ok = emit_subtree_v(scope, vf, seen, &nseen, 512);
       fclose(vf);
       if (!ok) {
-         notef("accel-jit: subtree '%s' not fully translatable (%d modules)",
-               top0, nseen);
-         return false;
+         if (getenv("NVC_ACCEL_RTLIL") != NULL && aj_rtlil_probe(scope)) {
+            notef("accel-jit: subtree '%s' not text-translatable — the "
+                  "rtlil walker admits it (%d modules)", top0, nseen);
+            walker_only = true;
+         }
+         else {
+            notef("accel-jit: subtree '%s' not fully translatable "
+                  "(%d modules)", top0, nseen);
+            return false;
+         }
       }
       // Skip trivial subtrees (a lone flop, a clock gate, ...): accelerating one
       // costs a synth + compile + a per-cycle bridge crossing for ~no compute,
@@ -8878,6 +8994,29 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    char top_mod[320];
    snprintf(top_mod, sizeof top_mod, "%s",
             vhdl2vlog_variant_name(tree_ident(ent), scope->where));
+   // Original-Verilog path: the synth top is the module named at the
+   // nvc_verilog_src line (see accel_verilog_module) — the entity is one
+   // parameterisation of it under a lowered, suffixed name.  FROM_VHDL
+   // emits the subtree itself under the variant name, so that name stays.
+   if (getenv("NVC_ACCEL_FROM_VHDL") == NULL) {
+      char vmod[320], vlow[320];
+      if (accel_verilog_module(ref, vmod, sizeof vmod)
+          && strcmp(vmod, top_mod) != 0) {
+         // The entity name is the module name lowered plus tgt-vhdl's
+         // numeric variant suffix; a name that is not a prefix of it was
+         // read off the wrong header (a mis-located window) and would
+         // synthesize a DIFFERENT module against this entity's ports —
+         // keep the variant name (yosys then declines "not found").
+         aj_lower(vlow, vmod, sizeof vlow);
+         if (strncmp(vlow, top, strlen(vlow)) != 0)
+            notef("accel-jit: entity '%s' vs Verilog module '%s' at the "
+                  "nvc_verilog_src line: not its module — ignored", top, vmod);
+         else {
+            notef("accel-jit: entity '%s' is Verilog module '%s'", top, vmod);
+            snprintf(top_mod, sizeof top_mod, "%s", vmod);
+         }
+      }
+   }
 
    // NVC_ACCEL_MERGE collect pass (task #53/#59), placed BEFORE the synth
    // step: collect mode must not pay per-candidate synthesis (measured: 6h
@@ -9048,10 +9187,17 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       return true;
    }
 
+   // Re-synthesize with the elaboration's actual generics (width/depth/...).
+   // The vhdl2vlog path emits already-elaborated modules (generics baked in),
+   // so passing them would chparam a non-existent defparam and error.
+   char *params = getenv("NVC_ACCEL_FROM_VHDL") ? NULL
+      : accel_verilog_params(ref);
+
    // Content-hash the synthesis inputs (the emitted/collected Verilog + the top
-   // module name) so the synth output is keyed by the LOGIC: a cached synth is
-   // reused when the logic is unchanged (in-place update) and gen_statemachine
-   // only re-runs when it actually changes. Override with NVC_ACCEL_NO_CACHE.
+   // module name + the parameter actuals) so the synth output is keyed by the
+   // LOGIC: a cached synth is reused when the logic is unchanged (in-place
+   // update) and gen_statemachine only re-runs when it actually changes.
+   // Override with NVC_ACCEL_NO_CACHE.
    uint64_t vhash = 1469598103934665603ULL;   // FNV-1a
    vhash = (vhash ^ 3u) * 1099511628211ULL;    // cache version — bump on codegen change
    // Mix gen_statemachine's mtime so a synth-tool change invalidates the cache
@@ -9086,6 +9232,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       for (const char *p = "+icg2en=scoped"; *p; p++)
          { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    for (const char *p = top_mod; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
+   for (const char *p = params ? params : ""; *p; p++) { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
    char **vtexts = xcalloc_array(nsrc, sizeof(char *));
    for (int i = 0; i < nsrc; i++) {
       char *vtext = aj_read_file(srcs[i]);
@@ -9165,6 +9312,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    }
    else if (getenv("NVC_ACCEL_NO_CACHE") == NULL && aj_decline_cached(dmark)) {
       notef("accel-jit: cached decline for '%s' — leaving in nvc", top);
+      free(params);
       return false;
    }
    else {
@@ -9188,28 +9336,28 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       const char *tmo = getenv("NVC_ACCEL_SYNTH_TIMEOUT");
       const int tmo_s = tmo ? atoi(tmo) : 600;
       const bool have_timeout = access("/usr/bin/timeout", X_OK) == 0;
+      // The CLI command is sized by its contents: the sources and the
+      // parameter actuals are unbounded (see accel_verilog_params).
+      const size_t scmdsz = 4096 + (size_t)nsrc * 608
+         + (params ? strlen(params) : 0);
+      char *scmd = xmalloc(scmdsz);
       int off;
       if (tmo_s > 0 && have_timeout)
-         off = snprintf(cmd, sizeof cmd,
+         off = snprintf(scmd, scmdsz,
                         "cd '%s' && /usr/bin/timeout -k 5 %d '%s'",
                         dir, tmo_s, aj_gen_sm());
       else
-         off = snprintf(cmd, sizeof cmd, "cd '%s' && '%s'", dir, aj_gen_sm());
+         off = snprintf(scmd, scmdsz, "cd '%s' && '%s'", dir, aj_gen_sm());
       for (int i = 0; i < nsrc; i++) {
          char sp[600];
          if (staged)
             aj_staged_path(sp, sizeof sp, accel_dir, top, vhash, i);
          else
             snprintf(sp, sizeof sp, "%s", srcs[i]);
-         off += snprintf(cmd + off, sizeof cmd - off, " '%s'", sp);
+         off += snprintf(scmd + off, scmdsz - off, " '%s'", sp);
       }
-      // Re-synthesize with the elaboration's actual generics (width/depth/...).
-      // The vhdl2vlog path emits already-elaborated modules (generics baked in),
-      // so passing them would chparam a non-existent defparam and error.
-      char params[256] = "";
-      if (!getenv("NVC_ACCEL_FROM_VHDL")
-          && accel_verilog_params(ref, params, sizeof params) && params[0]) {
-         off += snprintf(cmd + off, sizeof cmd - off, " %s", params);
+      if (params != NULL) {
+         off += snprintf(scmd + off, scmdsz - off, " %s", params);
          notef("accel-jit: params %s", params);
       }
       // Write-then-rename: a concurrent same-key synth must never leave a
@@ -9218,7 +9366,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       // renamed alongside; its absence must not fail the synth.
       char dutcbase[600];
       snprintf(dutcbase, sizeof dutcbase, "%.*s", (int)strlen(dutc) - 2, dutc);
-      off += snprintf(cmd + off, sizeof cmd - off,
+      off += snprintf(scmd + off, scmdsz - off,
                       " %s '%s_g%d.c' && mv -f '%s_g%d.c' '%s'"
                       " && { mv -f '%s_g%d_nvc.c' '%s_nvc.c' 2>/dev/null"
                       " || true; }",
@@ -9278,11 +9426,27 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          }
       }
 
+      if (!forked && walker_only) {
+         // the text emission is partial: no fallback synth from it
+         notef("accel-jit: walker-only subtree '%s' not built — leaving "
+               "in nvc", top);
+         src = 1;
+         forked = true;
+      }
       if (!forked && getenv("GEN_STATEMACHINE") == NULL
           && accel_gsm_fn() != NULL) {
          static char spawn_src[64][600];
-         static char pbuf[256];
-         const char *av[160];
+         // one argv slot per source, per parameter token, and the top
+         int ntok = 0;
+         for (const char *p = params; p != NULL && *p != '\0'; ) {
+            p += strspn(p, " ");
+            if (*p == '\0')
+               break;
+            ntok++;
+            p += strcspn(p, " ");
+         }
+         const char **av = xmalloc_array(nsrc + ntok + 1, sizeof(char *));
+         char *pbuf = params ? xstrdup(params) : NULL;
          int n = 0;
          for (int i = 0; i < nsrc && i < 64; i++) {
             if (staged)
@@ -9292,15 +9456,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                snprintf(spawn_src[i], sizeof spawn_src[i], "%s", srcs[i]);
             av[n++] = spawn_src[i];
          }
-         if (params[0] != '\0') {   // same tokens the shell split for the CLI
-            snprintf(pbuf, sizeof pbuf, "%s", params);
+         if (pbuf != NULL) {   // same tokens the shell split for the CLI
             char *sp = NULL;
-            for (char *t = strtok_r(pbuf, " ", &sp);
-                 t != NULL && n < 150; t = strtok_r(NULL, " ", &sp))
+            for (char *t = strtok_r(pbuf, " ", &sp); t != NULL;
+                 t = strtok_r(NULL, " ", &sp))
                av[n++] = t;
          }
          av[n++] = top_mod;
          const pid_t pid = aj_gsm_spawn(dir, n, av, dutc, tmo_s, top_mod);
+         free(av);     // the child holds its own copy
+         free(pbuf);
          if (pid > 0) {
             forked = true;
             notef("accel-jit: synth '%s' running as in-process fork (pid %d)",
@@ -9310,7 +9475,8 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          }
       }
       if (!forked)
-         src = system(cmd);
+         src = system(scmd);
+      free(scmd);
       if (aj_synth_timed_out(src) && tmo_s > 0 && (forked || have_timeout))
          notef("accel-jit: synth for '%s' exceeded %ds — leaving in nvc "
                "(raise NVC_ACCEL_SYNTH_TIMEOUT to allow longer)", top, tmo_s);
@@ -9324,9 +9490,11 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                 && access(dutc, F_OK) != 0)
                aj_decline_remember(dmark);
          }
+         free(params);
          return false;
       }
    }
+   free(params);
 
    // 3. capture the port boundary (post-elab addresses). A big datapath chunk
    // (dec) has hundreds of ports; a 64-pin cap silently dropped most of them ->
@@ -10881,7 +11049,7 @@ static void accel_scan_scope(rt_model_t *m, rt_scope_t *scope,
       // nvc_verilog_src attr either.
       if ((!per_inst || leaf) && r != NULL
           && (getenv("NVC_ACCEL_FROM_VHDL")
-              || accel_verilog_src(r, tmp, sizeof tmp))
+              || accel_verilog_src(r, tmp, sizeof tmp, NULL))
           && accel_install_subtree(m, scope, r, accel_dir)
           && !per_inst)
          return;   // whole subtree accelerated; don't recurse into it
@@ -13956,8 +14124,18 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src)
                   // in calculate_driving_value: if the walks disagree,
                   // nonnull over-counts and the resolution reads an
                   // uninitialized vals slot (pr2834340 garbage index)
+                  // A deposit/force pseudo-source is a real value too:
+                  // the accel bridge publishes registered outputs with
+                  // sched_deposit (NBA region), which attaches a
+                  // SOURCE_DEPOSIT to a :=-written rim — n_sources then
+                  // leaves the last_event class below, the walk found
+                  // no driver, and the port's readers fell back to
+                  // their INITIAL value (translated Vortex alu_top:
+                  // every br_* output read 'L' from its first push).
                   if (s->tag == SOURCE_DRIVER
-                      || s->tag == SOURCE_IMPLICIT) {
+                      || s->tag == SOURCE_IMPLICIT
+                      || s->tag == SOURCE_DEPOSIT
+                      || s->tag == SOURCE_FORCING) {
                      has_driver = true;
                      break;
                   }
@@ -14273,8 +14451,13 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
             if (input->n_sources > 0) {
                for (rt_source_t *si = &(input->sources);
                     si; si = si->chain_input) {
+                  // twin of the source_value walk: a deposit/force
+                  // pseudo-source (accel NBA publication of a := rim)
+                  // is a real value source
                   if (si->tag == SOURCE_DRIVER
-                      || si->tag == SOURCE_IMPLICIT) {
+                      || si->tag == SOURCE_IMPLICIT
+                      || si->tag == SOURCE_DEPOSIT
+                      || si->tag == SOURCE_FORCING) {
                      has_driver = true;
                      break;
                   }

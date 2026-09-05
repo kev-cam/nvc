@@ -76,10 +76,12 @@ void jit_reset(jit_t *j);
 bool jit_is_shutdown(jit_t *j);
 
 // Per-thread eval-lifetime arena for the simulation runtime. When enabled,
-// __nvc_mspace_alloc (escaping unconstrained results) is served from a
-// growable arena that is reset each process eval instead of the collected
-// heap — eliminating GC churn for static (RTL) designs. Enable only after
-// initialisation, on the thread that will run process bodies.
+// __nvc_eval_alloc (the TLAB overflow path: escaping unconstrained results)
+// is served from a growable arena that is reset each process eval instead
+// of the collected heap — eliminating GC churn for static (RTL) designs.
+// __nvc_mspace_alloc (MACRO_GALLOC: `new`, protected state) stays on the
+// collected heap. Enable only after initialisation, on the thread that will
+// run process bodies.
 void jit_eval_arena_enable(bool on);
 void jit_eval_arena_reset(void);
 typedef struct _eval_arena eval_arena_t;
