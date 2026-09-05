@@ -8275,6 +8275,33 @@ static bool aj_rtlil_subtree(const gsm_rtlil_api_t *api, rt_scope_t *scope,
    return true;
 }
 
+// NVC_ACCEL_RTLIL: dry-walk the subtree through the walker's null builder
+// in a fork child (a walker crash must not take the simulator down): true
+// when every module is admitted.  Used only where the TEXT emission failed
+// -- that emission is the cache key and the fallback; a subtree the text
+// path cannot express (a while-loop constant function, VX_csa_tree) is
+// carried by the walker alone.
+static bool aj_rtlil_probe(rt_scope_t *scope)
+{
+   const gsm_rtlil_api_t *api =
+      (const gsm_rtlil_api_t *)vhdl2rtlil_null_api();
+   fflush(stdout);
+   fflush(stderr);
+   const pid_t pid = fork();
+   if (pid < 0)
+      return false;
+   if (pid == 0) {
+      static ident_t seen[512];
+      int nseen = 0;
+      setenv("NVC_ACCEL_RTLIL_PROBE", "1", 1);   // a probe: no decline warning
+      _exit(aj_rtlil_subtree(api, scope, seen, &nseen, 512) ? 0 : 3);
+   }
+   int st = 0;
+   while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+      ;
+   return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
 // Fork-worker for the direct-RTLIL path: the CHILD walks the subtree on the
 // CoW-inherited elaborated tree, constructs the design through the builder
 // facade and synthesizes it — no Verilog parse.  Same deadline discipline as
@@ -8790,6 +8817,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // 1. gather the subtree's Verilog sources
    static char srcs[64][512];
    int nsrc = 0;
+   bool walker_only = false;   // admitted on the RTLIL walker's word alone
    // VHDL->Verilog path: emit the whole subtree via vhdl2vlog (logic3d->2-state)
    // into one .v. Used when the original SV won't parse in yosys (sv2ghdl).
    if (getenv("NVC_ACCEL_FROM_VHDL")) {
@@ -8802,9 +8830,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       const bool ok = emit_subtree_v(scope, vf, seen, &nseen, 512);
       fclose(vf);
       if (!ok) {
-         notef("accel-jit: subtree '%s' not fully translatable (%d modules)",
-               top0, nseen);
-         return false;
+         if (getenv("NVC_ACCEL_RTLIL") != NULL && aj_rtlil_probe(scope)) {
+            notef("accel-jit: subtree '%s' not text-translatable — the "
+                  "rtlil walker admits it (%d modules)", top0, nseen);
+            walker_only = true;
+         }
+         else {
+            notef("accel-jit: subtree '%s' not fully translatable "
+                  "(%d modules)", top0, nseen);
+            return false;
+         }
       }
       // Skip trivial subtrees (a lone flop, a clock gate, ...): accelerating one
       // costs a synth + compile + a per-cycle bridge crossing for ~no compute,
@@ -9294,6 +9329,13 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          }
       }
 
+      if (!forked && walker_only) {
+         // the text emission is partial: no fallback synth from it
+         notef("accel-jit: walker-only subtree '%s' not built — leaving "
+               "in nvc", top);
+         src = 1;
+         forked = true;
+      }
       if (!forked && getenv("GEN_STATEMACHINE") == NULL
           && accel_gsm_fn() != NULL) {
          static char spawn_src[64][600];

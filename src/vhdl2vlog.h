@@ -13,6 +13,7 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname);
 // (void* keeps this header free of gsm_rtlil.h).  false = declined —
 // fall back to the text path.
 bool vhdl2rtlil_module(const void *api, tree_t block, const char *modname);
+const void *vhdl2rtlil_null_api(void);   // dry-walk builder (probe/census)
 
 // Component-instantiation wrappers: elaboration wraps a bound entity in a
 // block whose T_HIER ref is the T_COMPONENT, with the entity's own block as
