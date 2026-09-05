@@ -3877,6 +3877,42 @@ static void aj_subscribe_clocks(rt_model_t *m, aj_chunk_t *chunk)
                   (void *)n, (void *)root, root != n ? " (root-sub)" : "");
       }
    }
+   // EVERY boundary INPUT, not just clocks.  The rerouted procs' dynamic
+   // waits are CONSUMED on their first wake (wakeup clears a dynamic
+   // wait's subscription before the vtable dispatch, and the NOP body
+   // never re-executes the wait to re-arm), so the chunk's data-input
+   // wakes die one by one until only the clock subscriptions above keep
+   // it alive — inputs are then rescanned only at clock-edge evals, and
+   // an input that settles a delta LATER than the clk eval within the
+   // same timestep is sampled pre-settled EVERY cycle.  Measured on
+   // eh2_lsu: lsu_bus_clk_en (computed by interp clk_ctrl after the clk
+   // delta) read stale-low forever — obuf never loaded, lsu_axi_arvalid
+   // never rose, the core hung on its first load.  sched_event entries
+   // are PERSISTENT and dedup by wakeable, and the quiet-skip early
+   // return bounds the cost of the extra wakes to one input scan.
+   if (chunk->rs_pins != NULL && getenv("NVC_ACCEL_NO_INSUB") == NULL) {
+      for (int i = 0; i < chunk->rs_npins; i++) {
+         if (chunk->rs_pins[i].is_output || chunk->rs_pins[i].sig == NULL)
+            continue;
+         rt_signal_t *sig = chunk->rs_pins[i].sig;
+         rt_nexus_t *n = &(sig->nexus);
+         for (unsigned nx = 0; nx < sig->n_nexus; nx++, n = n->chain) {
+            sched_event(m, &(n->pending), obj);
+            rt_nexus_t *root = n;
+            for (int hop = 0; hop < 16; hop++) {
+               rt_source_t *ps = NULL;
+               for (rt_source_t *s2 = &(root->sources); s2 != NULL;
+                    s2 = s2->chain_input)
+                  if (s2->tag == SOURCE_PORT && s2->u.port.input != NULL)
+                     ps = s2;
+               if (ps == NULL) break;
+               root = ps->u.port.input;
+            }
+            if (root != n)
+               sched_event(m, &(root->pending), obj);
+         }
+      }
+   }
 }
 
 // ---- NVC_FAST_CLK posedge-table dispatch -----------------------------------
@@ -4201,6 +4237,19 @@ static bool aj_chunk_demote(rt_model_t *m, aj_chunk_t *chunk)
       if (p->vtable == &chunk->vtable) {
          proc_set_vtable(p, chunk->rr_saved[i].vt);
          restored++;
+         // RE-ARM: a wait-at-bottom proc that was WOKEN while rerouted had
+         // its one-shot subscription consumed by the chunk vtable and never
+         // re-armed (the body that would re-execute the wait never ran).
+         // Restoring the vtable alone leaves such a proc deaf FOREVER —
+         // measured on eh2_lsu: lsu_bus_clk_en_q frozen from t=0 after a
+         // demote, freezing the bus-enable cone reset-immune and killing
+         // the run.  Run every restored proc once in the next delta:
+         // executing to its wait re-subscribes it.  A spurious run of the
+         // translated shapes is semantics-preserving (edge guards are
+         // level-checked; NBA shadows copy-through unchanged).
+         if (!p->wakeable.pending && !p->wakeable.delayed
+             && !p->wakeable.postponed)
+            deltaq_insert_proc(m, 0, p);
       }
       // else: something else (reset_process) already replaced it — leave it
    }
@@ -7493,9 +7542,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // clock is by construction LOW at the main posedge, so any remembered
       // high is the previous cycle's — clearing at the posedge re-arms
       // detection for the fresh rise.
-      if (chunk != NULL && chunk->merged && nck > 0)
-         fprintf(f, "  if(posedge) for(int _k=0;_k<%d;_k++)"
-                    " aj_cs->ck_last[_k]=0;\n", nck);
+      // ALL chunks with extra clocks, not just merged: a per-chunk unmerged
+      // chunk that sleeps through the clk-low half-cycle never observes the
+      // gated falls either — ck_last jams at 1 and rises are silently
+      // MISSED (measured on eh2_lsu: the active_clk-group dc2/dc3/dc4
+      // clken staging flops held their pulses one cycle long with rises
+      // aligned — a missed 655ns edge froze the whole bit2 group for a
+      // cycle; interp's staged-clken chain is 1-wide).  An ICG-of-clk
+      // gated clock is by construction LOW at the main posedge, so any
+      // remembered high is the previous cycle's; NVC_ACCEL_CK_KEEPLAST
+      // restores the old behaviour for genuinely-divided clocks.
+      if (chunk != NULL && nck > 0)
+         fprintf(f, "  { static int _kl2=-1; if(_kl2<0)"
+                    " _kl2=getenv(\"NVC_ACCEL_CK_KEEPLAST\")?1:0;"
+                    " if(posedge && !_kl2) for(int _k=0;_k<%d;_k++)"
+                    " aj_cs->ck_last[_k]=0; }\n", nck);
       // non-coincident (legacy): scan FIRST, then value-edge-detect each extra
       // clock from the freshly-scanned values — original behaviour, unchanged.
       fprintf(f, "  if(!_late && !_coinc){\n");
@@ -7530,8 +7591,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  extra_clk_field[k], extra_clk_bit[k], k);
       fprintf(f, "); }\n");
       {
+         // COINCIDENT mode defers the input scan until AFTER the advance,
+         // so the fused single-pass (sm_clock_out computes outputs inside
+         // the advance) would publish outputs from f(S(T), in(T-1)) — a
+         // stale input component for any Mealy-at-edge output cone, pushed
+         // into the NBA region where the mid-timestep correction races the
+         // queued commit (measured: dec's br*_wb_pkt trained the interp
+         // IFU's branch predictor with the previous cycle's history; one
+         // flipped prediction at ~1215ns forked the fetch path and the run
+         // finished 69 cycles off; NBA=0 discriminator run == interp
+         // EXACTLY).  Under _coinc use the unfused advance: the !_fused
+         // sm_comb re-settle after the deferred scan recomputes outputs
+         // from (S(T), in(T)) — interp-exact.
          const char *adv = has_clock_out
-            ? "{ if(!VERIFY){ sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
+            ? "{ if(!VERIFY && !_coinc){"
+              " sm_clock_out(&S,&in,&o,posedge_mask); _fused=1; }"
               " else sm_clock_masked(&S,&in,posedge_mask); }"
             : "sm_clock_masked(&S,&in,posedge_mask);";
          if (rst != NULL) {
@@ -8767,6 +8841,29 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                return false;
             }
       }
+      // NVC_ACCEL_SKIP_TREE=n1,n2 — HIERARCHICAL skip: tokens matched
+      // against the lowered full scope PATH, so a parent's exclusion covers
+      // per-instance descents into its interior.  Name-based SKIP cannot:
+      // EH2's ic_tag skip let the IC_TAG read-hold flops install under
+      // generic rvdffs5 names and one mistimed SRAM capture killed the
+      // whole-core run (grow-bisection, 2026-09-03).  A separate env
+      // because path-matching the existing short tokens would overreach
+      // ('mem' matches every mem_ctl descendant).
+      const char *skt = getenv("NVC_ACCEL_SKIP_TREE");
+      if (skt != NULL && skt[0] != '\0') {
+         char pbuf[1024];
+         snprintf(pbuf, sizeof pbuf, "%s", istr(scope->name));
+         for (char *q = pbuf; *q; q++)
+            *q = tolower((unsigned char)*q);
+         char buf[512];
+         snprintf(buf, sizeof buf, "%s", skt);
+         for (char *t = strtok(buf, ","); t != NULL; t = strtok(NULL, ","))
+            if (t[0] != '\0' && strstr(pbuf, t) != NULL) {
+               notef("accel-jit: subtree '%s' skipped (NVC_ACCEL_SKIP_TREE "
+                     "matched path)", top0);
+               return false;
+            }
+      }
    // NVC_ACCEL_SLICE=<seed>:<pct> — seeded random admission (user
    // directive: regression suites as accel-boundary fuzzers).  Each seed
    // draws a DIFFERENT deterministic accel/interp boundary through the
@@ -9573,6 +9670,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // the chunk name in as a literal (it used to read "accel chunk" because
    // rs_top was only filled in after the dlopen below).
    chunk->rs_top  = xstrdup(top);
+   notef("accel-jit: chunk '%s' scope %s", top, istr(scope->name));
    chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 4, sizeof(void *));
    aj_build_fastclk(m, clk.sig, clk.data);
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
@@ -9581,6 +9679,72 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                        have_rst ? &rst : NULL, m, chunk, false)) {
       aj_accel_teardown(m);
       return false;
+   }
+   // CONTENT-keyed .so name: identical bridge+model BYTES under the same
+   // toolchain reuse the compiled object across vhash namespaces.  An nvc
+   // rebuild flips the exe-mtime vhash fold: the synth re-runs and re-emits
+   // byte-identical C, but the vhash-derived .so name still recompiled —
+   // ~40 minutes of gcc per 86MB EH2 model, the dominant iteration tax.
+   // The bridge #includes the dutc BY ITS VHASH-NAMED PATH, so that path is
+   // masked out of the hash (replaced by a fixed token) or nothing would
+   // ever cross-hit.  The vhash-derived name stays the fallback when either
+   // file is unreadable.
+   {
+      char *bt2 = aj_read_file(bridge);
+      char *dt2 = aj_read_file(dutc);
+      if (bt2 != NULL && dt2 != NULL) {
+         uint64_t ch = 14695981039346656037ULL;
+         const size_t dlen = strlen(dutc);
+         for (const char *p2 = bt2; *p2; ) {
+            if (strncmp(p2, dutc, dlen) == 0) {
+               for (const char *q2 = "@DUTC@"; *q2; q2++)
+                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
+               p2 += dlen;
+               continue;
+            }
+            ch ^= (uint8_t)*p2++;
+            ch *= 1099511628211ULL;
+         }
+         // #line directives embed the vhash-named staged .v path, so a
+         // re-synth after any rebuild yields byte-different C for the SAME
+         // logic and defeated every cross-rebuild content hit (measured:
+         // EH2's giant models recompiled after each binary touch despite
+         // the tier).  They are semantically irrelevant to the .so — mask
+         // whole #line lines out of the hash.
+         for (const char *p2 = dt2; *p2; ) {
+            if ((p2 == dt2 || p2[-1] == '\n')
+                && strncmp(p2, "#line", 5) == 0) {
+               while (*p2 && *p2 != '\n')
+                  p2++;
+               for (const char *q2 = "@L@"; *q2; q2++)
+                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
+               continue;
+            }
+            ch ^= (uint8_t)*p2++;
+            ch *= 1099511628211ULL;
+         }
+         const char *cc2 = getenv("NVC_ACCEL_CC");
+         if (cc2 == NULL) cc2 = "gcc -g -O3";
+         for (const char *p2 = cc2; *p2; p2++)
+            { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+         if (getenv("NVC_ACCEL_SMDUMP") != NULL)
+            ch = (ch ^ 77u) * 1099511628211ULL;
+         struct utsname un2;
+         if (uname(&un2) == 0)
+            for (const char *p2 = un2.machine; *p2; p2++)
+               { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+#if defined(__x86_64__)
+         __builtin_cpu_init();
+         const unsigned isa2 = (__builtin_cpu_supports("avx512f") ? 4u : 0u)
+                             | (__builtin_cpu_supports("avx2")    ? 2u : 0u)
+                             | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
+         ch = (ch ^ isa2) * 1099511628211ULL;
+#endif
+         snprintf(so, sizeof so, "%s/aj_%s_c%016llx.so", accel_dir, top,
+                  (unsigned long long)ch);
+      }
+      free(bt2);
+      free(dt2);
    }
    // Compile only if this exact (de-baked, content-only) .so is not already
    // cached. A logic change re-hashes -> a fresh .so; unchanged logic skips BOTH

@@ -417,6 +417,194 @@ Determine where the current looseness actually is:
       re-deposit outputs after the init drain; sequencing is
       scheduler-delicate.  Diagnose with NVC_ACCEL_OUT_TRACE (seed
       pass sentinel d=4294967295) on the lsu_arv cone.
+      **EH2 DIVERGENCE LOCALIZED (2026-09-02, bisection complete):**
+      the tick "2-vs-6" was a STRENGTH-PLANE artifact (l3d position
+      print; both logic-0) — the t=0 theory was wrong (the #43
+      fixpoint stands on its own reproducers).  Warm-cache ONLY
+      bisection: eh2_exu alone PASSES exactly (2519); eh2_dec alone
+      "passes" at 2450 — a 69-cycle stall-timing SKEW, second defect;
+      **eh2_lsu alone DIVERGES** — the minimal reproducer.  First
+      value-plane diff at CYCLE 400: `lsu_axi_arvalid` NEVER rises
+      under accel (interp issues its first data-side bus read there;
+      accel: zero assertions in 17,500 cycles → the core stalls on
+      its first load forever).  NOT the ck_last/LATE class (CK_LATE=1
+      changes neither unit).  CK_TRACE bookkeeping is textbook: the
+      chunk has THREE gated extra clocks (active_thread_l2clk__b0/
+      __b1 + active_clk); thread clocks rise in the SAME delta as the
+      main posedge detect (mask 0xb), active_clk one delta later
+      (mask 0x4); pend always 0 (late off).  With everything else
+      interpreted, chunk inputs are interp-correct, and VERIFY proves
+      the model computes — so the defect is DELTA-LEVEL SAMPLING
+      SEMANTICS of the gated-group advance (which `in` snapshot the
+      thread-gated flops read at the coincident delta vs interp's
+      NBA at the gated clock's own delta).  Next: dump the chunk's
+      bus-buffer state-machine inputs (lsu_bus_clk_en, lsu_busreq
+      cone) at cycles 395-405 in both arms (NVC_ACCEL_OUT_TRACE_FROM
+      ~3.95ms); compare against interp per-delta.  Vehicle logs:
+      /home/claude/eh2_rtlil/eh2_bis_eh2_lsu.log, eh2_cktrace.log.
+      MERGE-flow experiment queued (the shipped EH1 gated-clock
+      answer — if EH2 passes under MERGE, per-chunk lsu drops in
+      priority and merge becomes the EH2 recipe).
+      **MERGE VERDICT: also diverges** (14 groups, same
+      arvalid-never-rises signature) — the gated-group sampling
+      defect is FLOW-INDEPENDENT; the delta-sampling fix is the only
+      EH2 path.
+      **RESIDUE SWEEP 3 (2026-09-02): declines 9 → 7, 4 modules.**
+      DYNAMIC PART-SELECT READS land: `sig(x+K downto x)` — bounds
+      dynamic, span constant — recognized structurally (left renders
+      as right + literal K with identical sub-specs) and lowered to
+      shr + [K:0], the l3d_part_read lowering for direct slicing
+      (dma_ctrl clears).  SPEC-ELEMENT READS land: element access of
+      a whole-substituted local indexes the spec — bare wire names
+      directly, sized literals via a width-VERIFIED temp connect
+      (an unverifiable spec width DECLINES: an RTLIL connect width
+      mismatch throws and poisons the session — caught in probe,
+      fixed before landing; poisons stay ZERO) (dec_gpr clears).
+      Remaining 4: lsu_stbuf spec-elem (non-literal spec), lsu_bus_
+      buffer 256-wide bit tables, ifu_aln var-elem under dynamic
+      guards, dec_decode unconstrained temp width.
+      **CONTENT-KEYED .SO TIER (2026-09-02):** the .so name now
+      derives from the bridge+model BYTES (dutc path masked out of
+      the bridge hash — it embeds the vhash) plus toolchain/machine/
+      ISA, so identical generated C reuses its compiled object
+      ACROSS vhash namespaces.  An nvc rebuild used to recompile
+      everything (~40min gcc per 86MB EH2 model — the dominant
+      iteration tax); measured now: touch the binary, rerun EH1a —
+      454/454 .so content-hits, zero compiles, identical result.
+      Rebuild cost is now re-walk only.
+
+      **EH2 LSU DEEP-DIVE (2026-09-02, three fixes landed + precise
+      residue):** the demote-bisection instrument exposed and fixed
+      THREE real defects: (1) DEMOTE RE-ARM — wakeup consumes a
+      dynamic wait's subscription BEFORE vtable dispatch, so a proc
+      woken while rerouted never re-arms; demote-restored procs were
+      permanently deaf (measured: lsu_bus_clk_en_q frozen from t=0,
+      reset-immune).  Fix: every restored proc runs once next delta
+      (spurious runs are semantics-preserving for the translated
+      shapes); lsu/exu demote@0 controls now PASS exactly.  (2) INPUT
+      SUBSCRIPTIONS — the same consumption starves the CHUNK's own
+      data-input wakes one by one until only clock wakes remain;
+      boundary inputs are now subscribed persistently like clocks
+      (NVC_ACCEL_NO_INSUB escape).  (3) UNIVERSAL posedge ck_last
+      clear — was merged-chunks-only; a quiet unmerged chunk jams
+      identically (CK_KEEPLAST escape).  All three validated: EH1a
+      census EXACT (1113, 7 declines, 0 poisons).  RESIDUE (the one
+      remaining EH2 defect, all configs LATE/COINC/fix-combos fail
+      identically): accel completes the non-blocking load READ
+      RESPONSE one cycle early — obuf_rdrsp_pend held 1 cycle vs
+      interp's 2 (first architectural divergence t=995ns; preceded
+      by dc2/3/4 clkenff pulse-width anomalies at 655ns that are
+      dump-staging-ambiguous).  State bisection: good ≤1.1us, dead
+      ≥1.2us.  TOOLKIT READY: comparator scripts in the session
+      scratchpad (compare2/final/verify*.py), SMDUMP recipe, interp
+      wave lsuwin.vcd, demote instrument now TRUSTWORTHY.  Next: the
+      rdrsp_pend cone (axi_rvalid sampling vs bus_clk_en gating in
+      the bit0/bit2 group split — which group commits rdrsp_pend and
+      what does its D-cone read at the coincident delta).
+      **COINCIDENT BREAKTHROUGH (2026-09-03):** eh2_lsu +
+      CK_COINCIDENT + the wake-fix trio = TEST_PASSED cycles=2519
+      EXACT (the July "COINC has zero effect" predates the wake
+      fixes — they were mutually masking).  EH1a under COINC: 1113
+      EXACT, no regression.  The FPGA-shape translation is single-
+      clock (every gated clock a pass-through), so one-pre-edge-
+      snapshot semantics are exactly right.  rdrsp_pend root cause
+      confirmed structural: it commits group 0 while sibling regs
+      commit groups 1/3 — value-edge mode gives delta-order-
+      dependent cross-group skew that interp's single clock never
+      has.  FULL EH2 under COINC still watchdogs (1849 installed):
+      composition has MORE defects.  Singles: exu 2519 exact; **dec
+      2450 — its 69-cycle-early completion is an INDEPENDENT defect
+      and the next minimal repro.**  ★ INSTRUMENT TRUST BOUNDARY:
+      demote is faithful on lsu/exu (reproduces interp exactly) but
+      NOT on dec (demote@1us→2364, a third trajectory; @500ns
+      breaks) — some dec shape violates the spurious-run-safe or
+      writeback assumptions; investigate before trusting demote
+      there.  dec plan: SMDUMP (no demote) + interp wave of the dec
+      scope to ~2.5us, comparator scripts as before.
+      **DEC DEFECT LOCALIZED (2026-09-03):** comparator on the dec
+      pair (250 dumps vs decwin.vcd; 1,288 matched, 31 true scalar
+      regs; 193 names +1-staged): first real divergence t=955ns
+      (de-staged) — `decode_cam_i0_i1_nonblock_load_stall_reg`
+      releases ONE CYCLE EARLY (3-wide vs interp 4-wide); then
+      i0-stall holds LONGER (thread-swapped widths), the whole
+      nbload pipeline walks apart, and the i0/i1 arbiter favor bit
+      sticks 72 cycles (1215–1935) vs interp's 3.  ★ COMB-NET
+      PHANTOMS: sm_dump_comb recomputes comb at the dump point from
+      a half-staged register bank — enable/comb nets in dumps show
+      pulses that never happened; ONLY the *_reg plane is evidence.
+      RULED OUT: input sampling phase — snapshotting all 11
+      lsu_nonblock_* pins via NVC_ACCEL_SNAP_PINS (engaged,
+      snap_nin=11) leaves 2450 unchanged.  NEXT SUSPECT: dec's
+      OUTPUT-side comb-at-edge staging classification — dec's
+      stall/valid outputs reaching the interp LSU a delta early
+      accelerate the round-trip (the staged-entry machinery's exact
+      domain; check whether the relevant outputs are classified
+      Mealy/off-edge and excluded from NBA-region staging).  Also
+      note the demote-unfaithful-on-dec trust boundary.
+      **★★★ FULL-CORE EH2 ACCEL CORRECT (2026-09-03): TEST_PASSED
+      cycles=2519 EXACT — the July blocker is closed.**  RECIPE:
+      NVC_ACCEL_CK_COINCIDENT=1 NVC_ACCEL_NBA=0
+      NVC_ACCEL_MIN_MODULES=8 + the standard SRAM skips, on the
+      wake-fix trio + the unfused-COINC bridge (1461d925d).  11
+      substantial chunks ACTIVE; wall 1327s; EH1a unchanged exact.
+      Final-chapter findings: (1) dec "stall early" DISPROVEN
+      (dump-frame skew); real dec divergence = the BP-training loop;
+      the NBA=0 discriminator == interp EXACT → NBA-region
+      loop-latency semantics are the principled follow-up, now
+      against a working baseline.  (2) The remaining composition
+      breakers were TINY LEAF CHUNKS — per-instance descents into
+      flop-wrapper interiors whose generic names LEAK past
+      NAME-substring skips (rvdffs5__9a17 = EH2_IC_TAG
+      rd_data_hold/tg_data_raw flops, past the ic_tag skip;
+      rvdffs__106d = rvdffe inner dffs; rvdffs__b5c5 = rvarbiter2
+      favor flops + fpga-shell dffs); convicted by grow-bisection
+      with exact-cycle verdicts.  MIN_MODULES=8 excludes the class
+      (design intent per the code comment; note the DEFAULT is
+      still 1).  FOLLOW-UPS: hierarchical skip; the leaf-chunk
+      composition defect (three minimal repros); NBA loop-latency;
+      recipe as FROM_VHDL default after soak.
+      **VAR-VERSIONING (SSA) MACHINERY (2026-09-05):** a write to a
+      process-local now allocates a fresh module-level wire =
+      $mux(pathcond, newvalue, prev-version) — feed-forward SSA, no
+      proc-action ordering, so read-after-write / dynamic part-writes
+      at any depth / slice reads through substitution are all legal.
+      A PATH-CONDITION stack (kept in lockstep with case depth; T_IF
+      pushes cond then !cond for the default arm, T_CASE pushes
+      per-arm eq-ORs and the default's NOT-any-previous) supplies the
+      mux select.  Promote-on-read makes a read-before-write local
+      latch state (pv wire = activation-start), and the pv commits
+      from the final version at edge/always.  HONEST STATUS:
+      gate-clean (EH1a 1113 EXACT, 0 poisons, 451 ACTIVE) and it
+      CLEARS real shapes (dma_ctrl, dec_gpr_ctl, dec_decode's l3d
+      single-bit write) — but INSTALL-NEUTRAL at census scale: the
+      residue modules stay multiply-blocked (lsu_bus_buffer/ifu_aln
+      var-elem const-index reads where promote-on-read returns NULL —
+      likely npv capacity or an already-versioned base with no reachable
+      subst; lsu_stbuf spec-elem; a dec_decode temp-width).  It is the
+      SSA foundation to RETIRE bits-mode (currently additive alongside
+      it).  NEXT: diagnose the var-elem const-index miss (one blocker
+      on two modules — a real +install if cleared), then fold
+      bits-mode into versioning.
+      **LEAF-CHUNK INVESTIGATION CONCLUDED (2026-09-04):** the
+      rvdffs__b5c5 trio identified via a new install-time scope note:
+      **IFU.MEM_CTL.BUS_CMD_FF / BUS_RDY_FF / BUS_RSP_VLD_FF** — the
+      IFU bus-handshake flops, the IFU twin of the LSU bus class.
+      Repro PASSES under SKIP_TREE=mem (the EXISTING 'mem' token,
+      applied hierarchically, covers .MEM_CTL. ancestry — 674 tree
+      skips).  Full composition at MIN_MODULES=1 with the standard
+      tokens hierarchical STILL fails (~80 non-mem leaf flops hold
+      at least one more breaker — the rvdffs__106d rvdffe-dff class,
+      scattered).  PATTERN ESTABLISHED: 1-bit interface/handshake
+      flops as standalone chunks mis-time their protocol at the
+      accel↔interp boundary; per-flop acceleration is pure overhead
+      regardless (the MIN_MODULES comment's design intent), so
+      MIN_MODULES=8 remains the recipe's exclusion of the entire
+      class.  Also this round: the chunk-scope install NOTE (which
+      turned three inference rounds into one grep), and the content
+      .so tier hardened — #line directives embed the vhash-named .v
+      path and defeated every cross-rebuild hit; whole #line lines
+      are now masked from the hash (rebuilds are truly re-walk-only
+      after one population pass).
 
 ## 2. ABI containment
 

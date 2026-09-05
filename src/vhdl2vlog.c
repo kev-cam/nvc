@@ -3353,6 +3353,32 @@ typedef struct { ident_t var; char *spec;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
 static int        g_r2_case_depth;   // >0 while inside any switch case
+// pv-wire name of a promoted latch var readable at this walk point (NULL
+// if none / already written) — implemented after the pvar machinery
+static const char *r2_pvar_read_pv(ident_t id);
+
+// PATH-CONDITION stack: one 1-bit sigspec per open case level, kept in
+// lockstep with g_r2_case_depth.  Powers VAR VERSIONING: a write to a
+// process-local under branches becomes a module-level $mux(pathcond,
+// value, prev-version) into a fresh wire — pure feed-forward SSA, no
+// proc-action ordering involved, so read-after-write and dynamic
+// part-writes to locals are all legal.
+static char g_r2_conds[24][96];
+static int  g_r2_nconds;
+
+static bool r2_cond_push(const char *cs)
+{
+   if (g_r2_nconds >= 24 || strlen(cs) >= sizeof g_r2_conds[0])
+      return false;
+   snprintf(g_r2_conds[g_r2_nconds++], sizeof g_r2_conds[0], "%s", cs);
+   return true;
+}
+
+static void r2_cond_pop(void)
+{
+   if (g_r2_nconds > 0)
+      g_r2_nconds--;
+}
 
 static r2_subst_t *r2_subst_of(ident_t var)
 {
@@ -3477,19 +3503,6 @@ static void r2_subst_poison_from(int depth)
    }
 }
 
-// a partial (slice/element) write inside an arm invalidates the flat value
-static void r2_subst_poison_var(ident_t var)
-{
-   r2_subst_t *e = r2_subst_of(var);
-   if (e == NULL)
-      return;
-   free(e->spec);
-   e->spec = NULL;
-   r2_subst_clear_bits(e);
-   e->has_ival = false;
-   e->wdepth = 0;
-   e->vtree = NULL;
-}
 
 // constant-valued substitution: spec doubles as the sigspec when the value
 // is representable there; a NEGATIVE value keeps spec NULL (no sigspec form)
@@ -3519,70 +3532,6 @@ static bool r2_subst_set_int(ident_t var, int64_t v)
    e->wdepth = g_r2_case_depth;
    e->sw = 0;
    e->vtree = NULL;
-   return true;
-}
-
-// per-bit write to a straight-line local (v(i) := b with const i): the var
-// becomes a bit table; a prior whole CONSTANT value expands into bits so
-// init-then-bit-build sequences merge.  Composition back to a full value
-// happens at read (r2_subst_compose).
-static bool r2_subst_set_bit(ident_t var, int idx, const char *bspec, int w)
-{
-   if (w < 1 || w > 128 || idx < 0 || idx >= w)
-      return false;
-   r2_subst_t *e = r2_subst_of(var);
-   if (e == NULL) {
-      if (g_r2_nsubst >= 32)
-         return false;
-      e = &g_r2_subst[g_r2_nsubst++];
-      e->var = var;
-      e->spec = NULL;
-      e->has_ival = false;
-      e->bw = 0;
-      e->wdepth = g_r2_case_depth;
-      e->sw = 0;
-      e->vtree = NULL;
-   }
-   e->vtree = NULL;
-   if (e->bw == 0) {
-      // convert: a constant whole value (integer OR sized literal spec)
-      // seeds the bits; anything else leaves unwritten bits unset — a
-      // later whole read of an incompletely-built var fails cleanly
-      char *seedspec = e->spec;
-      const bool ivseed = e->has_ival && w <= 63;
-      const int64_t sv = e->ival;
-      memset(e->bits, 0, sizeof e->bits);
-      e->bw = w;
-      if (ivseed)
-         for (int i = 0; i < w; i++) {
-            char b[8];
-            snprintf(b, sizeof b, "1'd%d", (int)((sv >> i) & 1));
-            e->bits[i] = xstrdup(b);
-         }
-      else if (seedspec != NULL && !r2_bits_seed(e->bits, w, seedspec)) {
-         // dynamic whole value: land it on a temp wire and seed each bit
-         // as an index into it — works for any spec shape
-         for (int i = 0; i < w; i++)
-            { free(e->bits[i]); e->bits[i] = NULL; }
-         char t[64];
-         if (r2_temp(w, t, sizeof t)
-             && g_r2->connect(t, seedspec) == 0) {
-            for (int i = 0; i < w; i++) {
-               char b[80];
-               snprintf(b, sizeof b, "%s[%d]", t, i);
-               e->bits[i] = xstrdup(b);
-            }
-         }
-      }
-      free(e->spec);
-      e->spec = NULL;
-      e->has_ival = false;
-   }
-   else if (e->bw != w)
-      return false;
-   free(e->bits[idx]);
-   e->bits[idx] = xstrdup(bspec);
-   e->wdepth = g_r2_case_depth;
    return true;
 }
 
@@ -4501,6 +4450,173 @@ static bool r2_index_switch(tree_t idx, const char *g0, int width, int W,
    return true;
 }
 
+// AND-chain of the open path conditions; false = stack too deep/none
+// representable.  Empty stack yields out[0] == '\0' (unconditional).
+static bool r2_path_cond(char *out, size_t sz)
+{
+   if (g_r2_nconds == 0) {
+      out[0] = '\0';
+      return true;
+   }
+   char cur[96];
+   snprintf(cur, sizeof cur, "%s", g_r2_conds[0]);
+   for (int i = 1; i < g_r2_nconds; i++) {
+      char t[64], cn[80];
+      if (!r2_temp(1, t, sizeof t))
+         return false;
+      snprintf(cn, sizeof cn, "c%s", t);
+      if (g_r2->cell_bin("and", cn, cur, g_r2_conds[i], t, 0) != 0)
+         return false;
+      snprintf(cur, sizeof cur, "%s", t);
+   }
+   snprintf(out, sz, "%s", cur);
+   return true;
+}
+
+// Static width of a rendered sigspec, -1 if underivable: bare wires are
+// unknowable (the caller must know), but "w[h:l]"/"w[i]" forms, sized
+// literals, and concats of those all classify.
+static int r2_spec_width(const char *sp)
+{
+   if (sp == NULL || sp[0] == '\0')
+      return -1;
+   if (sp[0] == '{') {
+      int total = 0;
+      const char *q = sp + 1;
+      while (*q && *q != '}') {
+         char el[256];
+         int d2 = 0;
+         size_t n = 0;
+         while (*q && n + 1 < sizeof el) {
+            if (*q == '{') d2++;
+            else if (*q == '}') { if (d2 == 0) break; d2--; }
+            else if (*q == ',' && d2 == 0) break;
+            el[n++] = *q++;
+         }
+         el[n] = '\0';
+         const int ew = r2_spec_width(el);
+         if (ew < 0)
+            return -1;
+         total += ew;
+         if (*q == ',')
+            q++;
+      }
+      return total > 0 ? total : -1;
+   }
+   if (isdigit((unsigned char)sp[0])) {
+      const char *tick = strchr(sp, 39);
+      return tick != NULL ? atoi(sp) : -1;
+   }
+   const char *br = strchr(sp, '[');
+   if (br != NULL) {
+      int h2, l2;
+      if (sscanf(br, "[%d:%d]", &h2, &l2) == 2)
+         return h2 - l2 + 1;
+      if (sscanf(br, "[%d]", &h2) == 1)
+         return 1;
+      return -1;
+   }
+   return -1;   // bare wire: width not in the string
+}
+
+// VERSIONED write to a process-local: new wire vN+1 =
+// $mux(pathcond, newvalue, vN) at module level.  `whole` spans the var;
+// otherwise [hi:lo] of the previous version is replaced (composed via
+// concat).  The subst entry's spec becomes the new wire (bare name, so
+// element reads index it directly).  Requires an existing whole-value
+// spec (a read-before-first-write local is latch state — pvar handles
+// those).
+static bool r2_var_write(ident_t vi, int w, const char *value,
+                         bool whole, int hi, int lo)
+{
+   r2_subst_t *e = r2_subst_of(vi);
+   if (e == NULL || e->spec == NULL || w < 1 || w > 4000) {
+      R2_DECLINE("var-version-base");
+      return false;
+   }
+   // slicing needs a WIRE base: materialize literal/compose specs once
+   bool bare = true;
+   for (const char *q = e->spec; *q && bare; q++)
+      if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+         bare = false;
+   if (!bare) {
+      // connect throws (and poisons the session) on width mismatch —
+      // materialize only when the spec's width derives statically AND
+      // matches the declaration
+      // an integer substitution renders as 32'dK regardless of the decl
+      // width — re-render at the declaration width when the value fits
+      char lit[48];
+      const char *msrc = e->spec;
+      int64_t mival = e->has_ival ? e->ival : -1;
+      // a single-bit var holding an l3d enum POSITION (folded_int on enum
+      // literals yields positions: '0'=2, '1'=3, weak 6/7): value plane
+      if (w == 1 && mival >= 2 && mival <= 7)
+         mival &= 1;
+      if (e->has_ival && mival >= 0
+          && (w >= 63 || mival < ((int64_t)1 << w))) {
+         snprintf(lit, sizeof lit, "%d'd%lld", w, (long long)mival);
+         msrc = lit;
+      }
+      else if (r2_spec_width(e->spec) != w) {
+         char why[96];
+         snprintf(why, sizeof why, "var-version-spec w%d '%.24s'",
+                  w, e->spec);
+         R2_DECLINE(why);
+         return false;
+      }
+      char mt[64];
+      if (!r2_temp(w, mt, sizeof mt) || g_r2->connect(mt, msrc) != 0) {
+         R2_DECLINE("var-version-mat");
+         return false;
+      }
+      if (!r2_subst_set(vi, mt))
+         return false;
+      e = r2_subst_of(vi);
+   }
+   char nv[R2_SPEC];
+   if (whole)
+      snprintf(nv, sizeof nv, "%s", value);
+   else {
+      // compose: {prev[w-1:hi+1], value, prev[lo-1:0]}
+      size_t off = 0;
+      nv[off++] = '{';
+      if (hi < w - 1)
+         off += snprintf(nv + off, sizeof nv - off, "%s[%d:%d],",
+                         e->spec, w - 1, hi + 1);
+      off += snprintf(nv + off, sizeof nv - off, "%s", value);
+      if (lo > 0)
+         off += snprintf(nv + off, sizeof nv - off, ",%s[%d:0]",
+                         e->spec, lo - 1);
+      if (off + 2 >= sizeof nv) {
+         R2_DECLINE("var-version-size");
+         return false;
+      }
+      nv[off++] = '}';
+      nv[off] = '\0';
+   }
+   char pc[96];
+   if (!r2_path_cond(pc, sizeof pc)) {
+      R2_DECLINE("var-version-cond");
+      return false;
+   }
+   char t[64];
+   if (!r2_temp(w, t, sizeof t))
+      return false;
+   bool ok;
+   if (pc[0] == '\0')
+      ok = g_r2->connect(t, nv) == 0;
+   else {
+      char cn[80];
+      snprintf(cn, sizeof cn, "c%s", t);
+      ok = g_r2->cell_mux(cn, e->spec, nv, pc, t) == 0;
+   }
+   if (!ok) {
+      R2_DECLINE("var-version-emit");
+      return false;
+   }
+   return r2_subst_set(vi, t);
+}
+
 // Map the text path's Verilog operator string to a builder cell op.
 static const char *r2_binop(const char *vop)
 {
@@ -4528,16 +4644,6 @@ static bool r2_is_onebit_op(const char *b)
 // machinery below); NULL when the variable is not promoted
 static const char *r2_pvar_g0(ident_t id);
 static int g_r2_tree_seq;   // top-level switch counter (a "tree")
-
-// A process variable or a function formal bound by the inliner: an element
-// or slice read resolves through the substitution / promotion tables — the
-// bare name has no wire (`op(1)` in an inlined VX_gpu_pkg_inst_alu_is_sub
-// body would poison the builder session)
-static bool r2_is_local(tree_t d)
-{
-   return d != NULL
-      && (tree_kind(d) == T_VAR_DECL || tree_kind(d) == T_PARAM_DECL);
-}
 
 // Re-size a sized literal spec ("N'dV" / "N'b...") to `w` bits, value
 // plane preserved (truncate high / zero-extend); false for any other spec.
@@ -4627,94 +4733,6 @@ static bool r2_dyn_slice(tree_t r, tree_t *lo_e, int64_t *k)
       return *k >= 0;
    if ((folded_int(p0, k) || r2_eval_int(p0, k)) && r2_tree_same(p1, lo))
       return *k >= 0;
-   return false;
-}
-
-// Resolve the BASE of a slice/element read of a process variable to a wire
-// name plus the offset of the variable's bit 0 within it.  A flat
-// substitution that is itself a name or a name select needs no wire; any
-// other spec (concat, literal, cell temp) lands on a temp of the
-// variable's width first — and the substitution is REWRITTEN to that temp,
-// so repeated selects share it.  An NBA alias reads its signal before any
-// write; a promoted variable reads its hold temp after the tree only
-// (depth 0: the hold wire is the mux chain's FINAL value, which equals the
-// value-so-far only once every write is behind the read).
-static bool r2_var_base(tree_t base, char *out, size_t sz, int *off)
-{
-   const ident_t id = tree_ident(base);
-   *off = 0;
-   r2_alias_t *al = r2_alias_of(id);
-   if (al != NULL) {
-      if (al->wrote) {
-         char why[96];
-         snprintf(why, sizeof why, "alias-raw %s", istr(id));
-         R2_DECLINE(why);
-         return false;
-      }
-      snprintf(out, sz, "%s", vid(al->sig));
-      return true;
-   }
-   r2_subst_t *sb = r2_subst_of(id);
-   if (sb != NULL && sb->spec != NULL) {
-      const char *s = sb->spec;
-      size_t n = 0;
-      while (isalnum((unsigned char)s[n]) || s[n] == '_')
-         n++;
-      if (n > 0 && s[n] == '\0') {
-         snprintf(out, sz, "%s", s);
-         return true;
-      }
-      if (n > 0 && s[n] == '[') {
-         // name[hi:lo] / name[i]: select within the select
-         const char *colon = strchr(s + n, ':');
-         const char *close = strchr(s + n, ']');
-         if (close != NULL && close[1] == '\0' && n < sz) {
-            memcpy(out, s, n);
-            out[n] = '\0';
-            *off = atoi(colon != NULL ? colon + 1 : s + n + 1);
-            return true;
-         }
-      }
-      tree_t d = tree_has_ref(base) ? tree_ref(base) : NULL;
-      type_t ty = d != NULL ? tree_type(d) : NULL;
-      const int w = (ty != NULL && type_const_bounds(ty))
-         ? (int)type_width(ty) : -1;
-      char lit[R2_SPEC];
-      if (r2_lit_resize(s, w, lit, sizeof lit))
-         s = lit;
-      // the landing wire takes the spec's rendered width when the writer
-      // recorded one (an identity chain can render narrower than the
-      // variable; a select past it then fails in the builder, not silently)
-      const int lw = (sb->sw > 0 && s != lit) ? sb->sw : w;
-      char t[64];
-      if (lw < 1 || !r2_temp(lw, t, sizeof t) || g_r2->connect(t, s) != 0) {
-         R2_DECLINE("var-land");
-         return false;
-      }
-      free(sb->spec);
-      sb->spec = xstrdup(t);
-      sb->sw = lw;
-      snprintf(out, sz, "%s", t);
-      return true;
-   }
-   const char *g0 = r2_pvar_g0(id);
-   if (g0 != NULL) {
-      if (g_r2_case_depth != 0) {
-         // inside a tree with no substitution left: the partial value is
-         // branch-dependent (a re-rooted variable's value at tree entry
-         // is seeded per arm by r2_arm_defaults, so this is a write in
-         // a nested arm, or a sibling arm of the promoting write)
-         char why[96];
-         snprintf(why, sizeof why, "pvar-read-in-tree %s", istr(id));
-         R2_DECLINE(why);
-         return false;
-      }
-      snprintf(out, sz, "%s", g0);
-      return true;
-   }
-   char why[96];
-   snprintf(why, sizeof why, "var-elem %s", istr(id));
-   R2_DECLINE(why);
    return false;
 }
 
@@ -4917,25 +4935,6 @@ static bool r2_wire_array(tree_t block, tree_t d)
 // multiplier chain 700 operands, and one r2_expr frame per operand (tens
 // of KB of sigspec buffers each) overflowed the stack.  A rendered chain
 // wider than one sigspec buffer lands in temp wires chunk by chunk.
-// width of a rendered sigspec when its shape says it: N'.., name[i],
-// name[hi:lo]; -1 otherwise
-static int r2_spec_width(const char *s)
-{
-   const char *tick = strchr(s, 39);
-   if (tick != NULL && tick > s && isdigit((unsigned char)s[0]))
-      return atoi(s);
-   const char *br = strchr(s, '[');
-   if (br == NULL || s[0] == '{')
-      return -1;
-   const char *close = strchr(br, ']');
-   if (close == NULL || close[1] != '\0')
-      return -1;
-   const char *colon = strchr(br, ':');
-   if (colon == NULL)
-      return 1;
-   return atoi(br + 1) - atoi(colon + 1) + 1;
-}
-
 // The DECLARED width of an expression where its rendering is
 // self-determined: a width-taking conversion's width argument, a scalar
 // logic3d's 1, a constrained type's width; -1 when unknown
@@ -5208,19 +5207,19 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                snprintf(out, sz, "%s", vid(al->sig));
                return true;
             }
-            // a promoted (branch-written) variable reads its hold temp
-            // after the tree: the wire is the mux chain's FINAL value,
-            // right only once every write is behind the read
-            const char *g0 = r2_pvar_g0(tree_ident(e));
-            if (g0 != NULL && g_r2_case_depth == 0) {
-               snprintf(out, sz, "%s", g0);
-               return true;
+            // a PROMOTED latch var read before any write this activation:
+            // the persistent pv wire IS the activation-start value
+            {
+               const char *pv2 = r2_pvar_read_pv(tree_ident(e));
+               if (pv2 != NULL) {
+                  snprintf(out, sz, "%s", pv2);
+                  return true;
+               }
             }
             // otherwise: no wire exists for a local — rendering the bare
             // name poisons the gsm session; decline cleanly
             char why[96];
-            snprintf(why, sizeof why, "%s %s",
-                     g0 != NULL ? "pvar-read-in-tree" : "var-read",
+            snprintf(why, sizeof why, "var-read %s",
                      istr(tree_ident(e)));
             if (getenv("NVC_RTLIL_DEBUG") != NULL) {
                fprintf(stderr, "r2 var-read '%s' decl '%s' depth %d subst:",
@@ -5324,6 +5323,46 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
               && !r2_eval_int(tree_left(r), &left))
              || (!folded_int(tree_right(r), &right)
                  && !r2_eval_int(tree_right(r), &right))) {
+            // DYNAMIC part-select READ: `sig(x + K downto x)` — the bounds
+            // are dynamic but their span is constant.  Recognize left as
+            // right + K structurally (render both sub-expressions and
+            // compare the sigspecs) and lower to shr + a low slice, the
+            // l3d_part_read lowering for direct slicing.
+            tree_t lt = tree_left(r), rt = tree_right(r);
+            int64_t span = -1;
+            char rs2[R2_SPEC];
+            if (tree_kind(lt) == T_FCALL && tree_params(lt) == 2
+                && strcmp(istr(tree_ident(lt)), "\"+\"") == 0
+                && (folded_int(tree_value(tree_param(lt, 1)), &span)
+                    || r2_eval_int(tree_value(tree_param(lt, 1)), &span))
+                && span > 0 && span < 4000) {
+               char ls2[R2_SPEC];
+               if (r2_expr(tree_value(tree_param(lt, 0)), ls2, sizeof ls2)
+                   && r2_expr(rt, rs2, sizeof rs2)
+                   && strcmp(ls2, rs2) == 0) {
+                  tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
+                  type_t bt = bd != NULL ? tree_type(bd) : NULL;
+                  const int bw = (bt != NULL && type_const_bounds(bt))
+                     ? (int)type_width(bt) : -1;
+                  if (bw >= 1 && bw <= 4000
+                      && (tree_kind(bd) == T_SIGNAL_DECL
+                          || tree_kind(bd) == T_PORT_DECL)) {
+                     char bspec[R2_SPEC], dt[R2_SPEC], cn[R2_SPEC + 8];
+                     if (!r2_expr(base, bspec, sizeof bspec))
+                        return false;
+                     if (!r2_temp(bw, dt, sizeof dt))
+                        return false;
+                     snprintf(cn, sizeof cn, "c%s", dt);
+                     if (g_r2->cell_bin("shr", cn, bspec, rs2, dt, 0) != 0) {
+                        R2_DECLINE("part-shr");
+                        return false;
+                     }
+                     snprintf(out, sz, "%s[%lld:0]", dt, (long long)span);
+                     return true;
+                  }
+               }
+            }
+            // origin structural x+K did not match: r2_dyn_slice fallback
             // dynamic part-select `a(b + K downto b)` (the lane selects
             // `alu_in1(To_Integer(t) + 31 downto To_Integer(t))`): the
             // l3d_part_read lowering (a >> b)[K:0] — what yosys makes of
@@ -5364,44 +5403,32 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
          }
          const int64_t hi = left > right ? left : right;
          const int64_t lo = left > right ? right : left;
-         tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
-         if (r2_is_local(bd)) {
-            // process variable / bound formal: a per-bit table composes
-            // the covered bits; anything else selects within the resolved
-            // base wire
-            r2_subst_t *sb = r2_subst_of(tree_ident(base));
-            if (sb != NULL && sb->bw > 0) {
-               if (hi >= sb->bw) {
-                  R2_DECLINE("slice-range");
+         {
+            // resolve the base like any reference: a substituted local
+            // slices its CURRENT VERSION wire; an unresolved local has no
+            // wire and must decline (bare names poison the session)
+            r2_subst_t *sb2 = r2_subst_of(tree_ident(base));
+            if (sb2 != NULL && sb2->spec != NULL) {
+               bool bare2 = true;
+               for (const char *q = sb2->spec; *q && bare2; q++)
+                  if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+                     bare2 = false;
+               if (!bare2) {
+                  R2_DECLINE("slice-subst");
                   return false;
                }
-               size_t len = 0;
-               out[len++] = '{';
-               for (int64_t i = hi; i >= lo; i--) {
-                  if (sb->bits[i] == NULL) {
-                     R2_DECLINE("bits-unset");
-                     return false;
-                  }
-                  if (len + strlen(sb->bits[i]) + 3 >= sz) {
-                     R2_DECLINE("concat-size");
-                     return false;
-                  }
-                  if (i != hi)
-                     out[len++] = ',';
-                  memcpy(out + len, sb->bits[i], strlen(sb->bits[i]));
-                  len += strlen(sb->bits[i]);
-               }
-               out[len++] = '}';
-               out[len] = '\0';
+               snprintf(out, sz, "%s[%lld:%lld]", sb2->spec,
+                        (long long)hi, (long long)lo);
                return true;
             }
-            char vb[R2_SPEC];
-            int off;
-            if (!r2_var_base(base, vb, sizeof vb, &off))
+            if (tree_has_ref(base)
+                && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               char why[96];
+               snprintf(why, sizeof why, "var-slice %s",
+                        istr(tree_ident(base)));
+               R2_DECLINE(why);
                return false;
-            snprintf(out, sz, "%s[%lld:%lld]", vb, (long long)(hi + off),
-                     (long long)(lo + off));
-            return true;
+            }
          }
          snprintf(out, sz, "%s[%lld:%lld]", vid(tree_ident(base)),
                   (long long)hi, (long long)lo);
@@ -5447,6 +5474,41 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                }
                snprintf(out, sz, "%s", sb->bits[bidx]);
                return true;
+            }
+            // element read of a WHOLE-substituted var: index the spec — a
+            // bare wire name directly, anything else via a landed temp
+            if (sb != NULL && sb->spec != NULL
+                && r2_eval_int(tree_value(tree_param(e, 0)), &bidx)
+                && bidx >= 0) {
+               bool bare = sb->spec[0] != '\0';
+               for (const char *q = sb->spec; *q && bare; q++)
+                  if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+                     bare = false;
+               if (bare) {
+                  snprintf(out, sz, "%s[%lld]", sb->spec, (long long)bidx);
+                  return true;
+               }
+               tree_t bd = tree_has_ref(base) ? tree_ref(base) : NULL;
+               type_t bt = bd != NULL ? tree_type(bd) : NULL;
+               const int bw2 = (bt != NULL && type_const_bounds(bt))
+                  ? (int)type_width(bt) : -1;
+               // temp-connect needs EQUAL widths (RTLIL connections throw
+               // on mismatch and poison the session): only a sized literal
+               // whose prefix width matches the decl is provably safe here
+               const bool litw = isdigit((unsigned char)sb->spec[0])
+                  && atoi(sb->spec) == bw2;
+               if (litw && bw2 >= 1 && bw2 <= 4000 && bidx < bw2) {
+                  char t2[64];
+                  if (r2_temp(bw2, t2, sizeof t2)
+                      && g_r2->connect(t2, sb->spec) == 0) {
+                     snprintf(out, sz, "%s[%lld]", t2, (long long)bidx);
+                     return true;
+                  }
+                  R2_DECLINE("spec-elem-connect");
+                  return false;
+               }
+               R2_DECLINE("spec-elem");
+               return false;
             }
          }
          if (!have_idx && tree_kind(base) == T_REF && tree_params(e) == 1) {
@@ -5511,25 +5573,30 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                R2_DECLINE(why);
                return false;
             }
-            else if (tree_has_ref(base) && r2_is_local(tree_ref(base))) {
-               // element of a substituted / promoted variable (or a bound
-               // formal): a per-bit table answers directly, anything else
-               // selects within the resolved base wire
-               r2_subst_t *sb = r2_subst_of(bi);
-               if (sb != NULL && sb->bw > 0) {
-                  if (idx >= sb->bw || sb->bits[idx] == NULL) {
-                     R2_DECLINE("bits-unset");
-                     return false;
-                  }
-                  snprintf(out, sz, "%s", sb->bits[idx]);
+            else if (tree_has_ref(base)
+                     && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               // read-before-any-write of a local: promote to latch state
+               // and read the persistent pv wire (activation-start value)
+               const char *pv3 = NULL;
+               {
+                  extern const char *r2_pvar_read_or_promote(tree_t);
+                  pv3 = r2_pvar_read_or_promote(tree_ref(base));
+               }
+               if (pv3 != NULL) {
+                  snprintf(out, sz, "%s[%lld]", pv3, (long long)idx);
                   return true;
                }
-               char vb[R2_SPEC];
-               int off;
-               if (!r2_var_base(base, vb, sizeof vb, &off))
-                  return false;
-               snprintf(out, sz, "%s[%lld]", vb, (long long)(idx + off));
-               return true;
+               {
+                  tree_t bd2 = tree_ref(base);
+                  type_t bt2 = tree_type(bd2);
+                  char why[112];
+                  snprintf(why, sizeof why, "var-elem %s cb%d w%d",
+                           istr(bi), (int)type_const_bounds(bt2),
+                           type_const_bounds(bt2) ? (int)type_width(bt2)
+                                                  : -1);
+                  R2_DECLINE(why);
+               }
+               return false;
             }
             snprintf(out, sz, "%s[%lld]", vid(bi), (long long)idx);
          }
@@ -6118,10 +6185,8 @@ static bool r2_cond(tree_t e, char *out, size_t sz)
 typedef struct {
    ident_t name;        // target signal ident
    char    g0[80];      // hold-temp wire
-   char    spec[80];    // target sigspec (vid, or vid[shi:slo])
+   char    spec[80];    // target sigspec (vid)
    int     width;
-   int     slo, shi;    // written range seen at collection (bits)
-   bool    whole;       // some write covers the whole target / is dynamic
 } r2_target_t;
 
 // backing store for the per-process target table: the giant decode/tlu
@@ -6139,9 +6204,10 @@ typedef struct { char memid[80]; char *addr; char *data; char en[32]; }
 // read_verilog would
 typedef struct { ident_t var; char pv[80]; char g0[80]; int width;
                  bool persistent;
-                 int tree;            // tree the hold temp belongs to
-                 char prev[80];       // re-rooted: the previous tree's temp
-               } r2_pvar_t;
+                 bool wrote;   // a write happened this walk: a later read
+                               // must see it — pv (activation-start) reads
+                               // are only sound BEFORE any write
+} r2_pvar_t;
 
 typedef struct {
    r2_target_t *t;        // points at g_r2_tgt (walker is child-single-
@@ -6156,6 +6222,8 @@ typedef struct {
    int         nsites;   // enable-temp counter
    r2_pvar_t   pv[16];   // promoted persistent variables (latch state)
    int         npv;
+   ident_t     dynwr[16];   // targets already dyn-composed this process
+   int         ndynwr;      //  (the compose reads the PRE value = the sig)
    bool        comb;     // process kind: only comb processes may promote
 } r2_targets_t;
 
@@ -6169,11 +6237,11 @@ static r2_pvar_t *r2_pvar_of(r2_targets_t *ts, ident_t id)
 
 // the process being walked (its promoted variables are visible to the
 // expression walker through r2_pvar_g0); NULL outside r2_process
-static r2_targets_t *g_r2_ts;
+static r2_targets_t *g_r2_pvts;
 
 static const char *r2_pvar_g0(ident_t id)
 {
-   r2_pvar_t *pe = g_r2_ts != NULL ? r2_pvar_of(g_r2_ts, id) : NULL;
+   r2_pvar_t *pe = g_r2_pvts != NULL ? r2_pvar_of(g_r2_pvts, id) : NULL;
    return pe != NULL ? pe->g0 : NULL;
 }
 
@@ -6191,40 +6259,26 @@ static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
    type_t ty = tree_type(vdecl);
    if (!type_const_bounds(ty))
       return NULL;
-   // an INTEGER variable (OOB_WriteV_Idx) is the translator's 32-bit
-   // signed, not type_width's scalar 1 — a 1-bit hold temp would truncate
-   const int w = (type_is_integer(ty) && !type_is_logic3d(ty))
-      ? 32 : (int)type_width(ty);
-   r2_subst_t *sb = r2_subst_of(id);
-   char comp[R2_SPEC];
-   const char *root = NULL;
-   if (sb != NULL && sb->spec != NULL) {
-      root = sb->spec;
-      if (r2_lit_resize(sb->spec, w, comp, sizeof comp))
-         root = comp;   // a constant so far: at the variable's width
-   }
-   else if (sb != NULL && sb->bw > 0 && r2_subst_compose(sb, comp, sizeof comp))
-      root = comp;   // built per-bit so far: the composed value roots it
-   if (root == NULL && !ts->comb)
-      return NULL;   // persistent state in a clocked process = a register
+   const int w = (int)type_width(ty);
    e = &ts->pv[ts->npv];
    e->var = id;
    e->width = w;
-   e->tree = g_r2_tree_seq;
-   e->prev[0] = '\0';
    snprintf(e->pv, sizeof e->pv, "pv%d_%s", ts->pidx, vid(id));
    snprintf(e->g0, sizeof e->g0, "g0pv%d_%s", ts->pidx, vid(id));
+   r2_subst_t *sb = r2_subst_of(id);
    if (g_r2->wire(e->g0, w, 0, NULL) != 0)
       return NULL;
-   if (root != NULL) {
+   if (sb != NULL && sb->spec != NULL) {
       // written straight-line earlier this activation: hold base is that
       // value — a plain tree temp, nothing persists
       e->persistent = false;
-      if (g_r2->case_assign_root(e->g0, root) != 0)
+      e->wrote = false;
+      if (g_r2->case_assign_root(e->g0, sb->spec) != 0)
          return NULL;
    }
    else {
       e->persistent = true;
+      e->wrote = false;
       if (g_r2->wire(e->pv, w, 0, NULL) != 0
           || g_r2->case_assign_root(e->g0, e->pv) != 0)
          return NULL;
@@ -6233,105 +6287,38 @@ static r2_pvar_t *r2_pvar_promote(r2_targets_t *ts, tree_t vdecl)
    return e;
 }
 
-// A new TOP-LEVEL switch (a "tree"): every variable promoted so far gets
-// a fresh hold temp for it, defaulting to the value so far -- the
-// straight-line substitution if one is live, else the previous temp.
-// That default is the FIRST action of every arm of the new switch
-// (r2_arm_defaults), never a root action: root actions run before all
-// switches, so a root default would read the previous temp before its
-// own switch assigned it.  (read_verilog's $N\v renaming.)
-static bool r2_tree_begin(r2_targets_t *ts)
+   // current process targets (pvar reads)
+
+// promote-on-READ: a local read before any write carries the previous
+// activation's value (latch semantics) — ensure a pv/hold pair exists and
+// return the pv wire, or NULL when promotion is unavailable (clocked
+// process, capacity, unconstrained width, already written this walk).
+const char *r2_pvar_read_or_promote(tree_t vdecl)
 {
-   g_r2_tree_seq++;
-   for (int i = 0; i < ts->npv; i++) {
-      r2_pvar_t *pe = &ts->pv[i];
-      char ng[80], sofar[R2_SPEC];
-      const char *prev = pe->g0;
-      r2_subst_t *sb = r2_subst_of(pe->var);
-      if (sb != NULL && (sb->spec != NULL || sb->has_ival || sb->bw > 0)) {
-         // live straight-line value: land it (a re-rooted temp reads it
-         // by name)
-         bool have = false;
-         if (sb->bw > 0)
-            have = r2_subst_compose(sb, sofar, sizeof sofar);
-         else if (sb->spec != NULL) {
-            snprintf(sofar, sizeof sofar, "%s", sb->spec);
-            have = true;
-         }
-         char lit[R2_SPEC];
-         if (have && r2_lit_resize(sofar, pe->width, lit, sizeof lit))
-            snprintf(sofar, sizeof sofar, "%s", lit);
-         char t[64];
-         if (!have || !r2_temp(pe->width, t, sizeof t)
-             || g_r2->connect(t, sofar) != 0)
-            return false;
-         snprintf(pe->prev, sizeof pe->prev, "%s", t);
-         prev = pe->prev;
-      }
-      else
-         snprintf(pe->prev, sizeof pe->prev, "%s", prev);
-      snprintf(ng, sizeof ng, "g%dpv%d_%s", g_r2_tree_seq, ts->pidx,
-               vid(pe->var));
-      if (g_r2->wire(ng, pe->width, 0, NULL) != 0)
-         return false;
-      snprintf(pe->g0, sizeof pe->g0, "%s", ng);
-      pe->tree = g_r2_tree_seq;
-      if (getenv("NVC_RTLIL_DEBUG") != NULL)
-         fprintf(stderr, "r2 tree %d: pvar %s prev=%s g0=%s npv=%d\n",
-                 g_r2_tree_seq, istr(pe->var), pe->prev, pe->g0, ts->npv);
+   if (g_r2_pvts == NULL)
+      return NULL;
+   r2_pvar_t *pe = r2_pvar_of(g_r2_pvts, tree_ident(vdecl));
+   if (pe == NULL) {
+      pe = r2_pvar_promote(g_r2_pvts, vdecl);
+      // seed the substitution so later writes VERSION from the pv wire
+      // and the end-of-walk commit (sync_assign pv <= final version)
+      // closes the register loop
+      if (pe != NULL && pe->persistent)
+         r2_subst_set(tree_ident(vdecl), pe->pv);
    }
-   return true;
+   if (pe != NULL && pe->persistent && !pe->wrote)
+      return pe->pv;
+   return NULL;
 }
 
-// First actions of a depth-1 arm: each re-rooted temp takes its previous
-// value, and the substitution sees that as the value so far in the arm
-// (a per-bit write then composes on it).
-static bool r2_arm_defaults(r2_targets_t *ts)
+static const char *r2_pvar_read_pv(ident_t id)
 {
-   for (int i = 0; i < ts->npv; i++) {
-      r2_pvar_t *pe = &ts->pv[i];
-      if (pe->tree != g_r2_tree_seq || pe->prev[0] == '\0')
-         continue;
-      if (g_r2->case_assign(pe->g0, pe->prev) != 0)
-         return false;
-      if (!r2_subst_set(pe->var, pe->prev))
-         return false;
-      if (getenv("NVC_RTLIL_DEBUG") != NULL)
-         fprintf(stderr, "r2 arm default: %s = %s (depth %d)\n", pe->g0,
-                 pe->prev, g_r2_case_depth);
-   }
-   return true;
-}
-
-static bool r2_tree_has_rerooted(r2_targets_t *ts)
-{
-   for (int i = 0; i < ts->npv; i++)
-      if (ts->pv[i].tree == g_r2_tree_seq && ts->pv[i].prev[0] != '\0')
-         return true;
-   return false;
-}
-
-// The bits lo..hi of a promoted variable were just written with `v` (vw
-// bits): keep the per-bit substitution current so later reads in this
-// arm see the value so far.  Anything unrepresentable poisons as before.
-static void r2_subst_bits_write(ident_t id, int lo, int hi, const char *v,
-                                int vw, int w)
-{
-   bool ok = w >= 1 && w <= 128;
-   if (ok && vw == 1)
-      ok = r2_subst_set_bit(id, lo, v, w);
-   else if (ok) {
-      char t[64];
-      if (!r2_temp(vw, t, sizeof t) || g_r2->connect(t, v) != 0)
-         ok = false;
-      for (int b = lo; ok && b <= hi; b++) {
-         char bs[80];
-         snprintf(bs, sizeof bs, "%s[%d]", t, b - lo);
-         ok = r2_subst_set_bit(id, b, bs, w);
-      }
-   }
-   if (!ok)
-      r2_subst_poison_var(id);
+   if (g_r2_pvts == NULL)
+      return NULL;
+   r2_pvar_t *pe = r2_pvar_of(g_r2_pvts, id);
+   if (pe != NULL && pe->persistent && !pe->wrote)
+      return pe->pv;
+   return NULL;
 }
 
 static r2_target_t *r2_target(r2_targets_t *ts, ident_t id)
@@ -6356,164 +6343,22 @@ static void r2_collect_cb(tree_t t, void *ctx)
       return;
    if (r2_mem_of(tree_ident(tg)) != NULL)   // memories write via memwr
       return;
+   if (ts->n >= R2_MAX_TARGETS) {
+      ts->capped = true;
+      return;
+   }
    ident_t id = tree_ident(tg);
-   r2_target_t *n = r2_target(ts, id);
-   if (n == NULL) {
-      if (ts->n >= R2_MAX_TARGETS) {
-         ts->capped = true;
-         return;
-      }
-      n = &ts->t[ts->n++];
-      n->name = id;
-      snprintf(n->spec, sizeof n->spec, "%s", vid(id));
-      snprintf(n->g0, sizeof n->g0, "g0p%d_%s", ts->pidx, vid(id));
-      type_t ty = tree_type(tree_ref(tg));
-      n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
-      n->whole = false;
-      n->slo = 1 << 30;
-      n->shi = -1;
-   }
-   // the written range: a constant slice / element (plain or nested) is a
-   // sub-range; a whole or dynamic write covers everything
-   tree_t tg0 = tree_target(t), root;
-   int64_t off, w;
-   if (tg0 == tg)
-      n->whole = true;
-   else if (r2_sel_range(tg0, &root, &off, &w) && w >= 1) {
-      if (off < n->slo) n->slo = (int)off;
-      if (off + w - 1 > n->shi) n->shi = (int)(off + w - 1);
-   }
-   else
-      n->whole = true;
+   if (r2_target(ts, id) != NULL)
+      return;
+   r2_target_t *n = &ts->t[ts->n++];
+   n->name = id;
+   snprintf(n->spec, sizeof n->spec, "%s", vid(id));
+   snprintf(n->g0, sizeof n->g0, "g0p%d_%s", ts->pidx, vid(id));
+   type_t ty = tree_type(tree_ref(tg));
+   n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
 }
 
 static bool r2_seq(tree_t list_of, r2_targets_t *ts);
-
-// Whole write `v := e` to a process variable INSIDE a switch arm.  The
-// value becomes an arm-scoped flat substitution (reads later in the arm
-// see it — read_verilog's subst_rvalue_map) and the promoted variable's
-// hold temp takes it as a case action, so a read AFTER the tree sees the
-// merged (mux) value.  A clocked process with no value-so-far gets the
-// substitution only (its promotion would be a register, not a temp).
-static bool r2_var_write_in_arm(tree_t s, r2_targets_t *ts, tree_t vdecl)
-{
-   const ident_t id = tree_ident(vdecl);
-   tree_t val = tree_value(s);
-   r2_pvar_t *pe = r2_pvar_of(ts, id);
-   if (pe == NULL) {
-      pe = r2_pvar_promote(ts, vdecl);
-      if (pe == NULL && ts->comb) {
-         R2_DECLINE("var-promote");
-         return false;
-      }
-   }
-   int64_t cv;
-   char vs[R2_SPEC];
-   const bool isint = r2_eval_int(val, &cv);
-   g_r2_site = "pvar-assign";
-   if (getenv("NVC_RTLIL_DEBUG") != NULL)
-      fprintf(stderr, "r2 arm write %s: val kind %d isint %d cv %lld\n",
-              istr(id), (int)tree_kind(val), isint, (long long)cv);
-   if (pe != NULL) {
-      if (!r2_const(val, vs, sizeof vs, pe->width)
-          && !r2_expr(val, vs, sizeof vs))
-         return false;
-      if (g_r2->case_assign(pe->g0, vs) != 0) {
-         R2_DECLINE("api-case-assign");
-         return false;
-      }
-   }
-   else if (!isint && !r2_expr(val, vs, sizeof vs))
-      return false;
-   const bool ok = isint ? r2_subst_set_int(id, cv)
-      : r2_subst_set_wt(id, vs, r2_width_or_operands(val), val);
-   if (!ok) {
-      R2_DECLINE("subst-count");
-      return false;
-   }
-   return true;
-}
-
-// Slice / element write `v(hi downto lo) := e` to a process variable
-// inside a switch arm: the variable is promoted (hold temp rooted at its
-// value so far) and the action lands on the hold temp's slice — the
-// signal-slice lowering.  The flat substitution is dropped afterwards: the
-// variable is no longer one expression (a read after the tree takes the
-// hold temp; one inside the tree declines).
-static bool r2_var_slice_write_in_arm(tree_t s, r2_targets_t *ts, tree_t tg)
-{
-   tree_t base = tree_value(tg);
-   tree_t vdecl = tree_ref(base);
-   const ident_t id = tree_ident(base);
-   int64_t hi, lo;
-   if (tree_kind(tg) == T_ARRAY_SLICE) {
-      tree_t r = tree_range(tg, 0);
-      int64_t l, rr;
-      if ((!folded_int(tree_left(r), &l) && !r2_eval_int(tree_left(r), &l))
-          || (!folded_int(tree_right(r), &rr)
-              && !r2_eval_int(tree_right(r), &rr))
-          || l < 0 || rr < 0) {
-         R2_DECLINE("var-slice-bounds");
-         return false;
-      }
-      hi = l > rr ? l : rr;
-      lo = l > rr ? rr : l;
-   }
-   else {
-      int64_t idx;
-      if (tree_params(tg) != 1
-          || (!folded_int(tree_value(tree_param(tg, 0)), &idx)
-              && !r2_eval_int(tree_value(tree_param(tg, 0)), &idx))
-          || idx < 0) {
-         R2_DECLINE("var-elem-dyn");
-         return false;
-      }
-      hi = lo = idx;
-   }
-   r2_pvar_t *pe = r2_pvar_of(ts, id);
-   if (pe == NULL && (pe = r2_pvar_promote(ts, vdecl)) == NULL) {
-      R2_DECLINE("var-promote");
-      return false;
-   }
-   if (hi >= pe->width) {
-      R2_DECLINE("var-slice-range");
-      return false;
-   }
-   const int vw = (int)(hi - lo + 1);
-   char lhs[96], v[R2_SPEC];
-   g_r2_site = "pvar-slice";
-   tree_t val = tree_value(s);
-   if (!r2_const(val, v, sizeof v, vw) && !r2_expr(val, v, sizeof v))
-      return false;
-   // AFTER the value (`v(a) := v(b)` reads first).  The written bits then
-   // update the per-bit substitution so later reads in this arm see the
-   // value so far (the FPU fflags merge `v(k) := v(k) or lane(k)`)
-   snprintf(lhs, sizeof lhs, "%s[%lld:%lld]", pe->g0, (long long)hi,
-            (long long)lo);
-   const int rw = r2_width_or_operands(val);
-   if (rw > vw) {
-      // the value renders wider than the slice (unconstrained operator
-      // chain): land it and take the low bits
-      char ct[64];
-      if (!r2_temp(rw, ct, sizeof ct) || g_r2->connect(ct, v) != 0) {
-         R2_DECLINE("coerce");
-         return false;
-      }
-      if (vw == 1)
-         snprintf(v, sizeof v, "%s[0]", ct);
-      else
-         snprintf(v, sizeof v, "%s[%d:0]", ct, vw - 1);
-   }
-   r2_subst_bits_write(id, (int)lo, (int)hi, v, vw, pe->width);
-   if (getenv("NVC_RTLIL_DEBUG") != NULL)
-      fprintf(stderr, "r2 slice write: %s <= %s (tree %d depth %d)\n", lhs, v,
-              g_r2_tree_seq, g_r2_case_depth);
-   if (g_r2->case_assign(lhs, v) != 0) {
-      R2_DECLINE("api-case-assign");
-      return false;
-   }
-   return true;
-}
 
 // tgt-vhdl's OOB_WriteV idiom — the dynamic part-select write
 // `t[i*W +: W] = v` rendered as
@@ -6681,10 +6526,6 @@ static bool r2_oob_for(tree_t s, r2_targets_t *ts, bool *handled)
    bool sgn;
    r2_index_shape(A, &stride, &sgn);
    g_r2_site = "oob-idx";
-   if (t->slo != 0) {
-      R2_DECLINE("oob-sliced-target");
-      return false;
-   }
    return r2_index_switch(A, t->g0, t->width, W, st, stride, sgn);
 }
 
@@ -6715,7 +6556,6 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                 && tree_kind(tree_value(tg)) == T_REF
                 && tree_has_ref(tree_value(tg))
                 && tree_kind(tree_ref(tree_value(tg))) == T_VAR_DECL
-                && g_r2_case_depth == 0
                 && r2_pvar_of(ts, tree_ident(tree_value(tg))) == NULL
                 && r2_mem_of(tree_ident(tree_value(tg))) == NULL) {
                // per-bit / per-slice build of a straight-line local vector
@@ -6744,54 +6584,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      brange = true;
                   }
                }
-               if (bw >= 1 && bw <= 128 && brange
+               if (bw >= 1 && bw <= 4000 && brange
                    && blo >= 0 && bhi < bw) {
-                  const int sw = (int)(bhi - blo + 1);
+                  // VERSIONED partial write (any depth): a fresh wire takes
+                  // $mux(pathcond, composed, prev-version)
                   char bs[R2_SPEC];
-                  int64_t bcv;
                   ident_t bvi = tree_ident(tree_value(tg));
-                  if (r2_eval_int(tree_value(s), &bcv)) {
-                     bool bok = true;
-                     for (int k = 0; bok && k < sw; k++) {
-                        char b1[8];
-                        snprintf(b1, sizeof b1, "1'd%d",
-                                 (int)((bcv >> k) & 1));
-                        bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
-                     }
-                     if (!bok) {
-                        R2_DECLINE("bit-build");
-                        return false;
-                     }
-                     return true;
-                  }
-                  if (!r2_expr(tree_value(s), bs, sizeof bs))
+                  g_r2_site = "var-part";
+                  if (!r2_const(tree_value(s), bs, sizeof bs,
+                                (int)(bhi - blo + 1))
+                      && !r2_expr(tree_value(s), bs, sizeof bs))
                      return false;
-                  if (sw == 1) {
-                     if (!r2_subst_set_bit(bvi, (int)blo, bs, bw)) {
-                        R2_DECLINE("bit-build");
-                        return false;
-                     }
-                     return true;
-                  }
-                  // multi-bit slice: land the value on a temp and seed
-                  // each covered bit as an index into it
-                  char t[64];
-                  if (!r2_temp(sw, t, sizeof t)
-                      || g_r2->connect(t, bs) != 0) {
-                     R2_DECLINE("bit-build-temp");
-                     return false;
-                  }
-                  bool bok = true;
-                  for (int k = 0; bok && k < sw; k++) {
-                     char b1[80];
-                     snprintf(b1, sizeof b1, "%s[%d]", t, k);
-                     bok = r2_subst_set_bit(bvi, (int)blo + k, b1, bw);
-                  }
-                  if (!bok) {
-                     R2_DECLINE("bit-build");
-                     return false;
-                  }
-                  return true;
+                  return r2_var_write(bvi, bw, bs, false, (int)bhi,
+                                      (int)blo);
                }
                {
                   char why[64];
@@ -6821,40 +6626,50 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   g_r2_site = "var-subst";
                   if (!r2_expr(tree_value(s), vs, sizeof vs))
                      return false;
-                  if (!r2_subst_set_wt(tree_ident(tg), vs,
-                                       r2_width_or_operands(tree_value(s)),
-                                       tree_value(s))) {
+                  if (!r2_subst_set(tree_ident(tg), vs)) {
                      R2_DECLINE("subst-count");
                      return false;
                   }
                   return true;
                }
-               // whole write inside a switch arm: arm-scoped substitution
-               // plus the promoted hold temp (r2_var_write_in_arm)
+               // branch-written variable WITH a current value: VERSION it
+               // (feed-forward mux, correct read-after-write)
+               if (tree_kind(tg) == T_REF && tree_has_ref(tg)
+                   && tree_kind(tree_ref(tg)) == T_VAR_DECL
+                   && g_r2_case_depth > 0) {
+                  r2_subst_t *sv = r2_subst_of(tree_ident(tg));
+                  type_t vt2 = tree_type(tree_ref(tg));
+                  const int vw2 = type_const_bounds(vt2)
+                     ? (int)type_width(vt2) : -1;
+                  if (sv != NULL && sv->spec != NULL
+                      && vw2 >= 1 && vw2 <= 4000) {
+                     char vs2[R2_SPEC];
+                     g_r2_site = "var-vers";
+                     if (!r2_const(tree_value(s), vs2, sizeof vs2, vw2)
+                         && !r2_expr(tree_value(s), vs2, sizeof vs2))
+                        return false;
+                     return r2_var_write(tree_ident(tg), vw2, vs2, true,
+                                         0, 0);
+                  }
+               }
+               // branch-written variable with NO prior value: LATCH state
+               // (VHDL process vars persist across activations) — promote
+               // to a pv/hold pair
                if (tree_kind(tg) == T_REF && tree_has_ref(tg)
                    && tree_kind(tree_ref(tg)) == T_VAR_DECL) {
-                  if (g_r2_case_depth == 0) {
-                     // a whole write AFTER the tree to a promoted variable:
-                     // root actions run before every switch, so the hold
-                     // temp cannot take it in order
-                     R2_DECLINE("pvar-late-write");
+                  r2_pvar_t *pe = r2_pvar_promote(ts, tree_ref(tg));
+                  if (pe == NULL) {
+                     R2_DECLINE("var-promote");
                      return false;
                   }
-                  return r2_var_write_in_arm(s, ts, tree_ref(tg));
-               }
-               // slice / element write inside an arm (or to a promoted
-               // variable): a case action on the hold temp's slice
-               if ((tree_kind(tg) == T_ARRAY_REF
-                    || tree_kind(tg) == T_ARRAY_SLICE)
-                   && tree_kind(tree_value(tg)) == T_REF
-                   && tree_has_ref(tree_value(tg))
-                   && tree_kind(tree_ref(tree_value(tg))) == T_VAR_DECL
-                   && r2_mem_of(tree_ident(tree_value(tg))) == NULL) {
-                  if (g_r2_case_depth == 0) {
-                     R2_DECLINE("pvar-late-write");
+                  char vs[R2_SPEC];
+                  g_r2_site = "pvar-assign";
+                  pe->wrote = true;
+                  tree_t pval = tree_value(s);
+                  if (!r2_const(pval, vs, sizeof vs, pe->width)
+                      && !r2_expr(pval, vs, sizeof vs))
                      return false;
-                  }
-                  return r2_var_slice_write_in_arm(s, ts, tg);
+                  return g_r2->case_assign(pe->g0, vs) == 0;
                }
                {
                   char why[48];
@@ -6959,7 +6774,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          int64_t hi = -1, lo = -1;
          if (r2_sel_nested(tg)) {
             // element / nested select of an array-of-vector wire: the
-            // flat bit range of the root signal
+            // flat bit range of the root signal (r17 wire arrays)
             tree_t root;
             int64_t off, w;
             if (!r2_sel_range(tg, &root, &off, &w)) {
@@ -6995,14 +6810,9 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                tg = tree_value(tg);
             }
             else if (tree_params(tg) == 1) {
-               // DYNAMIC single-bit write `t(i) <= b`: a switch on the
-               // index with a constant single-bit case action per reachable
-               // position (r2_index_switch).  Case actions on the hold temp
-               // compose in statement order, so several dynamic writes to
-               // one target (the LSU byte-enable decode, VX_allocator's
-               // free-slot set/clear) need no value-so-far read — the
-               // former masked compose read the signal's PRE value and had
-               // to decline a second write (`dyn-multi`).
+               // DYNAMIC single-bit write: lower to a masked whole-target
+               // compose — g0 = (g0 & ~(1<<i)) | (bit<<i) — ordinary cells,
+               // so the assignment threads decision trees like any other
                tree_t tb = tree_value(tg);
                ident_t bi = (tree_kind(tb) == T_REF && tree_has_ref(tb))
                   ? tree_ident(tb) : NULL;
@@ -7014,11 +6824,27 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   }
                }
                r2_target_t *t = bi != NULL ? r2_target(ts, bi) : NULL;
-               if (t == NULL || t->width <= 0 || t->width > 1024
-                   || t->slo != 0) {
+               if (t == NULL || t->width <= 0 || t->width > 4000) {
                   R2_DECLINE("dyn-target");
                   return false;
                }
+               // the compose reads the PRE-activation value (the signal):
+               // a second dynamic write to the same target would clobber
+               // the first — decline (the NBA sites are single-write)
+               for (int dw = 0; dw < ts->ndynwr; dw++)
+                  if (ts->dynwr[dw] == t->name) {
+                     R2_DECLINE("dyn-multi");
+                     return false;
+                  }
+               if (ts->ndynwr >= 16) {
+                  R2_DECLINE("dyn-count");
+                  return false;
+               }
+               ts->dynwr[ts->ndynwr++] = t->name;
+               char is[R2_SPEC];
+               g_r2_site = "dyn-idx";
+               if (!r2_expr(tree_value(tree_param(tg, 0)), is, sizeof is))
+                  return false;
                tree_t dval;
                if (tree_kind(s) == T_SIGNAL_ASSIGN) {
                   if (tree_waveforms(s) < 1
@@ -7035,12 +6861,38 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                if (!r2_const(dval, vs, sizeof vs, 1)
                    && !r2_expr(dval, vs, sizeof vs))
                   return false;
-               tree_t ie = tree_value(tree_param(tg, 0));
-               int stride;
-               bool sgn;
-               r2_index_shape(ie, &stride, &sgn);
-               g_r2_site = "dyn-idx";
-               return r2_index_switch(ie, t->g0, t->width, 1, vs, 1, sgn);
+               const int w = t->width;
+               char one[64], m1[R2_SPEC], m2[R2_SPEC], m3[R2_SPEC],
+                  m4[R2_SPEC], m5[R2_SPEC], cn[R2_SPEC + 8];
+               snprintf(one, sizeof one, "%d'd1", w);
+               // m1 = 1 << idx
+               if (!r2_temp(w, m1, sizeof m1)) return false;
+               snprintf(cn, sizeof cn, "c%s", m1);
+               if (g_r2->cell_bin("shl", cn, one, is, m1, 0) != 0)
+                  return false;
+               // m2 = ~m1
+               if (!r2_temp(w, m2, sizeof m2)) return false;
+               snprintf(cn, sizeof cn, "c%s", m2);
+               if (g_r2->cell_un("not", cn, m1, m2, 0) != 0)
+                  return false;
+               // m3 = <pre-value> & m2 — the SIGNAL, not g0: reading the
+               // post-mux g0 wire from module-level cells would be a
+               // combinational loop
+               if (!r2_temp(w, m3, sizeof m3)) return false;
+               snprintf(cn, sizeof cn, "c%s", m3);
+               if (g_r2->cell_bin("and", cn, t->spec, m2, m3, 0) != 0)
+                  return false;
+               // m4 = value << idx  (value zero-extends to width w)
+               if (!r2_temp(w, m4, sizeof m4)) return false;
+               snprintf(cn, sizeof cn, "c%s", m4);
+               if (g_r2->cell_bin("shl", cn, vs, is, m4, 0) != 0)
+                  return false;
+               // m5 = m3 | m4
+               if (!r2_temp(w, m5, sizeof m5)) return false;
+               snprintf(cn, sizeof cn, "c%s", m5);
+               if (g_r2->cell_bin("or", cn, m3, m4, m5, 0) != 0)
+                  return false;
+               return g_r2->case_assign(t->g0, m5) == 0;
             }
             else {
                R2_DECLINE("target-index");
@@ -7065,9 +6917,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          char lhs[96];
          int vw = t->width;
          if (hi >= 0) {
-            hi -= t->slo;   // a sliced comb target: within its own range
-            lo -= t->slo;
-            if (lo < 0 || hi >= t->width) {
+            if (hi >= t->width) {
                R2_DECLINE("target-range");
                return false;
             }
@@ -7156,28 +7006,24 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                char cs[R2_SPEC];
                g_r2_site = "if-cond";
                if (!r2_cond(tree_value(c), cs, sizeof cs)) { ok = false; break; }
-               if (g_r2_case_depth == 0 && !r2_tree_begin(ts)) {
-                  R2_DECLINE("tree-begin");
-                  ok = false;
-                  break;
-               }
                if (g_r2->switch_begin(cs) != 0
                    || g_r2->case_begin("1'b1") != 0) { ok = false; break; }
                g_r2_case_depth++;
-               if (g_r2_case_depth == 1 && !r2_arm_defaults(ts)) {
-                  R2_DECLINE("arm-defaults");
-                  ok = false;
-                  break;
-               }
+               if (!r2_cond_push(cs)) { ok = false; break; }
                ok = r2_seq(c, ts);
                r2_subst_poison_from(g_r2_case_depth);   // arm scope ends
                if (!ok) break;
                if (g_r2->case_end() != 0
                    || g_r2->case_begin(NULL) != 0) { ok = false; break; }
-               if (g_r2_case_depth == 1 && !r2_arm_defaults(ts)) {
-                  R2_DECLINE("arm-defaults");
-                  ok = false;
-                  break;
+               // entering the default arm: path condition flips to !cs
+               // (subsequent elsifs nest inside this default)
+               r2_cond_pop();
+               {
+                  char nt[64], ncn[80];
+                  if (!r2_temp(1, nt, sizeof nt)) { ok = false; break; }
+                  snprintf(ncn, sizeof ncn, "c%s", nt);
+                  if (g_r2->cell_un("not", ncn, cs, nt, 0) != 0
+                      || !r2_cond_push(nt)) { ok = false; break; }
                }
                depth++;
             }
@@ -7195,6 +7041,7 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             if (g_r2->case_end() != 0 || g_r2->switch_end() != 0)
                ok = false;
             g_r2_case_depth--;
+            r2_cond_pop();
          }
          return ok && (g_r2_fail == 0 || g_r2_census);
       }
@@ -7307,14 +7154,11 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
          if (!r2_expr(cv, sw, sizeof sw))
             return false;
          const int cw = r2_width(cv);
-         if (g_r2_case_depth == 0 && !r2_tree_begin(ts)) {
-            R2_DECLINE("tree-begin");
-            return false;
-         }
          if (g_r2->switch_begin(sw) != 0)
             return false;
          const int nalt = tree_stmts(s);
-         bool ok = true, had_default = false;
+         char anyprev[96] = "1'b0";   // OR of previous arms' conditions
+         bool ok = true;
          for (int i = 0; i < nalt && ok; i++) {
             tree_t alt = tree_stmt(s, i);
             const int nch = tree_choices(alt);
@@ -7354,32 +7198,64 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             // default from the builder's perspective (matches text path's
             // "<v>, default:")
             const char *cc = (others || cl == 0) ? NULL : cmp;
-            if (cc == NULL)
-               had_default = true;
             if (g_r2->case_begin(cc) != 0) { ok = false; break; }
             g_r2_case_depth++;
-            if (g_r2_case_depth == 1 && !r2_arm_defaults(ts)) {
-               R2_DECLINE("arm-defaults");
-               ok = false;
+            // path condition for this arm: OR of eq(sw, choice) — the
+            // default arm is NOT(any previous arm's condition)
+            {
+               char armc[96];
+               if (cc == NULL) {
+                  char nt[64], ncn[80];
+                  if (!r2_temp(1, nt, sizeof nt)) { ok = false; }
+                  else {
+                     snprintf(ncn, sizeof ncn, "c%s", nt);
+                     if (g_r2->cell_un("not", ncn, anyprev, nt, 0) != 0)
+                        ok = false;
+                     else
+                        snprintf(armc, sizeof armc, "%s", nt);
+                  }
+               }
+               else {
+                  armc[0] = '\0';
+                  char one2[R2_SPEC];
+                  snprintf(one2, sizeof one2, "%s", cmp);
+                  for (char *tk = strtok(one2, ";"); ok && tk != NULL;
+                       tk = strtok(NULL, ";")) {
+                     char eqw[64], eqn[80];
+                     if (!r2_temp(1, eqw, sizeof eqw)) { ok = false; break; }
+                     snprintf(eqn, sizeof eqn, "c%s", eqw);
+                     if (g_r2->cell_bin("eq", eqn, sw, tk, eqw, 0) != 0) {
+                        ok = false;
+                        break;
+                     }
+                     if (armc[0] == '\0')
+                        snprintf(armc, sizeof armc, "%s", eqw);
+                     else {
+                        char orw[64], orn[80];
+                        if (!r2_temp(1, orw, sizeof orw)) { ok = false; break; }
+                        snprintf(orn, sizeof orn, "c%s", orw);
+                        if (g_r2->cell_bin("or", orn, armc, eqw, orw, 0)
+                            != 0) { ok = false; break; }
+                        snprintf(armc, sizeof armc, "%s", orw);
+                     }
+                  }
+                  if (ok) {
+                     // fold into the running any-previous-arm condition
+                     char orw[64], orn[80];
+                     if (!r2_temp(1, orw, sizeof orw)) ok = false;
+                     else {
+                        snprintf(orn, sizeof orn, "c%s", orw);
+                        if (g_r2->cell_bin("or", orn, anyprev, armc, orw, 0)
+                            != 0) ok = false;
+                        else snprintf(anyprev, sizeof anyprev, "%s", orw);
+                     }
+                  }
+               }
+               if (ok && !r2_cond_push(armc)) ok = false;
             }
             if (ok)
                ok = r2_seq(alt, ts);
-            r2_subst_poison_from(g_r2_case_depth);   // arm scope ends
-            g_r2_case_depth--;
-            if (g_r2->case_end() != 0)
-               ok = false;
-         }
-         if (ok && !had_default && g_r2_case_depth == 0
-             && r2_tree_has_rerooted(ts)) {
-            // no `others`: the re-rooted temps still need their default
-            if (g_r2->case_begin(NULL) != 0)
-               ok = false;
-            g_r2_case_depth++;
-            if (ok && !r2_arm_defaults(ts)) {
-               R2_DECLINE("arm-defaults");
-               ok = false;
-            }
-            r2_subst_poison_from(g_r2_case_depth);
+            r2_cond_pop();
             g_r2_case_depth--;
             if (g_r2->case_end() != 0)
                ok = false;
@@ -7586,27 +7462,11 @@ static bool r2_process(tree_t p0, int pidx)
       g_r2_case_depth = 0;
       r2_targets_t cts = { .n = 0, .comb = true, .t = g_r2_tgt,
                            .pidx = pidx };
-      g_r2_ts = &cts;
+      g_r2_pvts = &cts;
       tree_visit(p, r2_collect_cb, &cts);
       if (cts.n == 0) {
          R2_DECLINE("comb-empty");
          return false;
-      }
-      for (int i = 0; i < cts.n; i++) {
-         // a process that writes only a constant sub-range drives exactly
-         // that range: hold temp and commit cover [shi:slo], so sibling
-         // processes driving the other bits of the wire (one tree node
-         // each in VX_find_first) never contend for the whole of it
-         r2_target_t *tt = &cts.t[i];
-         if (!tt->whole && tt->width > 0 && tt->shi >= tt->slo
-             && tt->shi < tt->width
-             && (tt->slo > 0 || tt->shi < tt->width - 1)) {
-            snprintf(tt->spec, sizeof tt->spec, "%s[%d:%d]", vid(tt->name),
-                     tt->shi, tt->slo);
-            tt->width = tt->shi - tt->slo + 1;
-         }
-         else
-            tt->slo = 0;
       }
       char cpn[64];
       snprintf(cpn, sizeof cpn, "p%d", pidx);
@@ -7631,9 +7491,15 @@ static bool r2_process(tree_t p0, int pidx)
       for (int i = 0; cok && i < cts.n; i++)
          cok = g_r2->sync_assign(cts.t[i].spec, cts.t[i].g0) == 0;
       for (int i = 0; cok && i < cts.npv; i++)
-         if (cts.pv[i].persistent)   // latch state: commit the hold value
-            cok = g_r2->sync_assign(cts.pv[i].pv, cts.pv[i].g0) == 0;
-      return cok && (g_r2_fail == 0 || g_r2_census);
+         if (cts.pv[i].persistent) {   // latch state: commit the hold value
+            // versioned flow: the current subst spec IS the final value;
+            // the g0 hold covers the pre-versioning branch-tree flow
+            r2_subst_t *sbp = r2_subst_of(cts.pv[i].var);
+            const char *src = (sbp != NULL && sbp->spec != NULL)
+               ? sbp->spec : cts.pv[i].g0;
+            cok = g_r2->sync_assign(cts.pv[i].pv, src) == 0;
+         }
+      return cok && g_r2_fail == 0;
    }
    // (rcond/rsig are derived below from ifstmt; the sensitivity may carry
    //  the async reset as a SECOND edge — resolved after areset_of runs)
@@ -7764,10 +7630,8 @@ static bool r2_process(tree_t p0, int pidx)
    }
 
    r2_targets_t ts = { .n = 0, .t = g_r2_tgt, .pidx = pidx };
-   g_r2_ts = &ts;
+   g_r2_pvts = &ts;
    tree_visit(p, r2_collect_cb, &ts);
-   for (int i = 0; i < ts.n; i++)
-      ts.t[i].slo = 0;   // registers hold whole (the root is Q)
    // aliased signals are targets even when the body writes only the shadow
    for (int i = 0; i < g_r2_nalias; i++) {
       if (r2_target(&ts, g_r2_alias[i].sig) != NULL
@@ -7776,8 +7640,6 @@ static bool r2_process(tree_t p0, int pidx)
       if (ts.n >= 64) { R2_DECLINE("targets"); return false; }
       r2_target_t *n = &ts.t[ts.n++];
       n->name = g_r2_alias[i].sig;
-      n->slo = 0;
-      n->whole = true;
       snprintf(n->spec, sizeof n->spec, "%s", vid(n->name));
       snprintf(n->g0, sizeof n->g0, "g0_%s", vid(n->name));
       type_t ty = tree_type(g_r2_alias[i].sigdecl);
@@ -7882,6 +7744,15 @@ static bool r2_process(tree_t p0, int pidx)
                && g_r2->sync(pe[e] ? "posedge" : "negedge", es) == 0;
             for (int i = 0; ok && i < ts.n; i++)
                ok = g_r2->sync_assign(ts.t[i].spec, ts.t[i].g0) == 0;
+            // promoted register-vars (read-before-write locals in clocked
+            // processes): commit the pv wire from the final version
+            for (int i = 0; ok && i < ts.npv; i++)
+               if (ts.pv[i].persistent) {
+                  r2_subst_t *sbp = r2_subst_of(ts.pv[i].var);
+                  const char *src = (sbp != NULL && sbp->spec != NULL)
+                     ? sbp->spec : ts.pv[i].g0;
+                  ok = g_r2->sync_assign(ts.pv[i].pv, src) == 0;
+               }
             if (ok && e == e0)
                ok = r2_flush_memwr(&ts);
          }
@@ -8203,7 +8074,7 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       tree_t s = tree_stmt(block, i);
       g_r2_cur = s;
       g_r2_site = "?";
-      g_r2_ts = NULL;   // no process scope for concurrent expressions
+      g_r2_pvts = NULL;   // no process scope for concurrent expressions
       switch (tree_kind(s)) {
       case T_SIGNAL_ASSIGN:
          {
