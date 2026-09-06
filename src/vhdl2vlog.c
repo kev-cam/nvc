@@ -1575,6 +1575,32 @@ static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
    return 0;
 }
 
+// A `wait until <edge>` (T_WAIT with an edge until-condition) is a CLOCK that
+// clock_of does not recognise (it only scans `if rising_edge`).  Emitted on the
+// comb path the flop loses its clock (`q <= b` becomes `assign q = b`, one cycle
+// lost); a pure such flop is caught by gen_statemachine's comb-only net and stays
+// in interp, but a module that ALSO has a real `if rising_edge` register passes
+// that net and installs SILENTLY WRONG.  No wait-until flop is currently
+// accelerated correctly, so decline any process that contains one rather than
+// drop its clock.  (A plain process sensitivity `wait on clk` has no
+// until-value and is not detected.)
+static void wait_edge_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found || tree_kind(t) != T_WAIT || !tree_has_value(t))
+      return;
+   tree_t sig[8]; bool pe[8];
+   if (edges_of(tree_value(t), sig, pe, 8) > 0)
+      *found = true;
+}
+
+static bool proc_has_wait_edge(tree_t p)
+{
+   bool found = false;
+   tree_visit(p, wait_edge_cb, &found);
+   return found;
+}
+
 // detect a clocked process: a wrapping `if rising_edge(clk) [or falling_edge(rst)]`.
 // Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list
 // and (if given) the enclosing T_IF so the caller can find an async-reset elsif.
@@ -2024,6 +2050,11 @@ static tree_t proc_body(tree_t p)
 static void emit_process(FILE *f, tree_t p0)
 {
    tree_t p = proc_body(p0);   // unwrap the process-sensitivity loop
+   if (proc_has_wait_edge(p)) {
+      // a `wait until <edge>` clock the comb path would silently drop
+      DECLINE("wait-edge-flop");
+      return;
+   }
    tree_t body_if = NULL, sig[8], ifstmt = NULL;
    bool pe[8];
    int ne = 0;
@@ -3381,13 +3412,16 @@ static const char *r2_pvar_read_pv(ident_t id);
 // value, prev-version) into a fresh wire — pure feed-forward SSA, no
 // proc-action ordering involved, so read-after-write and dynamic
 // part-writes to locals are all legal.
-static char g_r2_conds[24][96];
+#define R2_MAX_CONDS 64   // open path conditions: nesting depth + if/elsif arms
+static char g_r2_conds[R2_MAX_CONDS][96];
 static int  g_r2_nconds;
 
 static bool r2_cond_push(const char *cs)
 {
-   if (g_r2_nconds >= 24 || strlen(cs) >= sizeof g_r2_conds[0])
+   if (g_r2_nconds >= R2_MAX_CONDS || strlen(cs) >= sizeof g_r2_conds[0]) {
+      R2_DECLINE("cond-stack");   // attributable instead of a silent ok=false
       return false;
+   }
    snprintf(g_r2_conds[g_r2_nconds++], sizeof g_r2_conds[0], "%s", cs);
    return true;
 }
@@ -4579,7 +4613,12 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
          snprintf(lit, sizeof lit, "%d'd%lld", w, (long long)mival);
          msrc = lit;
       }
-      else if (r2_spec_width(e->spec) != w) {
+      else if (!whole && r2_spec_width(e->spec) != w) {
+         // a PARTIAL write slices the base e->spec[hi:lo], which needs a
+         // statically-sized bare wire; a WHOLE write only feeds e->spec as the
+         // mux else-input, and the builder sizes a {concat} itself at connect
+         // (a genuine mismatch then fails cleanly at var-version-mat) -- so let
+         // a whole write of a concat/composite prev fall through to materialize
          char why[96];
          snprintf(why, sizeof why, "var-version-spec w%d '%.24s'",
                   w, e->spec);
@@ -5764,17 +5803,70 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
              && vlog_op(fn) == NULL && np == 1 && r2_user_func(fn) == NULL)
             return r2_expr(tree_value(tree_param(e, 0)), out, sz);
 
-         // to_unsigned(<const>, <width>) -> sized literal
-         if (np == 2 && (strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned"))) {
-            int64_t v, w;
-            if (folded_int(tree_value(tree_param(e, 0)), &v)
-                && folded_int(tree_value(tree_param(e, 1)), &w)
-                && w > 0 && v >= 0) {
-               snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+         // to_unsigned/to_signed(<value>, <width>): a sized literal when the
+         // value folds; otherwise render the RUNTIME operand and resize on the
+         // value plane (to_unsigned zero-extends, to_signed sign-extends) --
+         // mirrors l3d_resize_s below.  The common counter->vector cast.
+         {
+            const bool is_tu = strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned");
+            const bool is_ts = strstr(fn, "TO_SIGNED")   || strstr(fn, "to_signed");
+            if (np == 2 && (is_tu || is_ts)) {
+               int64_t v, w;
+               if (folded_int(tree_value(tree_param(e, 0)), &v)
+                   && folded_int(tree_value(tree_param(e, 1)), &w)
+                   && w >= 1 && (is_ts || v >= 0)) {
+                  if (w <= 63) {
+                     const uint64_t m = (w == 63) ? (~0ULL >> 1) : ((1ULL << w) - 1);
+                     snprintf(out, sz, "%lld'd%llu", (long long)w,
+                              (unsigned long long)((uint64_t)v & m));
+                     return true;
+                  }
+                  if (v >= 0) {   // fits in 63 bits -> no truncation at width > 63
+                     snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+                     return true;
+                  }
+                  // negative into a >63-bit to_signed: two's complement beyond
+                  // int64 -- fall through to the runtime path (declines widen)
+               }
+               int64_t nw;
+               tree_t ea = tree_value(tree_param(e, 0));
+               if (!folded_int(tree_value(tree_param(e, 1)), &nw)
+                   && !r2_eval_int(tree_value(tree_param(e, 1)), &nw)) {
+                  R2_DECLINE("to_uns-width");
+                  return false;
+               }
+               char a[R2_SPEC];
+               if (!r2_expr(ea, a, sizeof a))
+                  return false;
+               const int aw = r2_rendered_width(ea);
+               if (aw <= 0 || nw <= 0 || nw > 4000) {
+                  R2_DECLINE("to_uns-operand");
+                  return false;
+               }
+               if (nw == aw) { snprintf(out, sz, "%s", a); return true; }
+               char y[R2_SPEC];
+               if (nw > aw) {
+                  // WIDENING needs the operand's TRUE width, but an integer
+                  // operand renders SELF-DETERMINED (e.g. to_integer(signed(a))
+                  // - 200 renders at 8 bits, not 32), so sign/zero-extending
+                  // from the rendered MSB is WRONG (silently wrong high bits).
+                  // Narrowing/equal below only take low bits that survive the
+                  // truncation, so they stay correct; decline the widen.
+                  R2_DECLINE("to_uns-widen");
+                  return false;
+               }
+               // narrowing: land and take the low nw bits (correct even when the
+               // aw-bit render already truncated -- low bits are preserved)
+               if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                  R2_DECLINE("to_uns-land");
+                  return false;
+               }
+               if (nw == 1)
+                  snprintf(out, sz, "%s[0]", y);
+               else
+                  snprintf(out, sz, "%s[%lld:0]", y, (long long)(nw - 1));
                return true;
             }
-            R2_DECLINE("to_unsigned");
-            return false;
          }
 
          // l3d vocabulary — the text path's own table (kind 0 binary,
@@ -7524,6 +7616,11 @@ static bool r2_process(tree_t p0, int pidx)
    }
    bool pe[8];
    int ne = 0;
+   if (proc_has_wait_edge(p)) {
+      // a `wait until <edge>` clock the comb path would silently drop
+      R2_DECLINE("wait-edge-flop");
+      return false;
+   }
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    (void)clk;
 
