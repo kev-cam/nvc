@@ -5162,6 +5162,107 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
    return ok;
 }
 
+// Serve a CONSTANT-index element read of a process-local variable from its
+// live SSA substitution version — the same source a whole-variable read
+// consults.  The !have_idx block in r2_expr_1's T_ARRAY_REF case already does
+// this for loop-substituted indices; this is the folded-constant counterpart,
+// so `v(1)` AFTER a write to `v` resolves instead of declining "var-elem".
+// Returns true and fills `out` when served.  Returns false with *hard=false
+// when the variable has NO live version (genuine read-before-write: the caller
+// MUST fall through to the promote-on-read latch path).  Returns false with
+// *hard=true after a DECLINE that must NOT fall through: a fall-through would
+// call r2_pvar_read_or_promote, whose ts->npv++ side effect creates a spurious
+// pvar that then poisons the NEXT statement's per-bit write gate (the
+// var-assign@var-part cascade).  Raw idx is the bit index, correct only for a
+// downto range and a 1-bit value-plane element (both hold for std_logic_vector
+// and logic3d_vector under --accel); anything else declines rather than risk a
+// silent wrong bit.
+static bool r2_subst_elem_read(tree_t base, int64_t idx,
+                               char *out, size_t sz, bool *hard)
+{
+   *hard = false;
+   if (!tree_has_ref(base))
+      return false;
+   r2_subst_t *sb = r2_subst_of(tree_ident(base));
+   if (sb == NULL)
+      return false;   // never written: genuine read-before-write -> promote/latch
+   if (sb->spec == NULL && sb->bw == 0) {
+      // WRITTEN then poisoned (a branch merge the walker cannot represent as a
+      // flat version, e.g. a partial write under an `if` with no covering
+      // else): the promote-on-read fallback would install a PERSISTENT pv wire
+      // that is never seeded with the earlier writes -> installs silently WRONG
+      // (the pre-existing branch-var pv defect).  Decline to the text path,
+      // which lowers the same shape correctly.
+      *hard = true; R2_DECLINE("var-elem-poison"); return false;
+   }
+   // flat-wire element offset computed EXACTLY as r2_sel_range does for
+   // signal/port selects, so a non-zero lower bound maps correctly (bit
+   // off = (idx - low) for a downto vector) and an ascending range is
+   // rejected rather than mirror-indexed.  Element width in the --accel value
+   // plane is 1 bit for a scalar-element vector (std_logic_vector AND
+   // logic3d_vector); >1 only for a 2-D array-of-vector local.
+   type_t vt = tree_type(tree_ref(base));
+   if (!type_is_array(vt) || dimension_of(vt) != 1 || !type_const_bounds(vt)) {
+      *hard = true; R2_DECLINE("var-elem-ty"); return false;
+   }
+   int64_t low, high;
+   if (!folded_bounds(range_of(vt, 0), &low, &high)) {
+      *hard = true; R2_DECLINE("var-elem-bounds"); return false;
+   }
+   if (direction_of(vt, 0) != RANGE_DOWNTO) {
+      // ascending (`to`) locals: the write and text paths mis-index them, so
+      // keep the walker off the shape rather than risk a mirror-bit read
+      *hard = true; R2_DECLINE("var-elem-to"); return false;
+   }
+   if (idx < low || idx > high) {
+      *hard = true; R2_DECLINE("var-elem-oob"); return false;
+   }
+   const int64_t bidx = idx - low;   // 0-based element position in the flat wire
+   type_t et = type_elem(vt);
+   const int64_t ew = type_is_array(et)
+      ? (type_const_bounds(et) ? (int64_t)type_width(et) : -1) : 1;
+   if (ew < 1) { *hard = true; R2_DECLINE("var-elem-ew"); return false; }
+   // per-bit build: bits[] hold one value-bit per element (scalar element)
+   if (sb->bw > 0) {
+      if (ew != 1 || bidx >= sb->bw) {
+         *hard = true; R2_DECLINE("var-elem-bitw"); return false;
+      }
+      if (sb->bits[bidx] == NULL) {
+         *hard = true; R2_DECLINE("var-elem-bit"); return false;
+      }
+      snprintf(out, sz, "%s", sb->bits[bidx]);
+      return true;
+   }
+   // whole/versioned spec: index it.  A bare wire name indexes directly;
+   // otherwise only a sized literal whose prefix width equals the decl width
+   // may be landed on a temp (a width-mismatched connect throws inside the gsm
+   // child and poisons it).
+   bool bare = sb->spec[0] != '\0';
+   for (const char *q = sb->spec; *q && bare; q++)
+      if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+         bare = false;
+   const char *S = sb->spec;
+   char t2[64];
+   if (!bare) {
+      const int bw2 = (int)type_width(vt);
+      const bool litw = isdigit((unsigned char)sb->spec[0])
+         && atoi(sb->spec) == bw2;
+      if (!(litw && bw2 >= 1 && bw2 <= 4000)) {
+         *hard = true; R2_DECLINE("var-elem-spec"); return false;
+      }
+      if (!(r2_temp(bw2, t2, sizeof t2) && g_r2->connect(t2, sb->spec) == 0)) {
+         *hard = true; R2_DECLINE("var-elem-connect"); return false;
+      }
+      S = t2;
+   }
+   if (ew == 1)
+      snprintf(out, sz, "%s[%lld]", S, (long long)bidx);
+   else
+      snprintf(out, sz, "%s[%lld:%lld]", S,
+               (long long)(bidx * ew + ew - 1), (long long)(bidx * ew));
+   return true;
+}
+
 static bool r2_expr_1(tree_t e, char *out, size_t sz)
 {
    if (g_r2_fail > 0 && !g_r2_census)
@@ -5593,6 +5694,17 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             }
             else if (tree_has_ref(base)
                      && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               // a written local's element read is served from its live SSA
+               // version (the folded-constant mirror of the !have_idx block
+               // above); only a GENUINE read-before-write falls through to the
+               // promote-on-read latch path below
+               {
+                  bool hard = false;
+                  if (r2_subst_elem_read(base, idx, out, sz, &hard))
+                     return true;
+                  if (hard)
+                     return false;
+               }
                // read-before-any-write of a local: promote to latch state
                // and read the persistent pv wire (activation-start value)
                const char *pv3 = NULL;
