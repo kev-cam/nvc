@@ -4552,6 +4552,10 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
       R2_DECLINE("var-version-base");
       return false;
    }
+   // depth at which the value BEING MERGED WITH is valid: a mux write below
+   // (cond ? new : prev) is valid at PREV's scope, so its version escapes the
+   // arm-exit poison and survives to the enclosing scope (SSA if-merge)
+   const int prev_wd = e->wdepth;
    // slicing needs a WIRE base: materialize literal/compose specs once
    bool bare = true;
    for (const char *q = e->spec; *q && bare; q++)
@@ -4632,7 +4636,16 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
       R2_DECLINE("var-version-emit");
       return false;
    }
-   return r2_subst_set(vi, t);
+   if (!r2_subst_set(vi, t))
+      return false;
+   // a MERGE write (t = mux(pathcond, new, prev)) is valid where prev was, so
+   // stamp it at prev's depth instead of this arm's — r2_subst_poison_from then
+   // keeps it live past the arm, giving a correct read-after-branch of a
+   // branch-written local (SSA if-merge: loop-carried found-flags, if/elsif/else
+   // merges).  A straight-line write (pathcond empty) keeps the current depth.
+   if (pc[0] != '\0')
+      r2_subst_of(vi)->wdepth = prev_wd;
+   return true;
 }
 
 // Map the text path's Verilog operator string to a builder cell op.
