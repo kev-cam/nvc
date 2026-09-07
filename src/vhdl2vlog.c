@@ -6181,13 +6181,25 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
                return false;
-            // numeric_std SIGNED, or VHDL INTEGER: the translator declares
-            // every integer `signed [31:0]`, and the OOB range guards
-            // compare an index against NEGATIVE bounds (`Idx >= -113`)
-            const int sg = type_is_signed(tree_type(ea))
-               || type_is_signed(tree_type(eb))
-               || type_is_integer(tree_type(ea))
+            // Signedness follows Verilog's self-determined rule (which the
+            // text path relies on by emitting a bare operator): an operation
+            // is SIGNED only when BOTH operands are signed — numeric_std
+            // SIGNED, or a plain INTEGER (the translator declares every
+            // integer `signed [31:0]`, so the OOB range guards `Idx >= -113`,
+            // integer vs integer, stay signed).  If EITHER operand is a
+            // numeric_std UNSIGNED vector (a plain Verilog reg), the whole
+            // expression is UNSIGNED — matching numeric_std, where
+            // `unsigned op natural` is unsigned.  Mixing a numeric_std signed
+            // and unsigned operand is a VHDL type error, so this AND only ever
+            // reclassifies the unsigned-paired-with-integer case, which the
+            // old OR wrongly made SIGNED: `unsigned(a)/16` became a SIGNED
+            // $div (silent-wrong when a's MSB is set — a=142 gave 8 vs 249),
+            // and `unsigned(a) < 16` a signed compare.
+            const bool ea_signed = type_is_signed(tree_type(ea))
+               || type_is_integer(tree_type(ea));
+            const bool eb_signed = type_is_signed(tree_type(eb))
                || type_is_integer(tree_type(eb));
+            const int sg = ea_signed && eb_signed;
             snprintf(cn, sizeof cn, "c%s", y);
             if (g_r2->cell_bin(bop, cn, a, b, y, sg) != 0) {
                R2_DECLINE("cell_bin");
