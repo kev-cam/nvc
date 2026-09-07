@@ -702,6 +702,18 @@ static int emitted_width(tree_t e, int depth)
          // pure false positives from this function's ignorance, not real
          // width errors.
          const char *vop = vlog_op(fn);
+         if (vop != NULL && strcmp(vop, "*") == 0 && tree_params(e) == 2) {
+            // a MULTIPLY's result width is the SUM of its operand widths
+            // (numeric_std `L'length+R'length`); the walker builds the $mul
+            // at that width.  Reporting the max here (via the -1/unconstrained
+            // fall-through) makes a widening resize over-read the narrower
+            // self-determined render (a range-check on the sum-wide temp).
+            const int wa = emitted_width(tree_value(tree_param(e, 0)), depth + 1);
+            const int wb = emitted_width(tree_value(tree_param(e, 1)), depth + 1);
+            if (wa > 0 && wb > 0)
+               return wa + wb;
+            return -1;
+         }
          if (vop != NULL) return vlog_op_ctx_width(vop) ? -1 : 1;
          bool rsgn = false;
          if (l3d_relop(id_base(fn), &rsgn) != NULL) return 1;
@@ -4239,6 +4251,18 @@ static int r2_width_or_operands(tree_t e)
          const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
          return (wa > 0 && wb > 0) ? wa + wb : -1;
       }
+      // a MULTIPLY's natural width is the SUM of the operand widths, NOT the
+      // max: numeric_std `"*"` returns `L'length+R'length` (an 8x8 product
+      // is 16 bits).  The max (the recursion below) truncates the product,
+      // which a widening resize/`$signed()` then sign-extends from the wrong
+      // MSB — silently wrong for a signed product exceeding the operand
+      // width.  Keeping this consistent with the binop emitter's own sum
+      // width is what makes NESTED muls `(a*b)*c` size correctly.
+      if (np == 2 && strcmp(istr(tree_ident(e)), "\"*\"") == 0) {
+         const int wa = r2_width_or_operands(tree_value(tree_param(e, 0)));
+         const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
+         return (wa > 0 && wb > 0) ? wa + wb : -1;
+      }
       // recurse: chains of unconstrained operator results (l3d_or of
       // l3d_and of resize of ...) carry their width arbitrarily deep
       int mx = -1;
@@ -6168,15 +6192,26 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
             if (w <= 0) {
                // operator returns are unconstrained: Verilog's context
-               // width — the WIDER operand for + - * & | ^ (a 1-bit lane
-               // index times a 32-bit constant is a 32-bit product), the
-               // left operand for shifts
+               // width — the WIDER operand for + - & | ^ (a 1-bit lane
+               // index or'd with a 32-bit constant is 32-bit wide), the
+               // left operand for shifts.  A MULTIPLY is the exception: its
+               // natural width is the SUM of the operand widths (an 8x8
+               // product is 16 bits, numeric_std `L'length+R'length`).  The
+               // max truncates the product; a widening resize then sign-
+               // extends the truncated MSB — silently wrong for a signed
+               // product exceeding the operand width.  Matches the sum in
+               // r2_width_or_operands so nested muls stay consistent.
                const bool shift = strcmp(bop, "shl") == 0
                   || strcmp(bop, "shr") == 0;
-               w = r2_width_or_operands(ea);
+               const int wa = r2_width_or_operands(ea);
                const int wb = shift ? -1 : r2_width_or_operands(eb);
-               if (wb > w)
-                  w = wb;
+               if (strcmp(bop, "mul") == 0 && wa > 0 && wb > 0)
+                  w = wa + wb;
+               else {
+                  w = wa;
+                  if (wb > w)
+                     w = wb;
+               }
             }
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
@@ -6200,6 +6235,40 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             const bool eb_signed = type_is_signed(tree_type(eb))
                || type_is_integer(tree_type(eb));
             const int sg = ea_signed && eb_signed;
+            // A widening MULTIPLY must EXTEND its operands to the product
+            // width before the `$mul`: the synth does not itself widen an
+            // operand narrower than Y from A_SIGNED, so an 8-bit `$signed(a)`
+            // fed to a 16-bit `$mul` multiplies as the raw (zero-extended) 8
+            // bits — `-1*5` came out `+255*5`.  Sign-extend when signed,
+            // zero-extend when unsigned (`$pos` with A_SIGNED=sg), matching
+            // the working direct-assignment netlist `mul_ss<16>($signed(a)…)`.
+            // Widths are consistent with r2_width_or_operands' sum, so nested
+            // muls extend from their true (already-summed) operand widths.
+            if (strcmp(bop, "mul") == 0) {
+               const int wa = r2_rendered_width(ea);
+               const int wb = r2_rendered_width(eb);
+               char ext[R2_SPEC], cx[R2_SPEC + 8];
+               if (wa > 0 && wa < w) {
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, a, ext, sg) != 0) {
+                     R2_DECLINE("mul-ext-a");
+                     return false;
+                  }
+                  snprintf(a, sizeof a, "%s", ext);
+               }
+               if (wb > 0 && wb < w) {
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, b, ext, sg) != 0) {
+                     R2_DECLINE("mul-ext-b");
+                     return false;
+                  }
+                  snprintf(b, sizeof b, "%s", ext);
+               }
+            }
             snprintf(cn, sizeof cn, "c%s", y);
             if (g_r2->cell_bin(bop, cn, a, b, y, sg) != 0) {
                R2_DECLINE("cell_bin");
