@@ -5975,31 +5975,52 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                     || strcasecmp(base, "to_l3d") == 0)) {
                tree_t ea = tree_value(tree_param(e, 0));
                type_t et = tree_type(ea);
+               const int nw = r2_decl_width(e);
+               const int aw = r2_rendered_width(ea);
+               const bool sgn = type_is_signed(et) || type_is_integer(et);
                // an UNCONSTRAINED operand type = an operator result (mul/add/..
                // whose width is its operands', per numeric_std) -- exactly what
-               // over-reads.  A signal/constant carries const bounds and keeps
-               // the passthrough.
+               // over-reads on a WIDEN.  A signal/constant carries const bounds
+               // and keeps the passthrough (the assignment widens it right).
                const bool unconstrained =
                   type_is_array(et) && !type_const_bounds(et);
-               if (unconstrained) {
-                  const int nw = r2_decl_width(e);
-                  const int aw = r2_rendered_width(ea);
-                  if (nw > 0 && aw > 0 && nw > aw) {
-                     char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
-                     if (!r2_expr(ea, a, sizeof a))
-                        return false;
-                     const bool sgn = type_is_signed(tree_type(ea))
-                        || type_is_integer(tree_type(ea));
-                     if (!r2_temp(nw, y, sizeof y))
-                        return false;
-                     snprintf(cn, sizeof cn, "c%s", y);
-                     if (g_r2->cell_un("pos", cn, a, y, sgn) != 0) {
-                        R2_DECLINE("resize-widen");
-                        return false;
-                     }
-                     snprintf(out, sz, "%s", y);
-                     return true;
+               if (unconstrained && nw > 0 && aw > 0 && nw > aw) {
+                  char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(nw, y, sizeof y))
+                     return false;
+                  snprintf(cn, sizeof cn, "c%s", y);
+                  if (g_r2->cell_un("pos", cn, a, y, sgn) != 0) {
+                     R2_DECLINE("resize-widen");
+                     return false;
                   }
+                  snprintf(out, sz, "%s", y);
+                  return true;
+               }
+               // NARROWING a SIGNED value: numeric_std copies the SIGN bit to
+               // the new MSB and the low (nw-1) bits -- NOT a plain low-nw
+               // truncation.  They differ on a signed narrowing OVERFLOW (the
+               // value's bit(nw-1) != its sign): resize(signed(a)*(-3), 8) with
+               // a=-56 -> product +168=0x00A8 -> sign(0):low7(0x28)=0x28, not a
+               // truncated 0xA8.  The kind-2 passthrough below truncates the low
+               // bits (correct for UNSIGNED, which drops high bits; wrong for
+               // SIGNED).  Applies to both constrained and unconstrained signed
+               // operands (a signal narrowing is just as wrong on overflow).
+               if (sgn && nw > 0 && aw > 0 && nw < aw) {
+                  char a[R2_SPEC], y[R2_SPEC];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                     R2_DECLINE("resize-narrow-land");
+                     return false;
+                  }
+                  if (nw == 1)
+                     snprintf(out, sz, "%s[%d]", y, aw - 1);   // sign bit only
+                  else
+                     snprintf(out, sz, "{%s[%d],%s[%d:0]}", y, aw - 1,
+                              y, nw - 2);
+                  return true;
                }
             }
             if (lop != NULL && lk == 2 && np >= 1)
