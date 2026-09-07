@@ -1613,6 +1613,40 @@ static bool proc_has_wait_edge(tree_t p)
    return found;
 }
 
+// An ASCENDING ('to') process VARIABLE accessed by element or slice: both this
+// text path and the flat value-plane write path assume a DOWNTO layout and
+// mis-index it -- a silent-wrong install on a rare shape (all corpus/VeeR/Vortex
+// vectors are downto).  The walker declines the access itself (var-part-to on a
+// partial write, var-elem-to on an element read); decline the whole process here
+// too so the subtree runs in the INTERPRETER rather than a wrong text model
+// (like the wait-until flop and the r22 multi-driver guard).  WHOLE-variable
+// access (`v := a; yr <= v`) is direction-agnostic and stays accelerated.
+static void asc_var_part_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found)
+      return;
+   const tree_kind_t k = tree_kind(t);
+   if (k != T_ARRAY_REF && k != T_ARRAY_SLICE)
+      return;
+   tree_t b = tree_value(t);
+   if (tree_kind(b) != T_REF || !tree_has_ref(b))
+      return;
+   tree_t d = tree_ref(b);
+   if (tree_kind(d) != T_VAR_DECL)
+      return;
+   type_t ty = tree_type(d);
+   if (type_is_array(ty) && direction_of(ty, 0) != RANGE_DOWNTO)
+      *found = true;
+}
+
+static bool proc_has_ascending_var_part(tree_t p)
+{
+   bool found = false;
+   tree_visit(p, asc_var_part_cb, &found);
+   return found;
+}
+
 // detect a clocked process: a wrapping `if rising_edge(clk) [or falling_edge(rst)]`.
 // Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list
 // and (if given) the enclosing T_IF so the caller can find an async-reset elsif.
@@ -2065,6 +2099,12 @@ static void emit_process(FILE *f, tree_t p0)
    if (proc_has_wait_edge(p)) {
       // a `wait until <edge>` clock the comb path would silently drop
       DECLINE("wait-edge-flop");
+      return;
+   }
+   if (proc_has_ascending_var_part(p)) {
+      // ascending ('to') local vector element/slice: mis-indexed here and in
+      // the walker's flat write path -- run it in the interpreter instead
+      DECLINE("asc-var-part");
       return;
    }
    tree_t body_if = NULL, sig[8], ifstmt = NULL;
@@ -6966,6 +7006,28 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      blo = l2 > r2v ? r2v : l2;
                      brange = true;
                   }
+               }
+               // convert the VHDL element/slice INDICES to FLAT bit positions:
+               // downto flat = index - low (fixes non-zero-base, e.g.
+               // `v:std_logic_vector(15 downto 8); v(10):=..`; base-0 unchanged),
+               // mirroring r2_subst_elem_read / r2_sel_range's `idx - low`.  An
+               // ASCENDING ('to') local is mis-indexed by BOTH the flat write
+               // here and the text path (a genuine silent-wrong install on a
+               // rare shape), so decline it -- the text frontend declines
+               // ascending process-var partial writes too, so the subtree runs
+               // in the interpreter (like reads, which decline var-elem-to).
+               if (brange) {
+                  int64_t vlo, vhi;
+                  if (!folded_bounds(range_of(bt, 0), &vlo, &vhi)) {
+                     R2_DECLINE("bit-build-bounds");
+                     return false;
+                  }
+                  if (direction_of(bt, 0) != RANGE_DOWNTO) {
+                     R2_DECLINE("var-part-to");
+                     return false;
+                  }
+                  bhi -= vlo;
+                  blo -= vlo;
                }
                if (bw >= 1 && bw <= 4000 && brange
                    && blo >= 0 && bhi < bw) {
