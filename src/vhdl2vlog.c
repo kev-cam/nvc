@@ -1647,6 +1647,61 @@ static bool proc_has_ascending_var_part(tree_t p)
    return found;
 }
 
+// A LOGIC3D REGISTERED assignment whose binop RHS has a CONCATENATION as its
+// LEFT operand (`yr <= (x & y) xor z`) samples that concat ONE DELTA STALE in the
+// accel register capture (the value-plane bridge treats a concat operand feeding
+// a flop like a delayed signal, not combinational logic) -- a silent-wrong on the
+// TEXT path (r30_A: interp != accel, [[accel-r30a-fp-installwrong]]).  The direct
+// RTLIL walker captures it correctly (VeeR is all logic3d and clean), and
+// std_logic is correct too, so this declines ONLY the logic3d text-path fallback
+// with this exact shape -> the process runs in the interpreter.  Scanned only over
+// the CLOCKED body (a combinational concat-binop is fine).
+static void reg_concat_binop_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found || tree_kind(t) != T_FCALL || tree_params(t) != 2)
+      return;
+   const char *fn = istr(tree_ident(t));
+   // The outer op must be a BINARY operator that is NOT concatenation itself:
+   // a standard operator (vlog_op, e.g. `"xor"` -> `^`) or a logic3d op
+   // (vlog_l3d_op kind 0, e.g. l3d_xor).
+   int lk = -1;
+   const bool l3d_binop = vlog_l3d_op(fn, &lk) != NULL && lk == 0;
+   const char *vop = vlog_op(fn);
+   if (!l3d_binop && (vop == NULL || strcmp(fn, "\"&\"") == 0))
+      return;
+   // LEFT operand a concatenation?  nvc folds `a & b` into a positional/concat
+   // T_AGGREGATE (or leaves a `"&"` FCALL).
+   tree_t p0 = tree_value(tree_param(t, 0));
+   while (tree_kind(p0) == T_TYPE_CONV || tree_kind(p0) == T_QUALIFIED
+          || tree_kind(p0) == T_INERTIAL)
+      p0 = tree_value(p0);
+   bool cat = tree_kind(p0) == T_FCALL && tree_params(p0) == 2
+      && strcmp(istr(tree_ident(p0)), "\"&\"") == 0;
+   if (!cat && tree_kind(p0) == T_AGGREGATE && tree_assocs(p0) > 0) {
+      cat = true;
+      for (int i = 0; i < tree_assocs(p0); i++) {
+         const assoc_kind_t sk = tree_subkind(tree_assoc(p0, i));
+         if (sk != A_CONCAT && sk != A_POS) { cat = false; break; }
+      }
+   }
+   if (!cat)
+      return;
+   // logic3d only (std_logic is captured correctly): a l3d op is inherently
+   // logic3d; otherwise the binop result or the concat operand carries the type.
+   if (l3d_binop
+       || (tree_has_type(t) && type_is_logic3d(tree_type(t)))
+       || (tree_has_type(p0) && type_is_logic3d(tree_type(p0))))
+      *found = true;
+}
+
+static bool body_has_reg_concat_binop(tree_t body)
+{
+   bool found = false;
+   tree_visit(body, reg_concat_binop_cb, &found);
+   return found;
+}
+
 // detect a clocked process: a wrapping `if rising_edge(clk) [or falling_edge(rst)]`.
 // Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list
 // and (if given) the enclosing T_IF so the caller can find an async-reset elsif.
@@ -2112,6 +2167,11 @@ static void emit_process(FILE *f, tree_t p0)
    int ne = 0;
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    if (clk != NULL) {
+      if (body_has_reg_concat_binop(body_if)) {
+         // logic3d register capture of a concat LEFT-operand is one delta stale
+         DECLINE("l3d-reg-concat-binop");
+         return;
+      }
       tree_t rsig = NULL; bool rpe = false, rbefore = false;
       tree_t rcond = (ifstmt != NULL)
          ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
@@ -7833,6 +7893,13 @@ static bool r2_process(tree_t p0, int pidx)
    }
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    (void)clk;
+
+   if (clk != NULL && body_has_reg_concat_binop(body_if)) {
+      // logic3d register capture of a concat LEFT-operand samples it one delta
+      // stale (r30_A) -- run in the interpreter (see the text-path guard)
+      R2_DECLINE("l3d-reg-concat-binop");
+      return false;
+   }
 
    if (clk == NULL) {
       // The lone-signal-assign process is a CONTINUOUS assign (the same
