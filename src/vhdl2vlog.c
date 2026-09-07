@@ -5956,6 +5956,52 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                 && (strcasecmp(base, "l3d_index") == 0
                     || strcasecmp(base, "l3d_shcount") == 0))
                return r2_expr(tree_value(tree_param(e, 0)), out, sz);
+            // PROPER resize/to_l3d WIDENING of an UNCONSTRAINED operator
+            // result.  These width-adjusters are kind-2 identities (they drop
+            // the width arg and let the assignment context resize), which is
+            // correct for a constrained operand but OVER-READS an operator
+            // result whose width is its operands' (not a declared type):
+            // `resize(signed(a)*signed(b), 32)` hands the 16-bit sum-wide
+            // product to the assignment, which slices [31:0] of a 16-bit temp
+            // (a range-check that declines to the text path).  Materialize +
+            // extend explicitly to the target width -- sign-extend a
+            // signed/integer operand, zero-extend an unsigned one -- mirroring
+            // l3d_resize_s above.  A CONSTRAINED operand (a signal/constant,
+            // whose array type carries const bounds) keeps the passthrough: the
+            // assignment widens it correctly, and that is the ubiquitous
+            // VeeR/logic3d idiom we must not perturb.
+            if (lop != NULL && lk == 2 && np == 2
+                && (strcasecmp(base, "resize") == 0
+                    || strcasecmp(base, "to_l3d") == 0)) {
+               tree_t ea = tree_value(tree_param(e, 0));
+               type_t et = tree_type(ea);
+               // an UNCONSTRAINED operand type = an operator result (mul/add/..
+               // whose width is its operands', per numeric_std) -- exactly what
+               // over-reads.  A signal/constant carries const bounds and keeps
+               // the passthrough.
+               const bool unconstrained =
+                  type_is_array(et) && !type_const_bounds(et);
+               if (unconstrained) {
+                  const int nw = r2_decl_width(e);
+                  const int aw = r2_rendered_width(ea);
+                  if (nw > 0 && aw > 0 && nw > aw) {
+                     char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
+                     if (!r2_expr(ea, a, sizeof a))
+                        return false;
+                     const bool sgn = type_is_signed(tree_type(ea))
+                        || type_is_integer(tree_type(ea));
+                     if (!r2_temp(nw, y, sizeof y))
+                        return false;
+                     snprintf(cn, sizeof cn, "c%s", y);
+                     if (g_r2->cell_un("pos", cn, a, y, sgn) != 0) {
+                        R2_DECLINE("resize-widen");
+                        return false;
+                     }
+                     snprintf(out, sz, "%s", y);
+                     return true;
+                  }
+               }
+            }
             if (lop != NULL && lk == 2 && np >= 1)
                return r2_expr(tree_value(tree_param(e, 0)), out, sz);
             if (lop != NULL && lk == 1 && np == 1) {
