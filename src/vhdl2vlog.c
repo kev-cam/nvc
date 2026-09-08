@@ -3549,6 +3549,9 @@ typedef struct { ident_t var; char *spec;
                                       // recognisers look through it: the
                                       // OOB_WriteV index `l3d_index(e * K)`)
                  int bw;              // >0: var built PER-BIT (bits[] specs)
+                 bool nonneg;         // F6: the assigned value is provably
+                                      // NON-NEGATIVE (to_integer(unsigned(..))),
+                                      // so a signed binop zero-extends it
                  char *bits[128]; } r2_subst_t;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
@@ -3666,6 +3669,7 @@ static bool r2_subst_set(ident_t var, const char *spec)
    e->wdepth = g_r2_case_depth;
    e->sw = 0;
    e->vtree = NULL;
+   e->nonneg = false;
    return true;
 }
 
@@ -4509,6 +4513,67 @@ static int r2_rendered_width(tree_t e)
       break;
    }
    return r2_width_or_operands(e);
+}
+
+// F6: is this INTEGER-valued expression provably NON-NEGATIVE (an unsigned
+// source -- to_integer(unsigned(..)), an `unsigned` cast, a natural subtype, a
+// >=0 constant)?  Such a value ZERO-extends into the 32-bit integer width; a
+// signed source (to_integer(signed(..)), a plain signed integer, a negative
+// constant) SIGN-extends.  Looks through conversions and substituted variables.
+// Conservative default: not provably non-negative -> false (sign-extend, the
+// pre-existing cell behaviour), so only KNOWN-non-negative operands change.
+static bool r2_int_nonneg(tree_t e)
+{
+   for (int guard = 0; guard < 32; guard++) {
+      const tree_kind_t k = tree_kind(e);
+      // a `(un)signed(a)` cast is a TYPE_CONV: decide by the RESULT type BEFORE
+      // looking through -- an unsigned array is non-negative, a signed one is
+      // not; looking through would reach the std_logic_vector source and lose
+      // the sign.  A QUALIFIED expression `unsigned'(..)` is the same.
+      if (k == T_TYPE_CONV || k == T_QUALIFIED) {
+         if (tree_has_type(e) && type_is_array(tree_type(e)))
+            return !type_is_signed(tree_type(e));
+         e = tree_value(e);
+         continue;
+      }
+      if (k == T_INERTIAL) { e = tree_value(e); continue; }
+      if (k == T_FCALL && tree_params(e) >= 1) {
+         const char *base = id_base(istr(tree_ident(e)));
+         if (strcasecmp(base, "to_integer") == 0) {
+            e = tree_value(tree_param(e, 0));
+            continue;
+         }
+         if (strcasecmp(base, "unsigned") == 0
+             || strcasecmp(base, "to_unsigned") == 0)
+            return true;
+         if (strcasecmp(base, "signed") == 0
+             || strcasecmp(base, "to_signed") == 0)
+            return false;
+         break;
+      }
+      if (k == T_REF) {
+         r2_subst_t *sb = r2_subst_of(tree_ident(e));
+         if (sb != NULL && sb->nonneg) return true;   // recorded at var-assign
+         if (sb != NULL && sb->has_ival) return sb->ival >= 0;
+         if (sb != NULL && sb->vtree != NULL) { e = sb->vtree; continue; }
+      }
+      // decide by the current node's own type
+      if (tree_has_type(e)) {
+         type_t t = tree_type(e);
+         if (type_is_array(t))       // a numeric_std unsigned/signed value
+            return !type_is_signed(t);
+         if (type_is_integer(t)) {   // natural (0..) yes; `integer`/`-8..7` no
+            int64_t lo, hi;
+            if (type_const_bounds(t) && folded_bounds(range_of(t, 0), &lo, &hi))
+               return lo >= 0;
+         }
+      }
+      break;
+   }
+   int64_t iv;
+   if (folded_int(e, &iv))
+      return iv >= 0;
+   return false;
 }
 
 // The shape of a dynamic index expression, looking through conversions and
@@ -6448,6 +6513,45 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             const bool eb_signed = type_is_signed(tree_type(eb))
                || type_is_integer(tree_type(eb));
             const int sg = ea_signed && eb_signed;
+            // F6: a SIGNED arithmetic/relational binop whose INTEGER operand
+            // renders NARROWER than the 32-bit integer width gets its sub-word
+            // MSB sign-extended by the cell -- silently wrong for a NON-negative
+            // value (to_integer(unsigned(a))=40000 read as -25536 in `n>32768`)
+            // and it truncates a sum that needs the full 32-bit width
+            // (to_integer(signed(a(7:0)))+to_integer(signed(b(7:0)))).  The TEXT
+            // path renders integers as 32-bit regs and gets these right; here
+            // EXTEND each narrow integer operand to 32 bits with its OWN sign
+            // (r2_int_nonneg -> zero-extend an unsigned source, else sign-
+            // extend) so the signed cell reads the true value.  Excludes mul
+            // (own extension below), the bitwise ops (no sign-extend), and the
+            // shifts (the count is not a value operand); an ARRAY INDEX renders
+            // through the array-ref path, not here, so memory addressing keeps
+            // its native width.
+            if (sg && strcmp(bop, "mul") != 0 && strcmp(bop, "and") != 0
+                && strcmp(bop, "or") != 0 && strcmp(bop, "xor") != 0
+                && strcmp(bop, "xnor") != 0 && strcmp(bop, "shl") != 0
+                && strcmp(bop, "shr") != 0) {
+               for (int side = 0; side < 2; side++) {
+                  tree_t eo = side ? eb : ea;
+                  char *os = side ? b : a;
+                  type_t ot = tree_type(eo);
+                  if (!type_is_integer(ot) || type_is_logic3d(ot))
+                     continue;
+                  const int ow = r2_rendered_width(eo);
+                  if (ow <= 0 || ow >= 32)
+                     continue;
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(32, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, os, ext,
+                                    r2_int_nonneg(eo) ? 0 : 1) != 0) {
+                     R2_DECLINE("int-ext32");
+                     return false;
+                  }
+                  snprintf(os, R2_SPEC, "%s", ext);
+               }
+            }
             // A widening MULTIPLY must EXTEND its operands to the product
             // width before the `$mul`: the synth does not itself widen an
             // operand narrower than Y from A_SIGNED, so an 8-bit `$signed(a)`
@@ -7177,10 +7281,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   g_r2_site = "var-subst";
                   if (!r2_expr(tree_value(s), vs, sizeof vs))
                      return false;
-                  if (!r2_subst_set(tree_ident(tg), vs)) {
+                  // F6: record the value's ACTUAL rendered width (an integer
+                  // variable set from to_integer(unsigned(a)) renders as the
+                  // 16-bit `a`, not the 32-bit integer type reports) so a later
+                  // signed binop sees it as sub-word and extends it; and its
+                  // NON-NEGATIVE origin so that extension zero-extends rather
+                  // than sign-extending the sub-word MSB.
+                  const int rw = r2_rendered_width(tree_value(s));
+                  if (!r2_subst_set_w(tree_ident(tg), vs, rw)) {
                      R2_DECLINE("subst-count");
                      return false;
                   }
+                  r2_subst_of(tree_ident(tg))->nonneg
+                     = r2_int_nonneg(tree_value(s));
                   return true;
                }
                // branch-written variable WITH a current value: VERSION it
