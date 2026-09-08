@@ -612,6 +612,31 @@ static bool type_is_signed(type_t t)
    return false;
 }
 
+// F1b: a VHDL sll/srl with a NEGATIVE count REVERSES direction (`x sll -k` ==
+// `x srl k`), but Verilog `<<`/`>>` and RTLIL `$shl`/`$shr` treat the amount as
+// UNSIGNED and never reverse -- so a shift whose count can be negative is
+// silently wrong under --accel.  Returns true when the count is not provably
+// non-negative, so both emit paths can DECLINE it to interp (rare shape: real
+// RTL shifts by a non-negative amount, and a constant / natural / unsigned
+// count stays accelerated).
+static bool shift_count_maybe_negative(tree_t cnt)
+{
+   int64_t cv;
+   if (folded_int(cnt, &cv))
+      return cv < 0;                    // constant count: safe iff >= 0
+   if (!tree_has_type(cnt))
+      return true;                      // unknown -> assume it can be negative
+   type_t t = tree_type(cnt);
+   if (type_is_signed(t))
+      return true;                      // numeric_std signed count
+   if (!type_is_integer(t))
+      return false;                     // not an integer count: not the sll shape
+   int64_t low, high;
+   if (type_const_bounds(t) && folded_bounds(range_of(t, 0), &low, &high))
+      return low < 0;                   // natural (0..) safe; `-8 to 7` unsafe
+   return true;                         // unconstrained integer -> can be negative
+}
+
 // Map an sv2vhdl logic3d package function to a Verilog operator on value bits.
 // *kind: 0=binary "(a op b)", 1=unary-prefix "(op a)", 2=identity "a",
 // 3=reduction "(op a)". Returns NULL if not a known logic3d op.
@@ -1208,6 +1233,10 @@ static void emit_expr(FILE *f, tree_t e)
             // A shift AMOUNT is self-determined -- nothing escapes from there.
             const bool ctxw = vlog_op_ctx_width(op);
             const bool shft = (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0);
+            // F1b: sll/srl with a possibly-negative count reverses in VHDL but
+            // not in Verilog -> silently wrong; decline to interp.
+            if (shft && shift_count_maybe_negative(a1))
+               DECLINE("shift-maybe-negative-count");
             fputc('(', f);
             if (sgn) fputs("$signed(", f);
             emit_ctx_operand(f, a0, celem && ctxw);
@@ -1262,7 +1291,17 @@ static void emit_expr(FILE *f, tree_t e)
             // l3d resize has a non-signed, non-array-numeric type so it stays
             // the bare identity below.
             tree_t a0 = tree_value(tree_param(e, 0));
-            const bool sgn = tree_has_type(e) && type_is_signed(tree_type(e));
+            // `to_integer(signed(x))` returns an INTEGER (not a numeric_std
+            // SIGNED), so type_is_signed(result) is false -- but the integer
+            // reg is declared `signed [31:0]`, and a bare unsigned operand
+            // zero-extends into it, DROPPING the sign (a negative to_integer
+            // becomes a large positive: wrong case arm / index / arithmetic).
+            // Treat `to_integer` of a SIGNED argument as a signed result so it
+            // is $signed-wrapped and the context sign-extends; to_integer of an
+            // UNSIGNED arg stays a bare zero-extend.
+            const bool sgn = (tree_has_type(e) && type_is_signed(tree_type(e)))
+               || (strcasecmp(id_base(fn), "to_integer") == 0
+                   && tree_has_type(a0) && type_is_signed(tree_type(a0)));
             // Target width: the resize/to_(un)signed size arg (param 1) folds to
             // a constant; the FCALL's own type is the unconstrained numeric_std
             // return type (no const bounds), so read the width from the arg.
@@ -6343,6 +6382,13 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             }
             tree_t ea = tree_value(tree_param(e, 0));
             tree_t eb = tree_value(tree_param(e, 1));
+            // F1b: sll/srl (shl/shr) with a possibly-negative count reverses in
+            // VHDL but not in RTLIL $shl/$shr -> silently wrong; decline.
+            if ((strcmp(bop, "shl") == 0 || strcmp(bop, "shr") == 0)
+                && shift_count_maybe_negative(eb)) {
+               R2_DECLINE("shift-maybe-negative-count");
+               return false;
+            }
             // `x = 'Z'` / `x /= 'Z'` against a std_logic CHARACTER
             // metavalue: tgt-vhdl's casez expansion `((sel(0) = 'Z') or
             // (sel(0) = '1')) and ...` tests a 2-state selector, which is
