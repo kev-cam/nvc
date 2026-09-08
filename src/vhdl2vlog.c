@@ -4549,6 +4549,23 @@ static bool r2_int_nonneg(tree_t e)
          if (strcasecmp(base, "signed") == 0
              || strcasecmp(base, "to_signed") == 0)
             return false;
+         // `nonneg + nonneg` and `nonneg * nonneg` are non-negative, PROVIDED
+         // the result cannot reach bit 31 -- a wider product/sum would look
+         // negative as a 32-bit signed int, which is exactly what a VHDL integer
+         // overflow does, so stay conservative (sign-extend) there.  `-` is
+         // excluded (a difference of non-negatives can be negative).
+         const char *vop = vlog_op(istr(tree_ident(e)));
+         if (vop != NULL && tree_params(e) == 2
+             && (strcmp(vop, "+") == 0 || strcmp(vop, "*") == 0)) {
+            tree_t x = tree_value(tree_param(e, 0));
+            tree_t y = tree_value(tree_param(e, 1));
+            const int wx = r2_rendered_width(x), wy = r2_rendered_width(y);
+            if (wx <= 0 || wy <= 0)
+               return false;
+            const int rw = (strcmp(vop, "*") == 0)
+               ? wx + wy : (wx > wy ? wx : wy) + 1;
+            return rw <= 31 && r2_int_nonneg(x) && r2_int_nonneg(y);
+         }
          break;
       }
       if (k == T_REF) {
@@ -6556,9 +6573,12 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             // width before the `$mul`: the synth does not itself widen an
             // operand narrower than Y from A_SIGNED, so an 8-bit `$signed(a)`
             // fed to a 16-bit `$mul` multiplies as the raw (zero-extended) 8
-            // bits — `-1*5` came out `+255*5`.  Sign-extend when signed,
-            // zero-extend when unsigned (`$pos` with A_SIGNED=sg), matching
-            // the working direct-assignment netlist `mul_ss<16>($signed(a)…)`.
+            // bits — `-1*5` came out `+255*5`.  Extend each operand with its
+            // OWN sign (r2_int_nonneg): zero-extend a non-negative source,
+            // sign-extend a signed one.  A single `sg` here was wrong for a
+            // MIXED to_integer(signed)*to_integer(unsigned) (both integer -> sg
+            // signed -> the unsigned operand sign-extended, -100*5 became
+            // -100*-11) and for to_integer(unsigned(a))*K (0..15 read negative).
             // Widths are consistent with r2_width_or_operands' sum, so nested
             // muls extend from their true (already-summed) operand widths.
             if (strcmp(bop, "mul") == 0) {
@@ -6569,7 +6589,8 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                   if (!r2_temp(w, ext, sizeof ext))
                      return false;
                   snprintf(cx, sizeof cx, "c%s", ext);
-                  if (g_r2->cell_un("pos", cx, a, ext, sg) != 0) {
+                  if (g_r2->cell_un("pos", cx, a, ext,
+                                    r2_int_nonneg(ea) ? 0 : 1) != 0) {
                      R2_DECLINE("mul-ext-a");
                      return false;
                   }
@@ -6579,7 +6600,8 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                   if (!r2_temp(w, ext, sizeof ext))
                      return false;
                   snprintf(cx, sizeof cx, "c%s", ext);
-                  if (g_r2->cell_un("pos", cx, b, ext, sg) != 0) {
+                  if (g_r2->cell_un("pos", cx, b, ext,
+                                    r2_int_nonneg(eb) ? 0 : 1) != 0) {
                      R2_DECLINE("mul-ext-b");
                      return false;
                   }
