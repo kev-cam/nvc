@@ -4380,8 +4380,33 @@ static bool r2_expr(tree_t e, char *out, size_t sz);
 // the widest operand when the result type is unconstrained (operator FCALL
 // results carry no bounds — verilog self-determination is the text-path
 // semantics being mirrored)
+static int r2_decl_width(tree_t e);
+
 static int r2_width_or_operands(tree_t e)
 {
+   // A `resize`/`to_l3d` with an unconstrained result: its natural width is the
+   // TARGET width when it actually resizes (a narrowing, or an unconstrained
+   // widening) -- NOT the pre-resize operand width.  Checked BEFORE r2_width
+   // because emitted_width only special-cases a WIDENING resize; for a NARROWING
+   // it reports the OPERAND width, so r2_width would wrongly return the pre-
+   // narrow width here.  Without this the numeric_std `+`/`-` of two narrowed
+   // operands sized to the operands' ORIGINAL width:
+   // resize(resize(unsigned(a),8)+resize(unsigned(b),8),16) added at 16 bits
+   // (keeping the carry) instead of the 8-bit wrap numeric_std defines.
+   // Mirrors r2_rendered_width's resize case.
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2) {
+      const char *rb = id_base(istr(tree_ident(e)));
+      if (strcasecmp(rb, "resize") == 0 || strcasecmp(rb, "to_l3d") == 0) {
+         const int rnw = r2_decl_width(e);
+         tree_t rea = tree_value(tree_param(e, 0));
+         const int raw = r2_width_or_operands(rea);
+         type_t ret = tree_type(rea);
+         const bool runc = type_is_array(ret) && !type_const_bounds(ret);
+         if (rnw > 0 && raw > 0 && (rnw < raw || (rnw > raw && runc)))
+            return rnw;
+         return raw > 0 ? raw : -1;
+      }
+   }
    const int w = r2_width(e);
    if (w > 0)
       return w;
@@ -4456,8 +4481,6 @@ static int r2_local_width(tree_t e)
 // index computed from a 2-bit field renders 2 bits wide) and follows a
 // substituted variable to the value it was rendered from.  Used where the
 // width must be exact: a switch signal and its compare constants.
-static int r2_decl_width(tree_t e);
-
 static int r2_rendered_width(tree_t e)
 {
    for (int guard = 0; guard < 32; guard++) {
@@ -4571,6 +4594,15 @@ static bool r2_int_nonneg(tree_t e)
          if (strcasecmp(base, "signed") == 0
              || strcasecmp(base, "to_signed") == 0)
             return false;
+         // resize/to_l3d preserve their operand's sign (resize(unsigned)->
+         // non-negative, resize(signed)->signed): look through to the operand.
+         // Without this the unrecognised-FCALL `break` below skipped the type
+         // check and a resize-narrowed UNSIGNED operand was SIGN-extended in a
+         // +/- (resize(unsigned(b),4) read as a 4-bit signed value).
+         if (strcasecmp(base, "resize") == 0 || strcasecmp(base, "to_l3d") == 0) {
+            e = tree_value(tree_param(e, 0));
+            continue;
+         }
          // `nonneg + nonneg` and `nonneg * nonneg` are non-negative, PROVIDED
          // the result cannot reach bit 31 -- a wider product/sum would look
          // negative as a 32-bit signed int, which is exactly what a VHDL integer
@@ -6605,6 +6637,35 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                   if (g_r2->cell_un("pos", cx, os, ext,
                                     r2_int_nonneg(eo) ? 0 : 1) != 0) {
                      R2_DECLINE("int-ext32");
+                     return false;
+                  }
+                  snprintf(os, R2_SPEC, "%s", ext);
+               }
+            }
+            // A numeric_std +/- of DIFFERENT-width VECTOR operands returns the
+            // WIDER width; the narrower operand must be extended to it with its
+            // OWN sign (numeric_std sign-extends a signed operand, zero-extends
+            // an unsigned one).  The gsm C backend leaves a narrower operand
+            // as-is (zero-extended), silently wrong for a NEGATIVE signed one:
+            // resize(signed(a),8)+resize(signed(b),4) read the 4-bit b unsigned.
+            // Extend each narrow VECTOR operand to w (INTEGER operands are
+            // handled by the int-ext32 block above; mul has its own below).
+            if (strcmp(bop, "add") == 0 || strcmp(bop, "sub") == 0) {
+               for (int side = 0; side < 2; side++) {
+                  tree_t eo = side ? eb : ea;
+                  char *os = side ? b : a;
+                  if (type_is_integer(tree_type(eo)))
+                     continue;
+                  const int ow = r2_rendered_width(eo);
+                  if (ow <= 0 || ow >= w)
+                     continue;
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, os, ext,
+                                    r2_int_nonneg(eo) ? 0 : 1) != 0) {
+                     R2_DECLINE("addsub-ext");
                      return false;
                   }
                   snprintf(os, R2_SPEC, "%s", ext);
