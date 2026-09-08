@@ -6270,11 +6270,17 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                const bool sgn = type_is_signed(et) || type_is_integer(et);
                // an UNCONSTRAINED operand type = an operator result (mul/add/..
                // whose width is its operands', per numeric_std) -- exactly what
-               // over-reads on a WIDEN.  A signal/constant carries const bounds
-               // and keeps the passthrough (the assignment widens it right).
+               // over-reads on a WIDEN.  An UNSIGNED signal/constant carries
+               // const bounds and keeps the passthrough (the assignment zero-
+               // extends it right).  A SIGNED constrained operand can NOT keep
+               // the passthrough: a direct signal assignment widens it by the
+               // implicit context, which does NOT sign-extend the value (v of
+               // signed(7:0):=resize(signed(a),8) widened to 16 replicated the
+               // raw bit 7, not the numeric_std sign) -- materialize + $pos
+               // sign-extend it explicitly, as the arithmetic path already does.
                const bool unconstrained =
                   type_is_array(et) && !type_const_bounds(et);
-               if (unconstrained && nw > 0 && aw > 0 && nw > aw) {
+               if ((unconstrained || sgn) && nw > 0 && aw > 0 && nw > aw) {
                   char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
                   if (!r2_expr(ea, a, sizeof a))
                      return false;
