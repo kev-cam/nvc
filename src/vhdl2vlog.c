@@ -4456,6 +4456,8 @@ static int r2_local_width(tree_t e)
 // index computed from a 2-bit field renders 2 bits wide) and follows a
 // substituted variable to the value it was rendered from.  Used where the
 // width must be exact: a switch signal and its compare constants.
+static int r2_decl_width(tree_t e);
+
 static int r2_rendered_width(tree_t e)
 {
    for (int guard = 0; guard < 32; guard++) {
@@ -4492,6 +4494,26 @@ static int r2_rendered_width(tree_t e)
                 || r2_eval_int(tree_value(tree_param(e, 1)), &nw))
                return nw > 0 ? (int)nw : -1;
             return -1;
+         }
+         // `resize`/`to_l3d` render at their TARGET width when they actually
+         // resize -- a NARROWING slices to nw, an UNCONSTRAINED WIDENING $pos-
+         // extends to nw (see r2_expr's resize handler).  Reporting the pre-
+         // resize operand width (via the ident see-through below) made a NESTED
+         // resize drop the inner narrowing: resize(resize(unsigned(a),8),16)
+         // read the inner as 16-bit and passed `a` through instead of a&0xFF.
+         // A constrained-widen / identity passes the operand through, so keep
+         // seeing through to it.
+         if (tree_params(e) == 2 && (strcasecmp(base, "resize") == 0
+                                     || strcasecmp(base, "to_l3d") == 0)) {
+            const int rnw = r2_decl_width(e);
+            tree_t rea = tree_value(tree_param(e, 0));
+            const int raw = r2_rendered_width(rea);
+            type_t ret = tree_type(rea);
+            const bool runc = type_is_array(ret) && !type_const_bounds(ret);
+            if (rnw > 0 && raw > 0 && (rnw < raw || (rnw > raw && runc)))
+               return rnw;
+            e = rea;
+            continue;
          }
          const bool ident =
             (lop != NULL && lk == 2)
@@ -6241,6 +6263,25 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                   else
                      snprintf(out, sz, "{%s[%d],%s[%d:0]}", y, aw - 1,
                               y, nw - 2);
+                  return true;
+               }
+               // NARROWING an UNSIGNED value: numeric_std drops the high bits,
+               // so take the LOW nw bits.  The kind-2 passthrough below leaves
+               // the full aw-bit value, which a WIDER consuming context then
+               // re-widens -- silently keeping the dropped high bits
+               // (resize(resize(unsigned(a),8),16) returned `a`, not a&0xFF).
+               if (!sgn && nw > 0 && aw > 0 && nw < aw) {
+                  char a[R2_SPEC], y[R2_SPEC];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                     R2_DECLINE("resize-narrow-u-land");
+                     return false;
+                  }
+                  if (nw == 1)
+                     snprintf(out, sz, "%s[0]", y);
+                  else
+                     snprintf(out, sz, "%s[%d:0]", y, nw - 1);
                   return true;
                }
             }
