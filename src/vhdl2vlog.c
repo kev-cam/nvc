@@ -4431,6 +4431,21 @@ static int r2_width_or_operands(tree_t e)
          const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
          return (wa > 0 && wb > 0) ? wa + wb : -1;
       }
+      // numeric_std `vector +/- integer` returns the VECTOR operand's length
+      // (the integer is converted to that width), NOT the max -- so the outer
+      // context (a resize) sizes to the vector width and the binop emitter's
+      // own width (which applies the same rule) stays consistent.
+      if (np == 2 && (strcmp(istr(tree_ident(e)), "\"+\"") == 0
+                      || strcmp(istr(tree_ident(e)), "\"-\"") == 0)) {
+         tree_t x = tree_value(tree_param(e, 0));
+         tree_t y = tree_value(tree_param(e, 1));
+         const bool x_arr = type_is_array(tree_type(x));
+         const bool y_arr = type_is_array(tree_type(y));
+         const bool x_int = type_is_integer(tree_type(x));
+         const bool y_int = type_is_integer(tree_type(y));
+         if (x_arr && y_int) return r2_width_or_operands(x);
+         if (y_arr && x_int) return r2_width_or_operands(y);
+      }
       // recurse: chains of unconstrained operator results (l3d_or of
       // l3d_and of resize of ...) carry their width arbitrarily deep
       int mx = -1;
@@ -6573,8 +6588,26 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                   || strcmp(bop, "shr") == 0;
                const int wa = r2_width_or_operands(ea);
                const int wb = shift ? -1 : r2_width_or_operands(eb);
+               // numeric_std `vector +/- integer` (unsigned+natural,
+               // signed+integer) returns the VECTOR operand's length -- the
+               // integer is converted to that width, NOT the max.  Sizing to
+               // the integer's 32-bit width dropped the N-bit wrap:
+               // resize(signed(a),8)+5 computed the sum at 32 bits, wrong on an
+               // 8-bit overflow.  Only for +/- (a shift's left operand already
+               // dominates; mul multiplies the widths; bitwise is width-
+               // preserving on equal-width numeric_std operands).
+               const bool addsub = strcmp(bop, "add") == 0
+                  || strcmp(bop, "sub") == 0;
+               const bool ea_arr = type_is_array(tree_type(ea));
+               const bool eb_arr = type_is_array(tree_type(eb));
+               const bool ea_int = type_is_integer(tree_type(ea));
+               const bool eb_int = type_is_integer(tree_type(eb));
                if (strcmp(bop, "mul") == 0 && wa > 0 && wb > 0)
                   w = wa + wb;
+               else if (addsub && ea_arr && eb_int && wa > 0)
+                  w = wa;
+               else if (addsub && eb_arr && ea_int && wb > 0)
+                  w = wb;
                else {
                   w = wa;
                   if (wb > w)
