@@ -4407,6 +4407,28 @@ static int r2_width_or_operands(tree_t e)
          return raw > 0 ? raw : -1;
       }
    }
+   // numeric_std `vector * scalar` (unsigned*natural / signed*integer): the
+   // scalar WRAPS to the vector length -> a 2*L'length product, NOT wa+wb.
+   // Checked BEFORE r2_width's early return, because r2_width reports a mul's
+   // operand-SUM width (a positive value that would shadow this).  Must match
+   // the binop emitter's vecmul width so a resize/to_signed context sizes and
+   // slices the product correctly (a LITERAL scalar renders wider than the
+   // vector length; unsigned(a(3:0))*16 is a 8-bit 0, not a 35-bit a*16).
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2
+       && strcmp(istr(tree_ident(e)), "\"*\"") == 0) {
+      tree_t ma = tree_value(tree_param(e, 0));
+      tree_t mb = tree_value(tree_param(e, 1));
+      const bool aarr = type_is_array(tree_type(ma));
+      const bool barr = type_is_array(tree_type(mb));
+      if (aarr && !barr && type_is_integer(tree_type(mb))) {
+         const int lw = r2_width_or_operands(ma);
+         if (lw > 0) return 2 * lw;
+      }
+      else if (barr && !aarr && type_is_integer(tree_type(ma))) {
+         const int lw = r2_width_or_operands(mb);
+         if (lw > 0) return 2 * lw;
+      }
+   }
    const int w = r2_width(e);
    if (w > 0)
       return w;
@@ -6578,7 +6600,23 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             char a[R2_SPEC], b[R2_SPEC];
             if (!r2_expr(ea, a, sizeof a) || !r2_expr(eb, b, sizeof b))
                return false;
+            // numeric_std `vector * scalar` (unsigned*natural / signed*integer,
+            // either operand order) is `L * TO_(UN)SIGNED(R, L'LENGTH)`: the
+            // scalar WRAPS to the vector's length before an L'length x L'length
+            // -> 2*L'length product.  Detected once here so the result width and
+            // the operand prep (the mul-ext block below) agree.  A raw integer
+            // multiply is silently wrong -- unsigned(a(3:0))*16 is *0 (16 mod
+            // 2^4), not *16; signed(a(2:0))*5 is *(-3) (TO_SIGNED(5,3)), not *5.
+            const bool m_ea_arr = type_is_array(tree_type(ea));
+            const bool m_eb_arr = type_is_array(tree_type(eb));
+            const bool vecmul = strcmp(bop, "mul") == 0
+               && ((m_ea_arr && !m_eb_arr && type_is_integer(tree_type(eb)))
+                   || (m_eb_arr && !m_ea_arr && type_is_integer(tree_type(ea))));
+            const int vec_lw = vecmul
+               ? r2_rendered_width(m_ea_arr ? ea : eb) : 0;
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
+            if (vecmul && vec_lw > 0)
+               w = 2 * vec_lw;
             if (w <= 0) {
                // operator returns are unconstrained: Verilog's context
                // width — the WIDER operand for + - & | ^ (a 1-bit lane
@@ -6722,7 +6760,57 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             // -100*-11) and for to_integer(unsigned(a))*K (0..15 read negative).
             // Widths are consistent with r2_width_or_operands' sum, so nested
             // muls extend from their true (already-summed) operand widths.
-            if (strcmp(bop, "mul") == 0) {
+            if (vecmul && vec_lw > 0) {
+               // numeric_std `vector * scalar`: `L * TO_(UN)SIGNED(R, L'LENGTH)`.
+               // WRAP the scalar to L'LENGTH bits (its two's-complement low bits
+               // = R mod 2^L'length) -- materialize R at its OWN sign into a
+               // temp wide enough to hold it, then slice the low L'length bits.
+               // Then extend BOTH operands (the vector, already L'length wide,
+               // and the wrapped scalar) to the 2*L'length product width with
+               // the MULTIPLY's sign (sg = the vector's signedness): a signed
+               // vector reads the wrapped scalar as TO_SIGNED, an unsigned one as
+               // TO_UNSIGNED.  cell_bin below multiplies at w = 2*L'length.
+               char *vs = m_ea_arr ? a : b;      // the vector operand's spec
+               char *ss = m_ea_arr ? b : a;      // the scalar operand's spec
+               tree_t se = m_ea_arr ? eb : ea;   // the scalar's tree
+               const int sw = r2_rendered_width(se);
+               if (sw <= 0) { R2_DECLINE("vecmul-scalar-width"); return false; }
+               const int w2 = sw > vec_lw ? sw : vec_lw;
+               char tw[R2_SPEC], ctw[R2_SPEC + 8];
+               if (!r2_temp(w2, tw, sizeof tw))
+                  return false;
+               snprintf(ctw, sizeof ctw, "c%s", tw);
+               if (g_r2->cell_un("pos", ctw, ss, tw,
+                                 r2_int_nonneg(se) ? 0 : 1) != 0) {
+                  R2_DECLINE("vecmul-scalar-conv");
+                  return false;
+               }
+               char slw[R2_SPEC];
+               if (vec_lw == 1)
+                  snprintf(slw, sizeof slw, "%s[0]", tw);
+               else
+                  snprintf(slw, sizeof slw, "%s[%d:0]", tw, vec_lw - 1);
+               // extend the vector (vec_lw) and the wrapped scalar (vec_lw) to w
+               char ve[R2_SPEC], cve[R2_SPEC + 8];
+               if (!r2_temp(w, ve, sizeof ve))
+                  return false;
+               snprintf(cve, sizeof cve, "c%s", ve);
+               if (g_r2->cell_un("pos", cve, vs, ve, sg ? 1 : 0) != 0) {
+                  R2_DECLINE("vecmul-vec-ext");
+                  return false;
+               }
+               char se2[R2_SPEC], cse[R2_SPEC + 8];
+               if (!r2_temp(w, se2, sizeof se2))
+                  return false;
+               snprintf(cse, sizeof cse, "c%s", se2);
+               if (g_r2->cell_un("pos", cse, slw, se2, sg ? 1 : 0) != 0) {
+                  R2_DECLINE("vecmul-scalar-ext");
+                  return false;
+               }
+               snprintf(a, sizeof a, "%s", ve);
+               snprintf(b, sizeof b, "%s", se2);
+            }
+            else if (strcmp(bop, "mul") == 0) {
                const int wa = r2_rendered_width(ea);
                const int wb = r2_rendered_width(eb);
                char ext[R2_SPEC], cx[R2_SPEC + 8];
