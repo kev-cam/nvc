@@ -4429,6 +4429,28 @@ static int r2_width_or_operands(tree_t e)
          if (lw > 0) return 2 * lw;
       }
    }
+   // numeric_std `scalar (/|rem|mod) vector` / `vector (/|rem|mod) scalar`: the
+   // result IS the vector's length (the scalar wraps to it), NOT the operand
+   // max.  Same early placement as the mul case (r2_width reports a wider
+   // operand max that would shadow this) so a resize/to_signed context sizes it.
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2) {
+      const char *db = istr(tree_ident(e));
+      if (strcmp(db, "\"/\"") == 0 || strcmp(db, "\"rem\"") == 0
+          || strcmp(db, "\"mod\"") == 0) {
+         tree_t da = tree_value(tree_param(e, 0));
+         tree_t dc = tree_value(tree_param(e, 1));
+         const bool aarr = type_is_array(tree_type(da));
+         const bool barr = type_is_array(tree_type(dc));
+         if (aarr && !barr && type_is_integer(tree_type(dc))) {
+            const int lw = r2_width_or_operands(da);
+            if (lw > 0) return lw;
+         }
+         else if (barr && !aarr && type_is_integer(tree_type(da))) {
+            const int lw = r2_width_or_operands(dc);
+            if (lw > 0) return lw;
+         }
+      }
+   }
    const int w = r2_width(e);
    if (w > 0)
       return w;
@@ -6609,10 +6631,20 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             // 2^4), not *16; signed(a(2:0))*5 is *(-3) (TO_SIGNED(5,3)), not *5.
             const bool m_ea_arr = type_is_array(tree_type(ea));
             const bool m_eb_arr = type_is_array(tree_type(eb));
-            const bool vecmul = strcmp(bop, "mul") == 0
-               && ((m_ea_arr && !m_eb_arr && type_is_integer(tree_type(eb)))
-                   || (m_eb_arr && !m_ea_arr && type_is_integer(tree_type(ea))));
-            const int vec_lw = vecmul
+            const bool vec_scalar_shape =
+               (m_ea_arr && !m_eb_arr && type_is_integer(tree_type(eb)))
+               || (m_eb_arr && !m_ea_arr && type_is_integer(tree_type(ea)));
+            const bool vecmul = strcmp(bop, "mul") == 0 && vec_scalar_shape;
+            // numeric_std `scalar (/|rem) vector` / `vector (/|rem) scalar`: the
+            // SCALAR wraps to the vector length and the result IS the vector's
+            // length -- L/TO_(UN)SIGNED(R,L'LENGTH), TO_(UN)SIGNED(L,R'LENGTH)/R.
+            // Division is NOT commutative, so (unlike mul) the scalar is wrapped
+            // IN PLACE below with operand order preserved.  bop "mod" here is
+            // VHDL `rem` (r2_binop maps "%"->"mod"); VHDL `mod` renders elsewhere.
+            const bool vecdivmod =
+               (strcmp(bop, "div") == 0 || strcmp(bop, "mod") == 0)
+               && vec_scalar_shape;
+            const int vec_lw = (vecmul || vecdivmod)
                ? r2_rendered_width(m_ea_arr ? ea : eb) : 0;
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
             if (vecmul && vec_lw > 0)
@@ -6680,6 +6712,71 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             const bool eb_signed = type_is_signed(tree_type(eb))
                || type_is_integer(tree_type(eb));
             const int sg = ea_signed && eb_signed;
+            // numeric_std `scalar (/|rem) vector` / `vector (/|rem) scalar`
+            // (one array operand + one integer): the division uses the FULL
+            // scalar (NOT wrapped to the vector length -- nvc computes
+            // 1000/u8 = 1000/u8, and s/vector at full precision), and the
+            // QUOTIENT is then RESIZEd (truncated) to the vector's length:
+            // 1000/1 -> 1000 mod 256 = 232, 300/12 = 25 -> 25 mod 16 = 9.  The
+            // raw walker divided at the operand-max width and returned the
+            // UNtruncated quotient (a resize to a wider target kept 1000).
+            // Divide at max(scalar,vector) with the division sign (operands
+            // extended so neither is silently truncated), preserving dividend/
+            // divisor order, then slice the low vec_lw bits.  Handled here
+            // (returning) so the shared int-ext32/cell_bin path does not run.
+            if (vecdivmod && vec_lw > 0) {
+               char *ss = m_ea_arr ? b : a;      // scalar spec
+               char *vs = m_ea_arr ? a : b;      // vector spec
+               tree_t se = m_ea_arr ? eb : ea;   // scalar tree
+               tree_t vtr = m_ea_arr ? ea : eb;  // vector tree
+               const int sw = r2_rendered_width(se);
+               const int vw = r2_rendered_width(vtr);
+               if (sw <= 0 || vw <= 0) { R2_DECLINE("vecdiv-width"); return false; }
+               // divide at >= 32 bits so a 32-bit VHDL integer scalar keeps its
+               // correct sign (its own render width can put a value bit in the
+               // MSB, which a SIGNED $div would misread -- 1000 at 10 bits looks
+               // negative); wider still if the vector is wider than 32.
+               const int wop = vec_lw > 32 ? vec_lw : 32;
+               if (vw < wop) {                              // extend vector -> wop
+                  char t[R2_SPEC], ct[R2_SPEC + 8];
+                  if (!r2_temp(wop, t, sizeof t)) return false;
+                  snprintf(ct, sizeof ct, "c%s", t);
+                  if (g_r2->cell_un("pos", ct, vs, t, sg ? 1 : 0) != 0) {
+                     R2_DECLINE("vecdiv-vec-ext"); return false; }
+                  snprintf(vs, R2_SPEC, "%s", t);
+               }
+               if (sw < wop) {                              // extend scalar -> wop
+                  char t[R2_SPEC], ct[R2_SPEC + 8];
+                  if (!r2_temp(wop, t, sizeof t)) return false;
+                  snprintf(ct, sizeof ct, "c%s", t);
+                  if (g_r2->cell_un("pos", ct, ss, t,
+                                    r2_int_nonneg(se) ? 0 : 1) != 0) {
+                     R2_DECLINE("vecdiv-scalar-ext"); return false; }
+                  snprintf(ss, R2_SPEC, "%s", t);
+               }
+               char yq[R2_SPEC], cq[R2_SPEC + 8];
+               if (!r2_temp(wop, yq, sizeof yq)) return false;
+               snprintf(cq, sizeof cq, "c%s", yq);
+               if (g_r2->cell_bin(bop, cq, a, b, yq, sg) != 0) {
+                  R2_DECLINE("vecdiv-cell"); return false; }
+               // RESIZE the quotient to the vector length: numeric_std narrows a
+               // SIGNED result to {sign, low N-1 bits} (1000/5 = 200 -> {0,low7} =
+               // 72) and an UNSIGNED one to the low N bits (1000/1 = 1000 -> 232).
+               if (vec_lw >= wop)
+                  snprintf(out, sz, "%s", yq);
+               else if (sg) {
+                  if (vec_lw == 1)
+                     snprintf(out, sz, "%s[%d]", yq, wop - 1);
+                  else
+                     snprintf(out, sz, "{%s[%d],%s[%d:0]}", yq, wop - 1,
+                              yq, vec_lw - 2);
+               }
+               else if (vec_lw == 1)
+                  snprintf(out, sz, "%s[0]", yq);
+               else
+                  snprintf(out, sz, "%s[%d:0]", yq, vec_lw - 1);
+               return true;
+            }
             // F6: a SIGNED arithmetic/relational binop whose INTEGER operand
             // renders NARROWER than the 32-bit integer width gets its sub-word
             // MSB sign-extended by the cell -- silently wrong for a NON-negative
