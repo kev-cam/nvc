@@ -4679,7 +4679,17 @@ static bool r2_int_nonneg(tree_t e)
                ? wx + wy : (wx > wy ? wx : wy) + 1;
             return rw <= 31 && r2_int_nonneg(x) && r2_int_nonneg(y);
          }
-         break;
+         // An unrecognised operator/function (`/`, `rem`, `mod`, `and`, `or`,
+         // `xor`, `not`, ...) is decided by its RESULT TYPE below -- fall
+         // through, do NOT break.  A numeric_std `unsigned / unsigned` (or rem,
+         // or a bitwise op of unsigned) yields an UNSIGNED result -> NON-negative,
+         // so a consuming multiply/resize/add must ZERO-extend it.  Breaking here
+         // defaulted such a value to signed and SIGN-extended it -- silently wrong
+         // when the result's MSB is set (unsigned(a)/unsigned(b) fed to a widening
+         // `*` read the 8-bit quotient as a negative 16-bit value).  A SIGNED
+         // operator result still returns false (sign-extend) from the array-type
+         // check, and an unbounded INTEGER result still falls to the conservative
+         // tail, so neither of those changes.
       }
       if (k == T_REF) {
          r2_subst_t *sb = r2_subst_of(tree_ident(e));
