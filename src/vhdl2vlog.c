@@ -6967,7 +6967,43 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                return false;
             int w = r2_width(e);
             if (w <= 0)
-               w = r2_width(ea);
+               w = r2_rendered_width(ea);   // operand's TRUE numeric_std width --
+            if (w <= 0)                      // r2_width(ea) looks THROUGH a resize
+               w = r2_width(ea);             // (to 10 for resize(..,1)), truncating
+            // A `neg` that WIDENS its operand (an integer neg renders at 32 bits
+            // while `to_integer(signed(a(3:0)))` renders at 4) must extend the
+            // operand with its OWN sign BEFORE negating: a narrow SIGNED operand
+            // zero-extended and negated is wrong (`-(to_integer(signed(a(3:0))))`
+            // read a 4-bit -1 (0xF) as +15 -> -15 instead of +1).  The $neg
+            // cell's own A_SIGNED extension is not honoured by the evaluator, so
+            // materialize a $pos-extended operand to width w explicitly, exactly
+            // as the mul/add-sub operand-extension blocks do (r2_int_nonneg ->
+            // zero-extend a non-negative source, sign-extend a signed one).
+            // Width-preserving negation (a vector whose result width equals the
+            // operand's) skips this -- the extend would be a no-op.  `not` is
+            // bitwise/width-preserving and unchanged.
+            if (strcmp(uop, "neg") == 0) {
+               const int oaw = r2_rendered_width(ea);
+               // The neg result must be at least as wide as the operand actually
+               // RENDERS -- r2_width(ea) can under-report (it looks through a
+               // constrained-widen resize to the pre-resize width), which made the
+               // neg TRUNCATE its own operand: `-(resize(signed(a(3:0)),8))`
+               // rendered an 8-bit operand but negated it at 4 bits.  Bump w to
+               // the rendered width so the negation is at least width-preserving.
+               if (oaw > w) w = oaw;
+               if (oaw > 0 && oaw < w) {
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, a, ext,
+                                    r2_int_nonneg(ea) ? 0 : 1) != 0) {
+                     R2_DECLINE("neg-ext");
+                     return false;
+                  }
+                  snprintf(a, sizeof a, "%s", ext);
+               }
+            }
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
                return false;
