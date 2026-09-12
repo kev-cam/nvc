@@ -4406,6 +4406,15 @@ static int r2_width_or_operands(tree_t e)
             return rnw;
          return raw > 0 ? raw : -1;
       }
+      // to_signed(v,N)/to_unsigned(v,N) render at their TARGET width N (the widen
+      // relaxation installs them there) -- report N, not the operand-max, so a
+      // consumer sizes to it.  Without this, `to_signed(x,12) + to_signed(y,12)`
+      // sized the sum to the 8-bit to_integer operand, truncating both widens.
+      if (strcasecmp(rb, "to_signed") == 0 || strcasecmp(rb, "to_unsigned") == 0) {
+         const int tnw = r2_decl_width(e);
+         if (tnw > 0)
+            return tnw;
+      }
    }
    // numeric_std `vector * scalar` (unsigned*natural / signed*integer): the
    // scalar WRAPS to the vector length -> a 2*L'length product, NOT wa+wb.
@@ -4597,6 +4606,24 @@ static int r2_rendered_width(tree_t e)
             e = rea;
             continue;
          }
+         // to_signed(v, N) / to_unsigned(v, N) ALWAYS render at their TARGET
+         // width N: the widen $pos-extends to N, the narrowing takes the low N
+         // bits, equal width is N (see r2_expr's to_uns handler).  Reporting the
+         // operand's pre-conversion width (via the ident see-through below, which
+         // matches "TO_SIGNED"/"TO_UNSIGNED" on the 1-param... no -- these are
+         // 2-param, so they fell to r2_width_or_operands' operand-max = the
+         // OPERAND width, not N).  A consumer then mis-sized the value: the
+         // negation of a to_signed(...,10) widen negated at the 4-bit operand
+         // width, dropping the widen.
+         if (tree_params(e) == 2
+             && (strcasecmp(base, "to_signed") == 0
+                 || strcasecmp(base, "to_unsigned") == 0)) {
+            int64_t tnw;
+            if (folded_int(tree_value(tree_param(e, 1)), &tnw)
+                || r2_eval_int(tree_value(tree_param(e, 1)), &tnw))
+               return tnw > 0 ? (int)tnw : -1;
+            return -1;
+         }
          const bool ident =
             (lop != NULL && lk == 2)
             || strcasecmp(base, "l3d_index") == 0
@@ -4675,8 +4702,20 @@ static bool r2_int_nonneg(tree_t e)
             const int wx = r2_rendered_width(x), wy = r2_rendered_width(y);
             if (wx <= 0 || wy <= 0)
                return false;
-            const int rw = (strcmp(vop, "*") == 0)
-               ? wx + wy : (wx > wy ? wx : wy) + 1;
+            // Bound the result value's width.  For `*` use the ACTUAL rendered
+            // product width -- a numeric_std vector*scalar wraps the scalar to the
+            // vector length (unsigned(a(2:0))*255 is a 6-bit product, not a 3+8
+            // = 11-bit one), so wx+wy over-counts a wide literal scalar and trips
+            // the <=31 overflow guard, wrongly making a NON-negative product look
+            // signed (it then sign-extended in a widening to_signed).  `+` keeps
+            // the max+1 carry bound.
+            int rw;
+            if (strcmp(vop, "*") == 0) {
+               rw = r2_rendered_width(e);
+               if (rw <= 0) rw = wx + wy;
+            }
+            else
+               rw = (wx > wy ? wx : wy) + 1;
             return rw <= 31 && r2_int_nonneg(x) && r2_int_nonneg(y);
          }
          // An unrecognised operator/function (`/`, `rem`, `mod`, `and`, `or`,
@@ -6214,14 +6253,25 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                if (nw == aw) { snprintf(out, sz, "%s", a); return true; }
                char y[R2_SPEC];
                if (nw > aw) {
-                  // WIDENING needs the operand's TRUE width, but an integer
-                  // operand renders SELF-DETERMINED (e.g. to_integer(signed(a))
-                  // - 200 renders at 8 bits, not 32), so sign/zero-extending
-                  // from the rendered MSB is WRONG (silently wrong high bits).
-                  // Narrowing/equal below only take low bits that survive the
-                  // truncation, so they stay correct; decline the widen.
-                  R2_DECLINE("to_uns-widen");
-                  return false;
+                  // WIDENING: extend the operand's rendered aw-bit value to nw --
+                  // zero-extend a non-negative operand, sign-extend a signed one
+                  // (to_unsigned's operand is a natural -> always zero-extend).
+                  // Sound now that the render produces the operand's TRUE value at
+                  // aw bits (the vector*scalar, division, unsigned-op and negation
+                  // render bugs that made a narrow render lose high bits are
+                  // fixed).  [EXPERIMENT: no r2_widen_trusted guard yet -- the
+                  // adversarial hunt decides what, if anything, still needs one.]
+                  char cnw[R2_SPEC + 8];
+                  if (!r2_temp((int)nw, y, sizeof y))
+                     return false;
+                  snprintf(cnw, sizeof cnw, "c%s", y);
+                  const int asig = (is_tu || r2_int_nonneg(ea)) ? 0 : 1;
+                  if (g_r2->cell_un("pos", cnw, a, y, asig) != 0) {
+                     R2_DECLINE("to_uns-widen-ext");
+                     return false;
+                  }
+                  snprintf(out, sz, "%s", y);
+                  return true;
                }
                // narrowing: land and take the low nw bits (correct even when the
                // aw-bit render already truncated -- low bits are preserved)
