@@ -4381,6 +4381,7 @@ static bool r2_expr(tree_t e, char *out, size_t sz);
 // results carry no bounds — verilog self-determination is the text-path
 // semantics being mirrored)
 static int r2_decl_width(tree_t e);
+static int r2_rendered_width(tree_t e);
 
 static int r2_width_or_operands(tree_t e)
 {
@@ -4463,6 +4464,34 @@ static int r2_width_or_operands(tree_t e)
             const int lw = r2_width_or_operands(dc);
             if (lw > 0) return lw;
          }
+      }
+   }
+   // A reinterpret cast (signed/unsigned/std_logic_vector, and T_TYPE_CONV /
+   // T_QUALIFIED) PRESERVES width, so its numeric_std width IS the width r2_expr
+   // RENDERS -- defer to r2_rendered_width (the ground truth) so this helper
+   // AGREES with it.  r2_width alone UNDER-reports a materialized resize under
+   // such a cast (signed(std_logic_vector(resize(unsigned(a(7:0)),12))) has
+   // r2_width 8 but renders 12), so a consuming +/-/* sized to 8 and truncated;
+   // r2_rendered_width already resolves both the constrained-unsigned PASSTHROUGH
+   // (via r2_signed_reinterpret_uwiden) and the unconstrained MATERIALIZE (via
+   // look-through).  to_integer is excluded (it is an integer, sized elsewhere);
+   // r2_rendered_width looks through the same casts, so no recursion on this node.
+   {
+      const tree_kind_t ek = tree_kind(e);
+      bool reint = (ek == T_TYPE_CONV || ek == T_QUALIFIED);
+      if (!reint && ek == T_FCALL && tree_params(e) == 1) {
+         const char *rfn = istr(tree_ident(e));
+         reint = vlog_op(rfn) == NULL && r2_user_func(rfn) == NULL
+                 && !strstr(rfn, "TO_INTEGER") && !strstr(rfn, "to_integer")
+                 && (strstr(rfn, "SIGNED") || strstr(rfn, "signed")
+                     || strstr(rfn, "STD_LOGIC_VECTOR")
+                     || strstr(rfn, "std_logic_vector")
+                     || strstr(rfn, "UNSIGNED") || strstr(rfn, "unsigned"));
+      }
+      if (reint) {
+         const int rr = r2_rendered_width(e);
+         if (rr > 0)
+            return rr;
       }
    }
    const int w = r2_width(e);
