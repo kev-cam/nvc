@@ -4548,6 +4548,8 @@ static int r2_local_width(tree_t e)
    return 1;
 }
 
+static int r2_signed_reinterpret_uwiden(tree_t e, tree_t operand);
+
 // The width of the sigspec r2_expr RENDERS for `e` — which differs from the
 // VHDL type width wherever the walker prints an identity's operand verbatim
 // (l3d_index / to_integer / resize drop their conversion, so an Integer
@@ -4559,6 +4561,16 @@ static int r2_rendered_width(tree_t e)
    for (int guard = 0; guard < 32; guard++) {
       const tree_kind_t k = tree_kind(e);
       if (k == T_TYPE_CONV || k == T_QUALIFIED || k == T_INERTIAL) {
+         // A signed reinterpret whose operand renders NARROWER than its (signed)
+         // cast width is an unsigned resize-widen passthrough: r2_signed_uwiden
+         // RENDERS it zero-extended to the cast width, so report that width rather
+         // than looking through to the pre-widen width -- else a consumer (e.g. a
+         // negation) mis-sizes it.
+         if (k == T_TYPE_CONV) {
+            const int cw = r2_signed_reinterpret_uwiden(e, tree_value(e));
+            if (cw > 0)
+               return cw;
+         }
          e = tree_value(e);
          continue;
       }
@@ -5620,6 +5632,80 @@ static bool r2_concat_chain(tree_t e, char *out, size_t sz)
 
 static bool r2_expr_1(tree_t e, char *out, size_t sz);
 
+// The constrained width of a SIGNED reinterpret cast `e` (T_TYPE_CONV to signed,
+// or the signed() function form) WHEN its operand renders NARROWER than that
+// width -- i.e. an unsigned resize/to_l3d WIDEN reached it via the PASSTHROUGH
+// (ck42 lets the consumer zero-extend, so the widen renders narrower than its
+// target).  Such a value must be zero-extended to the cast width before being
+// reinterpreted as signed, else the reinterpret re-signs the pre-widen bits
+// (signed(resize(u(5 downto 0),13)) -- directly or through a std_logic_vector cast
+// -- put the sign at bit 5, not the zero-extended bit 12).  A signed/unconstrained
+// widen already materializes to its width (renders == width), and a plain slice
+// renders at its width, so ONLY the unsigned passthrough makes an operand render
+// narrower than the signed cast -- the zero-extend is then exactly numeric_std.
+// Returns the resize target width (> the widen's rendered width), or -1 if not
+// this shape.  The signed reinterpret's own cast type is UNCONSTRAINED `signed`
+// (its bounds come from the operand), so the width comes from the resize: peel
+// width-preserving reinterpret casts (std_logic_vector / signed / unsigned) to
+// reach it -- handling both signed(resize(u,N)) and signed(std_logic_vector(
+// resize(u,N))).
+static int r2_signed_reinterpret_uwiden(tree_t e, tree_t operand)
+{
+   type_t ct = tree_has_type(e) ? tree_type(e) : NULL;
+   if (ct == NULL || !type_is_array(ct) || !type_is_signed(ct))
+      return -1;
+   tree_t x = operand;
+   for (int i = 0; i < 8 && x != NULL; i++) {
+      const tree_kind_t xk = tree_kind(x);
+      if (xk == T_TYPE_CONV || xk == T_QUALIFIED) {
+         x = tree_value(x);
+         continue;
+      }
+      if (xk == T_FCALL && tree_params(x) == 1) {
+         const char *fn = istr(tree_ident(x));
+         if (vlog_op(fn) == NULL && r2_user_func(fn) == NULL
+             && (strstr(fn, "SIGNED") || strstr(fn, "signed")
+                 || strstr(fn, "STD_LOGIC_VECTOR")
+                 || strstr(fn, "std_logic_vector")
+                 || strstr(fn, "UNSIGNED") || strstr(fn, "unsigned"))) {
+            x = tree_value(tree_param(x, 0));
+            continue;
+         }
+      }
+      break;
+   }
+   if (x == NULL || tree_kind(x) != T_FCALL || tree_params(x) != 2)
+      return -1;
+   const char *xb = id_base(istr(tree_ident(x)));
+   if (strcasecmp(xb, "resize") != 0 && strcasecmp(xb, "to_l3d") != 0)
+      return -1;
+   const int rn = r2_decl_width(x);
+   const int rw = r2_rendered_width(x);
+   return (rn > 0 && rw > 0 && rn > rw) ? rn : -1;
+}
+
+// Materialize the zero-extension for the shape above.  `operand` is the
+// reinterpret's operand.  Returns 1 = handled (out set), 0 = not this shape,
+// -1 = handled but failed (caller returns false).
+static int r2_signed_uwiden(tree_t e, tree_t operand, char *out, size_t sz)
+{
+   const int cw = r2_signed_reinterpret_uwiden(e, operand);
+   if (cw < 0)
+      return 0;
+   char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
+   if (!r2_expr(operand, a, sizeof a))
+      return -1;
+   if (!r2_temp(cw, y, sizeof y))
+      return -1;
+   snprintf(cn, sizeof cn, "c%s", y);
+   if (g_r2->cell_un("pos", cn, a, y, 0) != 0) {   // zero-extend to the cast width
+      R2_DECLINE("signed-of-uwiden");
+      return -1;
+   }
+   snprintf(out, sz, "%s", y);
+   return 1;
+}
+
 // depth guard: one r2_expr frame carries several sigspec buffers (tens of
 // KB); a pathological nesting declines instead of overflowing the stack
 static int g_r2_expr_depth;
@@ -5899,7 +5985,16 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
    case T_TYPE_CONV:
    case T_QUALIFIED:
    case T_INERTIAL:
-      return r2_expr(tree_value(e), out, sz);
+      {
+         // signed reinterpret (conversion form, e.g. `signed(resize(u,N))`) over
+         // an unsigned resize-widen passthrough -> zero-extend to the target first
+         if (tree_kind(e) == T_TYPE_CONV) {
+            const int r = r2_signed_uwiden(e, tree_value(e), out, sz);
+            if (r != 0)
+               return r == 1;
+         }
+         return r2_expr(tree_value(e), out, sz);
+      }
 
    case T_ARRAY_SLICE:
       {
@@ -6211,6 +6306,15 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
       {
          const char *fn = istr(tree_ident(e));
          const int np = tree_params(e);
+
+         // signed reinterpret (function-call form) over an unsigned resize-widen
+         // passthrough -> zero-extend to the target first (see r2_signed_uwiden)
+         if (np == 1 && vlog_op(fn) == NULL && r2_user_func(fn) == NULL) {
+            const int r = r2_signed_uwiden(e, tree_value(tree_param(e, 0)),
+                                           out, sz);
+            if (r != 0)
+               return r == 1;
+         }
 
          // transparent numeric_std/library identities (same set the text
          // path prints verbatim); never a user body that happens to carry
