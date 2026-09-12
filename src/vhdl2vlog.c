@@ -6857,6 +6857,19 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
             if (vecmul && vec_lw > 0)
                w = 2 * vec_lw;
+            else if (strcmp(bop, "mul") == 0) {
+               // A bare numeric_std `*` is ALWAYS L'length+R'length wide.
+               // r2_width(e) can UNDER-report it (returns an operand width -- 8
+               // for signed(reinterpret(u,8))*signed(reinterpret(...)), not 16),
+               // which truncates the product; the sum-width below only ran when
+               // r2_width was unconstrained.  Bump to the operand sum whenever it
+               // exceeds r2_width's value (never OVER-sizes: the product cannot
+               // exceed L+R).  vecmul is handled above.
+               const int mwa = r2_width_or_operands(ea);
+               const int mwb = r2_width_or_operands(eb);
+               if (mwa > 0 && mwb > 0 && mwa + mwb > w)
+                  w = mwa + mwb;
+            }
             if (w <= 0) {
                // operator returns are unconstrained: Verilog's context
                // width — the WIDER operand for + - & | ^ (a 1-bit lane
