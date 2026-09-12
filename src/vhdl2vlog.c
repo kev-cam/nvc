@@ -4402,7 +4402,12 @@ static int r2_width_or_operands(tree_t e)
          const int raw = r2_width_or_operands(rea);
          type_t ret = tree_type(rea);
          const bool runc = type_is_array(ret) && !type_const_bounds(ret);
-         if (rnw > 0 && raw > 0 && (rnw < raw || (rnw > raw && runc)))
+         // widening renders at target when r2_expr installs it there: an
+         // unconstrained OR a signed/integer operand (ck42), not a constrained
+         // unsigned -- mirror r2_rendered_width's resize case (see there).
+         const bool rsgn = type_is_signed(ret) || type_is_integer(ret);
+         if (rnw > 0 && raw > 0
+             && (rnw < raw || (rnw > raw && (runc || rsgn))))
             return rnw;
          return raw > 0 ? raw : -1;
       }
@@ -4601,7 +4606,17 @@ static int r2_rendered_width(tree_t e)
             const int raw = r2_rendered_width(rea);
             type_t ret = tree_type(rea);
             const bool runc = type_is_array(ret) && !type_const_bounds(ret);
-            if (rnw > 0 && raw > 0 && (rnw < raw || (rnw > raw && runc)))
+            // A WIDENING resize renders at its target when the r2_expr handler
+            // INSTALLS it there (materialize + $pos), which it does for an
+            // UNCONSTRAINED operand OR a SIGNED/integer one (ck42) -- NOT for a
+            // constrained unsigned (that passes through and the context zero-
+            // extends).  Mirror that here: without the `|| rsgn` a widening
+            // resize of a constrained SIGNED variable slice reported the
+            // pre-resize width, and a consuming negation then negated at that
+            // narrow width (`-(resize(s(5 downto 0),13))` negated the 6-bit slice).
+            const bool rsgn = type_is_signed(ret) || type_is_integer(ret);
+            if (rnw > 0 && raw > 0
+                && (rnw < raw || (rnw > raw && (runc || rsgn))))
                return rnw;
             e = rea;
             continue;
