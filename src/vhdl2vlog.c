@@ -678,6 +678,63 @@ static bool vlog_op_ctx_width(const char *o)
             || !strcmp(o, ">") || !strcmp(o, "<=") || !strcmp(o, ">="));
 }
 
+// SOUNDNESS (F4): is a memory-access INDEX a numeric_std VECTOR arithmetic
+// expression whose VHDL result wraps mod 2^operand-width but whose emitted
+// Verilog does NOT wrap?  `mem(to_integer(unsigned(a(2:0)) + 1))` wraps 7+1->0
+// in VHDL; the text path emits `mem[(a[2:0] + 1)]`, Verilog widens the unsized
+// literal to 32 bits, the add does not wrap, the index (8) exceeds the declared
+// `reg mem[0:7]`, and gen_statemachine reads garbage -- or, for a `- 1`
+// underflow, indexes _mem[0xffffffff] and SEGFAULTs.  A pure-INTEGER index
+// (`i + 1`, i:integer) is full-precision in both languages -- NOT flagged.  A
+// constant/folded index is exact -- the caller exempts it via folded_int.
+static bool mem_index_wraps(tree_t ix)
+{
+   // peel no-op wrappers: type conversions, qualifications, and the identity
+   // FCALLs (to_integer / resize / to_(un)signed, and the numeric_std casts)
+   for (;;) {
+      const tree_kind_t k = tree_kind(ix);
+      if (k == T_TYPE_CONV || k == T_QUALIFIED || k == T_INERTIAL) {
+         ix = tree_value(ix);
+         continue;
+      }
+      if (k == T_FCALL && tree_params(ix) >= 1) {
+         const char *b = id_base(istr(tree_ident(ix)));
+         int kd = -1;
+         const char *lo = vlog_l3d_op(istr(tree_ident(ix)), &kd);
+         if ((lo != NULL && kd == 2)
+             || !strcasecmp(b, "unsigned") || !strcasecmp(b, "signed")) {
+            ix = tree_value(tree_param(ix, 0));
+            continue;
+         }
+      }
+      break;
+   }
+   if (tree_kind(ix) != T_FCALL)
+      return false;
+   const char *ixfn = istr(tree_ident(ix));
+   const char *op = vlog_op(ixfn);
+   // shift_left is the numeric_std FUNCTION form of `sll` (`<<`): it overflows
+   // upward exactly like the operator, but is not in vlog_op's table.
+   const bool shl_fn = !strcasecmp(id_base(ixfn), "shift_left");
+   if (op == NULL && !shl_fn)
+      return false;
+   // only overflow / wrap-losing arithmetic: + - * << (and shift_left).  Bitwise
+   // ops are width-preserving; relationals are boolean; / rem srl shift_right
+   // rotate_* all stay in range (they shrink or wrap WITHIN the operand width).
+   if (op != NULL && strcmp(op, "+") && strcmp(op, "-") && strcmp(op, "*")
+       && strcmp(op, "<<"))
+      return false;
+   // require at least one numeric_std VECTOR operand (an array type): a pure
+   // integer operation computes at full precision identically in both languages
+   const int np = tree_params(ix);
+   for (int i = 0; i < np; i++) {
+      tree_t a = tree_value(tree_param(ix, i));
+      if (tree_has_type(a) && type_is_array(tree_type(a)))
+         return true;
+   }
+   return false;
+}
+
 // ---- Verilog SELF-DETERMINED width of what emit_expr() will actually PRINT ---
 //
 // Not the same thing as the VHDL type width: the l3dk==2 identities DROP their
@@ -1397,6 +1454,27 @@ static void emit_expr(FILE *f, tree_t e)
    case T_ARRAY_REF:
       {
          tree_t base = tree_value(e);
+         // SOUNDNESS (F4): a MEMORY access at a numeric_std vector-arithmetic
+         // index loses its modular wrap when emitted to Verilog -> an OOB $mem
+         // access (garbage word data, or a SIGSEGV on an underflowing `- 1`).
+         // The RTLIL walker already declines this shape (mem-usage); decline the
+         // text path too so the module stays in the golden interpreter.  This
+         // single site guards both reads and indexed WRITES (the write target
+         // routes through emit_expr(tree_target(s))).  Bare-index register files
+         // (mem(waddr)) and pure-integer indices are unaffected.
+         if (tree_params(e) == 1 && tree_kind(base) == T_REF
+             && tree_has_ref(base)) {
+            unsigned mnw, mew;
+            tree_t ixe = tree_value(tree_param(e, 0));
+            int64_t cix;
+            if ((sig_is_mem(tree_ref(base))
+                 || mem_shape(tree_type(tree_ref(base)), &mnw, &mew))
+                && !folded_int(ixe, &cix) && mem_index_wraps(ixe)) {
+               DECLINE("mem-idx-arith-wrap");
+               fputs("0/*mem-idx-arith-wrap*/", f);
+               break;
+            }
+         }
          // Verilog cannot bit-select a LITERAL, and an inlined constant emits as
          // one (`8'b..[i]` is a syntax error). For a constant base use shift+mask
          // -- which is exactly what yosys lowers a bit-select to anyway, and it
