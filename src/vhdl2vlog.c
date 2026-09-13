@@ -5511,6 +5511,87 @@ static bool r2_agg_is_concat(tree_t t)
    return !r2_const(t, tmp, sizeof tmp, -1);   // constants stay literals
 }
 
+// A NAMED / RANGE-choice aggregate of a 1-D vector with 1-bit elements, built as
+// an RTLIL concat.  The text path (emit_agg_general) mis-orders the ASCENDING
+// case for a numeric consumer (F3); the walker installs it CORRECTLY instead of
+// declining to that text path.  numeric_std: the LEFTMOST element is the MSB for
+// BOTH directions (verified: unsigned(std_logic_vector'(7=>b(0),..,0=>b(7))),
+// ascending, maps b(k)->2^k), so place each choice value at its distance-from-
+// left slot and emit slot[0] (leftmost = MSB) FIRST.  Returns false (-> decline)
+// for anything not faithfully representable (multi-bit elements, unfoldable
+// choices, A_SLICE/A_CONCAT here, uncovered index without others).
+static bool r2_agg_named(tree_t e, char *out, size_t sz)
+{
+   type_t at = tree_type(e);
+   if (!type_is_array(at) || !type_const_bounds(at) || dimension_of(at) != 1)
+      return false;
+   type_t et = type_elem(at);
+   if (type_is_array(et) || type_width(et) != 1)
+      return false;
+   tree_t r = range_of(at, 0);
+   int64_t left, right;
+   if (!folded_int(tree_left(r), &left) || !folded_int(tree_right(r), &right))
+      return false;
+   const bool is_downto = (tree_subkind(r) == RANGE_DOWNTO);
+   const int W = (int)type_width(at);
+   if (W <= 0 || W > 4096)
+      return false;
+   tree_t *slot = xcalloc_array(W, sizeof(tree_t));   // NULL = unfilled
+   tree_t others = NULL;
+   bool have_others = false, bad = false;
+   int pos = 0;
+   const int n = tree_assocs(e);
+   for (int i = 0; i < n && !bad; i++) {
+      tree_t a = tree_assoc(e, i);
+      switch (tree_subkind(a)) {
+      case A_POS:
+         if (pos < W) slot[pos] = tree_value(a); else bad = true;
+         pos++;
+         break;
+      case A_NAMED: {
+         int64_t idx;
+         if (!folded_int(tree_name(a), &idx)) { bad = true; break; }
+         const int64_t off = is_downto ? (left - idx) : (idx - left);
+         if (off >= 0 && off < W) slot[(int)off] = tree_value(a); else bad = true;
+         break;
+      }
+      case A_RANGE: {
+         tree_t rr = tree_range(a, 0);
+         int64_t lo, hi;
+         range_bounds(rr, &lo, &hi);
+         for (int64_t j = lo; j <= hi && !bad; j++) {
+            const int64_t off = is_downto ? (left - j) : (j - left);
+            if (off >= 0 && off < W) slot[(int)off] = tree_value(a); else bad = true;
+         }
+         break;
+      }
+      case A_OTHERS:
+         others = tree_value(a); have_others = true;
+         break;
+      default:
+         bad = true; break;
+      }
+   }
+   for (int k = 0; k < W && !bad; k++)
+      if (slot[k] == NULL) { if (have_others) slot[k] = others; else bad = true; }
+   if (!bad) {
+      size_t len = 0;
+      out[len++] = '{';
+      for (int b = 0; b < W && !bad; b++) {   // slot[0] = leftmost = MSB, emit first
+         char el[R2_SPEC];
+         if (!r2_expr(slot[b], el, sizeof el)) { bad = true; break; }
+         const size_t elen = strlen(el);
+         if (len + elen + 2 >= sz) { bad = true; break; }
+         if (b) out[len++] = ',';
+         memcpy(out + len, el, elen);
+         len += elen;
+      }
+      if (!bad) { out[len++] = '}'; out[len] = '\0'; }
+   }
+   free(slot);
+   return !bad;
+}
+
 static bool r2_concat_chain(tree_t e, char *out, size_t sz)
 {
    int cap = 64, n = 0, scap = 64, sn = 0;
@@ -5993,6 +6074,11 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                }
             }
          }
+         // named / range-choice / mixed aggregate (1-bit elements) -> concat,
+         // leftmost element = MSB (F3: install correctly instead of declining to
+         // the text path whose ascending ordering is wrong for numeric consumers)
+         if (tree_kind(e) == T_AGGREGATE && r2_agg_named(e, out, sz))
+            return true;
       }
       {
          char why[80];
