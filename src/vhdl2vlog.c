@@ -1618,6 +1618,56 @@ static bool folded_bit(tree_t e, bool *one)
    return false;
 }
 
+// SOUNDNESS (F4): does a memory-shaped signal/variable INITIALIZER equal
+// all-zero?  The accel resets memory state to 0 at power-on (sm_reset), so
+// DROPPING the initializer -- which both the RTLIL walker and the text path do
+// for a memory (no $meminit) -- is sound ONLY for an all-zero fill.  A uniform
+// but NONZERO fill `(others => x"00FF")` powered on at 0 and silently diverged.
+// Recurse uniform `(others => ...)` aggregates down to a zero bit ('0'/L/L3D_0,
+// via r2_bit_of_tree so std_logic AND logic3d resolve), an all-'0' bit-string,
+// or an integer 0; anything else (a set/meta bit, a nonzero literal, a
+// non-uniform aggregate, a non-constant value) is NOT provably zero, so the
+// caller must decline rather than drop it.
+static char r2_bit_of_tree(tree_t v);   // defined below (~3660): logic bit decode
+static bool mem_init_is_zero(tree_t v)
+{
+   if (v == NULL) return false;
+   switch (tree_kind(v)) {
+   case T_QUALIFIED:
+   case T_TYPE_CONV:
+      return mem_init_is_zero(tree_value(v));
+   case T_AGGREGATE:
+      if (tree_assocs(v) != 1 || tree_subkind(tree_assoc(v, 0)) != A_OTHERS)
+         return false;                    // non-uniform: not a plain zero fill
+      return mem_init_is_zero(tree_value(tree_assoc(v, 0)));
+   case T_STRING:
+      {
+         const int n = tree_chars(v);
+         if (n <= 0) return false;
+         for (int i = 0; i < n; i++) {
+            ident_t rune = tree_ident(tree_char(v, i));
+            const char c = (ident_len(rune) >= 2 && ident_char(rune, 0) == '\'')
+                           ? ident_char(rune, 1) : '?';
+            if (c != '0' && c != 'L') return false;   // set/meta bit -> not zero
+         }
+         return true;
+      }
+   default:
+      // A GENUINE integer-element memory carries a true integer value, so a
+      // zero fill is integer 0.  logic3d is ALSO type_is_integer (it is a
+      // bit-value-encoded integer type where L3D_0 has integer value 2, not 0),
+      // so exclude it -- and std_logic (a plain enum) -- and decode those as a
+      // bit via r2_bit_of_tree ('0'/L/L3D_0 -> value bit 0), matching mem_shape's
+      // own `type_is_integer(et) && !type_is_logic3d(et)` integer-element test.
+      if (tree_has_type(v) && type_is_integer(tree_type(v))
+          && !type_is_logic3d(tree_type(v))) {
+         int64_t iv;
+         return folded_int(v, &iv) && iv == 0;
+      }
+      return r2_bit_of_tree(v) == '0';
+   }
+}
+
 // Two expressions naming the SAME object (same resolved declaration). Used to
 // require `clk'event and clk = '1'` -- `clk'event and rst = '1'` is not an edge.
 static bool same_object(tree_t a, tree_t b)
@@ -3279,20 +3329,16 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       unsigned nw, ew;
       if (sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)) {
          // SOUNDNESS (F4): a memory-shaped signal's INITIALIZER cannot be
-         // emitted here -- the bare reg array below DROPS it.  A uniform
-         // (others => X) fill is a droppable power-on fill (matches the RTLIL
-         // walker, 9592-9604), but a NON-uniform per-element init -- signal m :
-         // arr := (x"0001", x"0002", ...) -- would power on at 0 and diverge on
-         // every cycle before each element is first written.  Mirror the
-         // walker's mem-init decline so the module stays in the golden interp.
-         if (tree_has_value(d)) {
-            tree_t iv = tree_value(d);
-            if (!(tree_kind(iv) == T_AGGREGATE && tree_assocs(iv) == 1
-                  && tree_subkind(tree_assoc(iv, 0)) == A_OTHERS)) {
-               DECLINE("mem-init");
-               fprintf(f, "  /*?mem-init %s*/\n", vid(tree_ident(d)));
-               continue;
-            }
+         // emitted here -- the bare reg array below DROPS it, and the accel
+         // resets memory state to 0.  So dropping is sound ONLY for an all-zero
+         // fill; a uniform NONZERO fill (others => x"00FF") or a non-uniform
+         // per-element init (x"0001", x"0002", ...) would power on at 0 and
+         // diverge before each element is written.  Mirror the walker's
+         // mem-init decline (9592+) so the module stays in the golden interp.
+         if (tree_has_value(d) && !mem_init_is_zero(tree_value(d))) {
+            DECLINE("mem-init");
+            fprintf(f, "  /*?mem-init %s*/\n", vid(tree_ident(d)));
+            continue;
          }
          const bool isint = type_is_integer(type_elem(tree_type(d)));
          fprintf(f, "  reg %s[%u:0] %s [0:%u];\n", isint ? "signed " : "",
@@ -9606,14 +9652,12 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
             goto declined;
          }
          if (tree_has_value(d)) {
-            // the TEXT path drops memory initializers outright (emits the
-            // bare reg array) — match it for a uniform (others => ...)
-            // aggregate; real per-element contents still decline
-            tree_t iv = tree_value(d);
-            if (tree_kind(iv) == T_AGGREGATE && tree_assocs(iv) == 1
-                && tree_subkind(tree_assoc(iv, 0)) == A_OTHERS)
-               ;   // uniform power-on fill: drop, as text does
-            else {
+            // the accel resets memory state to 0, so DROPPING the initializer
+            // (both this path and the text path do -- no $meminit) is sound
+            // ONLY for an all-zero fill.  A uniform but NONZERO fill
+            // (others => x"00FF") powers on at 0 and silently diverges; a
+            // non-uniform per-element init likewise.  Drop only a zero fill.
+            if (!mem_init_is_zero(tree_value(d))) {
                R2_DECLINE("mem-init");
                goto declined;
             }
