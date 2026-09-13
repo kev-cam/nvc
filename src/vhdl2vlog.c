@@ -3278,6 +3278,22 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       if (tree_kind(d) != T_SIGNAL_DECL) continue;
       unsigned nw, ew;
       if (sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)) {
+         // SOUNDNESS (F4): a memory-shaped signal's INITIALIZER cannot be
+         // emitted here -- the bare reg array below DROPS it.  A uniform
+         // (others => X) fill is a droppable power-on fill (matches the RTLIL
+         // walker, 9592-9604), but a NON-uniform per-element init -- signal m :
+         // arr := (x"0001", x"0002", ...) -- would power on at 0 and diverge on
+         // every cycle before each element is first written.  Mirror the
+         // walker's mem-init decline so the module stays in the golden interp.
+         if (tree_has_value(d)) {
+            tree_t iv = tree_value(d);
+            if (!(tree_kind(iv) == T_AGGREGATE && tree_assocs(iv) == 1
+                  && tree_subkind(tree_assoc(iv, 0)) == A_OTHERS)) {
+               DECLINE("mem-init");
+               fprintf(f, "  /*?mem-init %s*/\n", vid(tree_ident(d)));
+               continue;
+            }
+         }
          const bool isint = type_is_integer(type_elem(tree_type(d)));
          fprintf(f, "  reg %s[%u:0] %s [0:%u];\n", isint ? "signed " : "",
                  ew - 1, vid(tree_ident(d)), nw - 1);
