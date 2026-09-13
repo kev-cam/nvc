@@ -4758,20 +4758,21 @@ static bool r2_int_nonneg(tree_t e)
             const int wx = r2_rendered_width(x), wy = r2_rendered_width(y);
             if (wx <= 0 || wy <= 0)
                return false;
-            // Bound the result value's width.  For `*` use the ACTUAL rendered
-            // product width -- a numeric_std vector*scalar wraps the scalar to the
-            // vector length (unsigned(a(2:0))*255 is a 6-bit product, not a 3+8
-            // = 11-bit one), so wx+wy over-counts a wide literal scalar and trips
-            // the <=31 overflow guard, wrongly making a NON-negative product look
-            // signed (it then sign-extended in a widening to_signed).  `+` keeps
-            // the max+1 carry bound.
-            int rw;
-            if (strcmp(vop, "*") == 0) {
-               rw = r2_rendered_width(e);
-               if (rw <= 0) rw = wx + wy;
-            }
-            else
-               rw = (wx > wy ? wx : wy) + 1;
+            // Bound the result value's width by the ACTUAL rendered width of the
+            // operation, for both `*` and `+`.  wx+wy (mul) / max+1 (add) OVER-
+            // count a wide-rendered literal operand and trip the <=31 overflow
+            // guard, wrongly making a NON-negative result look signed (then
+            // sign-extended in a consuming multiply / widening to_signed):
+            //   unsigned(a(2:0))*255 is a 6-bit product, not 3+8=11;
+            //   (unsigned(a)/v + 1) is 8-bit (unsigned+natural = the vector's
+            //   width), not max(8, 32-bit literal)+1 = 33.
+            // r2_rendered_width returns the numeric_std result width (vecmul
+            // 2*len, vector+integer the vector's length, vector+vector the max),
+            // which is the true value bound; fall back to the old heuristic only
+            // if it is unavailable.
+            int rw = r2_rendered_width(e);
+            if (rw <= 0)
+               rw = (strcmp(vop, "*") == 0) ? wx + wy : (wx > wy ? wx : wy) + 1;
             return rw <= 31 && r2_int_nonneg(x) && r2_int_nonneg(y);
          }
          // An unrecognised operator/function (`/`, `rem`, `mod`, `and`, `or`,
