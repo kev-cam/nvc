@@ -1817,6 +1817,33 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          //   sig <= v      -> elided
          //   v(idx) := e   -> sig[idx] <= e   (direct NBA memory write)
          tree_t tg0 = tree_target(s);
+         // SOUNDNESS: a partial write (slice or sub-bit) into an element that
+         // is itself selected by a DYNAMIC index — mem(k)(7 downto 0) <= …,
+         // mem(k)(j) <= …  with k not static.  Emitting `mem[k][7:0] <= …`
+         // yosys mis-synthesizes (disjoint part-selects to the same dynamic
+         // word clobber / drop the address), a silent wrong install.  The
+         // rtlil walker declines this shape (dyn-elem-partial); decline in the
+         // text path too so the module stays in the golden interpreter.
+         {
+            tree_t sub = NULL;
+            if (tree_kind(tg0) == T_ARRAY_SLICE)
+               sub = tree_value(tg0);
+            else if (tree_kind(tg0) == T_ARRAY_REF && tree_params(tg0) == 1
+                     && (tree_kind(tree_value(tg0)) == T_ARRAY_REF
+                         || tree_kind(tree_value(tg0)) == T_ARRAY_SLICE))
+               sub = tree_value(tg0);
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_SLICE)
+               sub = tree_value(sub);
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_REF
+                && tree_params(sub) == 1) {
+               int64_t sidx;
+               if (!folded_int(tree_value(tree_param(sub, 0)), &sidx)) {
+                  DECLINE("dyn-elem-partial");
+                  fprintf(f, "  /*?dyn-elem-partial*/\n");
+                  break;
+               }
+            }
+         }
          if (tree_kind(s) == T_VAR_ASSIGN) {
             if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
                 && shadow_sig_of(tree_ref(tg0)) != NULL)
@@ -8038,6 +8065,35 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             // rewrite the BASE ident by aliasing: the slice/index structure
             // stays, target lookup below uses the signal's name
          }
+         // SOUNDNESS: a partial write (slice or sub-bit) into a element that
+         // is itself selected by a DYNAMIC index — dl(k)(7 downto 0) <= …,
+         // dl(k)(j) <= … with k not static.  The mem path peels only a bare
+         // T_ARRAY_REF, so this shape misses it and falls to the slice/sel
+         // lowering, which assumes a static base and silently installs a
+         // wrong netlist (the dynamic address is dropped / untouched bits are
+         // clobbered).  Decline so the module stays in the golden interp.
+         // Whole-element dynamic writes (dl(k) <= val — VeeR's register file)
+         // have a T_REF base here, are not caught, and keep the mem path.
+         {
+            tree_t sub = NULL;
+            if (tree_kind(tg) == T_ARRAY_SLICE)
+               sub = tree_value(tg);
+            else if (tree_kind(tg) == T_ARRAY_REF && tree_params(tg) == 1
+                     && (tree_kind(tree_value(tg)) == T_ARRAY_REF
+                         || tree_kind(tree_value(tg)) == T_ARRAY_SLICE))
+               sub = tree_value(tg);      // bit/slice OF an element
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_SLICE)
+               sub = tree_value(sub);     // dl(k)(7:0) written as slice-of-ref
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_REF
+                && tree_params(sub) == 1) {
+               int64_t sidx;
+               tree_t ix = tree_value(tree_param(sub, 0));
+               if (!folded_int(ix, &sidx) && !r2_eval_int(ix, &sidx)) {
+                  R2_DECLINE("dyn-elem-partial");
+                  return false;
+               }
+            }
+         }
          // memory writes: only the ENABLE threads the decision tree —
          // addr/data are unconditional comb, gated by EN at the port
          r2_mem_t *mm = NULL;
@@ -8639,8 +8695,15 @@ static void r2_memw_scan_cb(tree_t t, void *ctx)
    const tree_kind_t k = tree_kind(t);
    if (k != T_VAR_ASSIGN && k != T_SIGNAL_ASSIGN)
       return;
+   // peel the FULL select chain: dl(k) <= …, dl(k)(7 downto 0) <= …,
+   // dl(k)(j) <= … all write the memory `dl`.  A single-level peel missed
+   // the partial-slice/sub-bit forms, so a process whose ONLY memory writes
+   // are partial-slice left mws.n == 0 and the whole process early-returned
+   // as a silent no-op (no write port built, no decline).  Count them so the
+   // process proceeds to r2_seq, where the target lowering builds or soundly
+   // declines the shape.
    tree_t tg = tree_target(t);
-   if (tree_kind(tg) == T_ARRAY_REF)
+   while (tree_kind(tg) == T_ARRAY_REF || tree_kind(tg) == T_ARRAY_SLICE)
       tg = tree_value(tg);
    if (tree_kind(tg) != T_REF)
       return;
