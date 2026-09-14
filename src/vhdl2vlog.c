@@ -4589,6 +4589,34 @@ static int r2_width_or_operands(tree_t e)
             return tnw;
       }
    }
+   // CONCATENATION -- nvc elaborates `A & B & ...` into a concat AGGREGATE
+   // (A_CONCAT / A_POS elements), NOT a "&" FCALL.  Its width is the SUM of the
+   // element widths (a scalar bit contributes 1).  The result type is
+   // UNCONSTRAINED, so without this r2_width_or_operands returned -1 for a
+   // concat -- and a numeric_std `*` with a concat operand ((unsigned(a)&
+   // unsigned(b)) * resize(b,32)) then lost that operand's L'LENGTH and MASKED
+   // the 64-bit product to 32 bits (F4 resweep familyB wide MAC).
+   if (tree_kind(e) == T_AGGREGATE && type_is_array(tree_type(e))) {
+      const int n = tree_assocs(e);
+      bool isconcat = n > 0;
+      for (int i = 0; i < n && isconcat; i++) {
+         const assoc_kind_t sk = tree_subkind(tree_assoc(e, i));
+         if (sk != A_CONCAT && sk != A_POS)
+            isconcat = false;
+      }
+      if (isconcat) {
+         int sum = 0;
+         for (int i = 0; i < n; i++) {
+            tree_t el = tree_value(tree_assoc(e, i));
+            const int ew = type_is_array(tree_type(el))
+               ? r2_width_or_operands(el) : 1;
+            if (ew <= 0) { sum = -1; break; }
+            sum += ew;
+         }
+         if (sum > 0)
+            return sum;
+      }
+   }
    // numeric_std `vector * scalar` (unsigned*natural / signed*integer): the
    // scalar WRAPS to the vector length -> a 2*L'length product, NOT wa+wb.
    // Checked BEFORE r2_width's early return, because r2_width reports a mul's
