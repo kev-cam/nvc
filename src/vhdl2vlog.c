@@ -1433,6 +1433,24 @@ static void emit_expr(FILE *f, tree_t e)
             // false positive.
             const bool ident_bad =
                (celem && nw > 0 && emitted_width(a0, 0) != nw);
+            // NARROWING a SIGNED resize/to_signed -- resize(signed_product, 16)
+            // -- keeps {sign, low nw-1}, NOT a low-nw truncation.  The $signed
+            // identity below drops the width arg and the assignment truncates,
+            // silently dropping the sign on overflow (F4 resweep familyD:
+            // resize(resize(signed(a),20)*resize(signed(b),20), 16)).  The rtlil
+            // walker declines this shape (resize-narrow-land); decline the text
+            // path too so the module stays in the golden interpreter.
+            {
+               const char *rb = id_base(fn);
+               const int ow = (aw > 0) ? aw : emitted_width(a0, 0);
+               if ((strcasecmp(rb, "resize") == 0
+                    || strcasecmp(rb, "to_signed") == 0)
+                   && sgn && nw > 0 && ow > 0 && nw < ow) {
+                  DECLINE("resize-narrow-signed-land");
+                  fputs("0/*resize-narrow-signed*/", f);
+                  break;
+               }
+            }
             if (sgn) {
                if (ident_bad) DECLINE("identity-width-in-concat");
                // $signed(x) keeps x's self-determined width -> transparent.
