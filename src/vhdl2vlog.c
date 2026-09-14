@@ -7847,7 +7847,16 @@ static void r2_collect_cb(tree_t t, void *ctx)
    snprintf(n->spec, sizeof n->spec, "%s", vid(id));
    snprintf(n->g0, sizeof n->g0, "g0p%d_%s", ts->pidx, vid(id));
    type_t ty = tree_type(tree_ref(tg));
-   n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
+   // An INTEGER signal register follows the translator's signed [31:0] integer
+   // convention (r2_width returns 32 for an integer read) -- NOT type_width's
+   // scalar 1.  An `integer range 0 to 3` register sized to 1 bit TRUNCATED its
+   // value, so an integer signal used as a dynamic memory index only ever
+   // addressed words 0/1 (F4 sigidx: dl(k) with k a range-0-to-3 signal).
+   // logic3d is an integer subtype but genuinely bit-wide -- keep type_width.
+   if (type_is_integer(ty) && !type_is_logic3d(ty))
+      n->width = 32;
+   else
+      n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
 }
 
 static bool r2_seq(tree_t list_of, r2_targets_t *ts);
