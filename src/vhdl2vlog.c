@@ -1475,6 +1475,22 @@ static void emit_expr(FILE *f, tree_t e)
                break;
             }
          }
+         // ASCENDING-range vector element read `ua(i)` (ua : slv(0 to N)): the
+         // leftmost element is the MSB, so VHDL index i is Verilog bit N-1-i,
+         // but the [idx] emit below uses i directly -- the wrong bit (F4 resweep
+         // familyC).  The rtlil walker declines this (elem-ascending); decline
+         // the text path too.  Memories and multi-bit-element results unaffected.
+         if (tree_params(e) == 1 && tree_kind(base) == T_REF
+             && tree_has_ref(base) && !type_is_array(tree_type(e))
+             && !sig_is_mem(tree_ref(base))) {
+            type_t bt = tree_type(tree_ref(base));
+            if (type_is_array(bt) && type_const_bounds(bt)
+                && dimension_of(bt) == 1 && direction_of(bt, 0) == RANGE_TO) {
+               DECLINE("elem-ascending");
+               fputs("0/*elem-ascending*/", f);
+               break;
+            }
+         }
          // Verilog cannot bit-select a LITERAL, and an inlined constant emits as
          // one (`8'b..[i]` is a syntax error). For a constant base use shift+mask
          // -- which is exactly what yosys lowers a bit-select to anyway, and it
@@ -1523,13 +1539,20 @@ static void emit_expr(FILE *f, tree_t e)
    case T_ARRAY_SLICE:
       {
          tree_t r = tree_range(e, 0);
+         // ASCENDING-range slice `sig(lo to hi)`: the base vector's leftmost
+         // element is the MSB, so VHDL index i is Verilog bit N-1-i and the raw
+         // [right:left] mapping below silently REORDERS the bits (F4 resweep
+         // familyC: a byteswap installed as y=a).  The rtlil walker declines
+         // this (slice-ascending); decline the text path too so the module
+         // stays in the golden interpreter.
+         if (tree_subkind(r) == RANGE_TO) {
+            DECLINE("slice-ascending");
+            fputs("0/*slice-ascending*/", f);
+            break;
+         }
          emit_expr(f, tree_value(e));
          fputc('[', f);
-         if (tree_subkind(r) == RANGE_TO) {   // ascending: Verilog wants [hi:lo]
-            emit_expr(f, tree_right(r)); fputc(':', f); emit_expr(f, tree_left(r));
-         } else {                             // downto: [left:right] = [hi:lo]
-            emit_expr(f, tree_left(r)); fputc(':', f); emit_expr(f, tree_right(r));
-         }
+         emit_expr(f, tree_left(r)); fputc(':', f); emit_expr(f, tree_right(r));
          fputc(']', f);
       }
       break;
@@ -6317,6 +6340,16 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             return false;
          }
          tree_t r = tree_range(e, 0);
+         // ASCENDING-range slice `sig(lo to hi)` -- checked BEFORE the dynamic
+         // and static branches below, both of which lower to a DOWNTO
+         // bit-mapping (the dynamic r2_dyn_slice/x+K path returns shr+[k:0]).
+         // An ascending base's leftmost element is the MSB, so the whole
+         // ascending bit-order is mis-modeled (F4 resweep familyC): decline any
+         // ascending slice -- static OR dynamic-index -- to the golden interp.
+         if (tree_subkind(r) == RANGE_TO) {
+            R2_DECLINE("slice-ascending");
+            return false;
+         }
          int64_t left, right;
          if ((!folded_int(tree_left(r), &left)
               && !r2_eval_int(tree_left(r), &left))
@@ -6457,6 +6490,22 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                }
                snprintf(out, sz, "%s", dt);
                return true;
+            }
+         }
+         // ASCENDING-range vector element read `ua(i)` (ua : slv(0 to N)): the
+         // leftmost element is the MSB, so VHDL index i is Verilog bit N-1-i,
+         // but the emits below use i directly as the bit position -- the WRONG
+         // bit (F4 resweep familyC: ua(3) read ua[3], not ua[12]).  Decline to
+         // the golden interpreter, as for the ascending slice + var-elem policy.
+         // Memories (handled above via $memrd) and multi-bit results are
+         // unaffected -- this fires only for a scalar element of a 1-D vector.
+         if (tree_kind(base) == T_REF && tree_has_ref(base)
+             && tree_params(e) == 1 && !type_is_array(tree_type(e))) {
+            type_t bt = tree_type(tree_ref(base));
+            if (type_is_array(bt) && type_const_bounds(bt)
+                && dimension_of(bt) == 1 && direction_of(bt, 0) == RANGE_TO) {
+               R2_DECLINE("elem-ascending");
+               return false;
             }
          }
          bool have_idx = tree_kind(base) == T_REF && tree_params(e) == 1
