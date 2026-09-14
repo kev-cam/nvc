@@ -485,6 +485,31 @@ static bool mem_shape(type_t t, unsigned *nwords, unsigned *elemw)
    return true;
 }
 
+// A DYNAMIC (non-folded) index into a NON-ZERO-BASE array `arr(low to high)` /
+// `arr(high downto low)` with low != 0.  Both the walker mem path (mem addr =
+// raw index) and the flat-wire part-select `[(idx)*W +: W]` address storage at
+// the RAW index without subtracting array'low, so mem(5) of a (4 to 7) array
+// hits word 5 (out of a 4-word store), not word 1 (F4 resweep familyA: a signal
+// memory installs wrong; a LUT/ROM installs wrong via the text flat part-select).
+// Both paths decline it to the golden interpreter.  A FOLDED (static) index is
+// handled elsewhere; a 0-based array is unaffected.
+static bool r2_nonzero_base_dyn_index(tree_t e)
+{
+   if (tree_kind(e) != T_ARRAY_REF || tree_params(e) != 1)
+      return false;
+   tree_t base = tree_value(e);
+   if (tree_kind(base) != T_REF || !tree_has_ref(base))
+      return false;
+   type_t bt = tree_type(tree_ref(base));
+   if (!type_is_array(bt) || !type_const_bounds(bt) || dimension_of(bt) != 1)
+      return false;
+   int64_t low, high;
+   if (!folded_bounds(range_of(bt, 0), &low, &high) || low == 0)
+      return false;
+   int64_t cidx;
+   return !folded_int(tree_value(tree_param(e, 0)), &cidx);   // dynamic index
+}
+
 typedef struct { tree_t decl; int refs; int indexed; int agg; } mem_scan_t;
 
 static void mem_scan_cb(tree_t t, void *ctx)
@@ -1454,6 +1479,14 @@ static void emit_expr(FILE *f, tree_t e)
    case T_ARRAY_REF:
       {
          tree_t base = tree_value(e);
+         // SOUNDNESS (F4 resweep familyA): a dynamic index into a NON-ZERO-BASE
+         // array addresses the flat store at the raw index without subtracting
+         // array'low.  The rtlil walker declines this; decline the text path too.
+         if (r2_nonzero_base_dyn_index(e)) {
+            DECLINE("nonzero-base-dyn-index");
+            fputs("0/*nonzero-base-dyn-index*/", f);
+            break;
+         }
          // SOUNDNESS (F4): a MEMORY access at a numeric_std vector-arithmetic
          // index loses its modular wrap when emitted to Verilog -> an OOB $mem
          // access (garbage word data, or a SIGSEGV on an underflowing `- 1`).
@@ -6473,6 +6506,13 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
          int64_t idx;
          if (r2_sel_nested(e))
             return r2_sel_chain_expr(e, out, sz);
+         // SOUNDNESS (F4 resweep familyA): a dynamic index into a NON-ZERO-BASE
+         // array addresses the mem/flat store at the raw index without
+         // subtracting array'low (mem(5) of a (4 to 7) array hits word 5, not 1).
+         if (r2_nonzero_base_dyn_index(e)) {
+            R2_DECLINE("nonzero-base-dyn-index");
+            return false;
+         }
          if (tree_kind(base) == T_REF && tree_params(e) == 1) {
             r2_mem_t *mm = r2_mem_of(tree_ident(base));
             if (mm != NULL) {
@@ -8319,6 +8359,14 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   return false;
                }
             }
+         }
+         // SOUNDNESS (F4 resweep familyA): a dynamic WRITE index into a
+         // NON-ZERO-BASE array addresses the mem store at the raw index without
+         // subtracting array'low (mem(5) of a (4 to 7) array writes word 5, not
+         // 1) -- the read path declines the same shape.  Decline to interp.
+         if (r2_nonzero_base_dyn_index(tg)) {
+            R2_DECLINE("nonzero-base-dyn-index");
+            return false;
          }
          // memory writes: only the ENABLE threads the decision tree —
          // addr/data are unconditional comb, gated by EN at the port
