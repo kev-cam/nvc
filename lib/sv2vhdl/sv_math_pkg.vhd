@@ -55,6 +55,14 @@ package sv_math_pkg is
     function rtoi(x : real) return integer;   -- real to integer (truncate)
 
     -- ============================================================
+    -- Plusargs
+    -- ============================================================
+
+    -- $test$plusargs: 1 when any +plusarg on the simulator command line
+    -- starts with prefix, else 0.  Implemented in libresolver (VHPI tool argv).
+    impure function sv_test_plusargs(prefix : string) return integer;
+
+    -- ============================================================
     -- Random (simple — uses internal global seed)
     -- ============================================================
 
@@ -188,6 +196,9 @@ package body sv_math_pkg is
 
     function rtoi(x : real) return integer is begin end function;
     attribute foreign of rtoi [real return integer] : function is "VHPIDIRECT sv_rtoi";
+
+    impure function sv_test_plusargs(prefix : string) return integer is begin end function;
+    attribute foreign of sv_test_plusargs [string return integer] : function is "VHPIDIRECT sv_test_plusargs";
 
     -- ============================================================
     -- Random

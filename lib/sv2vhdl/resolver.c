@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -1620,6 +1621,33 @@ static void resolver_register_cleanup(void)
         .cb_rtn = end_of_sim,
     };
     vhpi_register_cb(&cb, vhpiReturnCb);
+}
+
+/* ---------- $test$plusargs ----------
+ *
+ * VHPIDIRECT target of sv_math_pkg.sv_test_plusargs(prefix : string).  NVC
+ * passes an unconstrained string as (data, length).  The simulator's plusargs
+ * reach VHPI as the tool's argv ("+name" strings); like Verilog, a plusarg
+ * matches when its text after the '+' starts with prefix.
+ */
+int32_t sv_test_plusargs(const char *prefix, int64_t len)
+{
+    vhpiHandleT tool = vhpi_handle(vhpiTool, NULL);
+    if (tool == NULL)
+        return 0;
+    vhpiHandleT it = vhpi_iterator(vhpiArgvs, tool);
+    if (it == NULL)
+        return 0;
+    int32_t found = 0;
+    vhpiHandleT a;
+    while ((a = vhpi_scan(it)) != NULL) {
+        const char *v = (const char *)vhpi_get_str(vhpiStrValP, a);
+        if (!found && v != NULL && v[0] == '+'
+            && (int64_t)strlen(v + 1) >= len && strncmp(v + 1, prefix, len) == 0)
+            found = 1;
+        vhpi_release_handle(a);
+    }
+    return found;
 }
 
 /* ---------- VHPI entry point ---------- */
