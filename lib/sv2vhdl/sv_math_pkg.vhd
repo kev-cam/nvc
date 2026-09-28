@@ -9,6 +9,9 @@
 --   nvc --std=2040 --load=.../libsv_math.so -e ...
 --
 
+library sv2vhdl;
+use sv2vhdl.logic3d_types_pkg.all;   -- $value$plusargs vector results
+
 package sv_math_pkg is
 
     -- ============================================================
@@ -61,6 +64,17 @@ package sv_math_pkg is
     -- $test$plusargs: 1 when any +plusarg on the simulator command line
     -- starts with prefix, else 0.  Implemented in libresolver (VHPI tool argv).
     impure function sv_test_plusargs(prefix : string) return integer;
+
+    -- $value$plusargs(fmt, var).  fmt is "<prefix>%<code>" (d o h x b s e f g).
+    -- sv_value_plusargs: 1 when a +plusarg starts with fmt's prefix.
+    -- sv_plusarg_vec / sv_plusarg_real: that plusarg's text converted per
+    -- fmt's code, with Icarus semantics (bad digits -> all x, '-' -> two's
+    -- complement, x/z digits, %s right-aligned chars).  C in libresolver.
+    impure function sv_value_plusargs(fmt : string) return integer;
+    impure function sv_plusarg_vec(fmt : string; w : positive) return logic3d_vector;
+    impure function sv_plusarg_real(fmt : string) return real;
+    -- Verilog string held in a vector (8 bits/char, NULs dropped) -> string.
+    function l3d_to_string(v : logic3d_vector) return string;
 
     -- ============================================================
     -- Random (simple — uses internal global seed)
@@ -199,6 +213,55 @@ package body sv_math_pkg is
 
     impure function sv_test_plusargs(prefix : string) return integer is begin end function;
     attribute foreign of sv_test_plusargs [string return integer] : function is "VHPIDIRECT sv_test_plusargs";
+
+    impure function sv_value_plusargs(fmt : string) return integer is begin end function;
+    attribute foreign of sv_value_plusargs [string return integer] : function is "VHPIDIRECT sv_value_plusargs";
+
+    impure function sv_plusarg_real(fmt : string) return real is begin end function;
+    attribute foreign of sv_plusarg_real [string return real] : function is "VHPIDIRECT sv_plusarg_real";
+
+    -- C fills bits(1 to w), MSB first, with '0' '1' 'x' 'z'.
+    procedure sv_plusarg_bits(fmt : in string; bits : out string) is begin end procedure;
+    attribute foreign of sv_plusarg_bits [string, string] : procedure is "VHPIDIRECT sv_plusarg_bits";
+
+    impure function sv_plusarg_vec(fmt : string; w : positive) return logic3d_vector is
+        variable buf : string(1 to w) := (others => '0');
+        variable r   : logic3d_vector(w - 1 downto 0);
+    begin
+        sv_plusarg_bits(fmt, buf);
+        for i in 1 to w loop
+            case buf(i) is
+                when '1'    => r(w - i) := L3D_1;
+                when 'x'    => r(w - i) := L3D_X;
+                when 'z'    => r(w - i) := L3D_Z;
+                when others => r(w - i) := L3D_0;
+            end case;
+        end loop;
+        return r;
+    end function;
+
+    function l3d_to_string(v : logic3d_vector) return string is
+        constant n : natural := (v'length + 7) / 8;
+        alias    vv : logic3d_vector(v'length - 1 downto 0) is v;
+        variable s : string(1 to n);
+        variable k : natural := 0;
+        variable c : natural;
+    begin
+        for j in n - 1 downto 0 loop           -- char j = bits j*8+7 .. j*8
+            c := 0;
+            for b in 7 downto 0 loop
+                c := c * 2;
+                if j * 8 + b < v'length then
+                    c := c + (vv(j * 8 + b) mod 2);   -- value plane
+                end if;
+            end loop;
+            if c /= 0 then
+                k := k + 1;
+                s(k) := character'val(c);
+            end if;
+        end loop;
+        return s(1 to k);
+    end function;
 
     -- ============================================================
     -- Random
