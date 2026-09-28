@@ -19138,7 +19138,7 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
             deltaq_insert_proc(m, 0, dep);
       }
 
-      if (has_driver && !src->pseudoqueued) {
+      if ((has_driver || standard() != STD_MX) && !src->pseudoqueued) {
          deltaq_insert_pseudo_source(m, src);
          src->pseudoqueued = 1;
       }
@@ -19187,7 +19187,7 @@ static void deposit_signal_impl(rt_model_t *m, rt_signal_t *s,
       // the write does not reappear at release. (IEEE 1364: the variable
       // retains the forced value until released, then keeps it until the
       // next procedural assignment.)
-      if (n->flags & NET_F_FORCED) {
+      if ((n->flags & NET_F_FORCED) && standard() == STD_MX) {
          vptr += valuesz;
          continue;
       }
