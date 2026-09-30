@@ -426,46 +426,54 @@ struct vacask_ctx {
    double         v_acc;     // A2D: voltage at t_acc
    double         v_sync;    // A2D: voltage when this probe last paused
    bool           have_acc;
+   // D2A ramp from r_v0 at r_t0 to r_v1 at r_t0 + rise_time.  Kept per source
+   // (not in the shared bridge_signal) so that a change arriving while a ramp
+   // is still running starts from the value actually being driven -- the
+   // source must stay continuous across a pause or the analog step collapses.
+   double         r_t0, r_v0, r_v1;
+   double         out_acc;   // D2A: output at t_acc
 };
 
-// D2A: the held NVC voltage, with a rise_time ramp starting at the sync
-// point where NVC changed it (the last accepted analog time).
+static double vacask_d2a_out(const vacask_ctx *ctx, double t)
+{
+   double t1 = ctx->r_t0 + ctx->sig->rise_time;
+   if (t >= t1)
+      return ctx->r_v1;
+   if (t <= ctx->r_t0)
+      return ctx->r_v0;
+   return ctx->r_v0 + (ctx->r_v1 - ctx->r_v0) * (t - ctx->r_t0) / (t1 - ctx->r_t0);
+}
+
+// D2A: the NVC voltage, reached by a rise_time ramp that starts at the sync
+// point where NVC changed it (the last accepted analog time).  Glitches that
+// come and go between two sync points leave the target unchanged: no ramp.
 static double vacask_d2a_value(void *p, double t, double *next_break)
 {
    vacask_ctx *ctx = (vacask_ctx *)p;
    bridge_signal *sig = ctx->sig;
    double nb = 0.0;
 
-   if (sig->transition_start == -2.0)
-      sig->transition_start = ctx->t_acc;
-
-   double v = sig->voltage;
-   if (sig->transition_start >= 0) {
-      double t0 = sig->transition_start;
-      double t1 = t0 + sig->rise_time;
-      if (t < t1) {
-         if (t > t0)
-            v = sig->prev_voltage + (sig->voltage - sig->prev_voltage) * (t - t0) / (t1 - t0);
-         else
-            v = sig->prev_voltage;
-         nb = t1;
-      }
+   if (fabs(sig->voltage - ctx->r_v1) > 1e-9) {
+      ctx->r_v0 = ctx->out_acc;
+      ctx->r_t0 = ctx->t_acc;
+      ctx->r_v1 = sig->voltage;
    }
 
+   double t1 = ctx->r_t0 + sig->rise_time;
+   if (t < t1)
+      nb = t1;
    if (sig->next_time_s > t && (nb == 0.0 || sig->next_time_s < nb))
       nb = sig->next_time_s;
 
    *next_break = nb;
-   return v;
+   return vacask_d2a_out(ctx, t);
 }
 
 static int vacask_d2a_accepted(void *p, double t, double v)
 {
    vacask_ctx *ctx = (vacask_ctx *)p;
-   bridge_signal *sig = ctx->sig;
    ctx->t_acc = t;
-   if (sig->transition_start >= 0 && t >= sig->transition_start + sig->rise_time)
-      sig->transition_start = -1.0;
+   ctx->out_acc = vacask_d2a_out(ctx, t);
    return 0;
 }
 
@@ -564,6 +572,9 @@ int vacask_bridge_init(const char *args, int is_vsource, VacaskExtSource *src)
    ctx->v_acc = 0.0;
    ctx->v_sync = 0.0;
    ctx->have_acc = false;
+   // D2A: no ramp pending, drive the registered initial voltage
+   ctx->r_t0 = -1.0;
+   ctx->r_v0 = ctx->r_v1 = ctx->out_acc = sig->voltage;
 
    src->ctx = ctx;
    src->value = d2a ? vacask_d2a_value : vacask_a2d_value;
