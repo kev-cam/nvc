@@ -23,6 +23,7 @@
 #include "rt/model.h"
 #include "rt/structs.h"
 #include "rt/rt.h"
+#include "cosim.h"
 
 #include <ctype.h>
 #include <dlfcn.h>
@@ -150,15 +151,31 @@ typedef struct {
    double         dt_max;       // maximum analog timestep (seconds)
 } cosim_state_t;
 
-// Load Xyce shared library via dlopen
-static bool xyce_load(xyce_handle_t *x)
+// Analog engine name (for messages) and C-interface symbol prefix
+static const char *engine_name(cosim_engine_t engine)
 {
-   const char *libnames[] = {
+   return engine == COSIM_VACASK ? "VACASK" : "Xyce";
+}
+
+// Load the analog engine's C-interface shared library via dlopen.  VACASK's
+// libvacaskcinterface mirrors Xyce's libxycecinterface with a vacask_ prefix.
+static bool xyce_load(xyce_handle_t *x, cosim_engine_t engine)
+{
+   const char *xyce_libnames[] = {
       "libxycecinterface.so",
       "/usr/local/lib/libxycecinterface.so",
       "/usr/lib/libxycecinterface.so",
       NULL
    };
+   const char *vacask_libnames[] = {
+      "libvacaskcinterface.so",
+      "/usr/local/lib/libvacaskcinterface.so",
+      "/usr/lib/libvacaskcinterface.so",
+      NULL
+   };
+   const char **libnames =
+      engine == COSIM_VACASK ? vacask_libnames : xyce_libnames;
+   const char *prefix = engine == COSIM_VACASK ? "vacask_" : "xyce_";
 
    for (const char **p = libnames; *p != NULL; p++) {
       // RTLD_LAZY (not RTLD_NOW): libXyceLib pulls in the Trilinos amesos2/
@@ -173,14 +190,17 @@ static bool xyce_load(xyce_handle_t *x)
    }
 
    if (x->lib == NULL) {
-      warnf("cannot load Xyce: %s", dlerror());
+      warnf("cannot load %s: %s", engine_name(engine), dlerror());
       return false;
    }
 
 #define LOAD_SYM(name) do { \
-      x->name = (xyce_##name##_fn)dlsym(x->lib, "xyce_" #name); \
+      char sym[64]; \
+      snprintf(sym, sizeof(sym), "%s%s", prefix, #name); \
+      x->name = (xyce_##name##_fn)dlsym(x->lib, sym); \
       if (x->name == NULL) { \
-         warnf("missing Xyce symbol xyce_%s: %s", #name, dlerror()); \
+         warnf("missing %s symbol %s: %s", engine_name(engine), sym, \
+               dlerror()); \
          dlclose(x->lib); \
          return false; \
       } \
@@ -195,7 +215,7 @@ static bool xyce_load(xyce_handle_t *x)
 
 #undef LOAD_SYM
 
-   notef("loaded libxycecinterface.so");
+   notef("loaded %s C interface", engine_name(engine));
    return true;
 }
 
@@ -541,9 +561,11 @@ static void cosim_free(cosim_state_t *cs)
 }
 
 // Main co-simulation entry point
-int cosim_run(rt_model_t *m, const char *xyce_netlist,
+int cosim_run(rt_model_t *m, cosim_engine_t engine, const char *xyce_netlist,
               const char *xyce_config, uint64_t stop_time)
 {
+   const char *ename = engine_name(engine);
+
    cosim_state_t cs = {
       .boundaries = NULL,
       .nboundaries = 0,
@@ -552,13 +574,13 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
    };
 
    // 1. Load shared libraries
-   notef("initializing Xyce co-simulation");
+   notef("initializing %s co-simulation", ename);
    if (!bridge_load()) {
       fatal("failed to load libcosim_bridge.so");
       return EXIT_FAILURE;
    }
-   if (!xyce_load(&cs.xyce)) {
-      fatal("failed to load libxycecinterface.so");
+   if (!xyce_load(&cs.xyce, engine)) {
+      fatal("failed to load the %s C interface library", ename);
       return EXIT_FAILURE;
    }
 
@@ -592,11 +614,11 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
    char *xyce_argv[] = { "Xyce", (char *)xyce_netlist };
    int rc = cs.xyce.initialize(&cs.xyce.ptr, 2, xyce_argv);
    if (rc == 0) {
-      fatal("xyce_initialize() failed for netlist %s", xyce_netlist);
+      fatal("%s initialize failed for netlist %s", ename, xyce_netlist);
       cosim_free(&cs);
       return EXIT_FAILURE;
    }
-   notef("Xyce initialized with netlist: %s", xyce_netlist);
+   notef("%s initialized with netlist: %s", ename, xyce_netlist);
 
    // 7. Co-simulation loop
    double xyce_time = 0.0;
@@ -668,9 +690,10 @@ int cosim_run(rt_model_t *m, const char *xyce_netlist,
       double dt_sim = prof ? prof_now() - t_a : 0.0;
       if (rc == 0) {
          if (cs.xyce.simulationComplete(&cs.xyce.ptr))
-            notef("Xyce simulation complete at time %.6g s", xyce_time);
+            notef("%s simulation complete at time %.6g s", ename, xyce_time);
          else
-            warnf("xyce_simulateUntil failed at cycle %d (t=%.6g)", cycle, xyce_time);
+            warnf("%s simulateUntil failed at cycle %d (t=%.6g)", ename, cycle,
+                  xyce_time);
          break;
       }
       xyce_time = actual_time;

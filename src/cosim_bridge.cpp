@@ -8,6 +8,11 @@
 //    When a change is detected, calls through to NVC deposit handle directly.
 //    I_out n_out 0 PWL(0 0) URI="code:libcosim_bridge.so:nvc_bridge_init:a2d:name"
 //
+//  VACASK uses the same registry through its external-source ABI
+//  (VACASK include/extsource.h), no function tables involved:
+//    v_in (n_in 0) vsource type="pwl" file="code:libcosim_bridge.so:vacask_bridge_init:d2a:name"
+//    i_out (n_out 0) isource type="pwl" file="code:libcosim_bridge.so:vacask_bridge_init:a2d:name"
+//
 //  Build:
 //    c++ -shared -fPIC -o libcosim_bridge.so cosim_bridge.cpp
 //
@@ -395,4 +400,177 @@ void *nvc_bridge_init(PWLinDynData *pwl, void **cb_data, const char *args)
            dir == DIR_D2A ? "D2A" : "A2D", sig_name);
 
    return (void *)(dir == DIR_D2A ? d2a_callback : a2d_callback);
+}
+
+
+// --- VACASK external-source interface ---
+//
+// VACASK calls value() at every Newton evaluation (the timepoint may still be
+// rejected) and accepted() at every accepted timepoint with v = V(p)-V(n).
+// A2D deposits therefore only ever see accepted analog solutions.
+// Must match VacaskExtSource in VACASK include/extsource.h.
+
+#define VACASK_EXTSRC_ABI 1
+
+struct VacaskExtSource {
+   int abi;
+   void *ctx;
+   double (*value)(void *ctx, double t, double *next_break);
+   int (*accepted)(void *ctx, double t, double v);   // nonzero: pause here
+   void (*destroy)(void *ctx);
+};
+
+struct vacask_ctx {
+   bridge_signal *sig;
+   double         t_acc;     // last accepted time
+   double         v_acc;     // A2D: voltage at t_acc
+   double         v_sync;    // A2D: voltage when this probe last paused
+   bool           have_acc;
+};
+
+// D2A: the held NVC voltage, with a rise_time ramp starting at the sync
+// point where NVC changed it (the last accepted analog time).
+static double vacask_d2a_value(void *p, double t, double *next_break)
+{
+   vacask_ctx *ctx = (vacask_ctx *)p;
+   bridge_signal *sig = ctx->sig;
+   double nb = 0.0;
+
+   if (sig->transition_start == -2.0)
+      sig->transition_start = ctx->t_acc;
+
+   double v = sig->voltage;
+   if (sig->transition_start >= 0) {
+      double t0 = sig->transition_start;
+      double t1 = t0 + sig->rise_time;
+      if (t < t1) {
+         if (t > t0)
+            v = sig->prev_voltage + (sig->voltage - sig->prev_voltage) * (t - t0) / (t1 - t0);
+         else
+            v = sig->prev_voltage;
+         nb = t1;
+      }
+   }
+
+   if (sig->next_time_s > t && (nb == 0.0 || sig->next_time_s < nb))
+      nb = sig->next_time_s;
+
+   *next_break = nb;
+   return v;
+}
+
+static int vacask_d2a_accepted(void *p, double t, double v)
+{
+   vacask_ctx *ctx = (vacask_ctx *)p;
+   bridge_signal *sig = ctx->sig;
+   ctx->t_acc = t;
+   if (sig->transition_start >= 0 && t >= sig->transition_start + sig->rise_time)
+      sig->transition_start = -1.0;
+   return 0;
+}
+
+// A2D: zero-current probe
+static double vacask_a2d_value(void *p, double t, double *next_break)
+{
+   *next_break = 0.0;
+   return 0.0;
+}
+
+static int vacask_a2d_accepted(void *p, double t, double v)
+{
+   vacask_ctx *ctx = (vacask_ctx *)p;
+   bridge_signal *sig = ctx->sig;
+
+   // Once the node has moved COSIM_A2D_DV volts since this probe last paused
+   // the analog, pause it here so the digital sees the change at this time
+   // (VACASK only calls us at accepted points, so this is event-accurate
+   // where the dV/dt prediction below cannot be: e.g. a step from a flat node).
+   int pause = 0;
+   if (!ctx->have_acc)
+      ctx->v_sync = v;
+   else if (fabs(v - ctx->v_sync) >= a2d_dv()) {
+      ctx->v_sync = v;
+      pause = 1;
+   }
+
+   if (fabs(v - sig->voltage) > 1e-6 || !ctx->have_acc) {
+      if (COSIM_DEBUG)
+         fprintf(stderr, "[a2d-vc] '%s' V=%.4f @%.4gns\n", sig->name, v, t * 1e9);
+      sig->voltage = v;
+      if (sig->deposit_fn)
+         sig->deposit_fn(sig->deposit_ctx, v, t);
+   }
+
+   // Predict the next crossing from the slope between accepted points
+   // (same policy as the Xyce probe, see a2d_callback).
+   if (ctx->have_acc && t > ctx->t_acc) {
+      double dvdt = fabs(v - ctx->v_acc) / (t - ctx->t_acc);
+      if (dvdt > 1e-9) {
+         double dt_pred = a2d_dv() / dvdt;
+         if (dt_pred < a2d_dtmin()) dt_pred = a2d_dtmin();
+         double t_pred = t + dt_pred;
+         if (g_a2d_next < 0.0 || t_pred < g_a2d_next || g_a2d_next <= t)
+            g_a2d_next = t_pred;
+      }
+   }
+
+   ctx->t_acc = t;
+   ctx->v_acc = v;
+   ctx->have_acc = true;
+   return pause;
+}
+
+static void vacask_destroy(void *p)
+{
+   delete (vacask_ctx *)p;
+}
+
+// Init function — called by VACASK via the file="code:..." URI
+// URI args: "d2a:signal_name" or "a2d:signal_name"
+extern "C"
+int vacask_bridge_init(const char *args, int is_vsource, VacaskExtSource *src)
+{
+   if (!src || src->abi != VACASK_EXTSRC_ABI) {
+      fprintf(stderr, "[cosim_bridge] VACASK external-source ABI mismatch\n");
+      return 0;
+   }
+   if (!args) args = "";
+
+   bool d2a;
+   if (strncmp(args, "d2a:", 4) == 0)
+      d2a = true;
+   else if (strncmp(args, "a2d:", 4) == 0)
+      d2a = false;
+   else {
+      fprintf(stderr, "[cosim_bridge] bad URI args '%s'\n", args);
+      return 0;
+   }
+   const char *sig_name = args + 4;
+
+   if (d2a && !is_vsource)
+      fprintf(stderr, "[cosim_bridge] warning: D2A '%s' bound to an isource\n", sig_name);
+   if (!d2a && is_vsource)
+      fprintf(stderr, "[cosim_bridge] warning: A2D '%s' bound to a vsource\n", sig_name);
+
+   bridge_signal *sig = find_signal(sig_name);
+   if (!sig) {
+      fprintf(stderr, "[cosim_bridge] signal '%s' not registered\n", sig_name);
+      return 0;
+   }
+
+   vacask_ctx *ctx = new vacask_ctx;
+   ctx->sig = sig;
+   ctx->t_acc = 0.0;
+   ctx->v_acc = 0.0;
+   ctx->v_sync = 0.0;
+   ctx->have_acc = false;
+
+   src->ctx = ctx;
+   src->value = d2a ? vacask_d2a_value : vacask_a2d_value;
+   src->accepted = d2a ? vacask_d2a_accepted : vacask_a2d_accepted;
+   src->destroy = vacask_destroy;
+
+   fprintf(stderr, "[cosim_bridge] bound %s VACASK source to '%s'\n",
+           d2a ? "D2A" : "A2D", sig_name);
+   return 1;
 }

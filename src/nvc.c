@@ -948,6 +948,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "export-resolvers", required_argument, 0, 'X' },
       { "xyce-netlist",     required_argument, 0, 'Y' },
       { "xyce-config",      required_argument, 0, 'Z' },
+      { "vacask-netlist",   required_argument, 0, 303 },
+      { "cosim-config",     required_argument, 0, 'Z' },
       { "accel",             no_argument,       0, 'A' },
       { "launch-debug",      optional_argument, 0, 300 },
       { "lazy-eval",         no_argument,       0, 301 },
@@ -964,6 +966,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *resolver_dir = NULL;
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
+   cosim_engine_t cosim_engine = COSIM_XYCE;
    // NVC_ACCEL in the environment is the equivalent of the --accel option
    // (auto-compile + engage via accel_auto), so test harnesses/scripts can opt
    // in without being modified. NVC_ACCEL=0 / empty / unset = off.
@@ -1090,6 +1093,11 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'Y':
          xyce_netlist = optarg;
+         cosim_engine = COSIM_XYCE;
+         break;
+      case 303:
+         xyce_netlist = optarg;
+         cosim_engine = COSIM_VACASK;
          break;
       case 'Z':
          xyce_config = optarg;
@@ -1303,7 +1311,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
                          enable_ieee_warnings_cb, state);
 
    if (xyce_netlist != NULL) {
-      const int rc = cosim_run(state->model, xyce_netlist,
+      const int rc = cosim_run(state->model, cosim_engine, xyce_netlist,
                                xyce_config, stop_time);
       set_ctrl_c_handler(NULL, NULL);
 
