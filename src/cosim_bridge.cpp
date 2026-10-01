@@ -84,8 +84,6 @@ struct bridge_signal {
    double            voltage;        // D2A: from NVC; A2D: last seen from Xyce
    double            next_voltage;   // D2A: next scheduled value
    double            next_time_s;    // D2A: next event time, -1 = none
-   double            prev_voltage;   // D2A: voltage before last change
-   double            transition_start; // D2A: time when transition began
    double            rise_time;      // D2A: rise/fall time for ramps (seconds)
    bridge_deposit_fn deposit_fn;     // A2D: NVC deposit callback
    void             *deposit_ctx;    // A2D: opaque context for callback
@@ -121,8 +119,6 @@ int cosim_bridge_register(const char *name, int dir,
    s->dir = (sig_dir_t)dir;
    s->voltage = initial_voltage;
    s->next_voltage = initial_voltage;
-   s->prev_voltage = initial_voltage;
-   s->transition_start = -1.0;
    s->rise_time = 1e-9;  // 1ns default rise/fall time
    s->next_time_s = -1.0;
    s->deposit_fn = deposit_fn;
@@ -137,11 +133,7 @@ void cosim_bridge_update_d2a(int idx, double voltage,
 {
    if (idx >= 0 && idx < g_nsignals && g_signals[idx].in_use) {
       bridge_signal *s = &g_signals[idx];
-      // Detect voltage change — mark transition start
-      if (fabs(voltage - s->voltage) > 1e-6) {
-         s->prev_voltage = s->voltage;
-         s->transition_start = -2.0;  // flag: set actual time on next callback
-      }
+      // The analog sources ramp to the new value themselves (d2a_ramp)
       s->voltage = voltage;
       s->next_voltage = next_v;
       s->next_time_s = next_time;
@@ -156,6 +148,46 @@ void cosim_bridge_reset(void)
 }
 
 } // extern "C"
+
+
+// --- D2A ramp ---
+//
+// Each D2A source ramps to the NVC voltage over rise_time.  The ramp state is
+// kept per source, and a new ramp starts from the value the source is driving
+// at that moment: a change that arrives while the previous ramp is still
+// running must not step the driven voltage (a step at a sync point collapses
+// the analog timestep).  A glitch that comes and goes between two looks at
+// the signal leaves the target unchanged, so there is no ramp at all.
+
+struct d2a_ramp {
+   double t0, v0, v1;   // from v0 at t0 to v1 at t0 + rise_time
+};
+
+static void d2a_ramp_init(d2a_ramp *r, double v)
+{
+   r->t0 = -1.0;
+   r->v0 = r->v1 = v;
+}
+
+static double d2a_ramp_value(const d2a_ramp *r, double rise, double t)
+{
+   double t1 = r->t0 + rise;
+   if (t >= t1)
+      return r->v1;
+   if (t <= r->t0)
+      return r->v0;
+   return r->v0 + (r->v1 - r->v0) * (t - r->t0) / (t1 - r->t0);
+}
+
+// Start a new ramp at t_start if the NVC value differs from the ramp target
+static void d2a_ramp_follow(d2a_ramp *r, const bridge_signal *sig, double t_start)
+{
+   if (fabs(sig->voltage - r->v1) > 1e-9) {
+      r->v0 = d2a_ramp_value(r, sig->rise_time, t_start);
+      r->t0 = t_start;
+      r->v1 = sig->voltage;
+   }
+}
 
 
 // --- Xyce DPWL callback interface ---
@@ -195,6 +227,8 @@ struct bridge_ctx {
    bridge_signal   *sig;
    void           **fns;          // Xyce function pointer table
    DeviceInstance  *dev_inst;     // Xyce device instance (for reading node V)
+   d2a_ramp         ramp;         // D2A
+   double           last_now;     // D2A: time of the previous update
 };
 
 
@@ -220,36 +254,31 @@ static int d2a_callback(PWLinDynData *pwl, void *ext_data,
    tTVVEC *tvvec = ((fn_get_tvvec_t)fns[FN_GET_TVVEC])(pwl);
 
    bridge_signal *sig = ctx->sig;
-   double v = sig->voltage;
+   d2a_ramp *r = &ctx->ramp;
 
-   // Latch transition start time on first callback after voltage change
-   if (sig->transition_start == -2.0)
-      sig->transition_start = now;
+   // A new value starts its ramp where NVC changed it: the sync point, i.e.
+   // the time Xyce last evaluated this source (not 'now', the next solve
+   // time, or the driven voltage would step by the old ramp's last stretch)
+   d2a_ramp_follow(r, sig, ctx->last_now < now ? ctx->last_now : now);
+   ctx->last_now = now;
 
    tvvec->clear();
 
-   if (sig->transition_start >= 0) {
+   double t1 = r->t0 + sig->rise_time;
+   if (now < t1) {
       // Active ramp transition
-      double t0 = sig->transition_start;
-      double t1 = t0 + sig->rise_time;
-
-      tvvec->push_back({0.0, sig->prev_voltage});
-      tvvec->push_back({t0, sig->prev_voltage});
-      tvvec->push_back({t1, v});
-      tvvec->push_back({t1 + 1e-6, v});
+      tvvec->push_back({0.0, r->v0});
+      tvvec->push_back({r->t0, r->v0});
+      tvvec->push_back({t1, r->v1});
+      tvvec->push_back({t1 + 1e-6, r->v1});
 
       // Request breakpoint at end of ramp
-      if (t1 > now)
-         ((fn_add_break_t)fns[FN_ADD_BREAK])(pwl, t1);
-
-      // Clear transition once ramp is complete
-      if (now >= t1)
-         sig->transition_start = -1.0;
+      ((fn_add_break_t)fns[FN_ADD_BREAK])(pwl, t1);
    }
    else {
       // Steady state
-      tvvec->push_back({0.0, v});
-      tvvec->push_back({now + 1e-6, v});
+      tvvec->push_back({0.0, r->v1});
+      tvvec->push_back({now + 1e-6, r->v1});
    }
 
    if (sig->next_time_s > now) {
@@ -393,6 +422,8 @@ void *nvc_bridge_init(PWLinDynData *pwl, void **cb_data, const char *args)
    ctx->sig = sig;
    ctx->fns = fns;
    ctx->dev_inst = nullptr;  // set on Init op
+   d2a_ramp_init(&ctx->ramp, sig->voltage);
+   ctx->last_now = 0.0;
 
    *cb_data = ctx;
 
@@ -426,23 +457,8 @@ struct vacask_ctx {
    double         v_acc;     // A2D: voltage at t_acc
    double         v_sync;    // A2D: voltage when this probe last paused
    bool           have_acc;
-   // D2A ramp from r_v0 at r_t0 to r_v1 at r_t0 + rise_time.  Kept per source
-   // (not in the shared bridge_signal) so that a change arriving while a ramp
-   // is still running starts from the value actually being driven -- the
-   // source must stay continuous across a pause or the analog step collapses.
-   double         r_t0, r_v0, r_v1;
-   double         out_acc;   // D2A: output at t_acc
+   d2a_ramp       ramp;      // D2A
 };
-
-static double vacask_d2a_out(const vacask_ctx *ctx, double t)
-{
-   double t1 = ctx->r_t0 + ctx->sig->rise_time;
-   if (t >= t1)
-      return ctx->r_v1;
-   if (t <= ctx->r_t0)
-      return ctx->r_v0;
-   return ctx->r_v0 + (ctx->r_v1 - ctx->r_v0) * (t - ctx->r_t0) / (t1 - ctx->r_t0);
-}
 
 // D2A: the NVC voltage, reached by a rise_time ramp that starts at the sync
 // point where NVC changed it (the last accepted analog time).  Glitches that
@@ -453,27 +469,22 @@ static double vacask_d2a_value(void *p, double t, double *next_break)
    bridge_signal *sig = ctx->sig;
    double nb = 0.0;
 
-   if (fabs(sig->voltage - ctx->r_v1) > 1e-9) {
-      ctx->r_v0 = ctx->out_acc;
-      ctx->r_t0 = ctx->t_acc;
-      ctx->r_v1 = sig->voltage;
-   }
+   d2a_ramp_follow(&ctx->ramp, sig, ctx->t_acc);
 
-   double t1 = ctx->r_t0 + sig->rise_time;
+   double t1 = ctx->ramp.t0 + sig->rise_time;
    if (t < t1)
       nb = t1;
    if (sig->next_time_s > t && (nb == 0.0 || sig->next_time_s < nb))
       nb = sig->next_time_s;
 
    *next_break = nb;
-   return vacask_d2a_out(ctx, t);
+   return d2a_ramp_value(&ctx->ramp, sig->rise_time, t);
 }
 
 static int vacask_d2a_accepted(void *p, double t, double v)
 {
    vacask_ctx *ctx = (vacask_ctx *)p;
    ctx->t_acc = t;
-   ctx->out_acc = vacask_d2a_out(ctx, t);
    return 0;
 }
 
@@ -573,8 +584,7 @@ int vacask_bridge_init(const char *args, int is_vsource, VacaskExtSource *src)
    ctx->v_sync = 0.0;
    ctx->have_acc = false;
    // D2A: no ramp pending, drive the registered initial voltage
-   ctx->r_t0 = -1.0;
-   ctx->r_v0 = ctx->r_v1 = ctx->out_acc = sig->voltage;
+   d2a_ramp_init(&ctx->ramp, sig->voltage);
 
    src->ctx = ctx;
    src->value = d2a ? vacask_d2a_value : vacask_a2d_value;
