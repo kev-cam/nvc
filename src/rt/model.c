@@ -123,6 +123,7 @@ typedef struct _rt_model {
    bool               can_create_delta;
    bool               next_is_delta;
    bool               force_stop;
+   bool               interrupted;     // model_interrupt stopped a running model
    bool               blocking_update;
    unsigned           n_signals;
    heap_t            *eventq_heap;
@@ -19363,6 +19364,15 @@ void model_stop(rt_model_t *m)
    relaxed_store(&m->force_stop, true);
 }
 
+// True once the simulation has been stopped from inside or outside the model
+// (std.env.stop/finish, a failure report or fatal error, model_stop, an
+// interrupt): model_step_to then does nothing.  An event queue that has run
+// dry is not a stop.  Used by the co-simulation driver (cosim.c).
+bool model_stopped(rt_model_t *m)
+{
+   return relaxed_load(&m->force_stop);
+}
+
 void model_set_phase_cb(rt_model_t *m, model_phase_t phase, rt_event_fn_t fn,
                         void *user)
 {
@@ -19465,10 +19475,23 @@ static void handle_interrupt_cb(jit_t *j, void *ctx)
    }
 }
 
+// Called from the SIGINT handler (nvc.c): lock-free stores only.  An
+// interrupt that arrives after the design has stopped itself ($finish, a
+// fatal error) changes nothing and is not recorded.
 void model_interrupt(rt_model_t *m)
 {
+   if (!relaxed_load(&m->force_stop))
+      relaxed_store(&m->interrupted, true);
    model_stop(m);
    jit_interrupt(m->jit, handle_interrupt_cb, m);
+}
+
+// True once an interrupt (model_interrupt) has stopped the model.  The model
+// is then also stopped (model_stopped), but the run did not end: the
+// co-simulation driver (cosim.c) reports it as interrupted, never as a stop.
+bool model_interrupted(rt_model_t *m)
+{
+   return relaxed_load(&m->interrupted);
 }
 
 int model_exit_status(rt_model_t *m)
@@ -19476,6 +19499,8 @@ int model_exit_status(rt_model_t *m)
    int status;
    if (jit_exit_status(m->jit, &status))
       return status;
+   else if (relaxed_load(&m->interrupted))
+      return EXIT_FAILURE;   // Interrupted between processes: no JIT status
    else if (m->stop_delta > 0 && m->iteration == m->stop_delta)
       return EXIT_FAILURE;
    else

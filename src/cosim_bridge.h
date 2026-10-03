@@ -6,7 +6,9 @@
 //  step t_n -> t_{n+1} it hands the bridge the node voltages at both ends
 //  (A2D probes) and the bridge advances NVC to t_{n+1} through the stepper
 //  the driver registered here.  If NVC changes an analog input (a D2A source)
-//  before t_{n+1}, the analog step is redone to end at that time.
+//  before t_{n+1}, the analog step is redone to end at that time.  If the
+//  digital has stopped ($finish, a fatal error), the stepper says so and the
+//  engine accepts the point and ends its transient (the finish protocol).
 //
 //  D2A: NVC signal value -> bridge registry -> analog source ramp.
 //  A2D: analog node voltage -> bridge -> NVC deposit (inside the model, at
@@ -20,8 +22,32 @@
 extern "C" {
 #endif
 
+// ABI version of this library, returned by cosim_bridge_abi().  2 = the
+// finish protocol (stepper result COSIM_STEP_FINISH), per-boundary ramps
+// (cosim_bridge_set_ramp) and the COSIM_BRIDGE_MAX_SIGNALS registry.  The
+// engines' C interfaces export the same version as vacask_cosim_abi() /
+// xyce_cosim_abi(); NVC refuses to co-simulate when any of them is missing
+// or older (an old engine reads a finish as "accept" and never ends).
+#define COSIM_BRIDGE_ABI 2
+int cosim_bridge_abi(void);
+
 #define BRIDGE_D2A 0
 #define BRIDGE_A2D 1
+
+// Registry limits.  Names are matched exactly (case-sensitive) against the
+// <name> of the engine's code: URI.
+#define COSIM_BRIDGE_MAX_SIGNALS 8192
+#define COSIM_BRIDGE_NAME_MAX    255
+
+// cosim_bridge_register() failures
+#define COSIM_BRIDGE_ERR_FULL  (-1)   // registry full (COSIM_BRIDGE_MAX_SIGNALS)
+#define COSIM_BRIDGE_ERR_DUP   (-2)   // the name is already registered
+#define COSIM_BRIDGE_ERR_NAME  (-3)   // empty or over-long name, bad direction
+
+// D2A ramps: the default rise/fall time, and the shortest one (shorter
+// values are clamped to it with a warning).
+#define COSIM_BRIDGE_DEFAULT_RAMP 1e-9
+#define COSIM_BRIDGE_MIN_RAMP     1e-15
 
 // A2D: deposit a voltage into an NVC signal at the model's current time.
 // Only ever called from inside the stepper's apply callback (see below), so
@@ -32,11 +58,23 @@ typedef void (*bridge_deposit_fn)(void *ctx, double voltage);
 
 // Register a boundary signal.
 // For A2D, deposit_fn/deposit_ctx are the NVC deposit callback.
-// Returns an index, or -1 on error.
+// Returns an index >= 0, or one of the COSIM_BRIDGE_ERR_* codes.
 int cosim_bridge_register(const char *name, int dir,
                           double initial_voltage,
                           bridge_deposit_fn deposit_fn,
                           void *deposit_ctx);
+
+// Set the rise and fall times (seconds) of a D2A signal's ramps.  Every new
+// ramp -- a mid-ramp reversal or a step to a mid level included -- takes the
+// full rise time (if it goes up from the voltage the source drives at that
+// moment) or fall time (if it goes down): these are durations, not slew
+// rates.  Values below COSIM_BRIDGE_MIN_RAMP are clamped to it with a
+// warning; NaN, infinite or negative values are rejected.  Without a call
+// both are COSIM_BRIDGE_DEFAULT_RAMP.  A ramp shorter than the analog engine
+// resolves at the time it starts (1e-13 x t: 1 fs from 10 ms on, 10 ps from
+// 100 s on) takes that long instead, with a warning naming the signal (once
+// per signal).  Returns 1 on success, 0 on a bad index or value.
+int cosim_bridge_set_ramp(int idx, double rise, double fall);
 
 // Give a D2A signal its NVC value, observed at digital time now_s, together
 // with the time of the next scheduled digital event (-1 if none).  Returns 1
@@ -46,6 +84,11 @@ int cosim_bridge_update_d2a(int idx, double voltage, double next_time_s,
 
 // Reset all registrations.
 void cosim_bridge_reset(void);
+
+// Results of a candidate step (the stepper's and cosim_bridge_step's return)
+#define COSIM_STEP_ACCEPT 0   // accept the candidate point
+#define COSIM_STEP_VETO   1   // redo the step so that it ends at *t_evt
+#define COSIM_STEP_FINISH 2   // accept the point, then end the transient
 
 // Analog-master stepping.  The driver registers a stepper that advances the
 // digital through an analog candidate step t_prev_s -> t_s:
@@ -58,13 +101,18 @@ void cosim_bridge_reset(void);
 //     deposits the values interpolated at that fraction of the step), so the
 //     digital resolves threshold crossings finer than the analog step;
 //   - if a D2A signal changed at a time t_evt < t_s (or at the start), it
-//     stops there and returns 1 with *t_evt_s set: the analog must redo the
-//     step so that it ends at t_evt;
+//     stops there and returns COSIM_STEP_VETO with *t_evt_s set: the analog
+//     must redo the step so that it ends at t_evt;
+//   - if the digital has stopped (or stops on the way) at t_f, it returns
+//     COSIM_STEP_VETO with *t_evt_s = t_f once when the step ends after t_f
+//     and the analog has not yet accepted a point at or after t_f, else
+//     COSIM_STEP_FINISH: the engine accepts this point and ends its
+//     transient (it never offers another step);
 //   - otherwise it reaches t_s, calls apply(ctx, 1) there (the candidate
-//     values), runs the digital at t_s and returns 0.
+//     values), runs the digital at t_s and returns COSIM_STEP_ACCEPT.
 // A D2A change exactly at t_s is not a veto: the source ramps from t_s.
-// Every apply() runs inside the model, so deposits are made at the digital
-// time it is called at.
+// *t_evt_s is -1 unless the result is a veto.  Every apply() runs inside the
+// model, so deposits are made at the digital time it is called at.
 typedef int (*bridge_apply_fn)(void *ctx, double frac);
 typedef int (*bridge_stepper_fn)(void *ctx, double t_prev_s, double t_s,
                                  int nsamples, bridge_apply_fn apply,
@@ -73,8 +121,8 @@ void cosim_bridge_set_stepper(bridge_stepper_fn fn, void *ctx);
 
 // Engine-neutral entry used by the engine glue (xyce_bridge_step,
 // vacask_extsource_step): all probes have staged their values for the
-// candidate time t; advance the digital.  Returns 1 and *t_evt if the step
-// must be redone to end at *t_evt.
+// candidate time t; advance the digital.  Returns the stepper's result
+// (COSIM_STEP_*), COSIM_STEP_ACCEPT when no stepper is registered.
 int cosim_bridge_step(double t, double *t_evt);
 
 #ifdef __cplusplus
