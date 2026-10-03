@@ -10,6 +10,7 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+use std.textio.all;   -- $readmem support: text/line and their implicit file_open/endfile/deallocate
 
 package logic3d_types_pkg is
 
@@ -494,6 +495,18 @@ package logic3d_types_pkg is
     function "nand"(a, b : logic3d_vector) return logic3d_vector;
     function "nor" (a, b : logic3d_vector) return logic3d_vector;
     function "xnor"(a, b : logic3d_vector) return logic3d_vector;
+
+    -- $readmemh / $readmemb support (emitted by iverilog tgt-vhdl).
+    -- sv_readmem_load parses the whole file (whitespace-separated words,
+    -- '_' separators, // and /* */ comments, @<hex> address directives,
+    -- x/z digits) into a process-wide store; the caller then copies word i
+    -- to mem(sv_readmem_addr(i)) for i in 0 .. sv_readmem_count-1, skipping
+    -- addresses outside the memory. start = first address (Verilog default:
+    -- the lowest address of the memory).
+    procedure sv_readmem_load(fname : string; hex : boolean; start : integer);
+    impure function sv_readmem_count return natural;
+    impure function sv_readmem_addr(i : natural) return integer;
+    impure function sv_readmem_word(i : natural; w : positive) return logic3d_vector;
 
 end package;
 
@@ -1787,5 +1800,214 @@ package body logic3d_types_pkg is
     function "nand"(a, b : logic3d_vector) return logic3d_vector is begin return l3d_nand(a, b); end function;
     function "nor" (a, b : logic3d_vector) return logic3d_vector is begin return l3d_nor(a, b);  end function;
     function "xnor"(a, b : logic3d_vector) return logic3d_vector is begin return l3d_xnor(a, b); end function;
+
+    -- ---------------------------------------------------------------------
+    -- $readmemh / $readmemb
+    -- ---------------------------------------------------------------------
+    type t_rm_lines is array (natural range <>) of std.textio.line;
+    type t_rm_lines_ptr is access t_rm_lines;
+    type t_rm_ints is array (natural range <>) of integer;
+    type t_rm_ints_ptr is access t_rm_ints;
+
+    type t_readmem is protected
+        procedure clear(hex : boolean);
+        procedure add(addr : integer; word : string);
+        impure function count return natural;
+        impure function addr(i : natural) return integer;
+        impure function word(i : natural; w : positive) return logic3d_vector;
+    end protected;
+
+    type t_readmem is protected body
+        variable words : t_rm_lines_ptr := null;
+        variable addrs : t_rm_ints_ptr := null;
+        variable n     : natural := 0;
+        variable is_hex : boolean := true;
+
+        procedure clear(hex : boolean) is
+        begin
+            if words /= null then
+                for i in 0 to n - 1 loop
+                    deallocate(words(i));
+                end loop;
+            end if;
+            n := 0;
+            is_hex := hex;
+        end procedure;
+
+        procedure add(addr : integer; word : string) is
+            variable nw : t_rm_lines_ptr;
+            variable na : t_rm_ints_ptr;
+        begin
+            if words = null then
+                words := new t_rm_lines(0 to 255);
+                addrs := new t_rm_ints(0 to 255);
+            elsif n > words'high then
+                nw := new t_rm_lines(0 to 2 * words'length - 1);
+                na := new t_rm_ints(0 to 2 * addrs'length - 1);
+                nw(0 to n - 1) := words(0 to n - 1);
+                na(0 to n - 1) := addrs(0 to n - 1);
+                deallocate(words); deallocate(addrs);
+                words := nw; addrs := na;
+            end if;
+            words(n) := new string'(word);
+            addrs(n) := addr;
+            n := n + 1;
+        end procedure;
+
+        impure function count return natural is
+        begin
+            return n;
+        end function;
+
+        impure function addr(i : natural) return integer is
+        begin
+            return addrs(i);
+        end function;
+
+        -- Digits are consumed from the right (LSB) end. A word narrower than
+        -- w is extended with 0, or with x/z when its leftmost digit is x/z
+        -- (IEEE 1364 value extension); a wider word is truncated.
+        impure function word(i : natural; w : positive) return logic3d_vector is
+            variable r    : logic3d_vector(w - 1 downto 0) := (others => L3D_0);
+            variable s    : string(1 to words(i)'length) := words(i).all;
+            variable bpd  : natural;
+            variable bpos  : natural := 0;
+            variable v    : natural;
+            variable fill : logic3d := L3D_0;
+            variable c    : character;
+        begin
+            if is_hex then bpd := 4; else bpd := 1; end if;
+            for k in s'high downto s'low loop
+                c := s(k);
+                for b in 0 to bpd - 1 loop
+                    if bpos + b <= w - 1 then
+                        case c is
+                            when 'x' | 'X' => r(bpos + b) := L3D_X;
+                            when 'z' | 'Z' | '?' => r(bpos + b) := L3D_Z;
+                            when others =>
+                                if c >= '0' and c <= '9' then
+                                    v := character'pos(c) - character'pos('0');
+                                elsif c >= 'a' and c <= 'f' then
+                                    v := character'pos(c) - character'pos('a') + 10;
+                                else
+                                    v := character'pos(c) - character'pos('A') + 10;
+                                end if;
+                                if (v / 2 ** b) mod 2 = 1 then
+                                    r(bpos + b) := L3D_1;
+                                else
+                                    r(bpos + b) := L3D_0;
+                                end if;
+                        end case;
+                    end if;
+                end loop;
+                bpos := bpos + bpd;
+            end loop;
+            if s'length > 0 then
+                case s(s'low) is
+                    when 'x' | 'X' => fill := L3D_X;
+                    when 'z' | 'Z' | '?' => fill := L3D_Z;
+                    when others => fill := L3D_0;
+                end case;
+            end if;
+            for k in bpos to w - 1 loop
+                r(k) := fill;
+            end loop;
+            return r;
+        end function;
+    end protected body;
+
+    shared variable g_readmem : t_readmem;
+
+    procedure sv_readmem_load(fname : string; hex : boolean; start : integer) is
+        file f : std.textio.text;
+        variable st     : file_open_status;
+        variable l      : std.textio.line;
+        variable cur    : integer := start;
+        variable i, j   : natural;
+        variable in_blk : boolean := false;   -- inside /* ... */
+        variable tok    : string(1 to 1024);
+        variable tn     : natural;
+        variable a      : integer;
+        variable c      : character;
+
+        function hexval(ch : character) return integer is
+        begin
+            if ch >= '0' and ch <= '9' then return character'pos(ch) - character'pos('0');
+            elsif ch >= 'a' and ch <= 'f' then return character'pos(ch) - character'pos('a') + 10;
+            elsif ch >= 'A' and ch <= 'F' then return character'pos(ch) - character'pos('A') + 10;
+            else return -1;
+            end if;
+        end function;
+
+        function is_space(ch : character) return boolean is
+        begin
+            return ch = ' ' or ch = HT or ch = CR or ch = LF or ch = VT or ch = FF;
+        end function;
+    begin
+        g_readmem.clear(hex);
+        file_open(st, f, fname, read_mode);
+        if st /= open_ok then
+            report "$readmem" & "h/b: cannot open file " & fname severity warning;
+            return;
+        end if;
+        while not endfile(f) loop
+            std.textio.readline(f, l);
+            if l /= null and l'length > 0 then
+                i := l'low;
+                while i <= l'high loop
+                    c := l(i);
+                    if in_blk then
+                        if c = '*' and i < l'high and l(i + 1) = '/' then
+                            in_blk := false; i := i + 2;
+                        else
+                            i := i + 1;
+                        end if;
+                    elsif is_space(c) then
+                        i := i + 1;
+                    elsif c = '/' and i < l'high and l(i + 1) = '/' then
+                        exit;                                 -- line comment
+                    elsif c = '/' and i < l'high and l(i + 1) = '*' then
+                        in_blk := true; i := i + 2;
+                    elsif c = '@' then                        -- @<hex address>
+                        a := 0; j := i + 1;
+                        while j <= l'high and hexval(l(j)) >= 0 loop
+                            a := a * 16 + hexval(l(j)); j := j + 1;
+                        end loop;
+                        cur := a; i := j;
+                    else                                      -- a data word
+                        tn := 0; j := i;
+                        while j <= l'high and not is_space(l(j)) and l(j) /= '/' loop
+                            if l(j) /= '_' and tn < tok'high then
+                                tn := tn + 1; tok(tn) := l(j);
+                            end if;
+                            j := j + 1;
+                        end loop;
+                        if tn > 0 then
+                            g_readmem.add(cur, tok(1 to tn));
+                            cur := cur + 1;
+                        end if;
+                        i := j;
+                    end if;
+                end loop;
+            end if;
+            deallocate(l);
+        end loop;
+        file_close(f);
+    end procedure;
+
+    impure function sv_readmem_count return natural is
+    begin
+        return g_readmem.count;
+    end function;
+
+    impure function sv_readmem_addr(i : natural) return integer is
+    begin
+        return g_readmem.addr(i);
+    end function;
+
+    impure function sv_readmem_word(i : natural; w : positive) return logic3d_vector is
+    begin
+        return g_readmem.word(i, w);
+    end function;
 
 end package body;
