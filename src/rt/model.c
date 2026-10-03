@@ -1411,10 +1411,12 @@ static void reset_process(rt_model_t *m, rt_proc_t *proc)
 
    tlab_t tlab = jit_null_tlab(m->jit);
 
+   proc->wakeable.resetting = 1;
    if (jit_fastcall(m->jit, proc->handle, &result, state, context, &tlab))
       *mptr_get(proc->privdata) = result.pointer;
    else
       m->force_stop = true;
+   proc->wakeable.resetting = 0;
 
    thread->active_obj = NULL;
    thread->active_scope = NULL;
@@ -12233,6 +12235,28 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
       proc->cur_sig = 0;
       proc->cur_count = 0;
    }
+   else if (obj->trigger == NULL && obj->wait_state == 1 && obj->dyn_wait
+            && proc->cur_count == 0 && !obj->pending && !obj->delayed) {
+      // A process whose waits are dynamic (it arms events from its body)
+      // suspended with an EMPTY wait set and no timeout: a bare `wait;` (or a
+      // `wait until` naming no signals). It must never resume, but the
+      // persistent registrations promoted from its earlier wait would wake it
+      // on every event of those signals (`wait until rising_edge(clk); ...
+      // wait;` re-ran the process from the top on the next clk edge). Static
+      // waits (armed once in the reset block -- sensitivity lists, concurrent
+      // assignments) never set dyn_wait and legitimately suspend with
+      // cur_count == 0; a timed suspend (the NBA `wait for 0 ns`) leaves
+      // pending/delayed set. Both keep their registrations.
+      for (unsigned i = 0; i < proc->wait_count; i++)
+         clear_event_par(m, &(proc->wait_set[i]->pending), obj);
+      free(proc->wait_set);
+      proc->wait_set = NULL;
+      proc->wait_count = proc->wait_cap = 0;
+      obj->wait_state = 2;
+      if (unlikely(obj->fastclk))
+         aj_fastclk_evict(m, obj, "wait-set emptied");
+      direct_eval_uninstall(proc);
+   }
 }
 
 // NVC_EVAL_RESIDENCY=1: measure how much of the run "bounces from eval
@@ -20228,6 +20252,8 @@ void x_sched_event(sig_shared_t *ss, uint32_t offset, int32_t count)
    // changes and demote it to the classic dynamic path.
    if (obj->kind == W_PROC && obj->trigger == NULL && obj->wait_state != 2) {
       rt_proc_t *p = container_of(obj, rt_proc_t, wakeable);
+      if (!obj->resetting)
+         obj->dyn_wait = 1;   // armed by a wait statement in the body
       for (; count > 0; n = n->chain) {
          p->cur_sig ^= (uint64_t)(uintptr_t)n;
          if (p->cur_count == p->cur_cap) {

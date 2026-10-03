@@ -70,6 +70,10 @@ typedef struct {
    unsigned        dep_recorded : 1; // cone's depositor map entries complete
    unsigned        wait_state : 2; // 0=first activation, 1=static (entries
                                    // persist, sched/clear no-op), 2=dynamic
+   unsigned        resetting : 1;  // inside reset_process (static-wait arming)
+   unsigned        dyn_wait : 1;   // armed an event wait from the process
+                                   // body (a dynamic wait statement), not
+                                   // only from the reset block
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
 
