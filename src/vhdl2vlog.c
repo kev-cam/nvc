@@ -485,6 +485,31 @@ static bool mem_shape(type_t t, unsigned *nwords, unsigned *elemw)
    return true;
 }
 
+// A DYNAMIC (non-folded) index into a NON-ZERO-BASE array `arr(low to high)` /
+// `arr(high downto low)` with low != 0.  Both the walker mem path (mem addr =
+// raw index) and the flat-wire part-select `[(idx)*W +: W]` address storage at
+// the RAW index without subtracting array'low, so mem(5) of a (4 to 7) array
+// hits word 5 (out of a 4-word store), not word 1 (F4 resweep familyA: a signal
+// memory installs wrong; a LUT/ROM installs wrong via the text flat part-select).
+// Both paths decline it to the golden interpreter.  A FOLDED (static) index is
+// handled elsewhere; a 0-based array is unaffected.
+static bool r2_nonzero_base_dyn_index(tree_t e)
+{
+   if (tree_kind(e) != T_ARRAY_REF || tree_params(e) != 1)
+      return false;
+   tree_t base = tree_value(e);
+   if (tree_kind(base) != T_REF || !tree_has_ref(base))
+      return false;
+   type_t bt = tree_type(tree_ref(base));
+   if (!type_is_array(bt) || !type_const_bounds(bt) || dimension_of(bt) != 1)
+      return false;
+   int64_t low, high;
+   if (!folded_bounds(range_of(bt, 0), &low, &high) || low == 0)
+      return false;
+   int64_t cidx;
+   return !folded_int(tree_value(tree_param(e, 0)), &cidx);   // dynamic index
+}
+
 typedef struct { tree_t decl; int refs; int indexed; int agg; } mem_scan_t;
 
 static void mem_scan_cb(tree_t t, void *ctx)
@@ -612,6 +637,31 @@ static bool type_is_signed(type_t t)
    return false;
 }
 
+// F1b: a VHDL sll/srl with a NEGATIVE count REVERSES direction (`x sll -k` ==
+// `x srl k`), but Verilog `<<`/`>>` and RTLIL `$shl`/`$shr` treat the amount as
+// UNSIGNED and never reverse -- so a shift whose count can be negative is
+// silently wrong under --accel.  Returns true when the count is not provably
+// non-negative, so both emit paths can DECLINE it to interp (rare shape: real
+// RTL shifts by a non-negative amount, and a constant / natural / unsigned
+// count stays accelerated).
+static bool shift_count_maybe_negative(tree_t cnt)
+{
+   int64_t cv;
+   if (folded_int(cnt, &cv))
+      return cv < 0;                    // constant count: safe iff >= 0
+   if (!tree_has_type(cnt))
+      return true;                      // unknown -> assume it can be negative
+   type_t t = tree_type(cnt);
+   if (type_is_signed(t))
+      return true;                      // numeric_std signed count
+   if (!type_is_integer(t))
+      return false;                     // not an integer count: not the sll shape
+   int64_t low, high;
+   if (type_const_bounds(t) && folded_bounds(range_of(t, 0), &low, &high))
+      return low < 0;                   // natural (0..) safe; `-8 to 7` unsafe
+   return true;                         // unconstrained integer -> can be negative
+}
+
 // Map an sv2vhdl logic3d package function to a Verilog operator on value bits.
 // *kind: 0=binary "(a op b)", 1=unary-prefix "(op a)", 2=identity "a",
 // 3=reduction "(op a)". Returns NULL if not a known logic3d op.
@@ -651,6 +701,63 @@ static bool vlog_op_ctx_width(const char *o)
 {
    return !(!strcmp(o, "==") || !strcmp(o, "!=") || !strcmp(o, "<")
             || !strcmp(o, ">") || !strcmp(o, "<=") || !strcmp(o, ">="));
+}
+
+// SOUNDNESS (F4): is a memory-access INDEX a numeric_std VECTOR arithmetic
+// expression whose VHDL result wraps mod 2^operand-width but whose emitted
+// Verilog does NOT wrap?  `mem(to_integer(unsigned(a(2:0)) + 1))` wraps 7+1->0
+// in VHDL; the text path emits `mem[(a[2:0] + 1)]`, Verilog widens the unsized
+// literal to 32 bits, the add does not wrap, the index (8) exceeds the declared
+// `reg mem[0:7]`, and gen_statemachine reads garbage -- or, for a `- 1`
+// underflow, indexes _mem[0xffffffff] and SEGFAULTs.  A pure-INTEGER index
+// (`i + 1`, i:integer) is full-precision in both languages -- NOT flagged.  A
+// constant/folded index is exact -- the caller exempts it via folded_int.
+static bool mem_index_wraps(tree_t ix)
+{
+   // peel no-op wrappers: type conversions, qualifications, and the identity
+   // FCALLs (to_integer / resize / to_(un)signed, and the numeric_std casts)
+   for (;;) {
+      const tree_kind_t k = tree_kind(ix);
+      if (k == T_TYPE_CONV || k == T_QUALIFIED || k == T_INERTIAL) {
+         ix = tree_value(ix);
+         continue;
+      }
+      if (k == T_FCALL && tree_params(ix) >= 1) {
+         const char *b = id_base(istr(tree_ident(ix)));
+         int kd = -1;
+         const char *lo = vlog_l3d_op(istr(tree_ident(ix)), &kd);
+         if ((lo != NULL && kd == 2)
+             || !strcasecmp(b, "unsigned") || !strcasecmp(b, "signed")) {
+            ix = tree_value(tree_param(ix, 0));
+            continue;
+         }
+      }
+      break;
+   }
+   if (tree_kind(ix) != T_FCALL)
+      return false;
+   const char *ixfn = istr(tree_ident(ix));
+   const char *op = vlog_op(ixfn);
+   // shift_left is the numeric_std FUNCTION form of `sll` (`<<`): it overflows
+   // upward exactly like the operator, but is not in vlog_op's table.
+   const bool shl_fn = !strcasecmp(id_base(ixfn), "shift_left");
+   if (op == NULL && !shl_fn)
+      return false;
+   // only overflow / wrap-losing arithmetic: + - * << (and shift_left).  Bitwise
+   // ops are width-preserving; relationals are boolean; / rem srl shift_right
+   // rotate_* all stay in range (they shrink or wrap WITHIN the operand width).
+   if (op != NULL && strcmp(op, "+") && strcmp(op, "-") && strcmp(op, "*")
+       && strcmp(op, "<<"))
+      return false;
+   // require at least one numeric_std VECTOR operand (an array type): a pure
+   // integer operation computes at full precision identically in both languages
+   const int np = tree_params(ix);
+   for (int i = 0; i < np; i++) {
+      tree_t a = tree_value(tree_param(ix, i));
+      if (tree_has_type(a) && type_is_array(tree_type(a)))
+         return true;
+   }
+   return false;
 }
 
 // ---- Verilog SELF-DETERMINED width of what emit_expr() will actually PRINT ---
@@ -702,6 +809,18 @@ static int emitted_width(tree_t e, int depth)
          // pure false positives from this function's ignorance, not real
          // width errors.
          const char *vop = vlog_op(fn);
+         if (vop != NULL && strcmp(vop, "*") == 0 && tree_params(e) == 2) {
+            // a MULTIPLY's result width is the SUM of its operand widths
+            // (numeric_std `L'length+R'length`); the walker builds the $mul
+            // at that width.  Reporting the max here (via the -1/unconstrained
+            // fall-through) makes a widening resize over-read the narrower
+            // self-determined render (a range-check on the sum-wide temp).
+            const int wa = emitted_width(tree_value(tree_param(e, 0)), depth + 1);
+            const int wb = emitted_width(tree_value(tree_param(e, 1)), depth + 1);
+            if (wa > 0 && wb > 0)
+               return wa + wb;
+            return -1;
+         }
          if (vop != NULL) return vlog_op_ctx_width(vop) ? -1 : 1;
          bool rsgn = false;
          if (l3d_relop(id_base(fn), &rsgn) != NULL) return 1;
@@ -1196,6 +1315,10 @@ static void emit_expr(FILE *f, tree_t e)
             // A shift AMOUNT is self-determined -- nothing escapes from there.
             const bool ctxw = vlog_op_ctx_width(op);
             const bool shft = (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0);
+            // F1b: sll/srl with a possibly-negative count reverses in VHDL but
+            // not in Verilog -> silently wrong; decline to interp.
+            if (shft && shift_count_maybe_negative(a1))
+               DECLINE("shift-maybe-negative-count");
             fputc('(', f);
             if (sgn) fputs("$signed(", f);
             emit_ctx_operand(f, a0, celem && ctxw);
@@ -1250,7 +1373,17 @@ static void emit_expr(FILE *f, tree_t e)
             // l3d resize has a non-signed, non-array-numeric type so it stays
             // the bare identity below.
             tree_t a0 = tree_value(tree_param(e, 0));
-            const bool sgn = tree_has_type(e) && type_is_signed(tree_type(e));
+            // `to_integer(signed(x))` returns an INTEGER (not a numeric_std
+            // SIGNED), so type_is_signed(result) is false -- but the integer
+            // reg is declared `signed [31:0]`, and a bare unsigned operand
+            // zero-extends into it, DROPPING the sign (a negative to_integer
+            // becomes a large positive: wrong case arm / index / arithmetic).
+            // Treat `to_integer` of a SIGNED argument as a signed result so it
+            // is $signed-wrapped and the context sign-extends; to_integer of an
+            // UNSIGNED arg stays a bare zero-extend.
+            const bool sgn = (tree_has_type(e) && type_is_signed(tree_type(e)))
+               || (strcasecmp(id_base(fn), "to_integer") == 0
+                   && tree_has_type(a0) && type_is_signed(tree_type(a0)));
             // Target width: the resize/to_(un)signed size arg (param 1) folds to
             // a constant; the FCALL's own type is the unconstrained numeric_std
             // return type (no const bounds), so read the width from the arg.
@@ -1300,6 +1433,24 @@ static void emit_expr(FILE *f, tree_t e)
             // false positive.
             const bool ident_bad =
                (celem && nw > 0 && emitted_width(a0, 0) != nw);
+            // NARROWING a SIGNED resize/to_signed -- resize(signed_product, 16)
+            // -- keeps {sign, low nw-1}, NOT a low-nw truncation.  The $signed
+            // identity below drops the width arg and the assignment truncates,
+            // silently dropping the sign on overflow (F4 resweep familyD:
+            // resize(resize(signed(a),20)*resize(signed(b),20), 16)).  The rtlil
+            // walker declines this shape (resize-narrow-land); decline the text
+            // path too so the module stays in the golden interpreter.
+            {
+               const char *rb = id_base(fn);
+               const int ow = (aw > 0) ? aw : emitted_width(a0, 0);
+               if ((strcasecmp(rb, "resize") == 0
+                    || strcasecmp(rb, "to_signed") == 0)
+                   && sgn && nw > 0 && ow > 0 && nw < ow) {
+                  DECLINE("resize-narrow-signed-land");
+                  fputs("0/*resize-narrow-signed*/", f);
+                  break;
+               }
+            }
             if (sgn) {
                if (ident_bad) DECLINE("identity-width-in-concat");
                // $signed(x) keeps x's self-determined width -> transparent.
@@ -1346,6 +1497,51 @@ static void emit_expr(FILE *f, tree_t e)
    case T_ARRAY_REF:
       {
          tree_t base = tree_value(e);
+         // SOUNDNESS (F4 resweep familyA): a dynamic index into a NON-ZERO-BASE
+         // array addresses the flat store at the raw index without subtracting
+         // array'low.  The rtlil walker declines this; decline the text path too.
+         if (r2_nonzero_base_dyn_index(e)) {
+            DECLINE("nonzero-base-dyn-index");
+            fputs("0/*nonzero-base-dyn-index*/", f);
+            break;
+         }
+         // SOUNDNESS (F4): a MEMORY access at a numeric_std vector-arithmetic
+         // index loses its modular wrap when emitted to Verilog -> an OOB $mem
+         // access (garbage word data, or a SIGSEGV on an underflowing `- 1`).
+         // The RTLIL walker already declines this shape (mem-usage); decline the
+         // text path too so the module stays in the golden interpreter.  This
+         // single site guards both reads and indexed WRITES (the write target
+         // routes through emit_expr(tree_target(s))).  Bare-index register files
+         // (mem(waddr)) and pure-integer indices are unaffected.
+         if (tree_params(e) == 1 && tree_kind(base) == T_REF
+             && tree_has_ref(base)) {
+            unsigned mnw, mew;
+            tree_t ixe = tree_value(tree_param(e, 0));
+            int64_t cix;
+            if ((sig_is_mem(tree_ref(base))
+                 || mem_shape(tree_type(tree_ref(base)), &mnw, &mew))
+                && !folded_int(ixe, &cix) && mem_index_wraps(ixe)) {
+               DECLINE("mem-idx-arith-wrap");
+               fputs("0/*mem-idx-arith-wrap*/", f);
+               break;
+            }
+         }
+         // ASCENDING-range vector element read `ua(i)` (ua : slv(0 to N)): the
+         // leftmost element is the MSB, so VHDL index i is Verilog bit N-1-i,
+         // but the [idx] emit below uses i directly -- the wrong bit (F4 resweep
+         // familyC).  The rtlil walker declines this (elem-ascending); decline
+         // the text path too.  Memories and multi-bit-element results unaffected.
+         if (tree_params(e) == 1 && tree_kind(base) == T_REF
+             && tree_has_ref(base) && !type_is_array(tree_type(e))
+             && !sig_is_mem(tree_ref(base))) {
+            type_t bt = tree_type(tree_ref(base));
+            if (type_is_array(bt) && type_const_bounds(bt)
+                && dimension_of(bt) == 1 && direction_of(bt, 0) == RANGE_TO) {
+               DECLINE("elem-ascending");
+               fputs("0/*elem-ascending*/", f);
+               break;
+            }
+         }
          // Verilog cannot bit-select a LITERAL, and an inlined constant emits as
          // one (`8'b..[i]` is a syntax error). For a constant base use shift+mask
          // -- which is exactly what yosys lowers a bit-select to anyway, and it
@@ -1394,13 +1590,20 @@ static void emit_expr(FILE *f, tree_t e)
    case T_ARRAY_SLICE:
       {
          tree_t r = tree_range(e, 0);
+         // ASCENDING-range slice `sig(lo to hi)`: the base vector's leftmost
+         // element is the MSB, so VHDL index i is Verilog bit N-1-i and the raw
+         // [right:left] mapping below silently REORDERS the bits (F4 resweep
+         // familyC: a byteswap installed as y=a).  The rtlil walker declines
+         // this (slice-ascending); decline the text path too so the module
+         // stays in the golden interpreter.
+         if (tree_subkind(r) == RANGE_TO) {
+            DECLINE("slice-ascending");
+            fputs("0/*slice-ascending*/", f);
+            break;
+         }
          emit_expr(f, tree_value(e));
          fputc('[', f);
-         if (tree_subkind(r) == RANGE_TO) {   // ascending: Verilog wants [hi:lo]
-            emit_expr(f, tree_right(r)); fputc(':', f); emit_expr(f, tree_left(r));
-         } else {                             // downto: [left:right] = [hi:lo]
-            emit_expr(f, tree_left(r)); fputc(':', f); emit_expr(f, tree_right(r));
-         }
+         emit_expr(f, tree_left(r)); fputc(':', f); emit_expr(f, tree_right(r));
          fputc(']', f);
       }
       break;
@@ -1489,6 +1692,56 @@ static bool folded_bit(tree_t e, bool *one)
    return false;
 }
 
+// SOUNDNESS (F4): does a memory-shaped signal/variable INITIALIZER equal
+// all-zero?  The accel resets memory state to 0 at power-on (sm_reset), so
+// DROPPING the initializer -- which both the RTLIL walker and the text path do
+// for a memory (no $meminit) -- is sound ONLY for an all-zero fill.  A uniform
+// but NONZERO fill `(others => x"00FF")` powered on at 0 and silently diverged.
+// Recurse uniform `(others => ...)` aggregates down to a zero bit ('0'/L/L3D_0,
+// via r2_bit_of_tree so std_logic AND logic3d resolve), an all-'0' bit-string,
+// or an integer 0; anything else (a set/meta bit, a nonzero literal, a
+// non-uniform aggregate, a non-constant value) is NOT provably zero, so the
+// caller must decline rather than drop it.
+static char r2_bit_of_tree(tree_t v);   // defined below (~3660): logic bit decode
+static bool mem_init_is_zero(tree_t v)
+{
+   if (v == NULL) return false;
+   switch (tree_kind(v)) {
+   case T_QUALIFIED:
+   case T_TYPE_CONV:
+      return mem_init_is_zero(tree_value(v));
+   case T_AGGREGATE:
+      if (tree_assocs(v) != 1 || tree_subkind(tree_assoc(v, 0)) != A_OTHERS)
+         return false;                    // non-uniform: not a plain zero fill
+      return mem_init_is_zero(tree_value(tree_assoc(v, 0)));
+   case T_STRING:
+      {
+         const int n = tree_chars(v);
+         if (n <= 0) return false;
+         for (int i = 0; i < n; i++) {
+            ident_t rune = tree_ident(tree_char(v, i));
+            const char c = (ident_len(rune) >= 2 && ident_char(rune, 0) == '\'')
+                           ? ident_char(rune, 1) : '?';
+            if (c != '0' && c != 'L') return false;   // set/meta bit -> not zero
+         }
+         return true;
+      }
+   default:
+      // A GENUINE integer-element memory carries a true integer value, so a
+      // zero fill is integer 0.  logic3d is ALSO type_is_integer (it is a
+      // bit-value-encoded integer type where L3D_0 has integer value 2, not 0),
+      // so exclude it -- and std_logic (a plain enum) -- and decode those as a
+      // bit via r2_bit_of_tree ('0'/L/L3D_0 -> value bit 0), matching mem_shape's
+      // own `type_is_integer(et) && !type_is_logic3d(et)` integer-element test.
+      if (tree_has_type(v) && type_is_integer(tree_type(v))
+          && !type_is_logic3d(tree_type(v))) {
+         int64_t iv;
+         return folded_int(v, &iv) && iv == 0;
+      }
+      return r2_bit_of_tree(v) == '0';
+   }
+}
+
 // Two expressions naming the SAME object (same resolved declaration). Used to
 // require `clk'event and clk = '1'` -- `clk'event and rst = '1'` is not an edge.
 static bool same_object(tree_t a, tree_t b)
@@ -1575,6 +1828,121 @@ static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
    return 0;
 }
 
+// A `wait until <edge>` (T_WAIT with an edge until-condition) is a CLOCK that
+// clock_of does not recognise (it only scans `if rising_edge`).  Emitted on the
+// comb path the flop loses its clock (`q <= b` becomes `assign q = b`, one cycle
+// lost); a pure such flop is caught by gen_statemachine's comb-only net and stays
+// in interp, but a module that ALSO has a real `if rising_edge` register passes
+// that net and installs SILENTLY WRONG.  No wait-until flop is currently
+// accelerated correctly, so decline any process that contains one rather than
+// drop its clock.  (A plain process sensitivity `wait on clk` has no
+// until-value and is not detected.)
+static void wait_edge_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found || tree_kind(t) != T_WAIT || !tree_has_value(t))
+      return;
+   tree_t sig[8]; bool pe[8];
+   if (edges_of(tree_value(t), sig, pe, 8) > 0)
+      *found = true;
+}
+
+static bool proc_has_wait_edge(tree_t p)
+{
+   bool found = false;
+   tree_visit(p, wait_edge_cb, &found);
+   return found;
+}
+
+// An ASCENDING ('to') process VARIABLE accessed by element or slice: both this
+// text path and the flat value-plane write path assume a DOWNTO layout and
+// mis-index it -- a silent-wrong install on a rare shape (all corpus/VeeR/Vortex
+// vectors are downto).  The walker declines the access itself (var-part-to on a
+// partial write, var-elem-to on an element read); decline the whole process here
+// too so the subtree runs in the INTERPRETER rather than a wrong text model
+// (like the wait-until flop and the r22 multi-driver guard).  WHOLE-variable
+// access (`v := a; yr <= v`) is direction-agnostic and stays accelerated.
+static void asc_var_part_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found)
+      return;
+   const tree_kind_t k = tree_kind(t);
+   if (k != T_ARRAY_REF && k != T_ARRAY_SLICE)
+      return;
+   tree_t b = tree_value(t);
+   if (tree_kind(b) != T_REF || !tree_has_ref(b))
+      return;
+   tree_t d = tree_ref(b);
+   if (tree_kind(d) != T_VAR_DECL)
+      return;
+   type_t ty = tree_type(d);
+   if (type_is_array(ty) && direction_of(ty, 0) != RANGE_DOWNTO)
+      *found = true;
+}
+
+static bool proc_has_ascending_var_part(tree_t p)
+{
+   bool found = false;
+   tree_visit(p, asc_var_part_cb, &found);
+   return found;
+}
+
+// A LOGIC3D REGISTERED assignment whose binop RHS has a CONCATENATION as its
+// LEFT operand (`yr <= (x & y) xor z`) samples that concat ONE DELTA STALE in the
+// accel register capture (the value-plane bridge treats a concat operand feeding
+// a flop like a delayed signal, not combinational logic) -- a silent-wrong on the
+// TEXT path (r30_A: interp != accel, [[accel-r30a-fp-installwrong]]).  The direct
+// RTLIL walker captures it correctly (VeeR is all logic3d and clean), and
+// std_logic is correct too, so this declines ONLY the logic3d text-path fallback
+// with this exact shape -> the process runs in the interpreter.  Scanned only over
+// the CLOCKED body (a combinational concat-binop is fine).
+static void reg_concat_binop_cb(tree_t t, void *ctx)
+{
+   bool *found = (bool *)ctx;
+   if (*found || tree_kind(t) != T_FCALL || tree_params(t) != 2)
+      return;
+   const char *fn = istr(tree_ident(t));
+   // The outer op must be a BINARY operator that is NOT concatenation itself:
+   // a standard operator (vlog_op, e.g. `"xor"` -> `^`) or a logic3d op
+   // (vlog_l3d_op kind 0, e.g. l3d_xor).
+   int lk = -1;
+   const bool l3d_binop = vlog_l3d_op(fn, &lk) != NULL && lk == 0;
+   const char *vop = vlog_op(fn);
+   if (!l3d_binop && (vop == NULL || strcmp(fn, "\"&\"") == 0))
+      return;
+   // LEFT operand a concatenation?  nvc folds `a & b` into a positional/concat
+   // T_AGGREGATE (or leaves a `"&"` FCALL).
+   tree_t p0 = tree_value(tree_param(t, 0));
+   while (tree_kind(p0) == T_TYPE_CONV || tree_kind(p0) == T_QUALIFIED
+          || tree_kind(p0) == T_INERTIAL)
+      p0 = tree_value(p0);
+   bool cat = tree_kind(p0) == T_FCALL && tree_params(p0) == 2
+      && strcmp(istr(tree_ident(p0)), "\"&\"") == 0;
+   if (!cat && tree_kind(p0) == T_AGGREGATE && tree_assocs(p0) > 0) {
+      cat = true;
+      for (int i = 0; i < tree_assocs(p0); i++) {
+         const assoc_kind_t sk = tree_subkind(tree_assoc(p0, i));
+         if (sk != A_CONCAT && sk != A_POS) { cat = false; break; }
+      }
+   }
+   if (!cat)
+      return;
+   // logic3d only (std_logic is captured correctly): a l3d op is inherently
+   // logic3d; otherwise the binop result or the concat operand carries the type.
+   if (l3d_binop
+       || (tree_has_type(t) && type_is_logic3d(tree_type(t)))
+       || (tree_has_type(p0) && type_is_logic3d(tree_type(p0))))
+      *found = true;
+}
+
+static bool body_has_reg_concat_binop(tree_t body)
+{
+   bool found = false;
+   tree_visit(body, reg_concat_binop_cb, &found);
+   return found;
+}
+
 // detect a clocked process: a wrapping `if rising_edge(clk) [or falling_edge(rst)]`.
 // Returns the wrapping cond (non-NULL = clocked), fills body_if + the edge list
 // and (if given) the enclosing T_IF so the caller can find an async-reset elsif.
@@ -1651,6 +2019,33 @@ static void emit_seq(FILE *f, tree_t s, int ind)
          //   sig <= v      -> elided
          //   v(idx) := e   -> sig[idx] <= e   (direct NBA memory write)
          tree_t tg0 = tree_target(s);
+         // SOUNDNESS: a partial write (slice or sub-bit) into an element that
+         // is itself selected by a DYNAMIC index — mem(k)(7 downto 0) <= …,
+         // mem(k)(j) <= …  with k not static.  Emitting `mem[k][7:0] <= …`
+         // yosys mis-synthesizes (disjoint part-selects to the same dynamic
+         // word clobber / drop the address), a silent wrong install.  The
+         // rtlil walker declines this shape (dyn-elem-partial); decline in the
+         // text path too so the module stays in the golden interpreter.
+         {
+            tree_t sub = NULL;
+            if (tree_kind(tg0) == T_ARRAY_SLICE)
+               sub = tree_value(tg0);
+            else if (tree_kind(tg0) == T_ARRAY_REF && tree_params(tg0) == 1
+                     && (tree_kind(tree_value(tg0)) == T_ARRAY_REF
+                         || tree_kind(tree_value(tg0)) == T_ARRAY_SLICE))
+               sub = tree_value(tg0);
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_SLICE)
+               sub = tree_value(sub);
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_REF
+                && tree_params(sub) == 1) {
+               int64_t sidx;
+               if (!folded_int(tree_value(tree_param(sub, 0)), &sidx)) {
+                  DECLINE("dyn-elem-partial");
+                  fprintf(f, "  /*?dyn-elem-partial*/\n");
+                  break;
+               }
+            }
+         }
          if (tree_kind(s) == T_VAR_ASSIGN) {
             if (tree_kind(tg0) == T_REF && tree_has_ref(tg0)
                 && shadow_sig_of(tree_ref(tg0)) != NULL)
@@ -2024,11 +2419,27 @@ static tree_t proc_body(tree_t p)
 static void emit_process(FILE *f, tree_t p0)
 {
    tree_t p = proc_body(p0);   // unwrap the process-sensitivity loop
+   if (proc_has_wait_edge(p)) {
+      // a `wait until <edge>` clock the comb path would silently drop
+      DECLINE("wait-edge-flop");
+      return;
+   }
+   if (proc_has_ascending_var_part(p)) {
+      // ascending ('to') local vector element/slice: mis-indexed here and in
+      // the walker's flat write path -- run it in the interpreter instead
+      DECLINE("asc-var-part");
+      return;
+   }
    tree_t body_if = NULL, sig[8], ifstmt = NULL;
    bool pe[8];
    int ne = 0;
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    if (clk != NULL) {
+      if (body_has_reg_concat_binop(body_if)) {
+         // logic3d register capture of a concat LEFT-operand is one delta stale
+         DECLINE("l3d-reg-concat-binop");
+         return;
+      }
       tree_t rsig = NULL; bool rpe = false, rbefore = false;
       tree_t rcond = (ifstmt != NULL)
          ? areset_of(ifstmt, body_if, &rsig, &rpe, &rbefore) : NULL;
@@ -2843,6 +3254,9 @@ tree_t vhdl2vlog_comp_inner(tree_t block)
    return inner;
 }
 
+// defined below (shared with the direct-RTLIL walker's soundness guard)
+static ident_t r2_multi_driver_array(tree_t block);
+
 bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
 {
    g_unhandled = 0;
@@ -2861,6 +3275,21 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
    // but parseable model would silently corrupt results.
    if (!block_types_synth(block))
       return false;
+
+   // Same soundness veto as the direct-RTLIL walker: an array signal written
+   // in disjoint elements by >1 driver renders as a `wire` with mixed
+   // continuous + procedural drivers (invalid Verilog; yosys mis-resolves it),
+   // so decline here too — the subtree then falls through to the interpreter
+   // rather than to a wrong text-path model (mylex r22_ffirst).
+   {
+      ident_t bad = r2_multi_driver_array(block);
+      if (bad != NULL) {
+         char why[64];
+         snprintf(why, sizeof why, "multi-driver-array %s", vid(bad));
+         DECLINE(why);
+         return false;
+      }
+   }
 
    build_reg_set(block);   // one walk; is_reg() is then a set lookup
 
@@ -2973,6 +3402,18 @@ bool vhdl2vlog_module(FILE *f, tree_t block, const char *modname)
       if (tree_kind(d) != T_SIGNAL_DECL) continue;
       unsigned nw, ew;
       if (sig_is_mem(d) && mem_shape(tree_type(d), &nw, &ew)) {
+         // SOUNDNESS (F4): a memory-shaped signal's INITIALIZER cannot be
+         // emitted here -- the bare reg array below DROPS it, and the accel
+         // resets memory state to 0.  So dropping is sound ONLY for an all-zero
+         // fill; a uniform NONZERO fill (others => x"00FF") or a non-uniform
+         // per-element init (x"0001", x"0002", ...) would power on at 0 and
+         // diverge before each element is written.  Mirror the walker's
+         // mem-init decline (9592+) so the module stays in the golden interp.
+         if (tree_has_value(d) && !mem_init_is_zero(tree_value(d))) {
+            DECLINE("mem-init");
+            fprintf(f, "  /*?mem-init %s*/\n", vid(tree_ident(d)));
+            continue;
+         }
          const bool isint = type_is_integer(type_elem(tree_type(d)));
          fprintf(f, "  reg %s[%u:0] %s [0:%u];\n", isint ? "signed " : "",
                  ew - 1, vid(tree_ident(d)), nw - 1);
@@ -3349,6 +3790,9 @@ typedef struct { ident_t var; char *spec;
                                       // recognisers look through it: the
                                       // OOB_WriteV index `l3d_index(e * K)`)
                  int bw;              // >0: var built PER-BIT (bits[] specs)
+                 bool nonneg;         // F6: the assigned value is provably
+                                      // NON-NEGATIVE (to_integer(unsigned(..))),
+                                      // so a signed binop zero-extends it
                  char *bits[128]; } r2_subst_t;
 static r2_subst_t g_r2_subst[32];
 static int        g_r2_nsubst;
@@ -3363,13 +3807,16 @@ static const char *r2_pvar_read_pv(ident_t id);
 // value, prev-version) into a fresh wire — pure feed-forward SSA, no
 // proc-action ordering involved, so read-after-write and dynamic
 // part-writes to locals are all legal.
-static char g_r2_conds[24][96];
+#define R2_MAX_CONDS 64   // open path conditions: nesting depth + if/elsif arms
+static char g_r2_conds[R2_MAX_CONDS][96];
 static int  g_r2_nconds;
 
 static bool r2_cond_push(const char *cs)
 {
-   if (g_r2_nconds >= 24 || strlen(cs) >= sizeof g_r2_conds[0])
+   if (g_r2_nconds >= R2_MAX_CONDS || strlen(cs) >= sizeof g_r2_conds[0]) {
+      R2_DECLINE("cond-stack");   // attributable instead of a silent ok=false
       return false;
+   }
    snprintf(g_r2_conds[g_r2_nconds++], sizeof g_r2_conds[0], "%s", cs);
    return true;
 }
@@ -3463,6 +3910,7 @@ static bool r2_subst_set(ident_t var, const char *spec)
    e->wdepth = g_r2_case_depth;
    e->sw = 0;
    e->vtree = NULL;
+   e->nonneg = false;
    return true;
 }
 
@@ -4173,8 +4621,148 @@ static bool r2_expr(tree_t e, char *out, size_t sz);
 // the widest operand when the result type is unconstrained (operator FCALL
 // results carry no bounds — verilog self-determination is the text-path
 // semantics being mirrored)
+static int r2_decl_width(tree_t e);
+static int r2_rendered_width(tree_t e);
+
 static int r2_width_or_operands(tree_t e)
 {
+   // A `resize`/`to_l3d` with an unconstrained result: its natural width is the
+   // TARGET width when it actually resizes (a narrowing, or an unconstrained
+   // widening) -- NOT the pre-resize operand width.  Checked BEFORE r2_width
+   // because emitted_width only special-cases a WIDENING resize; for a NARROWING
+   // it reports the OPERAND width, so r2_width would wrongly return the pre-
+   // narrow width here.  Without this the numeric_std `+`/`-` of two narrowed
+   // operands sized to the operands' ORIGINAL width:
+   // resize(resize(unsigned(a),8)+resize(unsigned(b),8),16) added at 16 bits
+   // (keeping the carry) instead of the 8-bit wrap numeric_std defines.
+   // Mirrors r2_rendered_width's resize case.
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2) {
+      const char *rb = id_base(istr(tree_ident(e)));
+      if (strcasecmp(rb, "resize") == 0 || strcasecmp(rb, "to_l3d") == 0) {
+         const int rnw = r2_decl_width(e);
+         tree_t rea = tree_value(tree_param(e, 0));
+         const int raw = r2_width_or_operands(rea);
+         type_t ret = tree_type(rea);
+         const bool runc = type_is_array(ret) && !type_const_bounds(ret);
+         // widening renders at target when r2_expr installs it there: an
+         // unconstrained OR a signed/integer operand (ck42), not a constrained
+         // unsigned -- mirror r2_rendered_width's resize case (see there).
+         const bool rsgn = type_is_signed(ret) || type_is_integer(ret);
+         if (rnw > 0 && raw > 0
+             && (rnw < raw || (rnw > raw && (runc || rsgn))))
+            return rnw;
+         return raw > 0 ? raw : -1;
+      }
+      // to_signed(v,N)/to_unsigned(v,N) render at their TARGET width N (the widen
+      // relaxation installs them there) -- report N, not the operand-max, so a
+      // consumer sizes to it.  Without this, `to_signed(x,12) + to_signed(y,12)`
+      // sized the sum to the 8-bit to_integer operand, truncating both widens.
+      if (strcasecmp(rb, "to_signed") == 0 || strcasecmp(rb, "to_unsigned") == 0) {
+         const int tnw = r2_decl_width(e);
+         if (tnw > 0)
+            return tnw;
+      }
+   }
+   // CONCATENATION -- nvc elaborates `A & B & ...` into a concat AGGREGATE
+   // (A_CONCAT / A_POS elements), NOT a "&" FCALL.  Its width is the SUM of the
+   // element widths (a scalar bit contributes 1).  The result type is
+   // UNCONSTRAINED, so without this r2_width_or_operands returned -1 for a
+   // concat -- and a numeric_std `*` with a concat operand ((unsigned(a)&
+   // unsigned(b)) * resize(b,32)) then lost that operand's L'LENGTH and MASKED
+   // the 64-bit product to 32 bits (F4 resweep familyB wide MAC).
+   if (tree_kind(e) == T_AGGREGATE && type_is_array(tree_type(e))) {
+      const int n = tree_assocs(e);
+      bool isconcat = n > 0;
+      for (int i = 0; i < n && isconcat; i++) {
+         const assoc_kind_t sk = tree_subkind(tree_assoc(e, i));
+         if (sk != A_CONCAT && sk != A_POS)
+            isconcat = false;
+      }
+      if (isconcat) {
+         int sum = 0;
+         for (int i = 0; i < n; i++) {
+            tree_t el = tree_value(tree_assoc(e, i));
+            const int ew = type_is_array(tree_type(el))
+               ? r2_width_or_operands(el) : 1;
+            if (ew <= 0) { sum = -1; break; }
+            sum += ew;
+         }
+         if (sum > 0)
+            return sum;
+      }
+   }
+   // numeric_std `vector * scalar` (unsigned*natural / signed*integer): the
+   // scalar WRAPS to the vector length -> a 2*L'length product, NOT wa+wb.
+   // Checked BEFORE r2_width's early return, because r2_width reports a mul's
+   // operand-SUM width (a positive value that would shadow this).  Must match
+   // the binop emitter's vecmul width so a resize/to_signed context sizes and
+   // slices the product correctly (a LITERAL scalar renders wider than the
+   // vector length; unsigned(a(3:0))*16 is a 8-bit 0, not a 35-bit a*16).
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2
+       && strcmp(istr(tree_ident(e)), "\"*\"") == 0) {
+      tree_t ma = tree_value(tree_param(e, 0));
+      tree_t mb = tree_value(tree_param(e, 1));
+      const bool aarr = type_is_array(tree_type(ma));
+      const bool barr = type_is_array(tree_type(mb));
+      if (aarr && !barr && type_is_integer(tree_type(mb))) {
+         const int lw = r2_width_or_operands(ma);
+         if (lw > 0) return 2 * lw;
+      }
+      else if (barr && !aarr && type_is_integer(tree_type(ma))) {
+         const int lw = r2_width_or_operands(mb);
+         if (lw > 0) return 2 * lw;
+      }
+   }
+   // numeric_std `scalar (/|rem|mod) vector` / `vector (/|rem|mod) scalar`: the
+   // result IS the vector's length (the scalar wraps to it), NOT the operand
+   // max.  Same early placement as the mul case (r2_width reports a wider
+   // operand max that would shadow this) so a resize/to_signed context sizes it.
+   if (tree_kind(e) == T_FCALL && tree_params(e) == 2) {
+      const char *db = istr(tree_ident(e));
+      if (strcmp(db, "\"/\"") == 0 || strcmp(db, "\"rem\"") == 0
+          || strcmp(db, "\"mod\"") == 0) {
+         tree_t da = tree_value(tree_param(e, 0));
+         tree_t dc = tree_value(tree_param(e, 1));
+         const bool aarr = type_is_array(tree_type(da));
+         const bool barr = type_is_array(tree_type(dc));
+         if (aarr && !barr && type_is_integer(tree_type(dc))) {
+            const int lw = r2_width_or_operands(da);
+            if (lw > 0) return lw;
+         }
+         else if (barr && !aarr && type_is_integer(tree_type(da))) {
+            const int lw = r2_width_or_operands(dc);
+            if (lw > 0) return lw;
+         }
+      }
+   }
+   // A reinterpret cast (signed/unsigned/std_logic_vector, and T_TYPE_CONV /
+   // T_QUALIFIED) PRESERVES width, so its numeric_std width IS the width r2_expr
+   // RENDERS -- defer to r2_rendered_width (the ground truth) so this helper
+   // AGREES with it.  r2_width alone UNDER-reports a materialized resize under
+   // such a cast (signed(std_logic_vector(resize(unsigned(a(7:0)),12))) has
+   // r2_width 8 but renders 12), so a consuming +/-/* sized to 8 and truncated;
+   // r2_rendered_width already resolves both the constrained-unsigned PASSTHROUGH
+   // (via r2_signed_reinterpret_uwiden) and the unconstrained MATERIALIZE (via
+   // look-through).  to_integer is excluded (it is an integer, sized elsewhere);
+   // r2_rendered_width looks through the same casts, so no recursion on this node.
+   {
+      const tree_kind_t ek = tree_kind(e);
+      bool reint = (ek == T_TYPE_CONV || ek == T_QUALIFIED);
+      if (!reint && ek == T_FCALL && tree_params(e) == 1) {
+         const char *rfn = istr(tree_ident(e));
+         reint = vlog_op(rfn) == NULL && r2_user_func(rfn) == NULL
+                 && !strstr(rfn, "TO_INTEGER") && !strstr(rfn, "to_integer")
+                 && (strstr(rfn, "SIGNED") || strstr(rfn, "signed")
+                     || strstr(rfn, "STD_LOGIC_VECTOR")
+                     || strstr(rfn, "std_logic_vector")
+                     || strstr(rfn, "UNSIGNED") || strstr(rfn, "unsigned"));
+      }
+      if (reint) {
+         const int rr = r2_rendered_width(e);
+         if (rr > 0)
+            return rr;
+      }
+   }
    const int w = r2_width(e);
    if (w > 0)
       return w;
@@ -4186,6 +4774,33 @@ static int r2_width_or_operands(tree_t e)
          const int wa = r2_width_or_operands(tree_value(tree_param(e, 0)));
          const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
          return (wa > 0 && wb > 0) ? wa + wb : -1;
+      }
+      // a MULTIPLY's natural width is the SUM of the operand widths, NOT the
+      // max: numeric_std `"*"` returns `L'length+R'length` (an 8x8 product
+      // is 16 bits).  The max (the recursion below) truncates the product,
+      // which a widening resize/`$signed()` then sign-extends from the wrong
+      // MSB — silently wrong for a signed product exceeding the operand
+      // width.  Keeping this consistent with the binop emitter's own sum
+      // width is what makes NESTED muls `(a*b)*c` size correctly.
+      if (np == 2 && strcmp(istr(tree_ident(e)), "\"*\"") == 0) {
+         const int wa = r2_width_or_operands(tree_value(tree_param(e, 0)));
+         const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
+         return (wa > 0 && wb > 0) ? wa + wb : -1;
+      }
+      // numeric_std `vector +/- integer` returns the VECTOR operand's length
+      // (the integer is converted to that width), NOT the max -- so the outer
+      // context (a resize) sizes to the vector width and the binop emitter's
+      // own width (which applies the same rule) stays consistent.
+      if (np == 2 && (strcmp(istr(tree_ident(e)), "\"+\"") == 0
+                      || strcmp(istr(tree_ident(e)), "\"-\"") == 0)) {
+         tree_t x = tree_value(tree_param(e, 0));
+         tree_t y = tree_value(tree_param(e, 1));
+         const bool x_arr = type_is_array(tree_type(x));
+         const bool y_arr = type_is_array(tree_type(y));
+         const bool x_int = type_is_integer(tree_type(x));
+         const bool y_int = type_is_integer(tree_type(y));
+         if (x_arr && y_int) return r2_width_or_operands(x);
+         if (y_arr && x_int) return r2_width_or_operands(y);
       }
       // recurse: chains of unconstrained operator results (l3d_or of
       // l3d_and of resize of ...) carry their width arbitrarily deep
@@ -4231,6 +4846,8 @@ static int r2_local_width(tree_t e)
    return 1;
 }
 
+static int r2_signed_reinterpret_uwiden(tree_t e, tree_t operand);
+
 // The width of the sigspec r2_expr RENDERS for `e` — which differs from the
 // VHDL type width wherever the walker prints an identity's operand verbatim
 // (l3d_index / to_integer / resize drop their conversion, so an Integer
@@ -4242,6 +4859,16 @@ static int r2_rendered_width(tree_t e)
    for (int guard = 0; guard < 32; guard++) {
       const tree_kind_t k = tree_kind(e);
       if (k == T_TYPE_CONV || k == T_QUALIFIED || k == T_INERTIAL) {
+         // A signed reinterpret whose operand renders NARROWER than its (signed)
+         // cast width is an unsigned resize-widen passthrough: r2_signed_uwiden
+         // RENDERS it zero-extended to the cast width, so report that width rather
+         // than looking through to the pre-widen width -- else a consumer (e.g. a
+         // negation) mis-sizes it.
+         if (k == T_TYPE_CONV) {
+            const int cw = r2_signed_reinterpret_uwiden(e, tree_value(e));
+            if (cw > 0)
+               return cw;
+         }
          e = tree_value(e);
          continue;
       }
@@ -4274,6 +4901,54 @@ static int r2_rendered_width(tree_t e)
                return nw > 0 ? (int)nw : -1;
             return -1;
          }
+         // `resize`/`to_l3d` render at their TARGET width when they actually
+         // resize -- a NARROWING slices to nw, an UNCONSTRAINED WIDENING $pos-
+         // extends to nw (see r2_expr's resize handler).  Reporting the pre-
+         // resize operand width (via the ident see-through below) made a NESTED
+         // resize drop the inner narrowing: resize(resize(unsigned(a),8),16)
+         // read the inner as 16-bit and passed `a` through instead of a&0xFF.
+         // A constrained-widen / identity passes the operand through, so keep
+         // seeing through to it.
+         if (tree_params(e) == 2 && (strcasecmp(base, "resize") == 0
+                                     || strcasecmp(base, "to_l3d") == 0)) {
+            const int rnw = r2_decl_width(e);
+            tree_t rea = tree_value(tree_param(e, 0));
+            const int raw = r2_rendered_width(rea);
+            type_t ret = tree_type(rea);
+            const bool runc = type_is_array(ret) && !type_const_bounds(ret);
+            // A WIDENING resize renders at its target when the r2_expr handler
+            // INSTALLS it there (materialize + $pos), which it does for an
+            // UNCONSTRAINED operand OR a SIGNED/integer one (ck42) -- NOT for a
+            // constrained unsigned (that passes through and the context zero-
+            // extends).  Mirror that here: without the `|| rsgn` a widening
+            // resize of a constrained SIGNED variable slice reported the
+            // pre-resize width, and a consuming negation then negated at that
+            // narrow width (`-(resize(s(5 downto 0),13))` negated the 6-bit slice).
+            const bool rsgn = type_is_signed(ret) || type_is_integer(ret);
+            if (rnw > 0 && raw > 0
+                && (rnw < raw || (rnw > raw && (runc || rsgn))))
+               return rnw;
+            e = rea;
+            continue;
+         }
+         // to_signed(v, N) / to_unsigned(v, N) ALWAYS render at their TARGET
+         // width N: the widen $pos-extends to N, the narrowing takes the low N
+         // bits, equal width is N (see r2_expr's to_uns handler).  Reporting the
+         // operand's pre-conversion width (via the ident see-through below, which
+         // matches "TO_SIGNED"/"TO_UNSIGNED" on the 1-param... no -- these are
+         // 2-param, so they fell to r2_width_or_operands' operand-max = the
+         // OPERAND width, not N).  A consumer then mis-sized the value: the
+         // negation of a to_signed(...,10) widen negated at the 4-bit operand
+         // width, dropping the widen.
+         if (tree_params(e) == 2
+             && (strcasecmp(base, "to_signed") == 0
+                 || strcasecmp(base, "to_unsigned") == 0)) {
+            int64_t tnw;
+            if (folded_int(tree_value(tree_param(e, 1)), &tnw)
+                || r2_eval_int(tree_value(tree_param(e, 1)), &tnw))
+               return tnw > 0 ? (int)tnw : -1;
+            return -1;
+         }
          const bool ident =
             (lop != NULL && lk == 2)
             || strcasecmp(base, "l3d_index") == 0
@@ -4294,6 +4969,116 @@ static int r2_rendered_width(tree_t e)
       break;
    }
    return r2_width_or_operands(e);
+}
+
+// F6: is this INTEGER-valued expression provably NON-NEGATIVE (an unsigned
+// source -- to_integer(unsigned(..)), an `unsigned` cast, a natural subtype, a
+// >=0 constant)?  Such a value ZERO-extends into the 32-bit integer width; a
+// signed source (to_integer(signed(..)), a plain signed integer, a negative
+// constant) SIGN-extends.  Looks through conversions and substituted variables.
+// Conservative default: not provably non-negative -> false (sign-extend, the
+// pre-existing cell behaviour), so only KNOWN-non-negative operands change.
+static bool r2_int_nonneg(tree_t e)
+{
+   for (int guard = 0; guard < 32; guard++) {
+      const tree_kind_t k = tree_kind(e);
+      // a `(un)signed(a)` cast is a TYPE_CONV: decide by the RESULT type BEFORE
+      // looking through -- an unsigned array is non-negative, a signed one is
+      // not; looking through would reach the std_logic_vector source and lose
+      // the sign.  A QUALIFIED expression `unsigned'(..)` is the same.
+      if (k == T_TYPE_CONV || k == T_QUALIFIED) {
+         if (tree_has_type(e) && type_is_array(tree_type(e)))
+            return !type_is_signed(tree_type(e));
+         e = tree_value(e);
+         continue;
+      }
+      if (k == T_INERTIAL) { e = tree_value(e); continue; }
+      if (k == T_FCALL && tree_params(e) >= 1) {
+         const char *base = id_base(istr(tree_ident(e)));
+         if (strcasecmp(base, "to_integer") == 0) {
+            e = tree_value(tree_param(e, 0));
+            continue;
+         }
+         if (strcasecmp(base, "unsigned") == 0
+             || strcasecmp(base, "to_unsigned") == 0)
+            return true;
+         if (strcasecmp(base, "signed") == 0
+             || strcasecmp(base, "to_signed") == 0)
+            return false;
+         // resize/to_l3d preserve their operand's sign (resize(unsigned)->
+         // non-negative, resize(signed)->signed): look through to the operand.
+         // Without this the unrecognised-FCALL `break` below skipped the type
+         // check and a resize-narrowed UNSIGNED operand was SIGN-extended in a
+         // +/- (resize(unsigned(b),4) read as a 4-bit signed value).
+         if (strcasecmp(base, "resize") == 0 || strcasecmp(base, "to_l3d") == 0) {
+            e = tree_value(tree_param(e, 0));
+            continue;
+         }
+         // `nonneg + nonneg` and `nonneg * nonneg` are non-negative, PROVIDED
+         // the result cannot reach bit 31 -- a wider product/sum would look
+         // negative as a 32-bit signed int, which is exactly what a VHDL integer
+         // overflow does, so stay conservative (sign-extend) there.  `-` is
+         // excluded (a difference of non-negatives can be negative).
+         const char *vop = vlog_op(istr(tree_ident(e)));
+         if (vop != NULL && tree_params(e) == 2
+             && (strcmp(vop, "+") == 0 || strcmp(vop, "*") == 0)) {
+            tree_t x = tree_value(tree_param(e, 0));
+            tree_t y = tree_value(tree_param(e, 1));
+            const int wx = r2_rendered_width(x), wy = r2_rendered_width(y);
+            if (wx <= 0 || wy <= 0)
+               return false;
+            // Bound the result value's width by the ACTUAL rendered width of the
+            // operation, for both `*` and `+`.  wx+wy (mul) / max+1 (add) OVER-
+            // count a wide-rendered literal operand and trip the <=31 overflow
+            // guard, wrongly making a NON-negative result look signed (then
+            // sign-extended in a consuming multiply / widening to_signed):
+            //   unsigned(a(2:0))*255 is a 6-bit product, not 3+8=11;
+            //   (unsigned(a)/v + 1) is 8-bit (unsigned+natural = the vector's
+            //   width), not max(8, 32-bit literal)+1 = 33.
+            // r2_rendered_width returns the numeric_std result width (vecmul
+            // 2*len, vector+integer the vector's length, vector+vector the max),
+            // which is the true value bound; fall back to the old heuristic only
+            // if it is unavailable.
+            int rw = r2_rendered_width(e);
+            if (rw <= 0)
+               rw = (strcmp(vop, "*") == 0) ? wx + wy : (wx > wy ? wx : wy) + 1;
+            return rw <= 31 && r2_int_nonneg(x) && r2_int_nonneg(y);
+         }
+         // An unrecognised operator/function (`/`, `rem`, `mod`, `and`, `or`,
+         // `xor`, `not`, ...) is decided by its RESULT TYPE below -- fall
+         // through, do NOT break.  A numeric_std `unsigned / unsigned` (or rem,
+         // or a bitwise op of unsigned) yields an UNSIGNED result -> NON-negative,
+         // so a consuming multiply/resize/add must ZERO-extend it.  Breaking here
+         // defaulted such a value to signed and SIGN-extended it -- silently wrong
+         // when the result's MSB is set (unsigned(a)/unsigned(b) fed to a widening
+         // `*` read the 8-bit quotient as a negative 16-bit value).  A SIGNED
+         // operator result still returns false (sign-extend) from the array-type
+         // check, and an unbounded INTEGER result still falls to the conservative
+         // tail, so neither of those changes.
+      }
+      if (k == T_REF) {
+         r2_subst_t *sb = r2_subst_of(tree_ident(e));
+         if (sb != NULL && sb->nonneg) return true;   // recorded at var-assign
+         if (sb != NULL && sb->has_ival) return sb->ival >= 0;
+         if (sb != NULL && sb->vtree != NULL) { e = sb->vtree; continue; }
+      }
+      // decide by the current node's own type
+      if (tree_has_type(e)) {
+         type_t t = tree_type(e);
+         if (type_is_array(t))       // a numeric_std unsigned/signed value
+            return !type_is_signed(t);
+         if (type_is_integer(t)) {   // natural (0..) yes; `integer`/`-8..7` no
+            int64_t lo, hi;
+            if (type_const_bounds(t) && folded_bounds(range_of(t, 0), &lo, &hi))
+               return lo >= 0;
+         }
+      }
+      break;
+   }
+   int64_t iv;
+   if (folded_int(e, &iv))
+      return iv >= 0;
+   return false;
 }
 
 // The shape of a dynamic index expression, looking through conversions and
@@ -4534,6 +5319,10 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
       R2_DECLINE("var-version-base");
       return false;
    }
+   // depth at which the value BEING MERGED WITH is valid: a mux write below
+   // (cond ? new : prev) is valid at PREV's scope, so its version escapes the
+   // arm-exit poison and survives to the enclosing scope (SSA if-merge)
+   const int prev_wd = e->wdepth;
    // slicing needs a WIRE base: materialize literal/compose specs once
    bool bare = true;
    for (const char *q = e->spec; *q && bare; q++)
@@ -4557,7 +5346,12 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
          snprintf(lit, sizeof lit, "%d'd%lld", w, (long long)mival);
          msrc = lit;
       }
-      else if (r2_spec_width(e->spec) != w) {
+      else if (!whole && r2_spec_width(e->spec) != w) {
+         // a PARTIAL write slices the base e->spec[hi:lo], which needs a
+         // statically-sized bare wire; a WHOLE write only feeds e->spec as the
+         // mux else-input, and the builder sizes a {concat} itself at connect
+         // (a genuine mismatch then fails cleanly at var-version-mat) -- so let
+         // a whole write of a concat/composite prev fall through to materialize
          char why[96];
          snprintf(why, sizeof why, "var-version-spec w%d '%.24s'",
                   w, e->spec);
@@ -4614,7 +5408,16 @@ static bool r2_var_write(ident_t vi, int w, const char *value,
       R2_DECLINE("var-version-emit");
       return false;
    }
-   return r2_subst_set(vi, t);
+   if (!r2_subst_set(vi, t))
+      return false;
+   // a MERGE write (t = mux(pathcond, new, prev)) is valid where prev was, so
+   // stamp it at prev's depth instead of this arm's — r2_subst_poison_from then
+   // keeps it live past the arm, giving a correct read-after-branch of a
+   // branch-written local (SSA if-merge: loop-carried found-flags, if/elsif/else
+   // merges).  A straight-line write (pathcond empty) keeps the current depth.
+   if (pc[0] != '\0')
+      r2_subst_of(vi)->wdepth = prev_wd;
+   return true;
 }
 
 // Map the text path's Verilog operator string to a builder cell op.
@@ -4977,6 +5780,87 @@ static bool r2_agg_is_concat(tree_t t)
    return !r2_const(t, tmp, sizeof tmp, -1);   // constants stay literals
 }
 
+// A NAMED / RANGE-choice aggregate of a 1-D vector with 1-bit elements, built as
+// an RTLIL concat.  The text path (emit_agg_general) mis-orders the ASCENDING
+// case for a numeric consumer (F3); the walker installs it CORRECTLY instead of
+// declining to that text path.  numeric_std: the LEFTMOST element is the MSB for
+// BOTH directions (verified: unsigned(std_logic_vector'(7=>b(0),..,0=>b(7))),
+// ascending, maps b(k)->2^k), so place each choice value at its distance-from-
+// left slot and emit slot[0] (leftmost = MSB) FIRST.  Returns false (-> decline)
+// for anything not faithfully representable (multi-bit elements, unfoldable
+// choices, A_SLICE/A_CONCAT here, uncovered index without others).
+static bool r2_agg_named(tree_t e, char *out, size_t sz)
+{
+   type_t at = tree_type(e);
+   if (!type_is_array(at) || !type_const_bounds(at) || dimension_of(at) != 1)
+      return false;
+   type_t et = type_elem(at);
+   if (type_is_array(et) || type_width(et) != 1)
+      return false;
+   tree_t r = range_of(at, 0);
+   int64_t left, right;
+   if (!folded_int(tree_left(r), &left) || !folded_int(tree_right(r), &right))
+      return false;
+   const bool is_downto = (tree_subkind(r) == RANGE_DOWNTO);
+   const int W = (int)type_width(at);
+   if (W <= 0 || W > 4096)
+      return false;
+   tree_t *slot = xcalloc_array(W, sizeof(tree_t));   // NULL = unfilled
+   tree_t others = NULL;
+   bool have_others = false, bad = false;
+   int pos = 0;
+   const int n = tree_assocs(e);
+   for (int i = 0; i < n && !bad; i++) {
+      tree_t a = tree_assoc(e, i);
+      switch (tree_subkind(a)) {
+      case A_POS:
+         if (pos < W) slot[pos] = tree_value(a); else bad = true;
+         pos++;
+         break;
+      case A_NAMED: {
+         int64_t idx;
+         if (!folded_int(tree_name(a), &idx)) { bad = true; break; }
+         const int64_t off = is_downto ? (left - idx) : (idx - left);
+         if (off >= 0 && off < W) slot[(int)off] = tree_value(a); else bad = true;
+         break;
+      }
+      case A_RANGE: {
+         tree_t rr = tree_range(a, 0);
+         int64_t lo, hi;
+         range_bounds(rr, &lo, &hi);
+         for (int64_t j = lo; j <= hi && !bad; j++) {
+            const int64_t off = is_downto ? (left - j) : (j - left);
+            if (off >= 0 && off < W) slot[(int)off] = tree_value(a); else bad = true;
+         }
+         break;
+      }
+      case A_OTHERS:
+         others = tree_value(a); have_others = true;
+         break;
+      default:
+         bad = true; break;
+      }
+   }
+   for (int k = 0; k < W && !bad; k++)
+      if (slot[k] == NULL) { if (have_others) slot[k] = others; else bad = true; }
+   if (!bad) {
+      size_t len = 0;
+      out[len++] = '{';
+      for (int b = 0; b < W && !bad; b++) {   // slot[0] = leftmost = MSB, emit first
+         char el[R2_SPEC];
+         if (!r2_expr(slot[b], el, sizeof el)) { bad = true; break; }
+         const size_t elen = strlen(el);
+         if (len + elen + 2 >= sz) { bad = true; break; }
+         if (b) out[len++] = ',';
+         memcpy(out + len, el, elen);
+         len += elen;
+      }
+      if (!bad) { out[len++] = '}'; out[len] = '\0'; }
+   }
+   free(slot);
+   return !bad;
+}
+
 static bool r2_concat_chain(tree_t e, char *out, size_t sz)
 {
    int cap = 64, n = 0, scap = 64, sn = 0;
@@ -5128,6 +6012,80 @@ static bool r2_concat_chain(tree_t e, char *out, size_t sz)
 
 static bool r2_expr_1(tree_t e, char *out, size_t sz);
 
+// The constrained width of a SIGNED reinterpret cast `e` (T_TYPE_CONV to signed,
+// or the signed() function form) WHEN its operand renders NARROWER than that
+// width -- i.e. an unsigned resize/to_l3d WIDEN reached it via the PASSTHROUGH
+// (ck42 lets the consumer zero-extend, so the widen renders narrower than its
+// target).  Such a value must be zero-extended to the cast width before being
+// reinterpreted as signed, else the reinterpret re-signs the pre-widen bits
+// (signed(resize(u(5 downto 0),13)) -- directly or through a std_logic_vector cast
+// -- put the sign at bit 5, not the zero-extended bit 12).  A signed/unconstrained
+// widen already materializes to its width (renders == width), and a plain slice
+// renders at its width, so ONLY the unsigned passthrough makes an operand render
+// narrower than the signed cast -- the zero-extend is then exactly numeric_std.
+// Returns the resize target width (> the widen's rendered width), or -1 if not
+// this shape.  The signed reinterpret's own cast type is UNCONSTRAINED `signed`
+// (its bounds come from the operand), so the width comes from the resize: peel
+// width-preserving reinterpret casts (std_logic_vector / signed / unsigned) to
+// reach it -- handling both signed(resize(u,N)) and signed(std_logic_vector(
+// resize(u,N))).
+static int r2_signed_reinterpret_uwiden(tree_t e, tree_t operand)
+{
+   type_t ct = tree_has_type(e) ? tree_type(e) : NULL;
+   if (ct == NULL || !type_is_array(ct) || !type_is_signed(ct))
+      return -1;
+   tree_t x = operand;
+   for (int i = 0; i < 8 && x != NULL; i++) {
+      const tree_kind_t xk = tree_kind(x);
+      if (xk == T_TYPE_CONV || xk == T_QUALIFIED) {
+         x = tree_value(x);
+         continue;
+      }
+      if (xk == T_FCALL && tree_params(x) == 1) {
+         const char *fn = istr(tree_ident(x));
+         if (vlog_op(fn) == NULL && r2_user_func(fn) == NULL
+             && (strstr(fn, "SIGNED") || strstr(fn, "signed")
+                 || strstr(fn, "STD_LOGIC_VECTOR")
+                 || strstr(fn, "std_logic_vector")
+                 || strstr(fn, "UNSIGNED") || strstr(fn, "unsigned"))) {
+            x = tree_value(tree_param(x, 0));
+            continue;
+         }
+      }
+      break;
+   }
+   if (x == NULL || tree_kind(x) != T_FCALL || tree_params(x) != 2)
+      return -1;
+   const char *xb = id_base(istr(tree_ident(x)));
+   if (strcasecmp(xb, "resize") != 0 && strcasecmp(xb, "to_l3d") != 0)
+      return -1;
+   const int rn = r2_decl_width(x);
+   const int rw = r2_rendered_width(x);
+   return (rn > 0 && rw > 0 && rn > rw) ? rn : -1;
+}
+
+// Materialize the zero-extension for the shape above.  `operand` is the
+// reinterpret's operand.  Returns 1 = handled (out set), 0 = not this shape,
+// -1 = handled but failed (caller returns false).
+static int r2_signed_uwiden(tree_t e, tree_t operand, char *out, size_t sz)
+{
+   const int cw = r2_signed_reinterpret_uwiden(e, operand);
+   if (cw < 0)
+      return 0;
+   char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
+   if (!r2_expr(operand, a, sizeof a))
+      return -1;
+   if (!r2_temp(cw, y, sizeof y))
+      return -1;
+   snprintf(cn, sizeof cn, "c%s", y);
+   if (g_r2->cell_un("pos", cn, a, y, 0) != 0) {   // zero-extend to the cast width
+      R2_DECLINE("signed-of-uwiden");
+      return -1;
+   }
+   snprintf(out, sz, "%s", y);
+   return 1;
+}
+
 // depth guard: one r2_expr frame carries several sigspec buffers (tens of
 // KB); a pathological nesting declines instead of overflowing the stack
 static int g_r2_expr_depth;
@@ -5142,6 +6100,107 @@ static bool r2_expr(tree_t e, char *out, size_t sz)
    const bool ok = r2_expr_1(e, out, sz);
    g_r2_expr_depth--;
    return ok;
+}
+
+// Serve a CONSTANT-index element read of a process-local variable from its
+// live SSA substitution version — the same source a whole-variable read
+// consults.  The !have_idx block in r2_expr_1's T_ARRAY_REF case already does
+// this for loop-substituted indices; this is the folded-constant counterpart,
+// so `v(1)` AFTER a write to `v` resolves instead of declining "var-elem".
+// Returns true and fills `out` when served.  Returns false with *hard=false
+// when the variable has NO live version (genuine read-before-write: the caller
+// MUST fall through to the promote-on-read latch path).  Returns false with
+// *hard=true after a DECLINE that must NOT fall through: a fall-through would
+// call r2_pvar_read_or_promote, whose ts->npv++ side effect creates a spurious
+// pvar that then poisons the NEXT statement's per-bit write gate (the
+// var-assign@var-part cascade).  Raw idx is the bit index, correct only for a
+// downto range and a 1-bit value-plane element (both hold for std_logic_vector
+// and logic3d_vector under --accel); anything else declines rather than risk a
+// silent wrong bit.
+static bool r2_subst_elem_read(tree_t base, int64_t idx,
+                               char *out, size_t sz, bool *hard)
+{
+   *hard = false;
+   if (!tree_has_ref(base))
+      return false;
+   r2_subst_t *sb = r2_subst_of(tree_ident(base));
+   if (sb == NULL)
+      return false;   // never written: genuine read-before-write -> promote/latch
+   if (sb->spec == NULL && sb->bw == 0) {
+      // WRITTEN then poisoned (a branch merge the walker cannot represent as a
+      // flat version, e.g. a partial write under an `if` with no covering
+      // else): the promote-on-read fallback would install a PERSISTENT pv wire
+      // that is never seeded with the earlier writes -> installs silently WRONG
+      // (the pre-existing branch-var pv defect).  Decline to the text path,
+      // which lowers the same shape correctly.
+      *hard = true; R2_DECLINE("var-elem-poison"); return false;
+   }
+   // flat-wire element offset computed EXACTLY as r2_sel_range does for
+   // signal/port selects, so a non-zero lower bound maps correctly (bit
+   // off = (idx - low) for a downto vector) and an ascending range is
+   // rejected rather than mirror-indexed.  Element width in the --accel value
+   // plane is 1 bit for a scalar-element vector (std_logic_vector AND
+   // logic3d_vector); >1 only for a 2-D array-of-vector local.
+   type_t vt = tree_type(tree_ref(base));
+   if (!type_is_array(vt) || dimension_of(vt) != 1 || !type_const_bounds(vt)) {
+      *hard = true; R2_DECLINE("var-elem-ty"); return false;
+   }
+   int64_t low, high;
+   if (!folded_bounds(range_of(vt, 0), &low, &high)) {
+      *hard = true; R2_DECLINE("var-elem-bounds"); return false;
+   }
+   if (direction_of(vt, 0) != RANGE_DOWNTO) {
+      // ascending (`to`) locals: the write and text paths mis-index them, so
+      // keep the walker off the shape rather than risk a mirror-bit read
+      *hard = true; R2_DECLINE("var-elem-to"); return false;
+   }
+   if (idx < low || idx > high) {
+      *hard = true; R2_DECLINE("var-elem-oob"); return false;
+   }
+   const int64_t bidx = idx - low;   // 0-based element position in the flat wire
+   type_t et = type_elem(vt);
+   const int64_t ew = type_is_array(et)
+      ? (type_const_bounds(et) ? (int64_t)type_width(et) : -1) : 1;
+   if (ew < 1) { *hard = true; R2_DECLINE("var-elem-ew"); return false; }
+   // per-bit build: bits[] hold one value-bit per element (scalar element)
+   if (sb->bw > 0) {
+      if (ew != 1 || bidx >= sb->bw) {
+         *hard = true; R2_DECLINE("var-elem-bitw"); return false;
+      }
+      if (sb->bits[bidx] == NULL) {
+         *hard = true; R2_DECLINE("var-elem-bit"); return false;
+      }
+      snprintf(out, sz, "%s", sb->bits[bidx]);
+      return true;
+   }
+   // whole/versioned spec: index it.  A bare wire name indexes directly;
+   // otherwise only a sized literal whose prefix width equals the decl width
+   // may be landed on a temp (a width-mismatched connect throws inside the gsm
+   // child and poisons it).
+   bool bare = sb->spec[0] != '\0';
+   for (const char *q = sb->spec; *q && bare; q++)
+      if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+         bare = false;
+   const char *S = sb->spec;
+   char t2[64];
+   if (!bare) {
+      const int bw2 = (int)type_width(vt);
+      const bool litw = isdigit((unsigned char)sb->spec[0])
+         && atoi(sb->spec) == bw2;
+      if (!(litw && bw2 >= 1 && bw2 <= 4000)) {
+         *hard = true; R2_DECLINE("var-elem-spec"); return false;
+      }
+      if (!(r2_temp(bw2, t2, sizeof t2) && g_r2->connect(t2, sb->spec) == 0)) {
+         *hard = true; R2_DECLINE("var-elem-connect"); return false;
+      }
+      S = t2;
+   }
+   if (ew == 1)
+      snprintf(out, sz, "%s[%lld]", S, (long long)bidx);
+   else
+      snprintf(out, sz, "%s[%lld:%lld]", S,
+               (long long)(bidx * ew + ew - 1), (long long)(bidx * ew));
+   return true;
 }
 
 static bool r2_expr_1(tree_t e, char *out, size_t sz)
@@ -5284,6 +6343,11 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                }
             }
          }
+         // named / range-choice / mixed aggregate (1-bit elements) -> concat,
+         // leftmost element = MSB (F3: install correctly instead of declining to
+         // the text path whose ascending ordering is wrong for numeric consumers)
+         if (tree_kind(e) == T_AGGREGATE && r2_agg_named(e, out, sz))
+            return true;
       }
       {
          char why[80];
@@ -5306,7 +6370,16 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
    case T_TYPE_CONV:
    case T_QUALIFIED:
    case T_INERTIAL:
-      return r2_expr(tree_value(e), out, sz);
+      {
+         // signed reinterpret (conversion form, e.g. `signed(resize(u,N))`) over
+         // an unsigned resize-widen passthrough -> zero-extend to the target first
+         if (tree_kind(e) == T_TYPE_CONV) {
+            const int r = r2_signed_uwiden(e, tree_value(e), out, sz);
+            if (r != 0)
+               return r == 1;
+         }
+         return r2_expr(tree_value(e), out, sz);
+      }
 
    case T_ARRAY_SLICE:
       {
@@ -5318,6 +6391,16 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             return false;
          }
          tree_t r = tree_range(e, 0);
+         // ASCENDING-range slice `sig(lo to hi)` -- checked BEFORE the dynamic
+         // and static branches below, both of which lower to a DOWNTO
+         // bit-mapping (the dynamic r2_dyn_slice/x+K path returns shr+[k:0]).
+         // An ascending base's leftmost element is the MSB, so the whole
+         // ascending bit-order is mis-modeled (F4 resweep familyC): decline any
+         // ascending slice -- static OR dynamic-index -- to the golden interp.
+         if (tree_subkind(r) == RANGE_TO) {
+            R2_DECLINE("slice-ascending");
+            return false;
+         }
          int64_t left, right;
          if ((!folded_int(tree_left(r), &left)
               && !r2_eval_int(tree_left(r), &left))
@@ -5441,6 +6524,13 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
          int64_t idx;
          if (r2_sel_nested(e))
             return r2_sel_chain_expr(e, out, sz);
+         // SOUNDNESS (F4 resweep familyA): a dynamic index into a NON-ZERO-BASE
+         // array addresses the mem/flat store at the raw index without
+         // subtracting array'low (mem(5) of a (4 to 7) array hits word 5, not 1).
+         if (r2_nonzero_base_dyn_index(e)) {
+            R2_DECLINE("nonzero-base-dyn-index");
+            return false;
+         }
          if (tree_kind(base) == T_REF && tree_params(e) == 1) {
             r2_mem_t *mm = r2_mem_of(tree_ident(base));
             if (mm != NULL) {
@@ -5458,6 +6548,22 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                }
                snprintf(out, sz, "%s", dt);
                return true;
+            }
+         }
+         // ASCENDING-range vector element read `ua(i)` (ua : slv(0 to N)): the
+         // leftmost element is the MSB, so VHDL index i is Verilog bit N-1-i,
+         // but the emits below use i directly as the bit position -- the WRONG
+         // bit (F4 resweep familyC: ua(3) read ua[3], not ua[12]).  Decline to
+         // the golden interpreter, as for the ascending slice + var-elem policy.
+         // Memories (handled above via $memrd) and multi-bit results are
+         // unaffected -- this fires only for a scalar element of a 1-D vector.
+         if (tree_kind(base) == T_REF && tree_has_ref(base)
+             && tree_params(e) == 1 && !type_is_array(tree_type(e))) {
+            type_t bt = tree_type(tree_ref(base));
+            if (type_is_array(bt) && type_const_bounds(bt)
+                && dimension_of(bt) == 1 && direction_of(bt, 0) == RANGE_TO) {
+               R2_DECLINE("elem-ascending");
+               return false;
             }
          }
          bool have_idx = tree_kind(base) == T_REF && tree_params(e) == 1
@@ -5575,6 +6681,17 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             }
             else if (tree_has_ref(base)
                      && tree_kind(tree_ref(base)) == T_VAR_DECL) {
+               // a written local's element read is served from its live SSA
+               // version (the folded-constant mirror of the !have_idx block
+               // above); only a GENUINE read-before-write falls through to the
+               // promote-on-read latch path below
+               {
+                  bool hard = false;
+                  if (r2_subst_elem_read(base, idx, out, sz, &hard))
+                     return true;
+                  if (hard)
+                     return false;
+               }
                // read-before-any-write of a local: promote to latch state
                // and read the persistent pv wire (activation-start value)
                const char *pv3 = NULL;
@@ -5608,6 +6725,15 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
          const char *fn = istr(tree_ident(e));
          const int np = tree_params(e);
 
+         // signed reinterpret (function-call form) over an unsigned resize-widen
+         // passthrough -> zero-extend to the target first (see r2_signed_uwiden)
+         if (np == 1 && vlog_op(fn) == NULL && r2_user_func(fn) == NULL) {
+            const int r = r2_signed_uwiden(e, tree_value(tree_param(e, 0)),
+                                           out, sz);
+            if (r != 0)
+               return r == 1;
+         }
+
          // transparent numeric_std/library identities (same set the text
          // path prints verbatim); never a user body that happens to carry
          // one of the names (VX_gpu_pkg_inst_alu_signed)
@@ -5621,17 +6747,81 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
              && vlog_op(fn) == NULL && np == 1 && r2_user_func(fn) == NULL)
             return r2_expr(tree_value(tree_param(e, 0)), out, sz);
 
-         // to_unsigned(<const>, <width>) -> sized literal
-         if (np == 2 && (strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned"))) {
-            int64_t v, w;
-            if (folded_int(tree_value(tree_param(e, 0)), &v)
-                && folded_int(tree_value(tree_param(e, 1)), &w)
-                && w > 0 && v >= 0) {
-               snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+         // to_unsigned/to_signed(<value>, <width>): a sized literal when the
+         // value folds; otherwise render the RUNTIME operand and resize on the
+         // value plane (to_unsigned zero-extends, to_signed sign-extends) --
+         // mirrors l3d_resize_s below.  The common counter->vector cast.
+         {
+            const bool is_tu = strstr(fn, "TO_UNSIGNED") || strstr(fn, "to_unsigned");
+            const bool is_ts = strstr(fn, "TO_SIGNED")   || strstr(fn, "to_signed");
+            if (np == 2 && (is_tu || is_ts)) {
+               int64_t v, w;
+               if (folded_int(tree_value(tree_param(e, 0)), &v)
+                   && folded_int(tree_value(tree_param(e, 1)), &w)
+                   && w >= 1 && (is_ts || v >= 0)) {
+                  if (w <= 63) {
+                     const uint64_t m = (w == 63) ? (~0ULL >> 1) : ((1ULL << w) - 1);
+                     snprintf(out, sz, "%lld'd%llu", (long long)w,
+                              (unsigned long long)((uint64_t)v & m));
+                     return true;
+                  }
+                  if (v >= 0) {   // fits in 63 bits -> no truncation at width > 63
+                     snprintf(out, sz, "%lld'd%lld", (long long)w, (long long)v);
+                     return true;
+                  }
+                  // negative into a >63-bit to_signed: two's complement beyond
+                  // int64 -- fall through to the runtime path (declines widen)
+               }
+               int64_t nw;
+               tree_t ea = tree_value(tree_param(e, 0));
+               if (!folded_int(tree_value(tree_param(e, 1)), &nw)
+                   && !r2_eval_int(tree_value(tree_param(e, 1)), &nw)) {
+                  R2_DECLINE("to_uns-width");
+                  return false;
+               }
+               char a[R2_SPEC];
+               if (!r2_expr(ea, a, sizeof a))
+                  return false;
+               const int aw = r2_rendered_width(ea);
+               if (aw <= 0 || nw <= 0 || nw > 4000) {
+                  R2_DECLINE("to_uns-operand");
+                  return false;
+               }
+               if (nw == aw) { snprintf(out, sz, "%s", a); return true; }
+               char y[R2_SPEC];
+               if (nw > aw) {
+                  // WIDENING: extend the operand's rendered aw-bit value to nw --
+                  // zero-extend a non-negative operand, sign-extend a signed one
+                  // (to_unsigned's operand is a natural -> always zero-extend).
+                  // Sound now that the render produces the operand's TRUE value at
+                  // aw bits (the vector*scalar, division, unsigned-op and negation
+                  // render bugs that made a narrow render lose high bits are
+                  // fixed).  [EXPERIMENT: no r2_widen_trusted guard yet -- the
+                  // adversarial hunt decides what, if anything, still needs one.]
+                  char cnw[R2_SPEC + 8];
+                  if (!r2_temp((int)nw, y, sizeof y))
+                     return false;
+                  snprintf(cnw, sizeof cnw, "c%s", y);
+                  const int asig = (is_tu || r2_int_nonneg(ea)) ? 0 : 1;
+                  if (g_r2->cell_un("pos", cnw, a, y, asig) != 0) {
+                     R2_DECLINE("to_uns-widen-ext");
+                     return false;
+                  }
+                  snprintf(out, sz, "%s", y);
+                  return true;
+               }
+               // narrowing: land and take the low nw bits (correct even when the
+               // aw-bit render already truncated -- low bits are preserved)
+               if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                  R2_DECLINE("to_uns-land");
+                  return false;
+               }
+               if (nw == 1)
+                  snprintf(out, sz, "%s[0]", y);
+               else
+                  snprintf(out, sz, "%s[%lld:0]", y, (long long)(nw - 1));
                return true;
             }
-            R2_DECLINE("to_unsigned");
-            return false;
          }
 
          // l3d vocabulary — the text path's own table (kind 0 binary,
@@ -5697,6 +6887,98 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                 && (strcasecmp(base, "l3d_index") == 0
                     || strcasecmp(base, "l3d_shcount") == 0))
                return r2_expr(tree_value(tree_param(e, 0)), out, sz);
+            // PROPER resize/to_l3d WIDENING of an UNCONSTRAINED operator
+            // result.  These width-adjusters are kind-2 identities (they drop
+            // the width arg and let the assignment context resize), which is
+            // correct for a constrained operand but OVER-READS an operator
+            // result whose width is its operands' (not a declared type):
+            // `resize(signed(a)*signed(b), 32)` hands the 16-bit sum-wide
+            // product to the assignment, which slices [31:0] of a 16-bit temp
+            // (a range-check that declines to the text path).  Materialize +
+            // extend explicitly to the target width -- sign-extend a
+            // signed/integer operand, zero-extend an unsigned one -- mirroring
+            // l3d_resize_s above.  A CONSTRAINED operand (a signal/constant,
+            // whose array type carries const bounds) keeps the passthrough: the
+            // assignment widens it correctly, and that is the ubiquitous
+            // VeeR/logic3d idiom we must not perturb.
+            if (lop != NULL && lk == 2 && np == 2
+                && (strcasecmp(base, "resize") == 0
+                    || strcasecmp(base, "to_l3d") == 0)) {
+               tree_t ea = tree_value(tree_param(e, 0));
+               type_t et = tree_type(ea);
+               const int nw = r2_decl_width(e);
+               const int aw = r2_rendered_width(ea);
+               const bool sgn = type_is_signed(et) || type_is_integer(et);
+               // an UNCONSTRAINED operand type = an operator result (mul/add/..
+               // whose width is its operands', per numeric_std) -- exactly what
+               // over-reads on a WIDEN.  An UNSIGNED signal/constant carries
+               // const bounds and keeps the passthrough (the assignment zero-
+               // extends it right).  A SIGNED constrained operand can NOT keep
+               // the passthrough: a direct signal assignment widens it by the
+               // implicit context, which does NOT sign-extend the value (v of
+               // signed(7:0):=resize(signed(a),8) widened to 16 replicated the
+               // raw bit 7, not the numeric_std sign) -- materialize + $pos
+               // sign-extend it explicitly, as the arithmetic path already does.
+               const bool unconstrained =
+                  type_is_array(et) && !type_const_bounds(et);
+               if ((unconstrained || sgn) && nw > 0 && aw > 0 && nw > aw) {
+                  char a[R2_SPEC], y[R2_SPEC], cn[R2_SPEC + 8];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(nw, y, sizeof y))
+                     return false;
+                  snprintf(cn, sizeof cn, "c%s", y);
+                  if (g_r2->cell_un("pos", cn, a, y, sgn) != 0) {
+                     R2_DECLINE("resize-widen");
+                     return false;
+                  }
+                  snprintf(out, sz, "%s", y);
+                  return true;
+               }
+               // NARROWING a SIGNED value: numeric_std copies the SIGN bit to
+               // the new MSB and the low (nw-1) bits -- NOT a plain low-nw
+               // truncation.  They differ on a signed narrowing OVERFLOW (the
+               // value's bit(nw-1) != its sign): resize(signed(a)*(-3), 8) with
+               // a=-56 -> product +168=0x00A8 -> sign(0):low7(0x28)=0x28, not a
+               // truncated 0xA8.  The kind-2 passthrough below truncates the low
+               // bits (correct for UNSIGNED, which drops high bits; wrong for
+               // SIGNED).  Applies to both constrained and unconstrained signed
+               // operands (a signal narrowing is just as wrong on overflow).
+               if (sgn && nw > 0 && aw > 0 && nw < aw) {
+                  char a[R2_SPEC], y[R2_SPEC];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                     R2_DECLINE("resize-narrow-land");
+                     return false;
+                  }
+                  if (nw == 1)
+                     snprintf(out, sz, "%s[%d]", y, aw - 1);   // sign bit only
+                  else
+                     snprintf(out, sz, "{%s[%d],%s[%d:0]}", y, aw - 1,
+                              y, nw - 2);
+                  return true;
+               }
+               // NARROWING an UNSIGNED value: numeric_std drops the high bits,
+               // so take the LOW nw bits.  The kind-2 passthrough below leaves
+               // the full aw-bit value, which a WIDER consuming context then
+               // re-widens -- silently keeping the dropped high bits
+               // (resize(resize(unsigned(a),8),16) returned `a`, not a&0xFF).
+               if (!sgn && nw > 0 && aw > 0 && nw < aw) {
+                  char a[R2_SPEC], y[R2_SPEC];
+                  if (!r2_expr(ea, a, sizeof a))
+                     return false;
+                  if (!r2_temp(aw, y, sizeof y) || g_r2->connect(y, a) != 0) {
+                     R2_DECLINE("resize-narrow-u-land");
+                     return false;
+                  }
+                  if (nw == 1)
+                     snprintf(out, sz, "%s[0]", y);
+                  else
+                     snprintf(out, sz, "%s[%d:0]", y, nw - 1);
+                  return true;
+               }
+            }
             if (lop != NULL && lk == 2 && np >= 1)
                return r2_expr(tree_value(tree_param(e, 0)), out, sz);
             if (lop != NULL && lk == 1 && np == 1) {
@@ -5917,6 +7199,13 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             }
             tree_t ea = tree_value(tree_param(e, 0));
             tree_t eb = tree_value(tree_param(e, 1));
+            // F1b: sll/srl (shl/shr) with a possibly-negative count reverses in
+            // VHDL but not in RTLIL $shl/$shr -> silently wrong; decline.
+            if ((strcmp(bop, "shl") == 0 || strcmp(bop, "shr") == 0)
+                && shift_count_maybe_negative(eb)) {
+               R2_DECLINE("shift-maybe-negative-count");
+               return false;
+            }
             // `x = 'Z'` / `x /= 'Z'` against a std_logic CHARACTER
             // metavalue: tgt-vhdl's casez expansion `((sel(0) = 'Z') or
             // (sel(0) = '1')) and ...` tests a 2-state selector, which is
@@ -5930,29 +7219,331 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
             char a[R2_SPEC], b[R2_SPEC];
             if (!r2_expr(ea, a, sizeof a) || !r2_expr(eb, b, sizeof b))
                return false;
+            // numeric_std `vector * scalar` (unsigned*natural / signed*integer,
+            // either operand order) is `L * TO_(UN)SIGNED(R, L'LENGTH)`: the
+            // scalar WRAPS to the vector's length before an L'length x L'length
+            // -> 2*L'length product.  Detected once here so the result width and
+            // the operand prep (the mul-ext block below) agree.  A raw integer
+            // multiply is silently wrong -- unsigned(a(3:0))*16 is *0 (16 mod
+            // 2^4), not *16; signed(a(2:0))*5 is *(-3) (TO_SIGNED(5,3)), not *5.
+            const bool m_ea_arr = type_is_array(tree_type(ea));
+            const bool m_eb_arr = type_is_array(tree_type(eb));
+            const bool vec_scalar_shape =
+               (m_ea_arr && !m_eb_arr && type_is_integer(tree_type(eb)))
+               || (m_eb_arr && !m_ea_arr && type_is_integer(tree_type(ea)));
+            const bool vecmul = strcmp(bop, "mul") == 0 && vec_scalar_shape;
+            // numeric_std `scalar (/|rem) vector` / `vector (/|rem) scalar`: the
+            // SCALAR wraps to the vector length and the result IS the vector's
+            // length -- L/TO_(UN)SIGNED(R,L'LENGTH), TO_(UN)SIGNED(L,R'LENGTH)/R.
+            // Division is NOT commutative, so (unlike mul) the scalar is wrapped
+            // IN PLACE below with operand order preserved.  bop "mod" here is
+            // VHDL `rem` (r2_binop maps "%"->"mod"); VHDL `mod` renders elsewhere.
+            const bool vecdivmod =
+               (strcmp(bop, "div") == 0 || strcmp(bop, "mod") == 0)
+               && vec_scalar_shape;
+            const int vec_lw = (vecmul || vecdivmod)
+               ? r2_rendered_width(m_ea_arr ? ea : eb) : 0;
             int w = r2_is_onebit_op(bop) ? 1 : r2_width(e);
+            if (vecmul && vec_lw > 0)
+               w = 2 * vec_lw;
+            else if (strcmp(bop, "mul") == 0) {
+               // A bare numeric_std `*` is ALWAYS L'length+R'length wide.
+               // r2_width(e) can UNDER-report it (returns an operand width -- 8
+               // for signed(reinterpret(u,8))*signed(reinterpret(...)), not 16),
+               // which truncates the product; the sum-width below only ran when
+               // r2_width was unconstrained.  Bump to the operand sum whenever it
+               // exceeds r2_width's value (never OVER-sizes: the product cannot
+               // exceed L+R).  vecmul is handled above.
+               const int mwa = r2_width_or_operands(ea);
+               const int mwb = r2_width_or_operands(eb);
+               if (mwa > 0 && mwb > 0 && mwa + mwb > w)
+                  w = mwa + mwb;
+            }
             if (w <= 0) {
                // operator returns are unconstrained: Verilog's context
-               // width — the WIDER operand for + - * & | ^ (a 1-bit lane
-               // index times a 32-bit constant is a 32-bit product), the
-               // left operand for shifts
+               // width — the WIDER operand for + - & | ^ (a 1-bit lane
+               // index or'd with a 32-bit constant is 32-bit wide), the
+               // left operand for shifts.  A MULTIPLY is the exception: its
+               // natural width is the SUM of the operand widths (an 8x8
+               // product is 16 bits, numeric_std `L'length+R'length`).  The
+               // max truncates the product; a widening resize then sign-
+               // extends the truncated MSB — silently wrong for a signed
+               // product exceeding the operand width.  Matches the sum in
+               // r2_width_or_operands so nested muls stay consistent.
                const bool shift = strcmp(bop, "shl") == 0
                   || strcmp(bop, "shr") == 0;
-               w = r2_width_or_operands(ea);
+               const int wa = r2_width_or_operands(ea);
                const int wb = shift ? -1 : r2_width_or_operands(eb);
-               if (wb > w)
+               // numeric_std `vector +/- integer` (unsigned+natural,
+               // signed+integer) returns the VECTOR operand's length -- the
+               // integer is converted to that width, NOT the max.  Sizing to
+               // the integer's 32-bit width dropped the N-bit wrap:
+               // resize(signed(a),8)+5 computed the sum at 32 bits, wrong on an
+               // 8-bit overflow.  Only for +/- (a shift's left operand already
+               // dominates; mul multiplies the widths; bitwise is width-
+               // preserving on equal-width numeric_std operands).
+               const bool addsub = strcmp(bop, "add") == 0
+                  || strcmp(bop, "sub") == 0;
+               const bool ea_arr = type_is_array(tree_type(ea));
+               const bool eb_arr = type_is_array(tree_type(eb));
+               const bool ea_int = type_is_integer(tree_type(ea));
+               const bool eb_int = type_is_integer(tree_type(eb));
+               if (strcmp(bop, "mul") == 0 && wa > 0 && wb > 0)
+                  w = wa + wb;
+               else if (addsub && ea_arr && eb_int && wa > 0)
+                  w = wa;
+               else if (addsub && eb_arr && ea_int && wb > 0)
                   w = wb;
+               else {
+                  w = wa;
+                  if (wb > w)
+                     w = wb;
+               }
             }
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
                return false;
-            // numeric_std SIGNED, or VHDL INTEGER: the translator declares
-            // every integer `signed [31:0]`, and the OOB range guards
-            // compare an index against NEGATIVE bounds (`Idx >= -113`)
-            const int sg = type_is_signed(tree_type(ea))
-               || type_is_signed(tree_type(eb))
-               || type_is_integer(tree_type(ea))
+            // Signedness follows Verilog's self-determined rule (which the
+            // text path relies on by emitting a bare operator): an operation
+            // is SIGNED only when BOTH operands are signed — numeric_std
+            // SIGNED, or a plain INTEGER (the translator declares every
+            // integer `signed [31:0]`, so the OOB range guards `Idx >= -113`,
+            // integer vs integer, stay signed).  If EITHER operand is a
+            // numeric_std UNSIGNED vector (a plain Verilog reg), the whole
+            // expression is UNSIGNED — matching numeric_std, where
+            // `unsigned op natural` is unsigned.  Mixing a numeric_std signed
+            // and unsigned operand is a VHDL type error, so this AND only ever
+            // reclassifies the unsigned-paired-with-integer case, which the
+            // old OR wrongly made SIGNED: `unsigned(a)/16` became a SIGNED
+            // $div (silent-wrong when a's MSB is set — a=142 gave 8 vs 249),
+            // and `unsigned(a) < 16` a signed compare.
+            const bool ea_signed = type_is_signed(tree_type(ea))
+               || type_is_integer(tree_type(ea));
+            const bool eb_signed = type_is_signed(tree_type(eb))
                || type_is_integer(tree_type(eb));
+            const int sg = ea_signed && eb_signed;
+            // numeric_std `scalar (/|rem) vector` / `vector (/|rem) scalar`
+            // (one array operand + one integer): the division uses the FULL
+            // scalar (NOT wrapped to the vector length -- nvc computes
+            // 1000/u8 = 1000/u8, and s/vector at full precision), and the
+            // QUOTIENT is then RESIZEd (truncated) to the vector's length:
+            // 1000/1 -> 1000 mod 256 = 232, 300/12 = 25 -> 25 mod 16 = 9.  The
+            // raw walker divided at the operand-max width and returned the
+            // UNtruncated quotient (a resize to a wider target kept 1000).
+            // Divide at max(scalar,vector) with the division sign (operands
+            // extended so neither is silently truncated), preserving dividend/
+            // divisor order, then slice the low vec_lw bits.  Handled here
+            // (returning) so the shared int-ext32/cell_bin path does not run.
+            if (vecdivmod && vec_lw > 0) {
+               char *ss = m_ea_arr ? b : a;      // scalar spec
+               char *vs = m_ea_arr ? a : b;      // vector spec
+               tree_t se = m_ea_arr ? eb : ea;   // scalar tree
+               tree_t vtr = m_ea_arr ? ea : eb;  // vector tree
+               const int sw = r2_rendered_width(se);
+               const int vw = r2_rendered_width(vtr);
+               if (sw <= 0 || vw <= 0) { R2_DECLINE("vecdiv-width"); return false; }
+               // divide at >= 32 bits so a 32-bit VHDL integer scalar keeps its
+               // correct sign (its own render width can put a value bit in the
+               // MSB, which a SIGNED $div would misread -- 1000 at 10 bits looks
+               // negative); wider still if the vector is wider than 32.
+               const int wop = vec_lw > 32 ? vec_lw : 32;
+               if (vw < wop) {                              // extend vector -> wop
+                  char t[R2_SPEC], ct[R2_SPEC + 8];
+                  if (!r2_temp(wop, t, sizeof t)) return false;
+                  snprintf(ct, sizeof ct, "c%s", t);
+                  if (g_r2->cell_un("pos", ct, vs, t, sg ? 1 : 0) != 0) {
+                     R2_DECLINE("vecdiv-vec-ext"); return false; }
+                  snprintf(vs, R2_SPEC, "%s", t);
+               }
+               if (sw < wop) {                              // extend scalar -> wop
+                  char t[R2_SPEC], ct[R2_SPEC + 8];
+                  if (!r2_temp(wop, t, sizeof t)) return false;
+                  snprintf(ct, sizeof ct, "c%s", t);
+                  if (g_r2->cell_un("pos", ct, ss, t,
+                                    r2_int_nonneg(se) ? 0 : 1) != 0) {
+                     R2_DECLINE("vecdiv-scalar-ext"); return false; }
+                  snprintf(ss, R2_SPEC, "%s", t);
+               }
+               char yq[R2_SPEC], cq[R2_SPEC + 8];
+               if (!r2_temp(wop, yq, sizeof yq)) return false;
+               snprintf(cq, sizeof cq, "c%s", yq);
+               if (g_r2->cell_bin(bop, cq, a, b, yq, sg) != 0) {
+                  R2_DECLINE("vecdiv-cell"); return false; }
+               // RESIZE the quotient to the vector length: numeric_std narrows a
+               // SIGNED result to {sign, low N-1 bits} (1000/5 = 200 -> {0,low7} =
+               // 72) and an UNSIGNED one to the low N bits (1000/1 = 1000 -> 232).
+               if (vec_lw >= wop)
+                  snprintf(out, sz, "%s", yq);
+               else if (sg) {
+                  if (vec_lw == 1)
+                     snprintf(out, sz, "%s[%d]", yq, wop - 1);
+                  else
+                     snprintf(out, sz, "{%s[%d],%s[%d:0]}", yq, wop - 1,
+                              yq, vec_lw - 2);
+               }
+               else if (vec_lw == 1)
+                  snprintf(out, sz, "%s[0]", yq);
+               else
+                  snprintf(out, sz, "%s[%d:0]", yq, vec_lw - 1);
+               return true;
+            }
+            // F6: a SIGNED arithmetic/relational binop whose INTEGER operand
+            // renders NARROWER than the 32-bit integer width gets its sub-word
+            // MSB sign-extended by the cell -- silently wrong for a NON-negative
+            // value (to_integer(unsigned(a))=40000 read as -25536 in `n>32768`)
+            // and it truncates a sum that needs the full 32-bit width
+            // (to_integer(signed(a(7:0)))+to_integer(signed(b(7:0)))).  The TEXT
+            // path renders integers as 32-bit regs and gets these right; here
+            // EXTEND each narrow integer operand to 32 bits with its OWN sign
+            // (r2_int_nonneg -> zero-extend an unsigned source, else sign-
+            // extend) so the signed cell reads the true value.  Excludes mul
+            // (own extension below), the bitwise ops (no sign-extend), and the
+            // shifts (the count is not a value operand); an ARRAY INDEX renders
+            // through the array-ref path, not here, so memory addressing keeps
+            // its native width.
+            if (sg && strcmp(bop, "mul") != 0 && strcmp(bop, "and") != 0
+                && strcmp(bop, "or") != 0 && strcmp(bop, "xor") != 0
+                && strcmp(bop, "xnor") != 0 && strcmp(bop, "shl") != 0
+                && strcmp(bop, "shr") != 0) {
+               for (int side = 0; side < 2; side++) {
+                  tree_t eo = side ? eb : ea;
+                  char *os = side ? b : a;
+                  type_t ot = tree_type(eo);
+                  if (!type_is_integer(ot) || type_is_logic3d(ot))
+                     continue;
+                  const int ow = r2_rendered_width(eo);
+                  if (ow <= 0 || ow >= 32)
+                     continue;
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(32, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, os, ext,
+                                    r2_int_nonneg(eo) ? 0 : 1) != 0) {
+                     R2_DECLINE("int-ext32");
+                     return false;
+                  }
+                  snprintf(os, R2_SPEC, "%s", ext);
+               }
+            }
+            // A numeric_std +/- of DIFFERENT-width VECTOR operands returns the
+            // WIDER width; the narrower operand must be extended to it with its
+            // OWN sign (numeric_std sign-extends a signed operand, zero-extends
+            // an unsigned one).  The gsm C backend leaves a narrower operand
+            // as-is (zero-extended), silently wrong for a NEGATIVE signed one:
+            // resize(signed(a),8)+resize(signed(b),4) read the 4-bit b unsigned.
+            // Extend each narrow VECTOR operand to w (INTEGER operands are
+            // handled by the int-ext32 block above; mul has its own below).
+            if (strcmp(bop, "add") == 0 || strcmp(bop, "sub") == 0) {
+               for (int side = 0; side < 2; side++) {
+                  tree_t eo = side ? eb : ea;
+                  char *os = side ? b : a;
+                  if (type_is_integer(tree_type(eo)))
+                     continue;
+                  const int ow = r2_rendered_width(eo);
+                  if (ow <= 0 || ow >= w)
+                     continue;
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, os, ext,
+                                    r2_int_nonneg(eo) ? 0 : 1) != 0) {
+                     R2_DECLINE("addsub-ext");
+                     return false;
+                  }
+                  snprintf(os, R2_SPEC, "%s", ext);
+               }
+            }
+            // A widening MULTIPLY must EXTEND its operands to the product
+            // width before the `$mul`: the synth does not itself widen an
+            // operand narrower than Y from A_SIGNED, so an 8-bit `$signed(a)`
+            // fed to a 16-bit `$mul` multiplies as the raw (zero-extended) 8
+            // bits — `-1*5` came out `+255*5`.  Extend each operand with its
+            // OWN sign (r2_int_nonneg): zero-extend a non-negative source,
+            // sign-extend a signed one.  A single `sg` here was wrong for a
+            // MIXED to_integer(signed)*to_integer(unsigned) (both integer -> sg
+            // signed -> the unsigned operand sign-extended, -100*5 became
+            // -100*-11) and for to_integer(unsigned(a))*K (0..15 read negative).
+            // Widths are consistent with r2_width_or_operands' sum, so nested
+            // muls extend from their true (already-summed) operand widths.
+            if (vecmul && vec_lw > 0) {
+               // numeric_std `vector * scalar`: `L * TO_(UN)SIGNED(R, L'LENGTH)`.
+               // WRAP the scalar to L'LENGTH bits (its two's-complement low bits
+               // = R mod 2^L'length) -- materialize R at its OWN sign into a
+               // temp wide enough to hold it, then slice the low L'length bits.
+               // Then extend BOTH operands (the vector, already L'length wide,
+               // and the wrapped scalar) to the 2*L'length product width with
+               // the MULTIPLY's sign (sg = the vector's signedness): a signed
+               // vector reads the wrapped scalar as TO_SIGNED, an unsigned one as
+               // TO_UNSIGNED.  cell_bin below multiplies at w = 2*L'length.
+               char *vs = m_ea_arr ? a : b;      // the vector operand's spec
+               char *ss = m_ea_arr ? b : a;      // the scalar operand's spec
+               tree_t se = m_ea_arr ? eb : ea;   // the scalar's tree
+               const int sw = r2_rendered_width(se);
+               if (sw <= 0) { R2_DECLINE("vecmul-scalar-width"); return false; }
+               const int w2 = sw > vec_lw ? sw : vec_lw;
+               char tw[R2_SPEC], ctw[R2_SPEC + 8];
+               if (!r2_temp(w2, tw, sizeof tw))
+                  return false;
+               snprintf(ctw, sizeof ctw, "c%s", tw);
+               if (g_r2->cell_un("pos", ctw, ss, tw,
+                                 r2_int_nonneg(se) ? 0 : 1) != 0) {
+                  R2_DECLINE("vecmul-scalar-conv");
+                  return false;
+               }
+               char slw[R2_SPEC];
+               if (vec_lw == 1)
+                  snprintf(slw, sizeof slw, "%s[0]", tw);
+               else
+                  snprintf(slw, sizeof slw, "%s[%d:0]", tw, vec_lw - 1);
+               // extend the vector (vec_lw) and the wrapped scalar (vec_lw) to w
+               char ve[R2_SPEC], cve[R2_SPEC + 8];
+               if (!r2_temp(w, ve, sizeof ve))
+                  return false;
+               snprintf(cve, sizeof cve, "c%s", ve);
+               if (g_r2->cell_un("pos", cve, vs, ve, sg ? 1 : 0) != 0) {
+                  R2_DECLINE("vecmul-vec-ext");
+                  return false;
+               }
+               char se2[R2_SPEC], cse[R2_SPEC + 8];
+               if (!r2_temp(w, se2, sizeof se2))
+                  return false;
+               snprintf(cse, sizeof cse, "c%s", se2);
+               if (g_r2->cell_un("pos", cse, slw, se2, sg ? 1 : 0) != 0) {
+                  R2_DECLINE("vecmul-scalar-ext");
+                  return false;
+               }
+               snprintf(a, sizeof a, "%s", ve);
+               snprintf(b, sizeof b, "%s", se2);
+            }
+            else if (strcmp(bop, "mul") == 0) {
+               const int wa = r2_rendered_width(ea);
+               const int wb = r2_rendered_width(eb);
+               char ext[R2_SPEC], cx[R2_SPEC + 8];
+               if (wa > 0 && wa < w) {
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, a, ext,
+                                    r2_int_nonneg(ea) ? 0 : 1) != 0) {
+                     R2_DECLINE("mul-ext-a");
+                     return false;
+                  }
+                  snprintf(a, sizeof a, "%s", ext);
+               }
+               if (wb > 0 && wb < w) {
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, b, ext,
+                                    r2_int_nonneg(eb) ? 0 : 1) != 0) {
+                     R2_DECLINE("mul-ext-b");
+                     return false;
+                  }
+                  snprintf(b, sizeof b, "%s", ext);
+               }
+            }
             snprintf(cn, sizeof cn, "c%s", y);
             if (g_r2->cell_bin(bop, cn, a, b, y, sg) != 0) {
                R2_DECLINE("cell_bin");
@@ -5976,7 +7567,43 @@ static bool r2_expr_1(tree_t e, char *out, size_t sz)
                return false;
             int w = r2_width(e);
             if (w <= 0)
-               w = r2_width(ea);
+               w = r2_rendered_width(ea);   // operand's TRUE numeric_std width --
+            if (w <= 0)                      // r2_width(ea) looks THROUGH a resize
+               w = r2_width(ea);             // (to 10 for resize(..,1)), truncating
+            // A `neg` that WIDENS its operand (an integer neg renders at 32 bits
+            // while `to_integer(signed(a(3:0)))` renders at 4) must extend the
+            // operand with its OWN sign BEFORE negating: a narrow SIGNED operand
+            // zero-extended and negated is wrong (`-(to_integer(signed(a(3:0))))`
+            // read a 4-bit -1 (0xF) as +15 -> -15 instead of +1).  The $neg
+            // cell's own A_SIGNED extension is not honoured by the evaluator, so
+            // materialize a $pos-extended operand to width w explicitly, exactly
+            // as the mul/add-sub operand-extension blocks do (r2_int_nonneg ->
+            // zero-extend a non-negative source, sign-extend a signed one).
+            // Width-preserving negation (a vector whose result width equals the
+            // operand's) skips this -- the extend would be a no-op.  `not` is
+            // bitwise/width-preserving and unchanged.
+            if (strcmp(uop, "neg") == 0) {
+               const int oaw = r2_rendered_width(ea);
+               // The neg result must be at least as wide as the operand actually
+               // RENDERS -- r2_width(ea) can under-report (it looks through a
+               // constrained-widen resize to the pre-resize width), which made the
+               // neg TRUNCATE its own operand: `-(resize(signed(a(3:0)),8))`
+               // rendered an 8-bit operand but negated it at 4 bits.  Bump w to
+               // the rendered width so the negation is at least width-preserving.
+               if (oaw > w) w = oaw;
+               if (oaw > 0 && oaw < w) {
+                  char ext[R2_SPEC], cx[R2_SPEC + 8];
+                  if (!r2_temp(w, ext, sizeof ext))
+                     return false;
+                  snprintf(cx, sizeof cx, "c%s", ext);
+                  if (g_r2->cell_un("pos", cx, a, ext,
+                                    r2_int_nonneg(ea) ? 0 : 1) != 0) {
+                     R2_DECLINE("neg-ext");
+                     return false;
+                  }
+                  snprintf(a, sizeof a, "%s", ext);
+               }
+            }
             char y[R2_SPEC], cn[R2_SPEC + 8];
             if (!r2_temp(w, y, sizeof y))
                return false;
@@ -6355,7 +7982,16 @@ static void r2_collect_cb(tree_t t, void *ctx)
    snprintf(n->spec, sizeof n->spec, "%s", vid(id));
    snprintf(n->g0, sizeof n->g0, "g0p%d_%s", ts->pidx, vid(id));
    type_t ty = tree_type(tree_ref(tg));
-   n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
+   // An INTEGER signal register follows the translator's signed [31:0] integer
+   // convention (r2_width returns 32 for an integer read) -- NOT type_width's
+   // scalar 1.  An `integer range 0 to 3` register sized to 1 bit TRUNCATED its
+   // value, so an integer signal used as a dynamic memory index only ever
+   // addressed words 0/1 (F4 sigidx: dl(k) with k a range-0-to-3 signal).
+   // logic3d is an integer subtype but genuinely bit-wide -- keep type_width.
+   if (type_is_integer(ty) && !type_is_logic3d(ty))
+      n->width = 32;
+   else
+      n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
 }
 
 static bool r2_seq(tree_t list_of, r2_targets_t *ts);
@@ -6584,6 +8220,28 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                      brange = true;
                   }
                }
+               // convert the VHDL element/slice INDICES to FLAT bit positions:
+               // downto flat = index - low (fixes non-zero-base, e.g.
+               // `v:std_logic_vector(15 downto 8); v(10):=..`; base-0 unchanged),
+               // mirroring r2_subst_elem_read / r2_sel_range's `idx - low`.  An
+               // ASCENDING ('to') local is mis-indexed by BOTH the flat write
+               // here and the text path (a genuine silent-wrong install on a
+               // rare shape), so decline it -- the text frontend declines
+               // ascending process-var partial writes too, so the subtree runs
+               // in the interpreter (like reads, which decline var-elem-to).
+               if (brange) {
+                  int64_t vlo, vhi;
+                  if (!folded_bounds(range_of(bt, 0), &vlo, &vhi)) {
+                     R2_DECLINE("bit-build-bounds");
+                     return false;
+                  }
+                  if (direction_of(bt, 0) != RANGE_DOWNTO) {
+                     R2_DECLINE("var-part-to");
+                     return false;
+                  }
+                  bhi -= vlo;
+                  blo -= vlo;
+               }
                if (bw >= 1 && bw <= 4000 && brange
                    && blo >= 0 && bhi < bw) {
                   // VERSIONED partial write (any depth): a fresh wire takes
@@ -6626,10 +8284,19 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
                   g_r2_site = "var-subst";
                   if (!r2_expr(tree_value(s), vs, sizeof vs))
                      return false;
-                  if (!r2_subst_set(tree_ident(tg), vs)) {
+                  // F6: record the value's ACTUAL rendered width (an integer
+                  // variable set from to_integer(unsigned(a)) renders as the
+                  // 16-bit `a`, not the 32-bit integer type reports) so a later
+                  // signed binop sees it as sub-word and extends it; and its
+                  // NON-NEGATIVE origin so that extension zero-extends rather
+                  // than sign-extending the sub-word MSB.
+                  const int rw = r2_rendered_width(tree_value(s));
+                  if (!r2_subst_set_w(tree_ident(tg), vs, rw)) {
                      R2_DECLINE("subst-count");
                      return false;
                   }
+                  r2_subst_of(tree_ident(tg))->nonneg
+                     = r2_int_nonneg(tree_value(s));
                   return true;
                }
                // branch-written variable WITH a current value: VERSION it
@@ -6681,6 +8348,43 @@ static bool r2_seq_one(tree_t s, r2_targets_t *ts)
             }
             // rewrite the BASE ident by aliasing: the slice/index structure
             // stays, target lookup below uses the signal's name
+         }
+         // SOUNDNESS: a partial write (slice or sub-bit) into a element that
+         // is itself selected by a DYNAMIC index — dl(k)(7 downto 0) <= …,
+         // dl(k)(j) <= … with k not static.  The mem path peels only a bare
+         // T_ARRAY_REF, so this shape misses it and falls to the slice/sel
+         // lowering, which assumes a static base and silently installs a
+         // wrong netlist (the dynamic address is dropped / untouched bits are
+         // clobbered).  Decline so the module stays in the golden interp.
+         // Whole-element dynamic writes (dl(k) <= val — VeeR's register file)
+         // have a T_REF base here, are not caught, and keep the mem path.
+         {
+            tree_t sub = NULL;
+            if (tree_kind(tg) == T_ARRAY_SLICE)
+               sub = tree_value(tg);
+            else if (tree_kind(tg) == T_ARRAY_REF && tree_params(tg) == 1
+                     && (tree_kind(tree_value(tg)) == T_ARRAY_REF
+                         || tree_kind(tree_value(tg)) == T_ARRAY_SLICE))
+               sub = tree_value(tg);      // bit/slice OF an element
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_SLICE)
+               sub = tree_value(sub);     // dl(k)(7:0) written as slice-of-ref
+            if (sub != NULL && tree_kind(sub) == T_ARRAY_REF
+                && tree_params(sub) == 1) {
+               int64_t sidx;
+               tree_t ix = tree_value(tree_param(sub, 0));
+               if (!folded_int(ix, &sidx) && !r2_eval_int(ix, &sidx)) {
+                  R2_DECLINE("dyn-elem-partial");
+                  return false;
+               }
+            }
+         }
+         // SOUNDNESS (F4 resweep familyA): a dynamic WRITE index into a
+         // NON-ZERO-BASE array addresses the mem store at the raw index without
+         // subtracting array'low (mem(5) of a (4 to 7) array writes word 5, not
+         // 1) -- the read path declines the same shape.  Decline to interp.
+         if (r2_nonzero_base_dyn_index(tg)) {
+            R2_DECLINE("nonzero-base-dyn-index");
+            return false;
          }
          // memory writes: only the ENABLE threads the decision tree —
          // addr/data are unconditional comb, gated by EN at the port
@@ -7283,8 +8987,15 @@ static void r2_memw_scan_cb(tree_t t, void *ctx)
    const tree_kind_t k = tree_kind(t);
    if (k != T_VAR_ASSIGN && k != T_SIGNAL_ASSIGN)
       return;
+   // peel the FULL select chain: dl(k) <= …, dl(k)(7 downto 0) <= …,
+   // dl(k)(j) <= … all write the memory `dl`.  A single-level peel missed
+   // the partial-slice/sub-bit forms, so a process whose ONLY memory writes
+   // are partial-slice left mws.n == 0 and the whole process early-returned
+   // as a silent no-op (no write port built, no decline).  Count them so the
+   // process proceeds to r2_seq, where the target lowering builds or soundly
+   // declines the shape.
    tree_t tg = tree_target(t);
-   if (tree_kind(tg) == T_ARRAY_REF)
+   while (tree_kind(tg) == T_ARRAY_REF || tree_kind(tg) == T_ARRAY_SLICE)
       tg = tree_value(tg);
    if (tree_kind(tg) != T_REF)
       return;
@@ -7381,8 +9092,20 @@ static bool r2_process(tree_t p0, int pidx)
    }
    bool pe[8];
    int ne = 0;
+   if (proc_has_wait_edge(p)) {
+      // a `wait until <edge>` clock the comb path would silently drop
+      R2_DECLINE("wait-edge-flop");
+      return false;
+   }
    tree_t clk = clock_of(p, &body_if, sig, pe, &ne, &ifstmt);
    (void)clk;
+
+   if (clk != NULL && body_has_reg_concat_binop(body_if)) {
+      // logic3d register capture of a concat LEFT-operand samples it one delta
+      // stale (r30_A) -- run in the interpreter (see the text-path guard)
+      R2_DECLINE("l3d-reg-concat-binop");
+      return false;
+   }
 
    if (clk == NULL) {
       // The lone-signal-assign process is a CONTINUOUS assign (the same
@@ -7797,6 +9520,133 @@ static void r2_wcount_cb(tree_t t, void *ctx)
       wc->n++;
 }
 
+// SOUNDNESS guard: an array/vector signal written by >1 distinct driver
+// (process / concurrent assign) where at least one write is PARTIAL
+// (indexed/slice/field) mis-composes.  Each driver is collected with its OWN
+// whole-array hold temp (g0p<pidx>_<sig>, see r2_collect_cb) and commits the
+// WHOLE wire, so the disjoint element writes CONTEND across drivers instead
+// of composing — r2_sel_nested lowers each write to a correct bit-range
+// WITHIN a process, but the per-process whole-wire commit still collides.
+// It installs but is silently WRONG (mylex r22_ffirst: d_n and s_n each have
+// 7 element-drivers).  A SINGLE driver writing many disjoint elements
+// (mylex r31_shiftvec: one clocked shift over sr(0..3)) composes fine — do
+// NOT decline that.  So the discriminator is: an array base written PARTIALLY
+// somewhere AND written by more than one distinct driver process.  Detect and
+// decline to the text path (soundness first); installing it correctly
+// (per-slice cross-process commit) is a later coverage gap.
+typedef struct { ident_t *ids; int n, cap; bool capped; } r2_pset_t;
+
+static void r2_partial_target_cb(tree_t t, void *ctx)
+{
+   r2_pset_t *ps = (r2_pset_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k != T_SIGNAL_ASSIGN && k != T_DEPOSIT)
+      return;                            // signal drivers only (not variables)
+   tree_t tg = tree_target(t);
+   bool partial = false;
+   while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF
+          || tree_kind(tg) == T_RECORD_REF) {
+      partial = true;
+      tg = tree_value(tg);
+   }
+   if (!partial || tree_kind(tg) != T_REF || !tree_has_ref(tg))
+      return;
+   ident_t id = tree_ident(tg);
+   for (int i = 0; i < ps->n; i++)
+      if (ps->ids[i] == id)
+         return;
+   if (ps->n == ps->cap) {
+      if (ps->cap >= 4096) { ps->capped = true; return; }
+      ps->cap = ps->cap ? ps->cap * 2 : 16;
+      ps->ids = xrealloc_array(ps->ids, ps->cap, sizeof(ident_t));
+   }
+   ps->ids[ps->n++] = id;
+}
+
+// per-process counts, per candidate signal: partial WRITES (assigns whose
+// target base is the signal) and total partial REFS (every indexed/slice/field
+// reference to it — targets and reads alike).  Because tree_visit also lands on
+// each assign target's own array-ref node, a single-index target contributes
+// one ref that exactly offsets its write, so refs > writes iff the process
+// partial-READS the signal in a value position.
+typedef struct { ident_t *ids; int *refs; int *writes; int n; } r2_wr_scan_t;
+
+static void r2_wr_scan_cb(tree_t t, void *ctx)
+{
+   r2_wr_scan_t *w = (r2_wr_scan_t *)ctx;
+   const tree_kind_t k = tree_kind(t);
+   if (k == T_ARRAY_REF || k == T_ARRAY_SLICE || k == T_RECORD_REF) {
+      tree_t b = t;
+      while (tree_kind(b) == T_ARRAY_SLICE || tree_kind(b) == T_ARRAY_REF
+             || tree_kind(b) == T_RECORD_REF)
+         b = tree_value(b);
+      if (tree_kind(b) == T_REF && tree_has_ref(b)) {
+         ident_t id = tree_ident(b);
+         for (int j = 0; j < w->n; j++)
+            if (w->ids[j] == id) { w->refs[j]++; break; }
+      }
+      return;
+   }
+   if (k == T_SIGNAL_ASSIGN || k == T_DEPOSIT) {
+      tree_t tg = tree_target(t);
+      bool partial = false;
+      while (tree_kind(tg) == T_ARRAY_SLICE || tree_kind(tg) == T_ARRAY_REF
+             || tree_kind(tg) == T_RECORD_REF) { partial = true; tg = tree_value(tg); }
+      if (partial && tree_kind(tg) == T_REF && tree_has_ref(tg)) {
+         ident_t id = tree_ident(tg);
+         for (int j = 0; j < w->n; j++)
+            if (w->ids[j] == id) { w->writes[j]++; break; }
+      }
+   }
+}
+
+// returns the id of an array signal that is partial-written by >1 distinct
+// driver AND partial-READ by at least one of those writing drivers (a
+// combinational chain THROUGH the array across drivers) — the shape that the
+// per-process whole-array hold temp mis-composes.  Disjoint slices with no
+// cross-driver read (mylex r4_slice_arm: two halves, read only in a separate
+// non-writing process) install correctly and are NOT declined; a single driver
+// writing many elements (r31_shiftvec) has only one writer and is NOT declined.
+static ident_t r2_multi_driver_array(tree_t block)
+{
+   r2_pset_t ps = { .ids = NULL, .n = 0, .cap = 0, .capped = false };
+   tree_visit(block, r2_partial_target_cb, &ps);
+   if (ps.capped)                        // pathological: keep today's behavior
+      warnf("vhdl2rtlil: multi-driver guard skipped (>4096 sliced signals)");
+   if (ps.n == 0 || ps.capped) {
+      free(ps.ids);
+      return NULL;
+   }
+   int  *nwriter   = xcalloc_array(ps.n, sizeof(int));
+   bool *crossread = xcalloc_array(ps.n, sizeof(bool));
+   const int nst = tree_stmts(block);
+   for (int i = 0; i < nst; i++) {
+      tree_t st = tree_stmt(block, i);
+      if (tree_kind(st) != T_PROCESS)
+         continue;
+      int *refs   = xcalloc_array(ps.n, sizeof(int));
+      int *writes = xcalloc_array(ps.n, sizeof(int));
+      r2_wr_scan_t w = { .ids = ps.ids, .refs = refs, .writes = writes,
+                         .n = ps.n };
+      tree_visit(st, r2_wr_scan_cb, &w);
+      for (int j = 0; j < ps.n; j++)
+         if (writes[j] > 0) {
+            nwriter[j]++;
+            if (refs[j] > writes[j])       // a value-position partial read
+               crossread[j] = true;
+         }
+      free(refs);
+      free(writes);
+   }
+   ident_t bad = NULL;
+   for (int j = 0; j < ps.n; j++)
+      if (nwriter[j] > 1 && crossread[j]) { bad = ps.ids[j]; break; }
+   free(nwriter);
+   free(crossread);
+   free(ps.ids);
+   return bad;
+}
+
 bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
 {
    const gsm_rtlil_api_t *api = (const gsm_rtlil_api_t *)api_;
@@ -7906,6 +9756,19 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
       }
    }
 
+   // soundness: disjoint element writes to one array signal from >1 driver
+   // contend through the per-process whole-array hold temp (installs-wrong)
+   {
+      ident_t bad = r2_multi_driver_array(block);
+      if (bad != NULL) {
+         char why[96];
+         snprintf(why, sizeof why, "multi-driver-array %s", vid(bad));
+         R2_DECLINE(why);
+         if (!g_r2_census)
+            goto declined;
+      }
+   }
+
    if (api->module(modname) != 0)
       return false;
 
@@ -7941,14 +9804,12 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
             goto declined;
          }
          if (tree_has_value(d)) {
-            // the TEXT path drops memory initializers outright (emits the
-            // bare reg array) — match it for a uniform (others => ...)
-            // aggregate; real per-element contents still decline
-            tree_t iv = tree_value(d);
-            if (tree_kind(iv) == T_AGGREGATE && tree_assocs(iv) == 1
-                && tree_subkind(tree_assoc(iv, 0)) == A_OTHERS)
-               ;   // uniform power-on fill: drop, as text does
-            else {
+            // the accel resets memory state to 0, so DROPPING the initializer
+            // (both this path and the text path do -- no $meminit) is sound
+            // ONLY for an all-zero fill.  A uniform but NONZERO fill
+            // (others => x"00FF") powers on at 0 and silently diverges; a
+            // non-uniform per-element init likewise.  Drop only a zero fill.
+            if (!mem_init_is_zero(tree_value(d))) {
                R2_DECLINE("mem-init");
                goto declined;
             }

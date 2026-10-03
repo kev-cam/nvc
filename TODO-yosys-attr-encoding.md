@@ -71,3 +71,51 @@ strip port attributes.  If a future pass set threatens them, the
 fallback is a side-table keyed by wire name emitted alongside the
 design instead of in-band attributes (the gsm cname() mangling rules
 already give stable names).
+
+## UPF cross-link (verified 2026-09-05 against current source)
+
+`UPF_PLAN.md` (added by the user) leans directly on this §5 machinery.
+Findings after verifying the shipped types — they REFRAME the plan's
+central "certainty-plane corruption bit" question:
+
+- **Power-missing is ALREADY a first-class distinguishable state.**
+  `logic3da_pkg.l3da_flags` has `AFL_NOPOWER` / `AFL_UNK_NOPOWER`
+  (corruption-X) / `AFL_UDR_NOPOWER`, with Thevenin driver resolution
+  over them; `logic3ds` flags carry `NOPOWER` too.  The plan's headline
+  demo (corruption-X ≠ reset-X ≠ uninit-X) is representable in shipped
+  types TODAY — not something to invent.
+- **The fast form has NO room, and that is the real boundary.**
+  `logic3dw` certainty is a FULL 2-bit enum (00 certain / 01 W / 10 X /
+  11 U, U-dominant) — verified in logic3dw_pkg.  No spare code.  Scalar
+  `logic3d` is `natural range 0 to 7` (value + 2 kind bits) — also full.
+- **Architecture fit is clean and already implied by this doc.** UPF
+  corruption is a flags-plane property on domain CROSSINGS (receivers =
+  rims).  The admission fence here already routes flags/strength/
+  certainty-plane nets interp-side or rim-only (`\nvc.planes` ≠ 1);
+  the interp-side resolution generator already owns the NOPOWER
+  vocabulary.  So per-receiver power resolution drops into the EXISTING
+  structure: `\nvc.planes` gains an observed-NOPOWER bit that fences the
+  crossing rim-only, and the resolution generator sets the l3da/l3ds
+  NOPOWER flag there.  The plan's "no inserted AND gates, zero area"
+  holds because corruption never enters the accelerated cone.
+- **The one open decision** (belongs with the certainty encoding, per
+  both docs' "design before mapping" rule): does corruption need to
+  ride the ACCELERATED l3dw path so large powered-DOWN regions still
+  run at accel speed?  If yes → l3dw needs a 3rd kind-bit or a separate
+  NOPOWER plane (breaks the zero-memory claim; scalar l3d must widen
+  past 0..7 — invasive: interp, vhdl2vlog, bridge aj_bit_base, VHPI).
+  If correctness-at-crossings suffices → free under today's fence, the
+  accel path never sees it, powered domains stay full-speed 2-state.
+
+Campaign items this doc already answers for `UPF_PLAN.md`: §9 IR tap
+point = `vhdl2rtlil_module` (post-elab, pre-sim-lower); §4 text-vs-
+linkage = the shipped direct `gsm_rtlil_*` builder (one RTLIL build →
+write_verilog for P&R + gen_statemachine for sim = "same input, both
+flows"); §5 "key functions on signature" = `gsm_rtlil_content_hash` +
+the content-keyed .so tier; §5 "specialise, don't branch on supply" =
+the double-bank / vtable-specialization substrate; §2 switch net =
+one `cell_bin("and")`.  TENSION to hold: the accel fast path trends to
+2-state value-plane (resolver elision, value-bit rim marshalling);
+keeping the certainty plane alive through synthesis is the conscious
+choice UPF requires — reconciled by the specialize-powered/unpowered
+approach, not by carrying certainty on the hot path.

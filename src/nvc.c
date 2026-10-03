@@ -752,21 +752,46 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
 static uint64_t parse_time(const char *str)
 {
-   char     unit[4];
-   unsigned base;
-   uint64_t mult = 1;
-
-   if (sscanf(str, "%u%3s", &base, unit) != 2)
+   // The count is read as 64 bits.  sscanf("%u") into an unsigned int
+   // wrapped any count of 2^32 or more modulo 2^32, so that
+   // --stop-time=6000000001fs silently ended the run at 1.705 us.  A time
+   // that does not fit is an error, never a shorter run.
+   const char *p = str;
+   while (isspace((unsigned char)*p))   // what "%u" accepted, except a '-'
+      p++;
+   if (*p == '+')
+      p++;
+   if (!isdigit((unsigned char)*p))
       fatal("invalid time format: %s", str);
 
-   if      (strcmp(unit, "fs") == 0)  mult = 1;
-   else if (strcmp(unit, "ps") == 0)  mult = 1000;
-   else if (strcmp(unit, "ns") == 0)  mult = 1000000;
-   else if (strcmp(unit, "us") == 0)  mult = 1000000000;
-   else if (strcmp(unit, "ms") == 0)  mult = 1000000000000;
-   else if (strcmp(unit, "sec") == 0) mult = 1000000000000000;
+   uint64_t base = 0;
+   bool overflow = false;
+   for (; isdigit((unsigned char)*p); p++) {
+      const unsigned digit = *p - '0';
+      if (base > (UINT64_MAX - digit) / 10)
+         overflow = true;
+      else
+         base = base * 10 + digit;
+   }
+
+   while (isspace((unsigned char)*p))
+      p++;
+
+   uint64_t mult;
+   if      (strcmp(p, "fs") == 0)  mult = 1;
+   else if (strcmp(p, "ps") == 0)  mult = 1000;
+   else if (strcmp(p, "ns") == 0)  mult = 1000000;
+   else if (strcmp(p, "us") == 0)  mult = 1000000000;
+   else if (strcmp(p, "ms") == 0)  mult = 1000000000000;
+   else if (strcmp(p, "sec") == 0) mult = 1000000000000000;
+   else if (*p == '\0')
+      fatal("invalid time format: %s", str);
    else
-      fatal("invalid unit: %s", unit);
+      fatal("invalid unit: %s", p);
+
+   if (overflow || base > (uint64_t)TIME_HIGH / mult)
+      fatal("time %s is too large: the largest is TIME'HIGH, %.9g s",
+            str, (double)TIME_HIGH / 1e15);
 
    return base * mult;
 }
@@ -948,6 +973,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "export-resolvers", required_argument, 0, 'X' },
       { "xyce-netlist",     required_argument, 0, 'Y' },
       { "xyce-config",      required_argument, 0, 'Z' },
+      { "vacask-netlist",   required_argument, 0, 303 },
+      { "cosim-config",     required_argument, 0, 'Z' },
       { "accel",             no_argument,       0, 'A' },
       { "launch-debug",      optional_argument, 0, 300 },
       { "lazy-eval",         no_argument,       0, 301 },
@@ -964,6 +991,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    const char   *resolver_dir = NULL;
    const char   *xyce_netlist = NULL;
    const char   *xyce_config = NULL;
+   cosim_engine_t cosim_engine = COSIM_XYCE;
    // NVC_ACCEL in the environment is the equivalent of the --accel option
    // (auto-compile + engage via accel_auto), so test harnesses/scripts can opt
    // in without being modified. NVC_ACCEL=0 / empty / unset = off.
@@ -1090,6 +1118,11 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'Y':
          xyce_netlist = optarg;
+         cosim_engine = COSIM_XYCE;
+         break;
+      case 303:
+         xyce_netlist = optarg;
+         cosim_engine = COSIM_VACASK;
          break;
       case 'Z':
          xyce_config = optarg;
@@ -1303,7 +1336,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
                          enable_ieee_warnings_cb, state);
 
    if (xyce_netlist != NULL) {
-      const int rc = cosim_run(state->model, xyce_netlist,
+      const int rc = cosim_run(state->model, cosim_engine, xyce_netlist,
                                xyce_config, stop_time);
       set_ctrl_c_handler(NULL, NULL);
 

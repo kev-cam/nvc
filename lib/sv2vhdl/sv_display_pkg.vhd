@@ -47,8 +47,15 @@ package sv_display_pkg is
                                 w : integer);
     -- Verilog %t: format a time `value` (in the calling scope's time units,
     -- signed power of 10) per the current $timeformat (or the default derived
-    -- from `scope_prec` if $timeformat was never called).
+    -- from `scope_prec` if $timeformat was never called).  The scaling is
+    -- exact decimal, for every count nvc passes: a 64-bit one such as the
+    -- translator's $time, (now / (1000 ps)), after 2.147 s included.
     impure function sv_tstr(value : integer; scope_units : integer;
+                            scope_prec : integer) return string;
+    -- Verilog %t of a real `value` (in units of 10^scope_units s): scaled in
+    -- double precision and printed with the $timeformat precision, C "%.*f",
+    -- as vvp does; no INTEGER range limit and no rounding to whole units.
+    impure function sv_tstr(value : real; scope_units : integer;
                             scope_prec : integer) return string;
 end package;
 
@@ -331,28 +338,80 @@ package body sv_display_pkg is
         return (1 to w - s'length => ' ') & s;
     end function;
 
-    -- Non-negative integer as a decimal with `p` fractional digits, e.g.
-    -- (3000, 6) -> "0.003000", (12345, 2) -> "123.45", (0, 0) -> "0".
-    function dec_with_point(n : natural; p : natural) return string is
-        constant s : string := integer'image(n);
-        variable pad : integer;
+    -- %t scales decimal digit strings, as vvp's get_time does, never INTEGER
+    -- values: INTEGER is 32 bits under --std=2040, so 3 ms counted in ps
+    -- (3e9) already overflowed it, while a time count has 64 bits.
+
+    -- `n` zero digits (none for n <= 0).
+    function zeros(n : integer) return string is
+    begin
+        if n <= 0 then
+            return "";
+        end if;
+        return (1 to n => '0');
+    end function;
+
+    -- A decimal digit string plus one: "1299" -> "1300", "99" -> "100".
+    function dec_incr(d : string) return string is
+        variable r : string(1 to d'length) := d;
+    begin
+        for i in r'reverse_range loop
+            if r(i) /= '9' then
+                r(i) := character'succ(r(i));
+                return r;
+            end if;
+            r(i) := '0';
+        end loop;
+        return "1" & r;
+    end function;
+
+    -- The decimal digit string `d` (no sign, no leading zeros) times 10^e:
+    -- e >= 0 appends e zeros, e < 0 drops -e digits and rounds half up, e.g.
+    -- ("3000000", 3) -> "3000000000", ("15", -1) -> "2", ("4", -1) -> "0".
+    function dec_scale(d : string; e : integer) return string is
+        constant n : natural := d'length;
+        alias a : string(1 to n) is d;
+    begin
+        if e >= 0 then
+            if a = "0" then
+                return a;
+            end if;
+            return a & zeros(e);
+        elsif n > -e then
+            if a(n + e + 1) >= '5' then
+                return dec_incr(a(1 to n + e));
+            end if;
+            return a(1 to n + e);
+        elsif n = -e and a(1) >= '5' then
+            return "1";
+        else
+            return "0";
+        end if;
+    end function;
+
+    -- The decimal digit string `d` with `p` fractional digits, e.g.
+    -- ("3000", 6) -> "0.003000", ("12345", 2) -> "123.45", ("0", 0) -> "0".
+    function dec_with_point(d : string; p : natural) return string is
+        constant n : natural := d'length;
+        alias a : string(1 to n) is d;
     begin
         if p = 0 then
-            return s;
+            return a;
+        elsif n <= p then
+            return "0." & zeros(p - n) & a;
         end if;
-        if s'length <= p then
-            pad := p - s'length;
-            return "0." & (1 to pad => '0') & s;
-        end if;
-        return s(s'left to s'left + (s'length - p) - 1) & "."
-             & s(s'left + (s'length - p) to s'right);
+        return a(1 to n - p) & "." & a(n - p + 1 to n);
     end function;
 
     impure function sv_tstr(value : integer; scope_units : integer;
                             scope_prec : integer) return string is
-        variable u, p, w, e : integer;
-        variable av, scaled, pw10 : integer;
-        variable neg : boolean;
+        -- `value` is only read through its image.  nvc hands the parameter
+        -- a count beyond INTEGER'HIGH intact (the translator's $time is
+        -- (now / (1000 ps)), a 64-bit quotient), but an INTEGER variable or
+        -- operation would cut it to 32 bits or fail.
+        constant img : string := integer'image(value);
+        constant neg : boolean := img(img'left) = '-';
+        variable u, p, w : integer;
     begin
         if g_timeformat.is_set then
             u := g_timeformat.get_u; p := g_timeformat.get_prec;
@@ -361,26 +420,46 @@ package body sv_display_pkg is
             -- default %t: units = simulation precision, 0 decimals, width 20.
             u := scope_prec; p := 0; w := 20;
         end if;
-        neg := value < 0;
-        av  := abs(value);
-        -- scale so the result carries `p` fractional digits:
-        -- scaled = round(value * 10^(scope_units - u + p))
-        e := scope_units - u + p;
-        if e >= 0 then
-            scaled := av;
-            for i in 1 to e loop scaled := scaled * 10; end loop;
-        else
-            pw10 := 1;
-            for i in 1 to -e loop pw10 := pw10 * 10; end loop;
-            scaled := (av + pw10 / 2) / pw10;   -- round to nearest
-        end if;
-        -- Assemble: [-]<digits>.<frac><suffix>, right-justified in width w.
-        -- get_suf is the empty string when $timeformat was never called.
+        -- The digits of round(|value| * 10^(scope_units - u + p)), with the
+        -- point p digits from the right: [-]<digits>.<frac><suffix>,
+        -- right-justified in width w.  get_suf is the empty string when
+        -- $timeformat was never called.
         if neg then
-            return rjust("-" & dec_with_point(scaled, p) & g_timeformat.get_suf, w);
+            return rjust("-" & dec_with_point(dec_scale(img(img'left + 1 to img'right),
+                                                        scope_units - u + p), p)
+                         & g_timeformat.get_suf, w);
         else
-            return rjust(dec_with_point(scaled, p) & g_timeformat.get_suf, w);
+            return rjust(dec_with_point(dec_scale(img, scope_units - u + p), p)
+                         & g_timeformat.get_suf, w);
         end if;
+    end function;
+
+    impure function sv_tstr(value : real; scope_units : integer;
+                            scope_prec : integer) return string is
+        variable u, p, w, shift : integer;
+        variable pw10, scaled : real;
+    begin
+        if g_timeformat.is_set then
+            u := g_timeformat.get_u; p := g_timeformat.get_prec;
+            w := g_timeformat.get_w;
+        else
+            u := scope_prec; p := 0; w := 20;
+        end if;
+        -- vvp's get_time_real: value * 10^shift, or value / 10^-shift, then
+        -- "%.<p>f" and the suffix.  10^k is built by multiplying, exact (as
+        -- C's pow(10.0, k)) up to k = 22.
+        shift := scope_units - u;
+        pw10 := 1.0;
+        for i in 1 to abs(shift) loop
+            pw10 := pw10 * 10.0;
+        end loop;
+        if shift >= 0 then
+            scaled := value * pw10;
+        else
+            scaled := value / pw10;
+        end if;
+        return rjust(to_string(scaled, "%." & integer'image(p) & "f")
+                     & g_timeformat.get_suf, w);
     end function;
 
     function sv_cstr(v : std_logic_vector) return string is

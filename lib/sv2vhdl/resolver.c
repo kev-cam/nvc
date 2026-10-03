@@ -28,7 +28,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <ctype.h>
+#include <float.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -1620,6 +1623,288 @@ static void resolver_register_cleanup(void)
         .cb_rtn = end_of_sim,
     };
     vhpi_register_cb(&cb, vhpiReturnCb);
+}
+
+/* ---------- $test$plusargs ----------
+ *
+ * VHPIDIRECT target of sv_math_pkg.sv_test_plusargs(prefix : string).  NVC
+ * passes an unconstrained string as (data, length).  The simulator's plusargs
+ * reach VHPI as the tool's argv ("+name" strings); like Verilog, a plusarg
+ * matches when its text after the '+' starts with prefix.
+ */
+int32_t sv_test_plusargs(const char *prefix, int64_t len)
+{
+    vhpiHandleT tool = vhpi_handle(vhpiTool, NULL);
+    if (tool == NULL)
+        return 0;
+    vhpiHandleT it = vhpi_iterator(vhpiArgvs, tool);
+    if (it == NULL)
+        return 0;
+    int32_t found = 0;
+    vhpiHandleT a;
+    while ((a = vhpi_scan(it)) != NULL) {
+        const char *v = (const char *)vhpi_get_str(vhpiStrValP, a);
+        if (!found && v != NULL && v[0] == '+'
+            && (int64_t)strlen(v + 1) >= len && strncmp(v + 1, prefix, len) == 0)
+            found = 1;
+        vhpi_release_handle(a);
+    }
+    return found;
+}
+
+/* ---------- $value$plusargs ----------
+ *
+ * VHPIDIRECT targets of sv_math_pkg.{sv_value_plusargs, sv_plusarg_real,
+ * sv_plusarg_bits}.  fmt is "<prefix>%<code>"; the first +plusarg starting
+ * with <prefix> supplies the text.  Validation and conversion follow Icarus
+ * (vpi/sys_plusargs.c + vvp string put_value): an invalid number becomes all
+ * x with a warning, '-' only as the first character negates (two's
+ * complement), x/z digits set x/z bits, '_' is ignored, %s packs characters
+ * right-aligned 8 bits each.
+ */
+
+/* Split fmt into prefix length + lower-case code; 0 when fmt has no code. */
+static int plusarg_fmt(const char *fmt, int64_t flen, int64_t *plen)
+{
+    for (int64_t i = 0; i < flen; i++) {
+        if (fmt[i] == '%') {
+            if (i + 1 >= flen)
+                return 0;
+            *plen = i;
+            return tolower((unsigned char)fmt[i + 1]);
+        }
+    }
+    return 0;
+}
+
+/* Text after "+<prefix>" of the first matching plusarg, or NULL. */
+static const char *plusarg_find(const char *prefix, int64_t plen)
+{
+    vhpiHandleT tool = vhpi_handle(vhpiTool, NULL);
+    if (tool == NULL)
+        return NULL;
+    vhpiHandleT it = vhpi_iterator(vhpiArgvs, tool);
+    if (it == NULL)
+        return NULL;
+    const char *hit = NULL;
+    vhpiHandleT a;
+    while ((a = vhpi_scan(it)) != NULL) {
+        const char *v = (const char *)vhpi_get_str(vhpiStrValP, a);
+        if (hit == NULL && v != NULL && v[0] == '+'
+            && (int64_t)strlen(v + 1) >= plen
+            && strncmp(v + 1, prefix, plen) == 0)
+            hit = v + 1 + plen;
+        vhpi_release_handle(a);
+    }
+    return hit;
+}
+
+static void plusarg_warn(const char *what, const char *text)
+{
+    fprintf(stderr, "WARNING: %s passed to $value$plusargs:\n"
+            "         \"%s\".\n", what, text);
+}
+
+int32_t sv_value_plusargs(const char *fmt, int64_t flen)
+{
+    int64_t plen;
+    if (!plusarg_fmt(fmt, flen, &plen))
+        return 0;
+    return plusarg_find(fmt, plen) != NULL;
+}
+
+/* Is every character of sp in set? */
+static int all_in(const char *sp, const char *set)
+{
+    return strspn(sp, set) == strlen(sp);
+}
+
+/* Two's-complement negate a bit string (MSB first, '0'/'1' only). */
+static void bits_negate(char *b, int64_t w)
+{
+    for (int64_t i = 0; i < w; i++)
+        b[i] = (b[i] == '1') ? '0' : '1';
+    for (int64_t i = w - 1; i >= 0; i--) {          /* +1 */
+        if (b[i] == '0') {
+            b[i] = '1';
+            break;
+        }
+        b[i] = '0';
+    }
+}
+
+/* Radix 2/8/16 digits (with x/z) into b[0..w), right-aligned. */
+static void bits_from_radix(char *b, int64_t w, const char *sp, int shift)
+{
+    int neg = 0, xz = 0;
+    if (*sp == '-') {
+        neg = 1;
+        sp++;
+    }
+    int64_t pos = w - 1;                             /* next bit from the LSB */
+    for (int64_t i = (int64_t)strlen(sp) - 1; i >= 0 && pos >= 0; i--) {
+        char c = sp[i];
+        if (c == '_')
+            continue;
+        char fill = 0;
+        int val = 0;
+        if (c == 'x' || c == 'X')
+            fill = 'x';
+        else if (c == 'z' || c == 'Z')
+            fill = 'z';
+        else if (isdigit((unsigned char)c))
+            val = c - '0';
+        else
+            val = tolower((unsigned char)c) - 'a' + 10;
+        if (fill)
+            xz = 1;
+        for (int k = 0; k < shift && pos >= 0; k++, pos--)
+            b[pos] = fill ? fill : (((val >> k) & 1) ? '1' : '0');
+    }
+    if (neg && !xz)
+        bits_negate(b, w);
+}
+
+/* Decimal digits into b[0..w) (two's complement), via b = b*10 + d. */
+static void bits_from_decimal(char *b, int64_t w, const char *sp)
+{
+    int neg = 0;
+    if (*sp == '-') {
+        neg = 1;
+        sp++;
+    }
+    for (; *sp; sp++) {
+        if (*sp == '_')
+            continue;
+        int carry = *sp - '0';
+        for (int64_t i = w - 1; i >= 0; i--) {
+            int v = (b[i] == '1') * 10 + carry;
+            b[i] = (v & 1) ? '1' : '0';
+            carry = v >> 1;
+        }
+    }
+    if (neg)
+        bits_negate(b, w);
+}
+
+static double plusarg_strtod(const char *sp)
+{
+    char *end;
+    double d = strtod(sp, &end);
+    /* tgt-vhdl writes a Verilog infinity constant (1.0/0.0) as real'high,
+     * since VHDL has no infinity literal. Use the same representation so
+     * "+x=Inf" compares equal to it inside the translated design. */
+    if (isinf(d))
+        d = d > 0 ? DBL_MAX : -DBL_MAX;
+    if (*end) {
+        if (end == sp)
+            plusarg_warn("Invalid real value", sp);
+        else
+            plusarg_warn("Extra character(s) in real value", sp);
+    }
+    return d;
+}
+
+void sv_plusarg_bits(const char *fmt, int64_t flen, char *b, int64_t w)
+{
+    for (int64_t i = 0; i < w; i++)
+        b[i] = '0';
+    int64_t plen;
+    int code = plusarg_fmt(fmt, flen, &plen);
+    const char *sp = code ? plusarg_find(fmt, plen) : NULL;
+    if (sp == NULL)
+        return;
+
+    const char *digits = NULL, *what = NULL;
+    int shift = 0;
+    switch (code) {
+    case 'd':
+        if (*sp && (all_in(sp, "xX_") || all_in(sp, "zZ_"))) {
+            char f = strpbrk(sp, "xX") ? 'x' : 'z';
+            for (int64_t i = 0; i < w; i++)
+                b[i] = f;
+            return;
+        }
+        digits = "-0123456789_";
+        what = "Invalid decimal value";
+        break;
+    case 'o':
+        digits = "-01234567_xXzZ";
+        what = "Invalid octal value";
+        shift = 3;
+        break;
+    case 'h':
+    case 'x':
+        digits = "-0123456789aAbBcCdDeEfF_xXzZ";
+        what = "Invalid hex value";
+        shift = 4;
+        break;
+    case 'b':
+        digits = "-01_xXzZ";
+        what = "Invalid binary value";
+        shift = 1;
+        break;
+    case 'e':
+    case 'f':
+    case 'g': {
+        double d = plusarg_strtod(sp);
+        int64_t v = (int64_t)(d >= 0 ? d + 0.5 : d - 0.5);
+        for (int64_t i = w - 1, k = 0; i >= 0; i--, k++) {
+            int bit = k < 64 ? (int)(((uint64_t)v >> k) & 1) : (v < 0);
+            b[i] = bit ? '1' : '0';
+        }
+        return;
+    }
+    case 's': {
+        int64_t pos = w - 1;
+        for (int64_t i = (int64_t)strlen(sp) - 1; i >= 0 && pos >= 0; i--)
+            for (int k = 0; k < 8 && pos >= 0; k++, pos--)
+                b[pos] = (((unsigned char)sp[i] >> k) & 1) ? '1' : '0';
+        return;
+    }
+    default:
+        return;
+    }
+
+    const char *minus = strrchr(sp, '-');
+    if (*sp == '\0' || !all_in(sp, digits) || *sp == '_'
+        || (minus != NULL && minus != sp)) {
+        plusarg_warn(what, sp);
+        for (int64_t i = 0; i < w; i++)
+            b[i] = 'x';
+        return;
+    }
+    if (code == 'd')
+        bits_from_decimal(b, w, sp);
+    else
+        bits_from_radix(b, w, sp, shift);
+}
+
+double sv_plusarg_real(const char *fmt, int64_t flen)
+{
+    int64_t plen;
+    int code = plusarg_fmt(fmt, flen, &plen);
+    const char *sp = code ? plusarg_find(fmt, plen) : NULL;
+    if (sp == NULL)
+        return 0.0;
+    if (code == 'e' || code == 'f' || code == 'g')
+        return plusarg_strtod(sp);
+    if (code == 'd' || code == 'o' || code == 'h' || code == 'x'
+        || code == 'b') {
+        int base = code == 'd' ? 10 : code == 'o' ? 8 : code == 'b' ? 2 : 16;
+        char clean[256];
+        size_t k = 0;
+        for (const char *c = sp; *c && k < sizeof(clean) - 1; c++)
+            if (*c != '_')
+                clean[k++] = *c;
+        clean[k] = '\0';
+        char *end;
+        long long v = strtoll(clean, &end, base);
+        if (*end || end == clean)
+            return 0.0;                     /* x/z or garbage: no real value */
+        return (double)v;
+    }
+    return 0.0;
 }
 
 /* ---------- VHPI entry point ---------- */

@@ -51,7 +51,9 @@ bool model_can_create_delta(rt_model_t *m);
 int64_t model_now(rt_model_t *m, unsigned *deltas);
 int64_t model_next_time(rt_model_t *m);
 void model_stop(rt_model_t *m);
+bool model_stopped(rt_model_t *m);
 void model_interrupt(rt_model_t *m);
+bool model_interrupted(rt_model_t *m);
 int model_exit_status(rt_model_t *m);
 
 rt_watch_t *watch_new(rt_model_t *m, sig_event_fn_t fn, void *user,
