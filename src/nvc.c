@@ -355,8 +355,8 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
          }
       }
       if (translator != NULL && nv > 1) {
-         char tmpdir[512];
-         checked_sprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_batch_%d", getpid());
+         // Removed when nvc exits (common.c sv2ghdl_temp_dir)
+         char *tmpdir LOCAL = sv2ghdl_temp_dir();
          char cmd[18000];
          checked_sprintf(cmd, sizeof(cmd), "%s -o '%s'%s%s%s 2>&1",
                          translator, tmpdir, incdir_args, define_args, vfiles);
@@ -949,6 +949,57 @@ static void enable_ieee_warnings_cb(rt_model_t *m, void *ctx)
    *ptr = 0;
 }
 
+// NVC_REPORT_END_TIME=1 (any value but empty or 0): the end of a run prints
+// the time the simulation ended at, for a tool that runs nvc (vamos's run
+// footer), with why it ended:
+//   ** Note: simulation ended at <time> (stop time)       --stop-time reached
+//   ** Note: simulation ended at <time> (no more events)  ran out of events
+//   ** Note: simulation ended at <time> (stopped)         finish, stop, a
+//                                                         failure or fatal error
+//   ** Note: simulation ended at <time> (interrupted)     SIGINT
+// <time> as nvc prints a time ("30ns", "3257407025fs"); a run bounded by
+// --stop-time that still had events ends at the stop time itself.
+static void report_end_time(rt_model_t *m, uint64_t stop_time)
+{
+   const char *env = getenv("NVC_REPORT_END_TIME");
+   if (env == NULL || *env == '\0' || strcmp(env, "0") == 0)
+      return;
+
+   uint64_t when = model_now(m, NULL);
+   const int64_t next = model_next_time(m);   // TIME_HIGH: no events left
+   const char *why;
+   if (model_stopped(m))
+      why = model_interrupted(m) ? "interrupted" : "stopped";
+   else if (next != TIME_HIGH && (uint64_t)next > stop_time) {
+      why = "stop time";
+      when = stop_time;
+   }
+   else
+      why = "no more events";
+
+   static const struct {
+      uint64_t    mult;
+      const char *unit;
+   } units[] = {
+      { UINT64_C(1000000000000), "ms" },
+      { UINT64_C(1000000000), "us" },
+      { UINT64_C(1000000), "ns" },
+      { UINT64_C(1000), "ps" },
+   };
+
+   uint64_t count = when;
+   const char *unit = "fs";
+   for (int i = 0; i < ARRAY_LEN(units); i++) {
+      if (when % units[i].mult == 0) {
+         count = when / units[i].mult;
+         unit = units[i].unit;
+         break;
+      }
+   }
+
+   notef("simulation ended at %"PRIu64"%s (%s)", count, unit, why);
+}
+
 static int run_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
@@ -964,6 +1015,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "exclude",       required_argument, 0, 'e' },
       { "exit-severity", required_argument, 0, 'x' },
       { "dump-arrays",   optional_argument, 0, 'a' },
+      { "dump-scope",    required_argument, 0, 304 },
       { "load",          required_argument, 0, 'l' },
       { "vhpi-debug",    no_argument,       0, 'D' },
       { "vhpi-trace",    no_argument,       0, 'T' },
@@ -1097,6 +1149,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
             opt_set_int(OPT_DUMP_ARRAYS, INT_MAX);
          else
             opt_set_int(OPT_DUMP_ARRAYS, parse_int(optarg));
+         break;
+      case 304:
+         wave_include_scope(optarg);
          break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
@@ -1359,6 +1414,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    }
 
    model_run(state->model, stop_time);
+
+   report_end_time(state->model, stop_time);
 
    set_ctrl_c_handler(NULL, NULL);
 
@@ -2566,6 +2623,9 @@ static void usage(void)
         {
            { "--dump-arrays[=N]",
              "Include nested arrays with up to N elements in waveform dump" },
+           { "--dump-scope=PATH[,LEVELS]",
+             "Include the signals of instance PATH and LEVELS-1 levels below "
+             "it (0: all) in waveform dump, as $dumpvars(LEVELS, PATH)" },
            { "--exclude=GLOB",
              "Exclude signals matching GLOB from waveform dump" },
            { "--exit-severity={note,warning,error,failure}",

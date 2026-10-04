@@ -52,7 +52,9 @@
 //  so the engine still ends its transient (its output is finished), but the
 //  run is a failure, never a stop: the interrupted line replaces the
 //  digital-stop line and the exit status is COSIM_EXIT_INTERRUPTED (130,
-//  128 + SIGINT), whatever the digital's own status.
+//  128 + SIGINT), whatever the digital's own status.  A second SIGINT ends
+//  the run at once, without waiting for the engine: the interrupted line
+//  (when no end line is out yet), exit status 130 (cosim_ctrl_c).
 //
 //  ABI: libcosim_bridge.so must export cosim_bridge_abi() and the engine's C
 //  interface vacask_cosim_abi() or xyce_cosim_abi(), each returning at least
@@ -77,11 +79,13 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <float.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/types.h>
 
 // Verbose co-sim tracing.  Flip to 1 (or build with -DCOSIM_DEBUG=1) to enable;
@@ -956,6 +960,9 @@ static void advance_timeout(rt_model_t *m, void *arg)
 static int stopped_step(cosim_state_t *cs, rt_model_t *m, int64_t T,
                         double *t_evt_s)
 {
+   if (model_interrupted(m))
+      model_drop_interrupt(m);   // Taken: the digital never runs again
+
    const int64_t tf = model_now(m, NULL);
    const int64_t tol = 1 + T / 100000000000000LL;   // 1 fs + 1e-14 relative
    *t_evt_s = -1.0;
@@ -1074,6 +1081,51 @@ static void cosim_free(cosim_state_t *cs)
    bridge.reset();
 }
 
+// Ctrl-C during the co-simulation.  The first SIGINT stops the digital as
+// nvc's own handler does (model_interrupt): the engine ends its transient at
+// its next step and the run ends with the interrupted line.  A further one
+// ends the run at once, without waiting for the engine: the interrupted line
+// (unless an end line is out already) and exit status 130.  nvc's handler
+// would take it as "quit now" with no end line (jit_interrupt exits 1 when
+// an interrupt is still pending, and the stopped digital, never entered
+// again, never takes the first one).  The state is static: the handler stays
+// installed until run_cmd clears it, after cosim_run returns.
+static struct {
+   rt_model_t           *model;
+   volatile sig_atomic_t count;   // SIGINTs the handler has had
+   volatile sig_atomic_t ended;   // An end line is out
+} cosim_sig;
+
+static void cosim_ctrl_c(void *arg)
+{
+   rt_model_t *m = cosim_sig.model;
+
+   if (cosim_sig.count++ == 0) {
+      model_interrupt_quiet(m);   // the interrupted line below says it all
+      return;
+   }
+
+   if (!cosim_sig.ended) {
+      char tbuf[TIME_TEXT_MAX], line[TIME_TEXT_MAX + 64];
+      const int n = snprintf(line, sizeof(line),
+                             "** Error: co-simulation interrupted at %s s\n",
+                             fs_text(tbuf, model_now(m, NULL)));
+      const size_t len = n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1;
+      if (n > 0 && write(STDERR_FILENO, line, len) < 0)
+         (void)0;   // Nothing else to do on the way out
+   }
+
+   _exit(COSIM_EXIT_INTERRUPTED);
+}
+
+// The interrupted end line, from the run itself
+static void cosim_interrupted(rt_model_t *m, const char *tbuf)
+{
+   model_drop_interrupt(m);   // Taken: the digital never runs again
+   errorf("co-simulation interrupted at %s s", tbuf);
+   cosim_sig.ended = 1;
+}
+
 // Main co-simulation entry point
 int cosim_run(rt_model_t *m, cosim_engine_t engine, const char *xyce_netlist,
               const char *xyce_config, uint64_t stop_time)
@@ -1129,6 +1181,13 @@ int cosim_run(rt_model_t *m, cosim_engine_t engine, const char *xyce_netlist,
    // t=0 point (the operating point) to the digital during initialisation
    bridge.set_stepper(cosim_advance, &cs);
 
+   // Ctrl-C from here on is the co-simulation's (cosim_ctrl_c); one that
+   // already stopped the digital counts as the first
+   cosim_sig.model = m;
+   cosim_sig.count = model_interrupted(m) ? 1 : 0;
+   cosim_sig.ended = 0;
+   set_ctrl_c_handler(cosim_ctrl_c, NULL);
+
    // 6. Initialize the engine — this triggers the code: URI binding
    cs.eng.open(&cs.eng.ptr);
 
@@ -1152,11 +1211,11 @@ int cosim_run(rt_model_t *m, cosim_engine_t engine, const char *xyce_netlist,
    if (model_stopped(m)) {
       // Stopped during the t=0 settle, or by the operating point
       if ((interrupted = model_interrupted(m)))
-         errorf("co-simulation interrupted at %s s",
-                fs_text(tbuf, model_now(m, NULL)));
+         cosim_interrupted(m, fs_text(tbuf, model_now(m, NULL)));
       else
          notef("co-simulation finished: digital stop at 0 s (before the "
                "first analog step)");
+      cosim_sig.ended = 1;
    }
    else {
       notef("starting co-simulation (stop_time=%.3g s)", stop_time_s);
@@ -1173,27 +1232,31 @@ int cosim_run(rt_model_t *m, cosim_engine_t engine, const char *xyce_netlist,
          if (model_stopped(m)) {
             fs_text(tbuf, model_now(m, NULL));
             if ((interrupted = model_interrupted(m)))
-               errorf("co-simulation interrupted at %s s", tbuf);
+               cosim_interrupted(m, tbuf);
             else
                notef("co-simulation finished: digital stop at %s s", tbuf);
+            cosim_sig.ended = 1;
             break;
          }
 
          const bool done = engine_complete(&cs.eng);
          if (rc == 0 && !done) {
             errorf("%s transient failed at %s s", ename, time_text(tbuf, t));
+            cosim_sig.ended = 1;
             status = EXIT_FAILURE;
             break;
          }
          if (done || t >= stop_time_s * (1 - 1e-12)) {
             notef("co-simulation finished: analog end at %s s",
                   time_text(tbuf, t));
+            cosim_sig.ended = 1;
             // Let the digital finish the last interval
             model_step_to(m, (uint64_t)llround(t * FS_PER_SEC));
             break;
          }
          if (t <= prev) {
             errorf("co-simulation stalled at %s s", time_text(tbuf, t));
+            cosim_sig.ended = 1;
             status = EXIT_FAILURE;
             break;
          }

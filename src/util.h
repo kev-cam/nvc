@@ -292,6 +292,8 @@ void *map_jit_pages(size_t align, size_t sz);
 
 void run_program(const char *const *args);
 char *nvc_temp_file(void);
+char *nvc_temp_dir(const char *prefix);
+void nvc_remove_tree(const char *path);
 
 text_buf_t *safe_symbol(ident_t id);
 

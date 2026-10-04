@@ -1479,6 +1479,15 @@ void jit_check_interrupt(jit_t *j)
       jit_handle_interrupt(j);
 }
 
+// Drop a pending interrupt without running it: its caller has dealt with
+// it.  A later jit_interrupt is then a new interrupt, never a second one
+// while the first is pending (which jit_interrupt takes as "quit now").
+bool jit_clear_interrupt(jit_t *j)
+{
+   jit_irq_fn_t fn = load_acquire(&j->interrupt);
+   return fn != NULL && atomic_cas(&j->interrupt, fn, NULL);
+}
+
 void jit_reset(jit_t *j)
 {
    SCOPED_LOCK(j->lock);

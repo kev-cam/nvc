@@ -16,6 +16,7 @@
 //
 
 #include "util.h"
+#include "array.h"
 #include "common.h"
 #include <unistd.h>
 #include "diag.h"
@@ -2623,6 +2624,46 @@ void capture_syntax(text_buf_t *tb)
    syntax_buf = tb;
 }
 
+// The translator's output directories (analyse_file below, and the batch
+// translation in nvc.c's analyse): private temporary directories removed
+// when nvc exits, after every diagnostic that may quote their VHDL.
+// NVC_SV2GHDL_KEEP (any value but empty or 0) keeps them, for debugging,
+// and says where each is.
+static A(char *) sv2ghdl_dirs;
+static pid_t     sv2ghdl_owner;
+
+static void sv2ghdl_cleanup(void)
+{
+   if (getpid() != sv2ghdl_owner)
+      return;   // A forked child: the directories are its parent's
+
+   for (int i = 0; i < sv2ghdl_dirs.count; i++) {
+      nvc_remove_tree(sv2ghdl_dirs.items[i]);
+      free(sv2ghdl_dirs.items[i]);
+   }
+   ACLEAR(sv2ghdl_dirs);
+}
+
+char *sv2ghdl_temp_dir(void)
+{
+   char *dir = nvc_temp_dir("nvc_sv2ghdl_");
+
+   const char *keep = getenv("NVC_SV2GHDL_KEEP");
+   if (keep != NULL && *keep != '\0' && strcmp(keep, "0") != 0)
+      notef("the translation is kept in %s (NVC_SV2GHDL_KEEP)", dir);
+   else {
+      static bool registered = false;
+      if (!registered) {
+         sv2ghdl_owner = getpid();
+         atexit(sv2ghdl_cleanup);
+         registered = true;
+      }
+      APUSH(sv2ghdl_dirs, xstrdup(dir));
+   }
+
+   return dir;
+}
+
 void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
                   mir_context_t *mc)
 {
@@ -2649,8 +2690,7 @@ void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
 
       if (translator != NULL) {
          // Translate to VHDL in a temp directory, then analyse the VHDL
-         char tmpdir[512];
-         snprintf(tmpdir, sizeof(tmpdir), "/tmp/nvc_sv2ghdl_%d", getpid());
+         char *tmpdir LOCAL = sv2ghdl_temp_dir();
 
          char cmd[2048];
          snprintf(cmd, sizeof(cmd),

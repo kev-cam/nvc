@@ -72,6 +72,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <ftw.h>
 #endif
 
 #ifdef HAVE_PTHREAD
@@ -1599,6 +1600,50 @@ void run_program(const char *const *args)
          tb_printf(tb, "%s%s", i > 0 ? " " : "", args[i]);
       fatal("$bold$%s$$ failed with status %d", tb_get(tb), status);
    }
+}
+
+char *nvc_temp_dir(const char *prefix)
+{
+   // A new private directory <TMPDIR, TEMP, TMP or /tmp>/<prefix>XXXXXX
+   static const char *try[] = { "TMPDIR", "TEMP", "TMP" };
+   const char *tmpdir = NULL;
+   for (int i = 0; tmpdir == NULL && i < ARRAY_LEN(try); i++)
+      tmpdir = getenv(try[i]);
+
+#ifdef __MINGW32__
+   char *buf = xasprintf("%s\\%sXXXXXX", tmpdir ?: ".", prefix);
+   if (_mktemp(buf) == NULL || mkdir(buf) != 0)
+      fatal_errno("cannot create a temporary directory %s", buf);
+   return buf;
+#else
+   char *buf = xasprintf("%s/%sXXXXXX", tmpdir ?: "/tmp", prefix);
+   if (mkdtemp(buf) == NULL)
+      fatal_errno("cannot create a temporary directory %s", buf);
+   return buf;
+#endif
+}
+
+#ifndef __MINGW32__
+static int remove_tree_cb(const char *path, const struct stat *sb, int flag,
+                          struct FTW *ftw)
+{
+   if (remove(path) != 0)
+      warnf("cannot remove %s: %s", path, strerror(errno));
+   return 0;   // Carry on with the rest
+}
+#endif
+
+void nvc_remove_tree(const char *path)
+{
+#ifndef __MINGW32__
+   // Children first, never following a symbolic link out of the tree
+   if (nftw(path, remove_tree_cb, 16, FTW_DEPTH | FTW_PHYS) != 0
+       && errno != ENOENT)
+      warnf("cannot remove %s: %s", path, strerror(errno));
+#else
+   if (rmdir(path) != 0 && errno != ENOENT)
+      warnf("cannot remove %s: %s", path, strerror(errno));
+#endif
 }
 
 char *nvc_temp_file(void)

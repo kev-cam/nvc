@@ -34,9 +34,28 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <signal.h>
 
 static int g_quiet = 0;
 #define resolver_printf(...) do { if (!g_quiet) vhpi_printf(__VA_ARGS__); } while(0)
+
+/* An error line, "** Error: resolver: ERROR - <text>", on stderr whatever
+ * SV2VHDL_QUIET says.  vhpi_printf makes a line an nvc note, which
+ * bin/vvp-sv2ghdl and vamos print on stdout as simulation output
+ * ("ERROR - cannot import ..."); an error line is shown as nvc's own
+ * errors are, apart from the design's output */
+static void resolver_error(const char *fmt, ...)
+{
+    va_list ap;
+    fflush(stdout);
+    fputs("** Error: resolver: ERROR - ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -1005,14 +1024,45 @@ static const char *get_plugin_dir(void)
     return dir;
 }
 
+/*
+ * Python must not take SIGINT.  The plugin starts Python while nvc loads it,
+ * before nvc installs its own handler; Python's handler would turn a SIGINT
+ * arriving then into a KeyboardInterrupt inside the resolver, and the run
+ * would go on.  Py_InitializeEx(0) installs none, but importing Python's
+ * signal module installs one while SIGINT is at its default, so the
+ * disposition is also put back after each call into Python.
+ */
+static struct sigaction g_sigint;
+
+static void sigint_save(void)
+{
+    sigaction(SIGINT, NULL, &g_sigint);
+}
+
+static void sigint_restore(void)
+{
+    sigaction(SIGINT, &g_sigint, NULL);
+}
+
+static int python_init_body(void);
+
 static int python_init(void)
+{
+    sigint_save();
+    const int ok = python_init_body();
+    sigint_restore();
+    return ok;
+}
+
+static int python_init_body(void)
 {
     /* Register VHPI bridge module BEFORE Py_Initialize */
     PyImport_AppendInittab(VHPI_MODULE, PyInit_sv2vhdl_vhpi);
 
-    Py_Initialize();
+    /* Py_InitializeEx(0), not Py_Initialize(): no Python signal handlers */
+    Py_InitializeEx(0);
     if (!Py_IsInitialized()) {
-        vhpi_printf("resolver: ERROR - failed to initialize Python");
+        resolver_error("failed to initialize Python");
         return 0;
     }
 
@@ -1031,7 +1081,7 @@ static int python_init(void)
 
     g_py_module = PyImport_ImportModule(RESOLVER_MODULE);
     if (!g_py_module) {
-        vhpi_printf("resolver: ERROR - cannot import %s", RESOLVER_MODULE);
+        resolver_error("cannot import %s", RESOLVER_MODULE);
         if (PyErr_Occurred()) {
             PyErr_Print();
             PyErr_Clear();
@@ -1041,8 +1091,7 @@ static int python_init(void)
 
     g_py_func = PyObject_GetAttrString(g_py_module, RESOLVER_FUNC);
     if (!g_py_func || !PyCallable_Check(g_py_func)) {
-        vhpi_printf("resolver: ERROR - %s.%s not callable",
-                     RESOLVER_MODULE, RESOLVER_FUNC);
+        resolver_error("%s.%s not callable", RESOLVER_MODULE, RESOLVER_FUNC);
         Py_XDECREF(g_py_func);
         g_py_func = NULL;
         return 0;
@@ -1180,7 +1229,7 @@ static PyObject *call_python_resolver(void)
     /* Build list of nets needing resolution */
     PyObject *net_list = PyList_New(0);
     if (!net_list) {
-        vhpi_printf("resolver: ERROR - cannot create Python list");
+        resolver_error("cannot create Python list");
         return NULL;
     }
 
@@ -1206,13 +1255,15 @@ static PyObject *call_python_resolver(void)
     /* Call: resolve_net(net_list, design_name) */
     PyObject *py_design = PyUnicode_FromString(g_design_name);
     PyObject *args = PyTuple_Pack(2, net_list, py_design);
+    sigint_save();
     PyObject *result = PyObject_CallObject(g_py_func, args);
+    sigint_restore();
     Py_DECREF(args);
     Py_DECREF(py_design);
     Py_DECREF(net_list);
 
     if (!result) {
-        vhpi_printf("resolver: ERROR - Python exception in %s", RESOLVER_FUNC);
+        resolver_error("Python exception in %s", RESOLVER_FUNC);
         if (PyErr_Occurred()) {
             PyErr_Print();
             PyErr_Clear();
@@ -1297,7 +1348,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 
     vhpiHandleT root = vhpi_handle(vhpiRootInst, NULL);
     if (!root) {
-        vhpi_printf("resolver: ERROR - cannot get root instance");
+        resolver_error("cannot get root instance");
         return;
     }
 
@@ -1347,7 +1398,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
     /* Phase 3: Call Python to generate per-net VHDL files */
     PyObject *file_dict = call_python_resolver();
     if (!file_dict) {
-        vhpi_printf("resolver: ERROR - no VHDL generated");
+        resolver_error("no VHDL generated");
         for (net_info_t *n = g_nets; n; n = n->next) {
             if (n->needs_resolution) {
                 resolver_printf("resolver: UNRESOLVED net %s (%d endpoints)",
@@ -1450,8 +1501,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
         /* Write the file */
         FILE *f = fopen(cache_path, "w");
         if (!f) {
-            vhpi_printf("resolver: ERROR - cannot write %s: %s",
-                         cache_path, strerror(errno));
+            resolver_error("cannot write %s: %s", cache_path, strerror(errno));
             errors++;
             continue;
         }
@@ -1468,8 +1518,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 
             FILE *proc = popen(cmd, "r");
             if (!proc) {
-                vhpi_printf("resolver: ERROR - cannot spawn nvc for %s",
-                             fname);
+                resolver_error("cannot spawn nvc for %s", fname);
                 errors++;
                 continue;
             }
@@ -1483,8 +1532,7 @@ static void start_of_sim(const vhpiCbDataT *cb_data)
 
             int status = pclose(proc);
             if (status != 0) {
-                vhpi_printf("resolver: ERROR - compilation failed for %s",
-                             fname);
+                resolver_error("compilation failed for %s", fname);
                 errors++;
             } else {
                 compiled++;

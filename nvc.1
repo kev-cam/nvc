@@ -428,6 +428,28 @@ disabled by default as it can have significant performance, memory, and
 disk space overhead.  With optional argument
 .Ar N
 only arrays with up to this many elements will be dumped.
+.\" --dump-scope
+.It Fl \-dump-scope Ns = Ns Ar path Ns Op , Ns Ar levels
+Include in the waveform data the signals of the instance
+.Ar path
+and of the instances up to
+.Ar levels
+\- 1 levels below it, as the Verilog
+.Ql $dumpvars(levels, path)
+does: a
+.Ar levels
+of 0, the default, includes every level below, and 1 the instance alone.
+.Ar path
+is a path name such as
+.Ql :top:u1
+or a Verilog hierarchical name such as
+.Ql top.u1 ,
+and can also name a single signal.  The option may be given more than once;
+with it, as with
+.Fl \-include ,
+only the signals selected are dumped.  A
+.Ar path
+that names no instance or signal of the design is a warning.
 .\" --exit-severity
 .It Fl \-exit-severity Ns = Ns Ar level
 Terminate the simulation after an assertion failures of severity greater
@@ -1320,6 +1342,30 @@ character.
 When both inclusion and exclusion patterns are present, exclusions have
 precedence over inclusions.  If no inclusion patterns are present then
 all signals are implicitly included.
+.Pp
+With inclusion or exclusion patterns, or
+.Fl \-dump-scope ,
+an instance or block that is left with no signal to dump is left out of
+the waveform data too.  A dump in which no signal is left is an empty
+waveform file and a warning.
+.Ss Designs translated from Verilog
+Under
+.Fl \-std=2040
+the waveform data of a design translated from Verilog is written as a
+Verilog simulator writes it: a signal of the 3D logic type of the
+.Ql sv2vhdl
+library
+.Pq Ql LOGIC3D
+or a vector of it is a four-state wire of values
+.Ql 0 ,
+.Ql 1 ,
+.Ql x
+and
+.Ql z ,
+dumped without
+.Fl \-dump-arrays ,
+instances are module scopes and blocks begin scopes, and a VCD file has
+no VHDL type extensions.
 .\" ------------------------------------------------------------
 .\" VHPI
 .\" ------------------------------------------------------------
@@ -1485,6 +1531,23 @@ Limit the number of worker threads
 can create.
 The default is either eight or the number of available CPUs, whichever
 is smaller.
+.It Ev NVC_REPORT_END_TIME
+When set to anything but an empty string or 0, the end of a
+.Fl r
+run prints the time the simulation ended at and why, for a tool that
+runs
+.Nm :
+.Ql simulation ended at <time> (stop time | no more events | stopped | interrupted) .
+A run that
+.Fl \-stop-time
+ends while events remain ends at the stop time itself.
+.It Ev NVC_SV2GHDL_KEEP
+When set to anything but an empty string or 0, the temporary directories
+that a Verilog source is translated into (through
+.Ql iverilog-sv2ghdl )
+are kept when
+.Nm
+exits, and their names are printed; otherwise they are removed.
 .El
 .\" .Sh FILES
 .\" .Sh EXIT STATUS

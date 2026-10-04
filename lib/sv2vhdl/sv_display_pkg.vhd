@@ -57,7 +57,68 @@ package sv_display_pkg is
     -- as vvp does; no INTEGER range limit and no rounding to whole units.
     impure function sv_tstr(value : real; scope_units : integer;
                             scope_prec : integer) return string;
+
+    -- ---- File I/O: $fopen family, $fdisplay/$fwrite/$fstrobe/$fmonitor,
+    -- ---- $fclose, $fflush ---------------------------------------------------
+    -- vvp's semantics (vpi/sys_fileio.c, sys_display.c, vvp/vpi_mcd.cc).  A
+    -- descriptor is the Verilog value's vpiIntVal (logic3d_types_pkg's
+    -- sv_vec_int32).  Bit 31 set (a negative integer): a file descriptor
+    -- (FD), index 0 stdin, 1 stdout, 2 stderr, files from 3 up, the lowest
+    -- free index first.  Bit 31 clear: a multi-channel descriptor (MCD), bit
+    -- 0 stdout, bits 1 .. 30 the files of the one-argument $fopen.  Text for
+    -- stdout -- and for stderr: a run has one output stream -- goes through
+    -- the $display line buffer above; other text reaches its files byte for
+    -- byte.  Messages are vvp's, printed like $display output; `loc' is the
+    -- call's "<file>:<line>", `task' its task name.  A relative file name is
+    -- resolved by logic3d_types_pkg's sv_file_path.
+    --
+    -- $fopen(name): an MCD, 0 when the file cannot be opened.  kind: the vpi
+    -- type of the name argument, for vvp's "not a valid string" message.
+    impure function sv_fopen(name : string; kind : string; loc : string)
+        return integer;
+    -- $fopen(name, mode) and $fopenr/$fopenw/$fopena(name) (`task' names the
+    -- call; only $fopen checks its mode): an FD, 0 on failure.  The files are
+    -- text: "b" changes nothing, and "w+"/"a+" write as "w"/"a" do (no task
+    -- reads a file back); "r+" (update in place) is refused with a warning.
+    impure function sv_fopen(name : string; kind : string; mode : string;
+                             task : string; loc : string) return integer;
+    -- $fwrite / $fdisplay (s & LF): a warning for an invalid descriptor,
+    -- nothing at all for 0 (vvp's get_fd_mcd_from_arg); the text is
+    -- evaluated either way, as vvp evaluates the arguments
+    procedure sv_fwrite(fd : integer; s : string; task : string; loc : string);
+    procedure sv_fdisplay(fd : integer; s : string; task : string; loc : string);
+    procedure sv_fclose(fd : integer; loc : string);
+    procedure sv_fflush_all;
+    procedure sv_fflush(fd : integer; loc : string);
+    -- $fstrobe: sv_fstrobe_arm checks the descriptor of a call of the
+    -- statement `key' (its request signal's 'path_name: one per instance)
+    -- and records the call; at the end of the time step the statement's
+    -- companion process writes each recorded call's text, evaluated for
+    -- it, to that call's descriptor:
+    --     while sv_fstrobe_next(key) loop sv_fput_due(<text> & LF); end loop;
+    -- skipping a descriptor that was closed meanwhile (vvp's strobe_cb).
+    procedure sv_fstrobe_arm(key : string; fd : integer; task : string;
+                             loc : string);
+    impure function sv_fstrobe_next(key : string) return boolean;
+    -- $fmonitor: each call of statement `key' starts a monitor on its
+    -- descriptor, which writes at the end of the call's time step and at the
+    -- end of every later time step in which a monitored value changed
+    -- (`changed'), until an $fclose of a descriptor it writes to (vvp's
+    -- sys_monitor_fclose):
+    --     while sv_fmonitor_next(key, <changed>) loop
+    --         sv_fput_due(<text> & LF);
+    --     end loop;
+    -- $monitoroff and $monitoron leave it alone.
+    procedure sv_fmonitor_arm(key : string; fd : integer; task : string;
+                              loc : string);
+    impure function sv_fmonitor_next(key : string; changed : boolean)
+        return boolean;
+    -- the text of the call sv_fstrobe_next / sv_fmonitor_next made due
+    procedure sv_fput_due(s : string);
 end package;
+
+use std.textio.all;                    -- the files (TEXT, written raw)
+use work.logic3d_types_pkg.all;        -- sv_file_path, sv_file_name_msg
 
 package body sv_display_pkg is
 
@@ -530,6 +591,688 @@ package body sv_display_pkg is
     procedure sv_write_flush is
     begin
         g_wbuf.flush_partial;
+    end procedure;
+
+
+    -- =====================================================================
+    -- File I/O (see the package declaration).  A TEXT file is written with
+    -- the implicit WRITE(f, string), which writes the characters and nothing
+    -- else, so the bytes of $fwrite/$fdisplay reach the file unchanged.
+    -- =====================================================================
+
+    -- C's "%x" of a 32-bit value (no leading zeros)
+    function hex32(i : integer) return string is
+        constant u : unsigned(31 downto 0) := unsigned(to_signed(i, 32));
+        variable r : string(1 to 8);
+    begin
+        for k in 0 to 7 loop
+            r(8 - k) := HEXCHARS(to_integer(u(4 * k + 3 downto 4 * k)) + 1);
+        end loop;
+        for k in 1 to 7 loop
+            if r(k) /= '0' then
+                return r(k to 8);
+            end if;
+        end loop;
+        return r(8 to 8);
+    end function;
+
+    function is_mcd(fd : integer) return boolean is
+    begin
+        return fd >= 0;
+    end function;
+
+    -- bit b (0 .. 30) of an MCD
+    function mcd_bit(fd : integer; b : natural) return boolean is
+    begin
+        return (fd / 2 ** b) mod 2 = 1;
+    end function;
+
+    -- the index of an FD (its bits 30 .. 0)
+    function fd_index(fd : integer) return natural is
+    begin
+        return (fd + 2147483647) + 1;
+    end function;
+
+    -- vvp's as_escaped, for a mode argument (printable here: the mode is
+    -- at most three characters when it is shown)
+    function c_esc(s : string) return string is
+        variable r : string(1 to 4 * s'length + 1);
+        variable k : natural := 0;
+        variable c : natural;
+    begin
+        for i in s'range loop
+            c := character'pos(s(i));
+            if c >= 32 and c < 127 then
+                k := k + 1;
+                r(k) := s(i);
+            else
+                r(k + 1) := '\';
+                r(k + 2) := character'val(48 + (c / 64) mod 8);
+                r(k + 3) := character'val(48 + (c / 8) mod 8);
+                r(k + 4) := character'val(48 + c mod 8);
+                k := k + 4;
+            end if;
+        end loop;
+        return r(1 to k);
+    end function;
+
+    -- One open file: an object per descriptor slot, made on first use and
+    -- reused after a close
+    type t_fslot is protected
+        impure function open_file(name : string; m : file_open_kind)
+            return boolean;
+        procedure put(s : string);
+        procedure close_file;
+        procedure flush_file;
+    end protected;
+
+    type t_fslot is protected body
+        file f : text;
+        variable opened : boolean := false;
+
+        impure function open_file(name : string; m : file_open_kind)
+            return boolean is
+            variable st : file_open_status;
+        begin
+            if opened then
+                file_close(f);
+                opened := false;
+            end if;
+            file_open(st, f, name, m);
+            opened := st = OPEN_OK;
+            return opened;
+        end function;
+
+        procedure put(s : string) is
+        begin
+            if opened then
+                write(f, s);
+            end if;
+        end procedure;
+
+        procedure close_file is
+        begin
+            if opened then
+                file_close(f);
+                opened := false;
+            end if;
+        end procedure;
+
+        procedure flush_file is
+        begin
+            if opened then
+                flush(f);
+            end if;
+        end procedure;
+    end protected body;
+
+    type t_fslot_ptr is access t_fslot;
+    -- nvc lowers a protected type's methods with its objects: without an object
+    -- of its own, a design that calls t_fslot.put through an access value but
+    -- never reaches `new t_fslot' failed to elaborate ("missing vcode for
+    -- SV2VHDL.SV_DISPLAY_PKG.T_FSLOT.PUT(S)")
+    shared variable g_fslot_lowered : t_fslot;
+
+    type t_chan is record
+        slot     : t_fslot_ptr;
+        is_open  : boolean;
+        writable : boolean;
+        touched  : natural;     -- the epoch of its last open or close
+    end record;
+    type t_chan_vec is array (natural range <>) of t_chan;
+    type t_chan_vec_ptr is access t_chan_vec;
+
+    constant FD_INCR : natural := 32;     -- vvp grows its FD table by 32 ...
+    constant FD_MAX  : natural := 1024;   -- ... up to 1024 descriptors
+
+    -- A $fstrobe call waiting for the end of its time step, or a running
+    -- $fmonitor
+    type t_arm is record
+        key   : line;             -- the statement (an instance's)
+        fd    : integer;
+        epoch : natural;          -- the file epoch when it was armed
+        first : boolean;          -- a monitor's first write is still due
+    end record;
+    type t_arm_vec is array (natural range <>) of t_arm;
+    type t_arm_vec_ptr is access t_arm_vec;
+
+    procedure arm_add(v : inout t_arm_vec_ptr; n : inout natural;
+                      key : string; fd : integer; epoch : natural) is
+        variable nv : t_arm_vec_ptr;
+    begin
+        if v = null then
+            v := new t_arm_vec(0 to 15);
+        elsif n > v'high then
+            nv := new t_arm_vec(0 to 2 * v'length - 1);
+            nv(0 to n - 1) := v(0 to n - 1);
+            deallocate(v);
+            v := nv;
+        end if;
+        v(n) := (new string'(key), fd, epoch, true);
+        n := n + 1;
+    end procedure;
+
+    -- The descriptor tables.  MCD bit 0 and FDs 0 .. 2 are always open.
+    type t_fio is protected
+        impure function open_mcd(name : string) return integer;
+        -- the index of the new FD; 0: the open failed, -1: the table is full
+        impure function open_fd(name : string; m : file_open_kind;
+                                writable : boolean) return integer;
+        impure function valid(fd : integer) return boolean;
+        procedure put(fd : integer; s : string);
+        procedure close(fd : integer);
+        procedure flush(fd : integer);
+        procedure flush_all;
+        procedure strobe_arm(key : string; fd : integer);
+        impure function strobe_next(key : string) return boolean;
+        procedure monitor_arm(key : string; fd : integer);
+        impure function monitor_next(key : string; changed : boolean)
+            return boolean;
+        procedure put_due(s : string);
+    end protected;
+
+    type t_fio is protected body
+        variable mcd : t_chan_vec(0 to 30);
+        variable fds : t_chan_vec_ptr := null;
+        variable ep  : natural := 0;
+        variable strobes  : t_arm_vec_ptr := null;
+        variable nstrobes : natural := 0;
+        variable mons     : t_arm_vec_ptr := null;
+        variable nmons    : natural := 0;
+        variable due_fd   : integer := 0;     -- the call sv_fput_due writes
+        variable scan     : integer := -1;    -- monitor_next's place, -1: idle
+
+        procedure ensure_fds is
+        begin
+            if fds = null then
+                fds := new t_chan_vec(0 to FD_INCR - 1);
+                for i in 0 to 2 loop
+                    fds(i).is_open := true;
+                end loop;
+            end if;
+        end procedure;
+
+        procedure touch(c : inout t_chan) is
+        begin
+            ep := ep + 1;
+            c.touched := ep;
+        end procedure;
+
+        impure function open_mcd(name : string) return integer is
+            variable p : t_fslot_ptr;
+        begin
+            for i in 1 to 30 loop
+                if not mcd(i).is_open then
+                    if mcd(i).slot = null then
+                        mcd(i).slot := new t_fslot;
+                    end if;
+                    p := mcd(i).slot;
+                    if not p.open_file(name, WRITE_MODE) then
+                        return 0;
+                    end if;
+                    mcd(i).is_open := true;
+                    mcd(i).writable := true;
+                    touch(mcd(i));
+                    return 2 ** i;
+                end if;
+            end loop;
+            return 0;           -- every channel is in use
+        end function;
+
+        impure function open_fd(name : string; m : file_open_kind;
+                                writable : boolean) return integer is
+            variable p   : t_fslot_ptr;
+            variable n   : t_chan_vec_ptr;
+            variable idx : integer := -1;
+        begin
+            ensure_fds;
+            for i in 3 to fds'high loop
+                if not fds(i).is_open then
+                    idx := i;
+                    exit;
+                end if;
+            end loop;
+            if idx < 0 then
+                if fds'length >= FD_MAX then
+                    return -1;
+                end if;
+                idx := fds'length;
+                n := new t_chan_vec(0 to fds'length + FD_INCR - 1);
+                n(fds'range) := fds.all;
+                deallocate(fds);
+                fds := n;
+            end if;
+            if fds(idx).slot = null then
+                fds(idx).slot := new t_fslot;
+            end if;
+            p := fds(idx).slot;
+            if not p.open_file(name, m) then
+                return 0;
+            end if;
+            fds(idx).is_open := true;
+            fds(idx).writable := writable;
+            touch(fds(idx));
+            return idx;
+        end function;
+
+        -- vvp's is_valid_fd_mcd (fd /= 0)
+        impure function valid(fd : integer) return boolean is
+            variable idx : natural;
+        begin
+            if is_mcd(fd) then
+                for b in 1 to 30 loop
+                    if mcd_bit(fd, b) and not mcd(b).is_open then
+                        return false;
+                    end if;
+                end loop;
+                return true;
+            end if;
+            ensure_fds;
+            idx := fd_index(fd);
+            return idx <= fds'high and fds(idx).is_open;
+        end function;
+
+        -- stdout: MCD bit 0, or FD 1 (and FD 2, stderr, which shares it)
+        procedure put(fd : integer; s : string) is
+            variable p   : t_fslot_ptr;
+            variable idx : natural;
+        begin
+            if is_mcd(fd) then
+                if mcd_bit(fd, 0) then
+                    sv_write_buf(s);
+                end if;
+                for b in 1 to 30 loop
+                    if mcd_bit(fd, b) and mcd(b).is_open then
+                        p := mcd(b).slot;
+                        p.put(s);
+                    end if;
+                end loop;
+                return;
+            end if;
+            ensure_fds;
+            idx := fd_index(fd);
+            if idx = 1 or idx = 2 then
+                sv_write_buf(s);
+            elsif idx >= 3 and idx <= fds'high and fds(idx).is_open
+                and fds(idx).writable then
+                p := fds(idx).slot;
+                p.put(s);
+            end if;
+        end procedure;
+
+        procedure close(fd : integer) is
+            variable p   : t_fslot_ptr;
+            variable idx : natural;
+        begin
+            if is_mcd(fd) then
+                if mcd_bit(fd, 0) then
+                    touch(mcd(0));          -- stdout stays open
+                end if;
+                for b in 1 to 30 loop
+                    if mcd_bit(fd, b) and mcd(b).is_open then
+                        p := mcd(b).slot;
+                        p.close_file;
+                        mcd(b).is_open := false;
+                        touch(mcd(b));
+                    end if;
+                end loop;
+                return;
+            end if;
+            ensure_fds;
+            idx := fd_index(fd);
+            if idx <= 2 then
+                touch(fds(idx));            -- stdin/stdout/stderr stay open
+            elsif idx <= fds'high and fds(idx).is_open then
+                p := fds(idx).slot;
+                p.close_file;
+                fds(idx).is_open := false;
+                touch(fds(idx));
+            end if;
+        end procedure;
+
+        procedure flush(fd : integer) is
+            variable p   : t_fslot_ptr;
+            variable idx : natural;
+        begin
+            if is_mcd(fd) then
+                for b in 1 to 30 loop
+                    if mcd_bit(fd, b) and mcd(b).is_open then
+                        p := mcd(b).slot;
+                        p.flush_file;
+                    end if;
+                end loop;
+                return;
+            end if;
+            ensure_fds;
+            idx := fd_index(fd);
+            if idx >= 3 and idx <= fds'high and fds(idx).is_open
+                and fds(idx).writable then
+                p := fds(idx).slot;
+                p.flush_file;
+            end if;
+        end procedure;
+
+        procedure flush_all is
+            variable p : t_fslot_ptr;
+        begin
+            for b in 1 to 30 loop
+                if mcd(b).is_open then
+                    p := mcd(b).slot;
+                    p.flush_file;
+                end if;
+            end loop;
+            if fds /= null then
+                for i in 3 to fds'high loop
+                    if fds(i).is_open and fds(i).writable then
+                        p := fds(i).slot;
+                        p.flush_file;
+                    end if;
+                end loop;
+            end if;
+        end procedure;
+
+        -- an $fmonitor armed at epoch `armed' still runs: no descriptor it
+        -- writes to was closed (or opened again) since -- vvp's
+        -- sys_monitor_fclose cancels it at the $fclose
+        impure function live(fd : integer; armed : natural) return boolean is
+            variable idx : natural;
+        begin
+            if is_mcd(fd) then
+                for b in 0 to 30 loop
+                    if mcd_bit(fd, b) then
+                        if (b > 0 and not mcd(b).is_open)
+                            or mcd(b).touched > armed then
+                            return false;
+                        end if;
+                    end if;
+                end loop;
+                return true;
+            end if;
+            ensure_fds;
+            idx := fd_index(fd);
+            return idx <= fds'high and fds(idx).is_open
+                and fds(idx).touched <= armed;
+        end function;
+
+        procedure strobe_arm(key : string; fd : integer) is
+        begin
+            arm_add(strobes, nstrobes, key, fd, ep);
+        end procedure;
+
+        -- the first recorded call of statement `key', taken off the list
+        -- (calls are recorded in call order)
+        impure function strobe_next(key : string) return boolean is
+        begin
+            for i in 0 to nstrobes - 1 loop
+                if strobes(i).key.all = key then
+                    due_fd := strobes(i).fd;
+                    deallocate(strobes(i).key);
+                    for k in i to nstrobes - 2 loop
+                        strobes(k) := strobes(k + 1);
+                    end loop;
+                    nstrobes := nstrobes - 1;
+                    return true;
+                end if;
+            end loop;
+            return false;
+        end function;
+
+        procedure monitor_arm(key : string; fd : integer) is
+        begin
+            arm_add(mons, nmons, key, fd, ep);
+        end procedure;
+
+        -- the next running monitor of statement `key' that writes now (a
+        -- monitored value changed, or its first write is due); a scan of
+        -- the list from where the last call left off, until it says false
+        impure function monitor_next(key : string; changed : boolean)
+            return boolean is
+            variable i : natural;
+            variable k : natural := 0;
+        begin
+            if scan < 0 then
+                scan := 0;
+            end if;
+            while scan < nmons loop
+                i := scan;
+                scan := scan + 1;
+                if mons(i).key.all = key and live(mons(i).fd, mons(i).epoch)
+                    and (changed or mons(i).first) then
+                    mons(i).first := false;
+                    due_fd := mons(i).fd;
+                    return true;
+                end if;
+            end loop;
+            scan := -1;
+            -- the end of a scan: forget the monitors an $fclose ended
+            for j in 0 to nmons - 1 loop
+                if live(mons(j).fd, mons(j).epoch) then
+                    mons(k) := mons(j);
+                    k := k + 1;
+                else
+                    deallocate(mons(j).key);
+                end if;
+            end loop;
+            nmons := k;
+            return false;
+        end function;
+
+        procedure put_due(s : string) is
+        begin
+            if due_fd /= 0 and valid(due_fd) then
+                put(due_fd, s);
+            end if;
+        end procedure;
+    end protected body;
+
+    shared variable g_fio : t_fio;
+
+    procedure fd_warn(fd : integer; task : string; loc : string) is
+    begin
+        if is_mcd(fd) then
+            sv_display_line("WARNING: " & loc & ": invalid MCD (0x" & hex32(fd)
+                            & ") given to " & task & "().");
+        else
+            sv_display_line("WARNING: " & loc & ": invalid file descriptor (0x"
+                            & hex32(fd) & ") given to " & task & "().");
+        end if;
+    end procedure;
+
+    impure function sv_fd_ok(fd : integer; task : string; loc : string)
+        return boolean is
+    begin
+        if fd = 0 then
+            return false;
+        end if;
+        if not g_fio.valid(fd) then
+            fd_warn(fd, task, loc);
+            return false;
+        end if;
+        return true;
+    end function;
+
+    procedure print_msg(s : string) is
+    begin
+        if s'length > 0 then
+            sv_write_buf(s);
+        end if;
+    end procedure;
+
+    impure function sv_fopen(name : string; kind : string; loc : string)
+        return integer is
+        constant msg : string := sv_file_name_msg(name, kind, "$fopen", loc);
+    begin
+        if msg'length > 0 then
+            print_msg(msg);
+            return 0;
+        end if;
+        return g_fio.open_mcd(sv_file_path(name));
+    end function;
+
+    impure function sv_fopen(name : string; kind : string; mode : string;
+                             task : string; loc : string) return integer is
+        alias md : string(1 to mode'length) is mode;
+        constant name_msg : string := sv_file_name_msg(name, kind, task, loc);
+        variable fail     : boolean := false;
+        variable bin      : boolean := false;
+        variable plus     : boolean := false;
+        variable idx      : integer;
+        variable writable : boolean := true;
+        variable m        : file_open_kind := WRITE_MODE;
+    begin
+        if task = "$fopen" then
+            -- vvp's sys_fopen_calltf checks the mode first
+            if md'length = 0 then
+                sv_display_line("WARNING: " & loc & ": $fopen's mode argument "
+                                & "is not a valid string.");
+                fail := true;
+            end if;
+            if md'length > 3 then
+                sv_display_line("WARNING: " & loc & ": $fopen's mode argument ("
+                                & c_esc(md) & ") is too long.");
+                fail := true;
+            else
+                if md'length = 0 or (md(1) /= 'r' and md(1) /= 'w'
+                                     and md(1) /= 'a') then
+                    fail := true;
+                else
+                    for i in 2 to md'length loop
+                        if md(i) = 'b' and not bin then
+                            bin := true;
+                        elsif md(i) = '+' and not plus then
+                            plus := true;
+                        else
+                            fail := true;
+                        end if;
+                    end loop;
+                end if;
+                if fail then
+                    sv_display_line("WARNING: " & loc & ": $fopen's mode "
+                                    & "argument (" & c_esc(md)
+                                    & ") is invalid.");
+                end if;
+            end if;
+        end if;
+        print_msg(name_msg);
+        if fail or name_msg'length > 0 or md'length = 0 then
+            return 0;
+        end if;
+        -- C fopen's modes on TEXT files ("b" changes nothing on POSIX)
+        for i in 2 to md'length loop
+            if md(i) = '+' then
+                plus := true;
+            end if;
+        end loop;
+        if md(1) = 'r' then
+            if plus then
+                -- read and write in place: textio has no such mode, so the
+                -- file is not opened (never written wrongly)
+                sv_display_line("WARNING: " & loc & ": " & task & ": mode """
+                                & md & """ (read and update) is not supported; "
+                                & "the file is not opened.");
+                return 0;
+            end if;
+            m := READ_MODE;
+            writable := false;
+        elsif md(1) = 'a' then
+            m := APPEND_MODE;
+        end if;
+        idx := g_fio.open_fd(sv_file_path(name), m, writable);
+        if idx < 0 then
+            sv_display_line("WARNING: " & loc & ": " & task & ": no more than "
+                            & integer'image(FD_MAX) & " files can be open at once.");
+            return 0;
+        elsif idx = 0 then
+            return 0;
+        end if;
+        return -2147483647 - 1 + idx;
+    end function;
+
+    procedure sv_fwrite(fd : integer; s : string; task : string;
+                        loc : string) is
+    begin
+        if sv_fd_ok(fd, task, loc) then
+            g_fio.put(fd, s);
+        end if;
+    end procedure;
+
+    procedure sv_fdisplay(fd : integer; s : string; task : string;
+                          loc : string) is
+    begin
+        if sv_fd_ok(fd, task, loc) then
+            g_fio.put(fd, s & LF);
+        end if;
+    end procedure;
+
+    procedure sv_fclose(fd : integer; loc : string) is
+        variable idx : natural;
+    begin
+        if not sv_fd_ok(fd, "$fclose", loc) then
+            return;
+        end if;
+        g_fio.close(fd);      -- also ends the $fmonitor calls on it
+        if is_mcd(fd) then
+            if mcd_bit(fd, 0) then
+                sv_display_line("WARNING: " & loc & ": could not close MCD "
+                                & "STDOUT (0x1) in $fclose().");
+            end if;
+        else
+            idx := fd_index(fd);
+            if idx = 0 then
+                sv_display_line("WARNING: " & loc & ": could not close file "
+                                & "descriptor STDIN (0x80000000) in $fclose().");
+            elsif idx = 1 then
+                sv_display_line("WARNING: " & loc & ": could not close file "
+                                & "descriptor STDOUT (0x80000001) in $fclose().");
+            elsif idx = 2 then
+                sv_display_line("WARNING: " & loc & ": could not close file "
+                                & "descriptor STDERR (0x80000002) in $fclose().");
+            end if;
+        end if;
+    end procedure;
+
+    procedure sv_fflush_all is
+    begin
+        g_fio.flush_all;
+    end procedure;
+
+    procedure sv_fflush(fd : integer; loc : string) is
+    begin
+        if sv_fd_ok(fd, "$fflush", loc) then
+            g_fio.flush(fd);
+        end if;
+    end procedure;
+
+    procedure sv_fstrobe_arm(key : string; fd : integer; task : string;
+                             loc : string) is
+    begin
+        if sv_fd_ok(fd, task, loc) then
+            g_fio.strobe_arm(key, fd);
+        end if;
+    end procedure;
+
+    impure function sv_fstrobe_next(key : string) return boolean is
+    begin
+        return g_fio.strobe_next(key);
+    end function;
+
+    procedure sv_fmonitor_arm(key : string; fd : integer; task : string;
+                              loc : string) is
+    begin
+        if sv_fd_ok(fd, task, loc) then
+            g_fio.monitor_arm(key, fd);
+        end if;
+    end procedure;
+
+    impure function sv_fmonitor_next(key : string; changed : boolean)
+        return boolean is
+    begin
+        return g_fio.monitor_next(key, changed);
+    end function;
+
+    procedure sv_fput_due(s : string) is
+    begin
+        g_fio.put_due(s);
     end procedure;
 
 end package body;

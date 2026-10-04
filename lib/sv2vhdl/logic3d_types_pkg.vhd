@@ -219,6 +219,9 @@ package logic3d_types_pkg is
     -- weak alphabet codes normalize to driven ones, Z stays Z
     --                  L  H  0  1  Z  W  X  U
     function l3d_strengthen(a : logic3d) return logic3d;
+    -- Element-wise, for a vector (a variable copied from a weak net stores
+    -- no strength; a vector continuous assignment drives its own)
+    function l3d_strengthen(a : logic3d_vector) return logic3d_vector;
     function l3d_weaken(a : logic3d) return logic3d;
     function l3d_set_uncertain(a : logic3d) return logic3d;
 
@@ -365,6 +368,8 @@ package logic3d_types_pkg is
     function l3d_le_s(a, b : logic3d_vector) return boolean;
     function l3d_ge_s(a, b : logic3d_vector) return boolean;
     function l3d_div_s(a, b : logic3d_vector) return logic3d_vector;
+    -- Verilog's signed %: the remainder takes the DIVIDEND's sign (VHDL rem,
+    -- not mod: -7 % 3 is -1); a % 0 is all x.
     function l3d_mod_s(a, b : logic3d_vector) return logic3d_vector;
     -- Sign-extending resize (Verilog signed widening): fill high bits w/ sign.
     function l3d_resize_s(a : logic3d_vector; new_size : natural) return logic3d_vector;
@@ -375,11 +380,10 @@ package logic3d_types_pkg is
     function "mod"(a, b : logic3d_vector) return logic3d_vector;
     function "rem"(a, b : logic3d_vector) return logic3d_vector;
 
-    -- Verilog $random(seed): one deterministic step of a seeded RNG. A pure
-    -- function (no inout) returning the next value; tgt-vhdl assigns it to the
-    -- target AND re-applies it to the seed, so it composes with any lvalue and
-    -- with a signal- or variable-class seed.
-    function sv_random(seed : logic3d_vector) return logic3d_vector;
+    -- (Verilog $random(seed) / $urandom(seed): sv_math_pkg's sv_random_value,
+    -- sv_urandom_value and sv_random_next, vvp's sequence.  The
+    -- glibc-constant LCG sv_random(seed) that stood here returned the new
+    -- seed as the value.)
 
     -- Resize (extend or truncate)
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector;
@@ -496,17 +500,88 @@ package logic3d_types_pkg is
     function "nor" (a, b : logic3d_vector) return logic3d_vector;
     function "xnor"(a, b : logic3d_vector) return logic3d_vector;
 
-    -- $readmemh / $readmemb support (emitted by iverilog tgt-vhdl).
-    -- sv_readmem_load parses the whole file (whitespace-separated words,
-    -- '_' separators, // and /* */ comments, @<hex> address directives,
-    -- x/z digits) into a process-wide store; the caller then copies word i
-    -- to mem(sv_readmem_addr(i)) for i in 0 .. sv_readmem_count-1, skipping
-    -- addresses outside the memory. start = first address (Verilog default:
-    -- the lowest address of the memory).
-    procedure sv_readmem_load(fname : string; hex : boolean; start : integer);
+    -- $readmemh / $readmemb / $writememh / $writememb support (emitted by
+    -- iverilog tgt-vhdl), with vvp's rules and messages (vpi/sys_readmem.c,
+    -- sys_readmem_lex.lex, sys_priv.c get_filename):
+    --
+    --   sv_readmem_load(<file>, <hex>, "$readmemh", "<file>:<line>",
+    --       "<scope>.<memory>", <left>, <right>, <word width>, <kind>,
+    --       <has start>, <start>, <start is real>,
+    --       <has finish>, <finish>, <finish is real>);
+    --   sv_write_buf(sv_memfile_msgs);         -- sv_display_pkg
+    --   for i in 0 to sv_readmem_count - 1 loop
+    --       mem(sv_readmem_addr(i) - <lowest address>) := sv_readmem_word(i, W);
+    --   end loop;
+    --
+    -- sv_readmem_load checks the arguments, reads the whole file into a
+    -- process-wide store and keeps the words that go into the memory, with
+    -- their Verilog addresses: lowest address first unless start/finish say
+    -- otherwise, @<hex> moves to an address (one outside [start, finish] is
+    -- an error), the load stops at an invalid character or at a word past
+    -- the range ("Too many words"), and a file with too few words and no
+    -- @address gets "Not enough words".  A word's digits fill it from the
+    -- right: x and z only where their digit is, the bits above the digits
+    -- 0, excess digits dropped (one warning per call).  <left>/<right>: the
+    -- memory's declared range [left:right]; <kind>: the vpi type of the
+    -- file name argument, for the "not a valid string" message.  1-bit
+    -- words: sv_readmem_bit(i).
+    --
+    --   sv_writemem_open(<file>, <hex>, "$writememh", <the same arguments
+    --       from the location on, less the word width>);
+    --   sv_write_buf(sv_memfile_msgs);
+    --   for i in 0 to sv_writemem_count - 1 loop
+    --       sv_writemem_word(<mem(sv_writemem_addr(i) - lowest) as %h or %b>);
+    --   end loop;
+    --   sv_writemem_close;
+    --
+    -- The messages are vvp's, "WARNING: <loc>: ..." / "ERROR: <loc>: ...",
+    -- each line ending in LF; sv_memfile_msgs returns (and forgets) those of
+    -- the last call, for the caller to print with the testbench's output.
+    procedure sv_readmem_load(fname : string; hex : boolean; task : string;
+                              loc : string; mem : string;
+                              left_a : integer; right_a : integer;
+                              wwid : positive; kind : string;
+                              has_start : boolean; start_a : integer;
+                              start_real : boolean;
+                              has_stop : boolean; stop_a : integer;
+                              stop_real : boolean);
     impure function sv_readmem_count return natural;
     impure function sv_readmem_addr(i : natural) return integer;
     impure function sv_readmem_word(i : natural; w : positive) return logic3d_vector;
+    impure function sv_readmem_bit(i : natural) return logic3d;
+    procedure sv_writemem_open(fname : string; hex : boolean; task : string;
+                               loc : string; mem : string;
+                               left_a : integer; right_a : integer;
+                               kind : string;
+                               has_start : boolean; start_a : integer;
+                               start_real : boolean;
+                               has_stop : boolean; stop_a : integer;
+                               stop_real : boolean);
+    impure function sv_writemem_count return natural;
+    impure function sv_writemem_addr(i : natural) return integer;
+    procedure sv_writemem_word(s : string);
+    procedure sv_writemem_close;
+    impure function sv_memfile_msgs return string;
+
+    -- The file name of a file task: a relative one resolves against
+    -- $SV2VHDL_FILE_DIR when that is set (vamos sets it to the directory
+    -- ./simv was started from), else against the simulator's working
+    -- directory.  Messages show the name as the testbench gave it.
+    impure function sv_file_path(name : string) return string;
+    -- vvp's get_filename check: "" for a valid file name, else its warning
+    -- (one or two lines, each ending in LF).  kind: the vpi type of the
+    -- argument ("vpiConstant", "vpiReg", ...).
+    function sv_file_name_msg(name : string; kind : string; task : string;
+                              loc : string) return string;
+    -- vvp's vpiStringVal of a vector: 8-bit characters, most significant
+    -- first; a bit counts as 1 only when it is 1; leading NULs are skipped,
+    -- NULs after the first character become spaces.
+    function sv_vec_str(v : logic3d_vector) return string;
+    function sv_vec_str(v : logic3d) return string;
+    -- vvp's vpiIntVal: the low 32 bits as a two's complement integer (x and
+    -- z bits count as 0); is_signed: a narrower value is sign-extended.
+    function sv_vec_int32(v : logic3d_vector; is_signed : boolean) return integer;
+    function sv_vec_int32(v : logic3d; is_signed : boolean) return integer;
 
 end package;
 
@@ -576,6 +651,15 @@ package body logic3d_types_pkg is
         constant STRENGTHEN_LUT : lut1_t := (2, 3, 2, 3, 4, 6, 6, 7);
     begin
         return STRENGTHEN_LUT(a);
+    end function;
+
+    function l3d_strengthen(a : logic3d_vector) return logic3d_vector is
+        variable r : logic3d_vector(a'range);
+    begin
+        for i in a'range loop
+            r(i) := l3d_strengthen(a(i));
+        end loop;
+        return r;
     end function;
 
     function l3d_weaken(a : logic3d) return logic3d is
@@ -1161,13 +1245,15 @@ package body logic3d_types_pkg is
             signed(std_logic_vector(l3d_to_unsigned(a)))
           / signed(std_logic_vector(l3d_to_unsigned(b))), a'length))));
     end function;
+    -- Verilog's %: rem, the dividend's sign (VHDL mod takes the divisor's,
+    -- -7 % 3 gave 2 where Verilog gives -1); as tgt-vhdl's Verilog_Rem_S.
     function l3d_mod_s(a, b : logic3d_vector) return logic3d_vector is
         variable allx : logic3d_vector(a'range) := (others => L3D_X);
     begin
         if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(unsigned(std_logic_vector(ieee.numeric_std.resize(
             signed(std_logic_vector(l3d_to_unsigned(a)))
-            mod signed(std_logic_vector(l3d_to_unsigned(b))), a'length))));
+            rem signed(std_logic_vector(l3d_to_unsigned(b))), a'length))));
     end function;
 
     -- Sign-extending resize: reinterpret as signed so numeric_std.resize fills
@@ -1207,17 +1293,6 @@ package body logic3d_types_pkg is
     begin
         if l3d_to_unsigned(b) = 0 then return allx; end if;
         return unsigned_to_l3d(l3d_to_unsigned(a) rem l3d_to_unsigned(b));
-    end function;
-
-    function sv_random(seed : logic3d_vector) return logic3d_vector is
-        variable s : unsigned(31 downto 0);
-    begin
-        -- Deterministic 32-bit LCG (glibc constants). Verilog $random's exact
-        -- sequence is not required: the self-checking tests verify reproducibility
-        -- for a given seed and a non-zero seed advance. seed=0 -> 12345.
-        s := resize(l3d_to_unsigned(seed), 32);
-        s := resize(s * to_unsigned(1103515245, 32), 32) + to_unsigned(12345, 32);
-        return unsigned_to_l3d(resize(s, seed'length));
     end function;
 
     function resize(a : logic3d_vector; new_size : natural) return logic3d_vector is
@@ -1864,26 +1939,26 @@ package body logic3d_types_pkg is
             return addrs(i);
         end function;
 
-        -- Digits are consumed from the right (LSB) end. A word narrower than
-        -- w is extended with 0, or with x/z when its leftmost digit is x/z
-        -- (IEEE 1364 value extension); a wider word is truncated.
+        -- vvp's make_hex_value / make_bin_value: the digits fill the word
+        -- from the right, x and z only where their digit is; the bits above
+        -- the digits are 0 and digits beyond the word are dropped.
         impure function word(i : natural; w : positive) return logic3d_vector is
             variable r    : logic3d_vector(w - 1 downto 0) := (others => L3D_0);
-            variable s    : string(1 to words(i)'length) := words(i).all;
+            constant s    : string(1 to words(i)'length) := words(i).all;
             variable bpd  : natural;
-            variable bpos  : natural := 0;
+            variable bpos : natural := 0;
             variable v    : natural;
-            variable fill : logic3d := L3D_0;
             variable c    : character;
         begin
             if is_hex then bpd := 4; else bpd := 1; end if;
             for k in s'high downto s'low loop
+                exit when bpos >= w;
                 c := s(k);
                 for b in 0 to bpd - 1 loop
                     if bpos + b <= w - 1 then
                         case c is
                             when 'x' | 'X' => r(bpos + b) := L3D_X;
-                            when 'z' | 'Z' | '?' => r(bpos + b) := L3D_Z;
+                            when 'z' | 'Z' => r(bpos + b) := L3D_Z;
                             when others =>
                                 if c >= '0' and c <= '9' then
                                     v := character'pos(c) - character'pos('0');
@@ -1894,23 +1969,11 @@ package body logic3d_types_pkg is
                                 end if;
                                 if (v / 2 ** b) mod 2 = 1 then
                                     r(bpos + b) := L3D_1;
-                                else
-                                    r(bpos + b) := L3D_0;
                                 end if;
                         end case;
                     end if;
                 end loop;
                 bpos := bpos + bpd;
-            end loop;
-            if s'length > 0 then
-                case s(s'low) is
-                    when 'x' | 'X' => fill := L3D_X;
-                    when 'z' | 'Z' | '?' => fill := L3D_Z;
-                    when others => fill := L3D_0;
-                end case;
-            end if;
-            for k in bpos to w - 1 loop
-                r(k) := fill;
             end loop;
             return r;
         end function;
@@ -1918,80 +1981,506 @@ package body logic3d_types_pkg is
 
     shared variable g_readmem : t_readmem;
 
-    procedure sv_readmem_load(fname : string; hex : boolean; start : integer) is
-        file f : std.textio.text;
-        variable st     : file_open_status;
-        variable l      : std.textio.line;
-        variable cur    : integer := start;
-        variable i, j   : natural;
-        variable in_blk : boolean := false;   -- inside /* ... */
-        variable tok    : string(1 to 1024);
-        variable tn     : natural;
-        variable a      : integer;
-        variable c      : character;
+    -- The messages of the last $readmem/$writemem call (sv_memfile_msgs)
+    type t_msgs is protected
+        procedure add(s : string);
+        impure function take return string;
+    end protected;
 
-        function hexval(ch : character) return integer is
+    type t_msgs is protected body
+        variable buf   : std.textio.line := null;
+        variable taken : boolean := false;     -- buf was returned by take
+
+        procedure forget is
         begin
-            if ch >= '0' and ch <= '9' then return character'pos(ch) - character'pos('0');
-            elsif ch >= 'a' and ch <= 'f' then return character'pos(ch) - character'pos('a') + 10;
-            elsif ch >= 'A' and ch <= 'F' then return character'pos(ch) - character'pos('A') + 10;
-            else return -1;
+            if taken then
+                deallocate(buf);
+                taken := false;
             end if;
-        end function;
+        end procedure;
 
-        function is_space(ch : character) return boolean is
+        procedure add(s : string) is
+            variable old : std.textio.line;
         begin
-            return ch = ' ' or ch = HT or ch = CR or ch = LF or ch = VT or ch = FF;
+            forget;
+            if buf = null then
+                buf := new string'(s & LF);
+            else
+                old := buf;
+                buf := new string'(old.all & s & LF);
+                deallocate(old);
+            end if;
+        end procedure;
+
+        impure function take return string is
+        begin
+            forget;
+            if buf = null then
+                return "";
+            end if;
+            taken := true;
+            return buf.all;
         end function;
+    end protected body;
+
+    shared variable g_memfile_msgs : t_msgs;
+
+    impure function sv_memfile_msgs return string is
     begin
-        g_readmem.clear(hex);
-        file_open(st, f, fname, read_mode);
-        if st /= open_ok then
-            report "$readmem" & "h/b: cannot open file " & fname severity warning;
+        return g_memfile_msgs.take;
+    end function;
+
+    -- nvc's getenv (std.env.getenv is VHDL-2019's; the library is --std=2040)
+    impure function sv_getenv(name : string) return string is
+    begin
+        return "";
+    end function;
+    attribute foreign of sv_getenv [string return string] : function is
+        "INTERNAL _std_env_getenv";
+
+    impure function sv_file_path(name : string) return string is
+        constant dir : string := sv_getenv("SV2VHDL_FILE_DIR");
+    begin
+        if dir'length = 0 or name'length = 0 or name(name'left) = '/' then
+            return name;
+        end if;
+        return dir & "/" & name;
+    end function;
+
+    -- C's isprint in the C locale
+    function c_isprint(c : character) return boolean is
+    begin
+        return character'pos(c) >= 32 and character'pos(c) < 127;
+    end function;
+
+    -- the three octal digits of 0 <= n < 512
+    function oct3(n : natural) return string is
+    begin
+        return character'val(48 + (n / 64) mod 8) & character'val(48 + (n / 8) mod 8)
+            & character'val(48 + n mod 8);
+    end function;
+
+    -- vvp's as_escaped: a non-printable character as sprintf("\\%03o") of
+    -- a signed char (one above 127 as its 32-bit two's complement)
+    function c_escaped(s : string) return string is
+        variable r : string(1 to 12 * s'length + 1);
+        variable k : natural := 0;
+        variable c : natural;
+    begin
+        for i in s'range loop
+            c := character'pos(s(i));
+            if c_isprint(s(i)) then
+                k := k + 1;
+                r(k) := s(i);
+            elsif c < 128 then
+                r(k + 1 to k + 4) := "\" & oct3(c);
+                k := k + 4;
+            else
+                r(k + 1 to k + 12) := "\37777777" & oct3(c + 256);
+                k := k + 12;
+            end if;
+        end loop;
+        return r(1 to k);
+    end function;
+
+    function sv_file_name_msg(name : string; kind : string; task : string;
+                              loc : string) return string is
+        constant head : string := "WARNING: " & loc & ":";
+        -- vvp formats that head in a 64-byte buffer
+        function cut(s : string) return string is
+        begin
+            if s'length > 63 then
+                return s(s'left to s'left + 62);
+            end if;
+            return s;
+        end function;
+        constant h63 : string := cut(head);
+    begin
+        if name'length = 0 then
+            return head & " " & task & "'s file name argument (" & kind
+                & ") is not a valid string." & LF;
+        end if;
+        for i in name'range loop
+            if not c_isprint(name(i)) then
+                return h63 & " " & task & "'s file name argument contains "
+                    & "non-printable characters." & LF
+                    & (1 to h63'length => ' ') & " """ & c_escaped(name) & """"
+                    & LF;
+            end if;
+        end loop;
+        return "";
+    end function;
+
+    -- a bit vvp's vpi values count as 1 (BIT4_1: a strong or weak 1)
+    function vpi_one(b : logic3d) return boolean is
+    begin
+        return b = L3D_1 or b = L3D_H;
+    end function;
+
+    function sv_vec_str(v : logic3d_vector) return string is
+        constant n   : natural := v'length;
+        alias av     : logic3d_vector(n - 1 downto 0) is v;
+        variable r   : string(1 to (n + 7) / 8);
+        variable k   : natural := 0;
+        variable c   : natural := 0;
+    begin
+        for i in n - 1 downto 0 loop
+            c := c * 2;
+            if vpi_one(av(i)) then
+                c := c + 1;
+            end if;
+            if i mod 8 = 0 then
+                if c /= 0 or k > 0 then
+                    k := k + 1;
+                    if c = 0 then
+                        r(k) := ' ';
+                    else
+                        r(k) := character'val(c);
+                    end if;
+                end if;
+                c := 0;
+            end if;
+        end loop;
+        return r(1 to k);
+    end function;
+
+    function sv_vec_str(v : logic3d) return string is
+    begin
+        return sv_vec_str(logic3d_vector'(0 => v));
+    end function;
+
+    function sv_vec_int32(v : logic3d_vector; is_signed : boolean) return integer is
+        constant n : natural := v'length;
+        alias av   : logic3d_vector(n - 1 downto 0) is v;
+        variable low : natural := 0;    -- bits 30 .. 0
+        variable b31 : boolean;
+    begin
+        if n = 0 then
+            return 0;
+        end if;
+        for i in 30 downto 0 loop
+            low := low * 2;
+            if i < n then
+                if vpi_one(av(i)) then
+                    low := low + 1;
+                end if;
+            elsif is_signed and vpi_one(av(n - 1)) then
+                low := low + 1;                  -- sign extension
+            end if;
+        end loop;
+        if n > 31 then
+            b31 := vpi_one(av(31));
+        else
+            b31 := is_signed and vpi_one(av(n - 1));
+        end if;
+        if b31 then
+            return -2147483647 - 1 + low;
+        end if;
+        return low;
+    end function;
+
+    function sv_vec_int32(v : logic3d; is_signed : boolean) return integer is
+    begin
+        return sv_vec_int32(logic3d_vector'(0 => v), is_signed);
+    end function;
+
+    function dec(i : integer) return string is
+    begin
+        return integer'image(i);
+    end function;
+
+    -- C's "%x" of an int (its 32 bits, no leading zeros); pad: "%08x"
+    function hex_c(i : integer; pad : boolean := false) return string is
+        constant HEXD : string(1 to 16) := "0123456789abcdef";
+        variable u : unsigned(31 downto 0) := unsigned(to_signed(i, 32));
+        variable r : string(1 to 8);
+    begin
+        for k in 0 to 7 loop
+            r(8 - k) := HEXD(to_integer(u(4 * k + 3 downto 4 * k)) + 1);
+        end loop;
+        if pad then
+            return r;
+        end if;
+        for k in 1 to 7 loop
+            if r(k) /= '0' then
+                return r(k to 8);
+            end if;
+        end loop;
+        return r(8 to 8);
+    end function;
+
+    -- vvp's get_mem_params (after the file name) and process_params: the
+    -- addresses of a $readmem/$writemem call, or ok = false (its messages
+    -- are in g_memfile_msgs)
+    procedure mem_params(fname : string; kind : string; task : string;
+                         loc : string; mem : string;
+                         left_a : integer; right_a : integer;
+                         has_start : boolean; start_a : integer;
+                         start_real : boolean;
+                         has_stop : boolean; stop_a : integer;
+                         stop_real : boolean;
+                         start_v : out integer; stop_v : out integer;
+                         incr : out integer; min_a : out integer;
+                         max_a : out integer; ok : out boolean) is
+        constant name_msg : string := sv_file_name_msg(fname, kind, task, loc);
+        constant lo : integer := minimum(left_a, right_a);
+        constant hi : integer := maximum(left_a, right_a);
+        variable s, e : integer;
+        constant range_txt : string := "'" & mem & "[" & dec(left_a) & ":"
+            & dec(right_a) & "]'!";
+    begin
+        ok := false;
+        start_v := 0; stop_v := 0; incr := 1; min_a := 0; max_a := 0;
+        if name_msg'length > 0 then
+            -- the message already ends in LF: add it without another
+            g_memfile_msgs.add(name_msg(name_msg'left to name_msg'right - 1));
+        end if;
+        if has_start and start_real then
+            g_memfile_msgs.add("WARNING: " & loc & ": " & task & "'s third "
+                               & "argument (start address) is a real value.");
+        end if;
+        if has_start and has_stop and stop_real then
+            g_memfile_msgs.add("WARNING: " & loc & ": " & task & "'s fourth "
+                               & "argument (finish address) is a real value.");
+        end if;
+        if name_msg'length > 0 then
             return;
         end if;
-        while not endfile(f) loop
-            std.textio.readline(f, l);
-            if l /= null and l'length > 0 then
-                i := l'low;
-                while i <= l'high loop
-                    c := l(i);
-                    if in_blk then
-                        if c = '*' and i < l'high and l(i + 1) = '/' then
-                            in_blk := false; i := i + 2;
-                        else
-                            i := i + 1;
-                        end if;
-                    elsif is_space(c) then
-                        i := i + 1;
-                    elsif c = '/' and i < l'high and l(i + 1) = '/' then
-                        exit;                                 -- line comment
-                    elsif c = '/' and i < l'high and l(i + 1) = '*' then
-                        in_blk := true; i := i + 2;
-                    elsif c = '@' then                        -- @<hex address>
-                        a := 0; j := i + 1;
-                        while j <= l'high and hexval(l(j)) >= 0 loop
-                            a := a * 16 + hexval(l(j)); j := j + 1;
-                        end loop;
-                        cur := a; i := j;
-                    else                                      -- a data word
-                        tn := 0; j := i;
-                        while j <= l'high and not is_space(l(j)) and l(j) /= '/' loop
-                            if l(j) /= '_' and tn < tok'high then
-                                tn := tn + 1; tok(tn) := l(j);
-                            end if;
-                            j := j + 1;
-                        end loop;
-                        if tn > 0 then
-                            g_readmem.add(cur, tok(1 to tn));
-                            cur := cur + 1;
-                        end if;
-                        i := j;
-                    end if;
-                end loop;
+        if not has_start then
+            s := lo;
+            e := hi;
+            incr := 1;
+        elsif not has_stop then
+            s := start_a;
+            e := hi;
+            incr := 1;
+        else
+            s := start_a;
+            e := stop_a;
+            if s < e then
+                incr := 1;
+            else
+                incr := -1;
             end if;
+        end if;
+        start_v := s;
+        stop_v := e;
+        min_a := minimum(s, e);
+        max_a := maximum(s, e);
+        if not has_stop and left_a > right_a then
+            g_memfile_msgs.add("WARNING: " & loc & ": " & task & ": The behaviour "
+                & "for reg[...] mem[N:0]; " & task & "(""..."", mem); changed in "
+                & "the 1364-2005 standard. To avoid ambiguity, use mem[0:N] or "
+                & "explicit range parameters " & task & "(""..."", mem, start, "
+                & "stop);. Defaulting to 1364-2005 behavior.");
+        end if;
+        if s < lo or s > hi then
+            g_memfile_msgs.add("ERROR: " & loc & ": " & task & ": Start address "
+                & dec(s) & " is out of bounds for memory " & range_txt);
+            return;
+        end if;
+        if e < lo or e > hi then
+            g_memfile_msgs.add("ERROR: " & loc & ": " & task & ": Finish address "
+                & dec(e) & " is out of bounds for memory " & range_txt);
+            return;
+        end if;
+        ok := true;
+    end procedure;
+
+    function is_hexd(c : character) return boolean is
+    begin
+        return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f')
+            or (c >= 'A' and c <= 'F');
+    end function;
+
+    -- the characters of a word token (sys_readmem_lex.lex)
+    function is_wordc(c : character; hex : boolean) return boolean is
+    begin
+        if c = '_' or c = 'x' or c = 'X' or c = 'z' or c = 'Z' then
+            return true;
+        elsif hex then
+            return is_hexd(c);
+        end if;
+        return c = '0' or c = '1';
+    end function;
+
+    -- @<hex>: sscanf("%x") into an unsigned int, read as an int (the low 32
+    -- bits; a value beyond 64 bits saturates, as strtoul does)
+    function addr_value(s : string) return integer is
+        variable acc : unsigned(31 downto 0) := (others => '0');
+        variable sig : natural := 0;     -- significant digits
+        variable d   : natural;
+    begin
+        for i in s'range loop
+            if s(i) >= '0' and s(i) <= '9' then
+                d := character'pos(s(i)) - character'pos('0');
+            elsif s(i) >= 'a' and s(i) <= 'f' then
+                d := character'pos(s(i)) - character'pos('a') + 10;
+            else
+                d := character'pos(s(i)) - character'pos('A') + 10;
+            end if;
+            if sig > 0 or d /= 0 then
+                sig := sig + 1;
+            end if;
+            acc := shift_left(acc, 4) + d;
+        end loop;
+        if sig > 16 then
+            return -1;                   -- ULONG_MAX, its low 32 bits
+        end if;
+        return to_integer(signed(acc));
+    end function;
+
+    procedure sv_readmem_load(fname : string; hex : boolean; task : string;
+                              loc : string; mem : string;
+                              left_a : integer; right_a : integer;
+                              wwid : positive; kind : string;
+                              has_start : boolean; start_a : integer;
+                              start_real : boolean;
+                              has_stop : boolean; stop_a : integer;
+                              stop_real : boolean) is
+        file f : std.textio.text;
+        variable st       : file_open_status;
+        variable l        : std.textio.line;
+        variable ok       : boolean;
+        variable start_v, stop_v, incr, min_a, max_a : integer;
+        variable addr     : integer;
+        variable past     : boolean := false;   -- addr ran off the int range
+        variable count    : integer;            -- words the range still wants
+        variable i, j     : integer;
+        variable c        : character;
+        variable in_blk   : boolean := false;   -- inside /* ... */
+        variable done     : boolean := false;   -- stopped by an error
+        variable excess_said : boolean := false;
+        variable ndig, need, extra : natural;
+        variable tok      : std.textio.line;
+        variable tn       : natural;
+        variable a        : integer;
+        -- "<loc>: <task>(<file>): ", the head of the messages about the file
+        constant fhead    : string := loc & ": " & task & "(" & fname & "): ";
+    begin
+        g_readmem.clear(hex);
+        mem_params(fname, kind, task, loc, mem, left_a, right_a, has_start,
+                   start_a, start_real, has_stop, stop_a, stop_real,
+                   start_v, stop_v, incr, min_a, max_a, ok);
+        if not ok then
+            return;
+        end if;
+        file_open(st, f, sv_file_path(fname), read_mode);
+        if st /= open_ok then
+            g_memfile_msgs.add("ERROR: " & loc & ": " & task & ": Unable to open "
+                               & fname & " for reading.");
+            return;
+        end if;
+        count := max_a - min_a + 1;
+        addr := start_v;
+        if hex then
+            need := (wwid + 3) / 4;
+        else
+            need := wwid;
+        end if;
+        while not done and not endfile(f) loop
+            std.textio.readline(f, l);
+            if l = null then
+                next;
+            end if;
+            i := l'low;
+            while not done and i <= l'high loop
+                c := l(i);
+                if in_blk then
+                    if c = '*' and i < l'high and l(i + 1) = '/' then
+                        in_blk := false;
+                        i := i + 2;
+                    else
+                        i := i + 1;
+                    end if;
+                elsif c = ' ' or c = HT or c = FF or c = CR then
+                    i := i + 1;
+                elsif c = '/' and i < l'high and l(i + 1) = '/' then
+                    exit;                                   -- to the line's end
+                elsif c = '/' and i < l'high and l(i + 1) = '*' then
+                    in_blk := true;
+                    i := i + 2;
+                elsif c = '@' and i < l'high and is_hexd(l(i + 1)) then
+                    j := i + 1;
+                    while j <= l'high and is_hexd(l(j)) loop
+                        j := j + 1;
+                    end loop;
+                    a := addr_value(l(i + 1 to j - 1));
+                    i := j;
+                    if a < min_a or a > max_a then
+                        g_memfile_msgs.add("ERROR: " & fhead & "address (0x"
+                            & hex_c(a) & ") is out of range [0x" & hex_c(start_v)
+                            & ":0x" & hex_c(stop_v) & "]");
+                        done := true;
+                    else
+                        addr := a;
+                        past := false;
+                        -- an address turns the "Not enough words" check off
+                        count := 0;
+                    end if;
+                elsif is_wordc(c, hex) then
+                    j := i;
+                    ndig := 0;
+                    while j <= l'high and is_wordc(l(j), hex) loop
+                        if l(j) /= '_' then
+                            ndig := ndig + 1;
+                        end if;
+                        j := j + 1;
+                    end loop;
+                    -- the digits, '_' taken out
+                    tok := new string(1 to ndig);
+                    tn := 0;
+                    for k in i to j - 1 loop
+                        if l(k) /= '_' then
+                            tn := tn + 1;
+                            tok(tn) := l(k);
+                        end if;
+                    end loop;
+                    if ndig > need and not excess_said then
+                        extra := ndig - need;
+                        excess_said := true;
+                        if hex then
+                            g_memfile_msgs.add("WARNING: " & loc & ": Excess hex "
+                                & "digits (" & dec(extra) & " of '" & l(i to j - 1)
+                                & "') while reading " & dec(wwid) & "-bit words.");
+                        else
+                            g_memfile_msgs.add("WARNING: " & loc & ": Excess binary "
+                                & "digits (" & dec(extra) & " of '" & l(i to j - 1)
+                                & "') while reading " & dec(wwid) & "-bit words.");
+                        end if;
+                    end if;
+                    i := j;
+                    if not past and addr >= min_a and addr <= max_a then
+                        g_readmem.add(addr, tok.all);
+                        if count > 0 then
+                            count := count - 1;
+                        end if;
+                        if (incr > 0 and addr = integer'high)
+                            or (incr < 0 and addr = integer'low) then
+                            past := true;
+                        else
+                            addr := addr + incr;
+                        end if;
+                    else
+                        g_memfile_msgs.add("WARNING: " & fhead & "Too many words in "
+                            & "the file for the requested range [" & dec(start_v)
+                            & ":" & dec(stop_v) & "].");
+                        done := true;
+                    end if;
+                    deallocate(tok);
+                else
+                    g_memfile_msgs.add("ERROR: " & fhead & "Invalid input character: "
+                                       & c);
+                    done := true;
+                end if;
+            end loop;
             deallocate(l);
         end loop;
+        if not done and count > 0 then
+            g_memfile_msgs.add("WARNING: " & fhead & "Not enough words in the file "
+                & "for the requested range [" & dec(start_v) & ":" & dec(stop_v)
+                & "].");
+        end if;
         file_close(f);
     end procedure;
 
@@ -2009,5 +2498,128 @@ package body logic3d_types_pkg is
     begin
         return g_readmem.word(i, w);
     end function;
+
+    impure function sv_readmem_bit(i : natural) return logic3d is
+        constant r : logic3d_vector(0 downto 0) := g_readmem.word(i, 1);
+    begin
+        return r(0);
+    end function;
+
+    -- $writemem: the file and the addresses it writes
+    type t_writemem is protected
+        impure function open_file(path : string) return boolean;
+        procedure set_range(first : integer; step : integer; n : natural);
+        impure function count return natural;
+        impure function addr(i : natural) return integer;
+        procedure put(s : string);
+        procedure close_file;
+    end protected;
+
+    type t_writemem is protected body
+        file wf : std.textio.text;
+        variable active : boolean := false;
+        variable first_a : integer := 0;
+        variable step_a  : integer := 1;
+        variable n_words : natural := 0;
+        variable written : natural := 0;
+
+        procedure close_file is
+        begin
+            if active then
+                file_close(wf);
+                active := false;
+            end if;
+            n_words := 0;
+        end procedure;
+
+        impure function open_file(path : string) return boolean is
+            variable st : file_open_status;
+        begin
+            close_file;
+            file_open(st, wf, path, write_mode);
+            active := st = open_ok;
+            written := 0;
+            return active;
+        end function;
+
+        procedure set_range(first : integer; step : integer; n : natural) is
+        begin
+            first_a := first;
+            step_a := step;
+            n_words := n;
+        end procedure;
+
+        impure function count return natural is
+        begin
+            if not active then
+                return 0;
+            end if;
+            return n_words;
+        end function;
+
+        impure function addr(i : natural) return integer is
+        begin
+            return first_a + step_a * i;
+        end function;
+
+        procedure put(s : string) is
+        begin
+            if active then
+                if written mod 16 = 0 then
+                    write(wf, "// 0x" & hex_c(written, true) & LF);
+                end if;
+                write(wf, s & LF);
+                written := written + 1;
+            end if;
+        end procedure;
+    end protected body;
+
+    shared variable g_writemem : t_writemem;
+
+    procedure sv_writemem_open(fname : string; hex : boolean; task : string;
+                               loc : string; mem : string;
+                               left_a : integer; right_a : integer;
+                               kind : string;
+                               has_start : boolean; start_a : integer;
+                               start_real : boolean;
+                               has_stop : boolean; stop_a : integer;
+                               stop_real : boolean) is
+        variable ok : boolean;
+        variable start_v, stop_v, incr, min_a, max_a : integer;
+    begin
+        g_writemem.close_file;
+        mem_params(fname, kind, task, loc, mem, left_a, right_a, has_start,
+                   start_a, start_real, has_stop, stop_a, stop_real,
+                   start_v, stop_v, incr, min_a, max_a, ok);
+        if not ok then
+            return;
+        end if;
+        if not g_writemem.open_file(sv_file_path(fname)) then
+            g_memfile_msgs.add("ERROR: " & loc & ": " & task & ": Unable to open "
+                               & fname & " for writing.");
+            return;
+        end if;
+        g_writemem.set_range(start_v, incr, max_a - min_a + 1);
+    end procedure;
+
+    impure function sv_writemem_count return natural is
+    begin
+        return g_writemem.count;
+    end function;
+
+    impure function sv_writemem_addr(i : natural) return integer is
+    begin
+        return g_writemem.addr(i);
+    end function;
+
+    procedure sv_writemem_word(s : string) is
+    begin
+        g_writemem.put(s);
+    end procedure;
+
+    procedure sv_writemem_close is
+    begin
+        g_writemem.close_file;
+    end procedure;
 
 end package body;

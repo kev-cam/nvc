@@ -1903,6 +1903,33 @@ static tree_t try_resolve_name(nametab_t *tab, ident_t name)
    return NULL;
 }
 
+// STD_MX: the literal NAME of the one enumeration type in the context's
+// type set that has it, else NULL (none, or more than one)
+static tree_t mx_literal_of_context(nametab_t *tab, ident_t name)
+{
+   if (tab->top_type_set == NULL)
+      return NULL;
+
+   tree_t found = NULL;
+   for (int i = 0; i < tab->top_type_set->members.count; i++) {
+      type_t base = type_base_recur(tab->top_type_set->members.items[i].type);
+      if (!type_is_enum(base))
+         continue;
+
+      const int nlits = type_enum_literals(base);
+      for (int j = 0; j < nlits; j++) {
+         tree_t lit = type_enum_literal(base, j);
+         if (tree_ident(lit) != name)
+            continue;
+         else if (found != NULL && found != lit)
+            return NULL;
+         found = lit;
+      }
+   }
+
+   return found;
+}
+
 tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
 {
    tree_t decl = try_resolve_name(tab, name);
@@ -2011,6 +2038,18 @@ tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
       return NULL;  // Suppress cascading errors
    else if ((sym->mask & N_ERROR) || tab->top_scope->suppress)
       return NULL;    // Was an earlier error
+   else if (standard() == STD_MX && ident_char(name, 0) == '\'') {
+      // STD_MX tolerates ambiguous names from generated VHDL, but a
+      // character literal must still denote a literal: one left unresolved
+      // without an error reached simplification as a reference to nothing
+      // (simp_ref crashed).  The type the context expects decides it, as
+      // for the string or bit string literal of a NUMERIC_STD UNSIGNED
+      // where no use clause makes the STD_ULOGIC literals visible; one no
+      // single expected enumeration type has is the error below.
+      tree_t lit = mx_literal_of_context(tab, name);
+      if (lit != NULL)
+         return lit;
+   }
    else if (standard() == STD_MX)
       return NULL;    // STD_MX: tolerate ambiguous names from generated VHDL
 

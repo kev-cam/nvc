@@ -33,5 +33,6 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit);
 void wave_include_glob(const char *glob);
 void wave_exclude_glob(const char *glob);
 void wave_include_file(const char *base);
+void wave_include_scope(const char *spec);
 
 #endif  // _RT_WAVE_H

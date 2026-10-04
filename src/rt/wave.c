@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <string.h>
+#include <time.h>
 
 #if !defined __CYGWIN__ && !defined __MINGW32__
 #include <libgen.h>
@@ -70,6 +71,7 @@ typedef struct {
    enum fstVarType              vartype;
    enum fstSupplementalDataType sdt;
    unsigned                     size;
+   bool                         packed;   // An array of it is one bit vector
    union {
       const char    *map;
       fst_unit_t    *units;
@@ -77,6 +79,13 @@ typedef struct {
       fstEnumHandle  enumh;
    } u;
 } fst_type_t;
+
+typedef struct {
+   char *path;      // ":tb:u1", lower case
+   char *spec;      // As given, for messages
+   int   levels;    // 0: every level below
+   bool  matched;   // Names an instance or a signal of the design
+} dump_scope_t;
 
 typedef struct _fst_data {
    wave_dumper_t *dumper;
@@ -121,10 +130,13 @@ typedef struct _wave_dumper {
 
 static glob_array_t incl;
 static glob_array_t excl;
+static A(dump_scope_t) scopes;
 
 static void fst_process_signal(wave_dumper_t *wd, rt_scope_t *scope, tree_t d,
                                type_t type, text_buf_t *tb);
 static bool wave_should_dump(rt_scope_t *scope, ident_t id);
+static void wave_mark_scope(const char *path);
+static void wave_check_scopes(void);
 
 static bool should_dump_array(tree_t where, unsigned length)
 {
@@ -144,19 +156,41 @@ static bool should_dump_array(tree_t where, unsigned length)
    return false;
 }
 
+// A VCD file with no variables.  The FST reader refuses an FST file with
+// none (fstReaderOpen fails), so the conversion below cannot make it.
+static void vcd_write_empty(FILE *f, uint64_t now)
+{
+   const time_t t = time(NULL);
+   fprintf(f, "$date\n\t%s$end\n", ctime(&t));
+   fprintf(f, "$version\n\t%s\n$end\n", PACKAGE_STRING);
+   fprintf(f, "$timescale\n\t1fs\n$end\n");
+   fprintf(f, "$enddefinitions $end\n");
+   fprintf(f, "#%"PRIu64"\n", now);
+}
+
 static void fst_close(rt_model_t *m, void *arg)
 {
    wave_dumper_t *wd = arg;
 
-   fstWriterEmitTimeChange(wd->fst_ctx, model_now(m, NULL));
+   const uint64_t now = model_now(m, NULL);
+   fstWriterEmitTimeChange(wd->fst_ctx, now);
    fstWriterClose(wd->fst_ctx);
 
-   if (wd->vcdfile) {
+   if (wd->dumped.count == 0)
+      warnf("no signals were written to the waveform dump: none matched "
+            "the include patterns or scopes, or none had a type that can "
+            "be dumped");
+
+   if (wd->vcdfile && wd->dumped.count == 0)
+      vcd_write_empty(wd->vcdfile, now);
+   else if (wd->vcdfile) {
       void *xc = fstReaderOpen(wd->tmpfst);
       if (xc == NULL)
          fatal("fstReaderOpen failed for temporary FST file");
 
-      fstReaderSetVcdExtensions(xc, 1);
+      // A design translated from Verilog (--std=2040) gets a plain IEEE
+      // 1364 VCD: no $attrbegin extensions
+      fstReaderSetVcdExtensions(xc, standard() != STD_MX);
       if (!fstReaderProcessHier(xc, wd->vcdfile))
          fatal("fstReaderProcessHier failed");
 
@@ -164,6 +198,9 @@ static void fst_close(rt_model_t *m, void *arg)
       fstReaderIterBlocks(xc, NULL, NULL, wd->vcdfile);
 
       fstReaderClose(xc);
+   }
+
+   if (wd->vcdfile) {
       fclose(wd->vcdfile);
       wd->vcdfile = NULL;
 
@@ -260,6 +297,47 @@ static void fst_fmt_enum(rt_watch_t *w, fst_data_t *data)
 }
 #endif
 
+// The sv2vhdl library's 3D logic (lib/sv2vhdl/logic3d_types_pkg.vhd), the
+// type the Verilog translator gives every net and variable bit: an integer
+// subtype 0 to 7 whose bits are value, driven and uncertain.  It is dumped
+// as four-state logic, by its own name or a subtype's (RESOLVED_LOGIC3D):
+//   0 L (undriven 0) and 2 (0) -> 0,  1 H (undriven 1) and 3 (1) -> 1,
+//   4 Z -> z,  5 W (weak unknown), 6 X and 7 U -> x
+static const char logic3d_map[8] = { '0', '1', '0', '1', 'z', 'x', 'x', 'x' };
+
+static bool is_sv2vhdl_logic3d(type_t type)
+{
+   static ident_t name = NULL;
+   if (name == NULL)
+      name = ident_new("SV2VHDL.LOGIC3D_TYPES_PKG.LOGIC3D");
+
+   return type_kind(type) == T_SUBTYPE && type_has_ident(type)
+      && type_ident(type) == name;
+}
+
+static void fst_fmt_logic3d(rt_watch_t *w, fst_data_t *data)
+{
+   // data->count variables of data->size bits each, one element per bit,
+   // in signal order (the leftmost element is the first character)
+   const uint8_t *p = signal_value(data->signal);
+   const unsigned esize = signal_size(data->signal);
+
+   for (int i = 0; i < data->count; i++) {
+      char buf[data->size];
+      for (int j = 0; j < data->size; j++, p += esize) {
+         uint64_t code;
+         switch (esize) {
+         case 1: code = *p; break;
+         case 2: code = *(const uint16_t *)p; break;
+         case 4: code = *(const uint32_t *)p; break;
+         default: code = *(const uint64_t *)p; break;
+         }
+         buf[j] = code < 8 ? logic3d_map[code] : 'x';
+      }
+      fstWriterEmitValueChange(data->dumper->fst_ctx, data->handle[i], buf);
+   }
+}
+
 static void fst_fmt_verilog(rt_watch_t *w, fst_data_t *data)
 {
    static const char map[] = "01zx";
@@ -317,6 +395,18 @@ static fst_type_t *fst_type_for(wave_dumper_t *wd, type_t type,
       return ft;
 
    ft = xcalloc(sizeof(fst_type_t));
+
+   if (is_sv2vhdl_logic3d(type)) {
+      ft->sdt     = FST_SDT_NONE;
+      ft->vartype = FST_VT_VCD_WIRE;
+      ft->fn      = fst_fmt_logic3d;
+      ft->u.map   = logic3d_map;
+      ft->size    = 1;
+      ft->packed  = true;
+
+      hash_put(wd->typecache, type, ft);
+      return ft;
+   }
 
    switch (type_kind(type)) {
    case T_SUBTYPE:
@@ -628,7 +718,8 @@ static void fst_create_array_var(wave_dumper_t *wd, tree_t d, rt_signal_t *s,
    if (ft == NULL)
       return;
 
-   if (type_is_enum(elem)) {
+   // A vector of logic3d bits is one variable, as a std_logic_vector is
+   if (type_is_enum(elem) || (ft->packed && type_is_scalar(elem))) {
       data = xcalloc(sizeof(fst_data_t) + sizeof(fstHandle));
       data->type  = ft;
       data->size  = length * ft->size;
@@ -878,8 +969,18 @@ static void fst_alias_var(wave_dumper_t *wd, tree_t d, rt_scope_t *scope,
                           rt_signal_t *s, text_buf_t *tb)
 {
    rt_watch_t *w = find_watch(&(s->nexus), fst_event_cb);
-   if (w == NULL)
-      return;   // Did not dump the primary signal
+   if (w == NULL) {
+      // The primary signal was not dumped: an --exclude pattern, or an
+      // --include pattern or --dump-scope it is outside, left it out (or
+      // its type cannot be dumped, which then fails here too).  This name
+      // was selected, so it is dumped as the signal itself.
+      type_t type = tree_type(d);
+      if (type_is_array(type))
+         fst_create_array_var(wd, d, s, type, tb);
+      else if (type_is_scalar(type))
+         fst_create_scalar_var(wd, d, s, type, tb);
+      return;
+   }
 
    fst_data_t *data = w->user_data;
    if (data->count != 1)
@@ -913,7 +1014,7 @@ static void fst_process_signal(wave_dumper_t *wd, rt_scope_t *scope, tree_t d,
       rt_signal_t *s = find_signal(scope, d);
       if (s == NULL)
          return;
-      else if (s->where != d)
+      else if (s->where != d || find_watch(&(s->nexus), fst_event_cb) != NULL)
          fst_alias_var(wd, d, scope, s, tb);  // Collapsed with another signal
       else if (type_is_array(type))
          fst_create_array_var(wd, d, s, type, tb);
@@ -1054,14 +1155,26 @@ static void fst_process_verilog(wave_dumper_t *wd, rt_scope_t *scope,
 static void fst_enter_scope(wave_dumper_t *wd, tree_t unit, rt_scope_t *scope,
                             text_buf_t *tb)
 {
+   // A design translated from Verilog (--std=2040) has modules and named
+   // blocks, as Verilog's own VCD names them; a VHDL design its VHDL kinds
+   const bool vlog = (standard() == STD_MX);
+
    enum fstScopeType st;
    switch (tree_kind(unit)) {
-   case T_ARCH: st = FST_ST_VHDL_ARCHITECTURE; break;
-   case T_BLOCK: st = FST_ST_VHDL_BLOCK; break;
-   case T_FOR_GENERATE: st = FST_ST_VHDL_FOR_GENERATE; break;
-   case T_IF_GENERATE: st = FST_ST_VHDL_IF_GENERATE; break;
+   case T_ARCH:
+   case T_COMPONENT:
+      st = vlog ? FST_ST_VCD_MODULE : FST_ST_VHDL_ARCHITECTURE;
+      break;
+   case T_BLOCK:
+      st = vlog ? FST_ST_VCD_BEGIN : FST_ST_VHDL_BLOCK;
+      break;
+   case T_FOR_GENERATE:
+      st = vlog ? FST_ST_VCD_BEGIN : FST_ST_VHDL_FOR_GENERATE;
+      break;
+   case T_IF_GENERATE:
+      st = vlog ? FST_ST_VCD_BEGIN : FST_ST_VHDL_IF_GENERATE;
+      break;
    case T_PACKAGE: st = FST_ST_VHDL_PACKAGE; break;
-   case T_COMPONENT: st = FST_ST_VHDL_ARCHITECTURE; break;
    case T_VERILOG: st = FST_ST_VCD_MODULE; break;
    default:
       st = FST_ST_VHDL_ARCHITECTURE;
@@ -1103,6 +1216,75 @@ static void fst_leave_scope(wave_dumper_t *wd)
    }
 }
 
+// The block whose signals the walk below dumps: the implicit block statement
+// created for a component instantiation, else BLOCK itself
+static tree_t fst_inner_block(tree_t block)
+{
+   tree_t h = tree_decl(block, 0);
+   assert(tree_kind(h) == T_HIER);
+
+   if (tree_subkind(h) == T_COMPONENT && tree_stmts(block) > 0) {
+      tree_t inner = tree_stmt(block, 0);
+      assert(tree_kind(inner) == T_BLOCK);
+      return inner;
+   }
+
+   return block;
+}
+
+// Does the walk below dump a signal of BLOCK or of a block below it.  Only
+// asked with --include, --exclude or --dump-scope, which can leave a scope
+// nothing to dump (vamos excludes the Verilog translator's own nets, so
+// the instances it makes for gates and continuous assignments, such as
+// sv_and_ivl_1, have none): such a scope is left out of the waveform, as
+// its signals are.  (A signal selected here can still have a type that
+// cannot be dumped; its scope is then written with nothing in it.)
+static bool fst_block_dumps_any(wave_dumper_t *wd, tree_t block)
+{
+   block = fst_inner_block(block);
+
+   rt_scope_t *scope = find_scope(wd->model, block);
+   if (scope == NULL)
+      return false;
+
+   const int nports = tree_ports(block);
+   for (int i = 0; i < nports; i++) {
+      if (wave_should_dump(scope, tree_ident(tree_port(block, i))))
+         return true;
+   }
+
+   const int ndecls = tree_decls(block);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(block, i);
+      switch (tree_kind(d)) {
+      case T_SIGNAL_DECL:
+         if (wave_should_dump(scope, tree_ident(d)))
+            return true;
+         break;
+      case T_VERILOG:
+         {
+            vlog_node_t v = tree_vlog(d);
+            const vlog_kind_t kind = vlog_kind(v);
+            if ((kind == V_NET_DECL || kind == V_VAR_DECL)
+                && wave_should_dump(scope, vlog_ident(v)))
+               return true;
+         }
+         break;
+      default:
+         break;
+      }
+   }
+
+   const int nstmts = tree_stmts(block);
+   for (int i = 0; i < nstmts; i++) {
+      tree_t s = tree_stmt(block, i);
+      if (tree_kind(s) == T_BLOCK && fst_block_dumps_any(wd, s))
+         return true;
+   }
+
+   return false;
+}
+
 static void fst_walk_design(wave_dumper_t *wd, tree_t block)
 {
    tree_t h = tree_decl(block, 0);
@@ -1111,6 +1293,18 @@ static void fst_walk_design(wave_dumper_t *wd, tree_t block)
    rt_scope_t *scope = find_scope(wd->model, block);
    if (scope == NULL)
       fatal_trace("missing scope for %s", istr(tree_ident(block)));
+
+   if (scopes.count > 0) {
+      // A --dump-scope naming this instance names something, even when
+      // the scope has nothing left to dump
+      LOCAL_TEXT_BUF path = tb_new();
+      get_path_name(find_scope(wd->model, fst_inner_block(block)), path);
+      wave_mark_scope(tb_get(path));
+   }
+
+   if ((excl.count > 0 || incl.count > 0 || scopes.count > 0)
+       && !fst_block_dumps_any(wd, block))
+      return;
 
    LOCAL_TEXT_BUF tb = tb_new();
    fst_enter_scope(wd, tree_ref(h), scope, tb);
@@ -1212,6 +1406,7 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit)
 
    fst_walk_design(wd, tree_stmt(wd->top, 0));
    fst_walk_packages(wd);
+   wave_check_scopes();
 
    if (wd->gtkw != NULL) {
       fclose(wd->gtkw->file);
@@ -1344,18 +1539,106 @@ void wave_include_file(const char *base)
    wave_process_file(exclf, false);
 }
 
+void wave_include_scope(const char *spec)
+{
+   // PATH[,LEVELS]: the signals of the instance PATH and of LEVELS - 1
+   // levels of instances below it (0, the default: every level), or the
+   // single signal PATH, as Verilog's $dumpvars(LEVELS, PATH).  PATH is a
+   // path name (":top:u1") or a Verilog hierarchical name ("top.u1")
+   const char *comma = strrchr(spec, ',');
+   int levels = 0;
+   size_t len = strlen(spec);
+   if (comma != NULL) {
+      char *end = NULL;
+      const long n = strtol(comma + 1, &end, 10);
+      if (end == comma + 1 || *end != '\0' || n < 0 || n > INT_MAX)
+         fatal("invalid level count in $bold$--dump-scope=%s$$: expected a "
+               "path and a non-negative number of levels such as top.u1,2",
+               spec);
+      levels = n;
+      len = comma - spec;
+   }
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   for (size_t i = 0; i < len; i++) {
+      const char ch = spec[i];
+      if (i == 0 && ch != ':' && ch != '.')
+         tb_append(tb, ':');
+      tb_append(tb, ch == '.' ? ':' : ch);
+   }
+   tb_downcase(tb);
+
+   if (tb_len(tb) <= 1)
+      fatal("$bold$--dump-scope=%s$$ names no instance", spec);
+
+   APUSH(scopes, ((dump_scope_t){ .path = xstrdup(tb_get(tb)),
+                                  .spec = xstrndup(spec, len),
+                                  .levels = levels }));
+}
+
+// A --dump-scope that names nothing dumps nothing: say so, never silently
+static void wave_check_scopes(void)
+{
+   for (int i = 0; i < scopes.count; i++) {
+      if (!scopes.items[i].matched)
+         warnf("waveform dump scope %s (--dump-scope) names no instance or "
+               "signal of the design: nothing is dumped for it",
+               scopes.items[i].spec);
+   }
+}
+
+// The instance or block with path name PATH exists: the dump scopes naming it
+static void wave_mark_scope(const char *path)
+{
+   for (int i = 0; i < scopes.count; i++) {
+      if (strcmp(scopes.items[i].path, path) == 0)
+         scopes.items[i].matched = true;
+   }
+}
+
+// Is the signal NAME in the scope with path name SPATH below a --dump-scope
+static bool wave_in_dump_scope(const char *spath, const char *name)
+{
+   const size_t slen = strlen(spath);
+
+   for (int i = 0; i < scopes.count; i++) {
+      dump_scope_t *d = &(scopes.items[i]);
+      const size_t plen = strlen(d->path);
+
+      if (strcmp(name, d->path) == 0)
+         return (d->matched = true);   // The signal itself
+      else if (slen < plen || strncmp(spath, d->path, plen) != 0)
+         continue;
+      else if (slen > plen && spath[plen] != ':')
+         continue;   // ":tb:u10" is not below ":tb:u1"
+
+      // Level 1 is the instance itself, 2 its children, ...
+      int depth = 1;
+      for (const char *p = spath + plen; *p; p++)
+         depth += (*p == ':');
+
+      if (d->levels == 0 || depth <= d->levels)
+         return true;
+   }
+
+   return false;
+}
+
 static bool wave_should_dump(rt_scope_t *scope, ident_t id)
 {
-   if (excl.count == 0 && incl.count == 0)
+   if (excl.count == 0 && incl.count == 0 && scopes.count == 0)
       return true;
 
    LOCAL_TEXT_BUF tb = tb_new();
    get_path_name(scope, tb);
+   const size_t spath_len = tb_len(tb);
    tb_append(tb, ':');
    tb_istr(tb, id);
    tb_downcase(tb);
 
    ident_t name = ident_new(tb_get(tb));
+
+   wave_mark_scope(tb_get(tb));   // A --dump-scope naming this signal
 
    for (int i = 0; i < excl.count; i++) {
       if (ident_glob(name, excl.items[i].text, excl.items[i].len))
@@ -1367,5 +1650,11 @@ static bool wave_should_dump(rt_scope_t *scope, ident_t id)
          return true;
    }
 
-   return (incl.count == 0);
+   if (scopes.count > 0) {
+      char *spath LOCAL = xstrndup(tb_get(tb), spath_len);
+      if (wave_in_dump_scope(spath, tb_get(tb)))
+         return true;
+   }
+
+   return (incl.count == 0 && scopes.count == 0);
 }

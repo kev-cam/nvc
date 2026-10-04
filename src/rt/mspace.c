@@ -420,11 +420,18 @@ void *tlab_alloc(tlab_t *t, size_t size)
 
 #define ARENA_BLOCK_MIN (64 * 1024)
 
+// Every arena result is 16-byte aligned, as a TLAB result is: the SSE4.1
+// vector intrinsics (jit-intrin.c, __tlab_overflow) store with aligned
+// 128-bit moves, and the data of a 24-byte header was only 8-byte aligned (a
+// long run of std_logic_1164 "xor" calls in one evaluation spilled into the
+// arena and faulted, SIGSEGV at address nil, in ieee_xor_vector_sse41).
+#define ARENA_ALIGN 16
+
 typedef struct _arena_block {
    struct _arena_block *next;
    size_t               cap;
    size_t               used;
-   char                 data[];
+   char                 data[] __attribute__((aligned(ARENA_ALIGN)));
 } arena_block_t;
 
 struct _eval_arena {
@@ -460,7 +467,7 @@ static arena_block_t *eval_arena_make_block(size_t need)
 
 void *eval_arena_alloc(eval_arena_t *a, size_t size)
 {
-   size = ALIGN_UP(size, sizeof(double));
+   size = ALIGN_UP(size, ARENA_ALIGN);
 
    arena_block_t *b = a->cur;
    if (unlikely(b == NULL)) {

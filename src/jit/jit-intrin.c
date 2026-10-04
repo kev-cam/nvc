@@ -261,7 +261,7 @@ static inline void *__tlab_alloc(tlab_t *t, size_t size, size_t align)
       return t->data + base;
    }
    else
-      return __tlab_overflow(t, size);
+      return __tlab_overflow(t, alignup);   // the full vector the routines write
 }
 
 __attribute__((always_inline))

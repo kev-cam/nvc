@@ -539,6 +539,7 @@ STATIC_ASSERT(sizeof(handle_slot_t) <= 16);
 typedef struct _vhpi_context {
    c_tool          *tool;
    c_rootInst      *root;
+   tree_t           vlog_top;   // The top-level unit is a Verilog module: no root
    vhpiObjectListT  packages;
    shash_t         *strtab;
    rt_model_t      *model;
@@ -2351,8 +2352,16 @@ vhpiHandleT vhpi_handle(vhpiOneToOneT type, vhpiHandleT referenceHandle)
    switch (type) {
    case vhpiRootInst:
       {
-         c_rootInst *root = vhpi_context()->root;
-         if (root == NULL) {
+         vhpi_context_t *c = vhpi_context();
+         c_rootInst *root = c->root;
+         if (root == NULL && c->vlog_top != NULL) {
+            vhpi_error(vhpiError, tree_loc(c->vlog_top), "the top-level unit "
+                       "%s is a Verilog module, which VHPI does not model: "
+                       "there is no root instance",
+                       istr(tree_ident(c->vlog_top)));
+            return NULL;
+         }
+         else if (root == NULL) {
             vhpi_error(vhpiError, NULL, "cannot get root instance before "
                        "simulation has started");
             return NULL;
@@ -2522,7 +2531,12 @@ vhpiHandleT vhpi_handle_by_name(const char *name, vhpiHandleT scope)
    if (scope == NULL) {
       vhpi_context_t *c = vhpi_context();
 
-      if (vhpi_name_cmp(&c->root->designInstUnit.region.object, elem))
+      if (elem == NULL) {
+         vhpi_error(vhpiError, NULL, "empty name in vhpi_handle_by_name");
+         return NULL;
+      }
+      else if (c->root != NULL
+               && vhpi_name_cmp(&c->root->designInstUnit.region.object, elem))
          where = &(c->root->designInstUnit.region.object);
       else {
          for (int i = 0; i < c->packages.count; i++) {
@@ -2532,7 +2546,14 @@ vhpiHandleT vhpi_handle_by_name(const char *name, vhpiHandleT scope)
             }
          }
 
-         if (where == NULL) {
+         if (where == NULL && c->root == NULL && c->vlog_top != NULL) {
+            vhpi_error(vhpiError, tree_loc(c->vlog_top), "no design unit "
+                       "instance named %s: the top-level unit %s is a "
+                       "Verilog module, which VHPI does not model", elem,
+                       istr(tree_ident(c->vlog_top)));
+            return NULL;
+         }
+         else if (where == NULL) {
             vhpi_error(vhpiError, NULL, "no design unit instance named %s",
                        elem);
             return NULL;
@@ -4842,6 +4863,21 @@ static void vhpi_lazy_fields(c_vhpiObject *obj)
    }
 }
 
+// A component instance bound to a module from the native Verilog parser
+// (a T_VERILOG unit): VHPI does not model Verilog
+static bool is_verilog_comp_inst(tree_t block, tree_t h)
+{
+   if (tree_subkind(h) != T_COMPONENT || tree_stmts(block) < 1)
+      return false;
+
+   tree_t inner = tree_stmt(block, 0);
+   if (tree_kind(inner) != T_BLOCK || tree_decls(inner) < 1)
+      return false;
+
+   tree_t ih = tree_decl(inner, 0);
+   return tree_kind(ih) == T_HIER && tree_kind(tree_ref(ih)) == T_VERILOG;
+}
+
 static void vhpi_lazy_stmts(c_vhpiObject *obj)
 {
    c_abstractRegion *r = is_abstractRegion(obj);
@@ -4865,8 +4901,20 @@ static void vhpi_lazy_stmts(c_vhpiObject *obj)
                sub->stmts.fn = vhpi_lazy_stmts;
                sub->decls.fn = vhpi_lazy_decls;
                break;
-            case T_ARCH:
             case T_COMPONENT:
+               if (is_verilog_comp_inst(s, h)) {
+                  static bool noted = false;
+                  if (!noted) {
+                     notef("instance %s is a Verilog module, which VHPI does "
+                           "not model: it and any other Verilog instance are "
+                           "left out of the VHPI hierarchy",
+                           istr(tree_ident(s)));
+                     noted = true;
+                  }
+                  continue;
+               }
+               // Fall-through
+            case T_ARCH:
                sub = build_compInstStmt(s, tree_ref(h), r);
                sub->stmts.fn = vhpi_lazy_stmts;
                sub->decls.fn = vhpi_lazy_decls;
@@ -5029,6 +5077,20 @@ static void vhpi_initialise_cb(rt_model_t *m, void *arg)
    assert(tree_kind(h) == T_HIER);
 
    tree_t s = tree_ref(h);
+   if (tree_kind(s) == T_VERILOG) {
+      // A top-level module from the native Verilog parser (nvc -a x.v
+      // falls back to it when sv2ghdl cannot translate a file).  VHPI does
+      // not model Verilog: there is no root instance, and a plugin asking
+      // for one gets a VHPI error (vhpi_handle); one that only exports
+      // foreign subprograms works.
+      c->vlog_top = s;
+      notef("the top-level unit %s is a Verilog module, which VHPI does not "
+            "model: VHPI plugins get no root instance",
+            istr(tree_ident(s)));
+      vhpi_run_callbacks(vhpiCbEndOfInitialization, 0);
+      return;
+   }
+
    assert(tree_kind(s) == T_ARCH);
 
    c_designUnit *du = cached_designUnit(s);
@@ -5755,29 +5817,39 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
 
    int32_t member_elem = -1;
    if (net_path != NULL) {
-      // A trailing "(N)" indexes one element of a vector net signal
-      // (per-bit strength nets key by the indexed port-map actual).
-      // Strip it for name resolution; the element offset passes to
-      // registration.
+      // Trailing "(N)" groups index one element of a vector net signal
+      // (per-bit strength nets key by the indexed port-map actual), or of
+      // a word of a memory of nets, "(W)(B)" (ivtest pr1703346: the
+      // memory's element nets were declined, so their strength drivers
+      // went through the VHDL resolution and read x).  Strip them for name
+      // resolution; the element offset passes to registration.
       char nbase[512];
       const char *np = (const char *)net_path;
       const size_t nl = strlen(np);
-      int32_t vidx = -1;
-      if (nl >= 4 && nl < sizeof(nbase) && np[nl - 1] == ')') {
-         const char *lp = strrchr(np, '(');
-         if (lp != NULL && lp > np) {
+      int64_t vidx[8];
+      int nidx = 0;
+      if (nl < sizeof(nbase)) {
+         size_t bl = nl;
+         while (bl >= 4 && np[bl - 1] == ')' && nidx < 8) {
+            size_t lp = bl - 1;
+            while (lp > 0 && np[lp] != '(')
+               lp--;
+            if (lp == 0 || np[lp] != '(')
+               break;
             char *end = NULL;
-            const long v = strtol(lp + 1, &end, 10);
-            if (end != NULL && *end == ')' && *(end + 1) == '\0' && v >= 0) {
-               const size_t bl = lp - np;
-               memcpy(nbase, np, bl);
-               nbase[bl] = '\0';
-               vidx = (int32_t)v;
-            }
+            const long v = strtol(np + lp + 1, &end, 10);
+            if (end == NULL || end != np + bl - 1 || v < 0)
+               break;
+            vidx[nidx++] = v;            // innermost first
+            bl = lp;
          }
+         memcpy(nbase, np, bl);
+         nbase[bl] = '\0';
       }
+      else
+         nbase[0] = '\0';
 
-      vhpiHandleT nh = vhpi_handle_by_name(vidx >= 0 ? nbase : np, NULL);
+      vhpiHandleT nh = vhpi_handle_by_name(nidx > 0 ? nbase : np, NULL);
       if (nh == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 8); return 0; }
       c_vhpiObject *obj = from_handle(nh);
       if (obj == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 9); return 0; }
@@ -5786,13 +5858,31 @@ int nvc_vhpi_stitch_net(int nep, const vhpiCharT **inst_paths,
       rt_signal_t *sig = vhpi_get_signal_objDecl(decl);
       if (sig == NULL) { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 11); return 0; }
 
-      if (vidx >= 0) {
-         // Translator vectors are (msb downto 0), stored left-to-right:
-         // canonical element offset = width-1 - index
-         const uint32_t sw = signal_width(sig);
-         if ((uint32_t)vidx >= sw)
-            { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 13); return 0; }
-         member_elem = (int32_t)sw - 1 - vidx;
+      if (nidx > 0) {
+         // The element's offset in the signal's storage (left to right,
+         // the outer index first): per index, its position in that
+         // dimension's range (high - v for downto, v - low for to) times
+         // the width of an element of that dimension.  The indices must
+         // reach a scalar element.
+         type_t t = tree_type(decl->decl.tree);
+         int64_t off = 0;
+         for (int k = nidx - 1; k >= 0; k--) {
+            if (t == NULL || !type_is_array(t) || dimension_of(t) != 1)
+               { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 14); return 0; }
+            tree_t r = range_of(t, 0);
+            int64_t low, high;
+            if (tree_subkind(r) == RANGE_EXPR || !folded_bounds(r, &low, &high))
+               { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 15); return 0; }
+            if (vidx[k] < low || vidx[k] > high)
+               { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 13); return 0; }
+            const int64_t pos = tree_subkind(r) == RANGE_DOWNTO
+               ? high - vidx[k] : vidx[k] - low;
+            t = type_elem(t);
+            off += pos * (int64_t)type_width(t);
+         }
+         if (type_width(t) != 1 || off >= (int64_t)signal_width(sig))
+            { if (getenv("NVC_STITCH_DEBUG")) fprintf(stderr, "#STITCH ext decline @%d\\n", 16); return 0; }
+         member_elem = (int32_t)off;
       }
 
       const char *tname = type_pp(tree_type(decl->decl.tree));

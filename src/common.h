@@ -96,6 +96,7 @@ type_t merge_constraints(type_t to, type_t from);
 
 void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
                   mir_context_t *mc);
+char *sv2ghdl_temp_dir(void);
 
 void print_syntax(const char *fmt, ...)
    __attribute__((format(printf, 1, 2)));

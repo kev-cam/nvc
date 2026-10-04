@@ -123,12 +123,12 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_one(c) then
-            a_val := a_val mod L3D_DRIVEN;
-            b_val := b_val mod L3D_DRIVEN;
-        elsif is_uncertain(c) then
+        if is_uncertain(c) then
             a_val := (a_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
             b_val := (b_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
+        elsif is_one(c) then
+            a_val := a_val mod L3D_DRIVEN;
+            b_val := b_val mod L3D_DRIVEN;
         end if;
 
         a'driver := a_val;
@@ -152,13 +152,13 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_one(c) then
+        if is_uncertain(c) then
+            a_val := l3ds_set_unknown(a_val);
+            b_val := l3ds_set_unknown(b_val);
+        elsif is_one(c) then
             -- ctrl=1: tranif0 blocks
             a_val := L3DS_Z;
             b_val := L3DS_Z;
-        elsif is_uncertain(c) then
-            a_val := l3ds_set_unknown(a_val);
-            b_val := l3ds_set_unknown(b_val);
         end if;
 
         a'driver := a_val;
@@ -191,12 +191,12 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_zero(c) then
-            a_val := a_val mod L3D_DRIVEN;
-            b_val := b_val mod L3D_DRIVEN;
-        elsif is_uncertain(c) then
+        if is_uncertain(c) then
             a_val := (a_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
             b_val := (b_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
+        elsif is_zero(c) then
+            a_val := a_val mod L3D_DRIVEN;
+            b_val := b_val mod L3D_DRIVEN;
         end if;
 
         a'driver := a_val;
@@ -220,13 +220,13 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_zero(c) then
+        if is_uncertain(c) then
+            a_val := l3ds_set_unknown(a_val);
+            b_val := l3ds_set_unknown(b_val);
+        elsif is_zero(c) then
             -- ctrl=0: tranif1 blocks
             a_val := L3DS_Z;
             b_val := L3DS_Z;
-        elsif is_uncertain(c) then
-            a_val := l3ds_set_unknown(a_val);
-            b_val := l3ds_set_unknown(b_val);
         end if;
 
         a'driver := a_val;
@@ -302,12 +302,12 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_one(c) then
-            a_val := a_val mod L3D_DRIVEN;
-            b_val := b_val mod L3D_DRIVEN;
-        elsif is_uncertain(c) then
+        if is_uncertain(c) then
             a_val := (a_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
             b_val := (b_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
+        elsif is_one(c) then
+            a_val := a_val mod L3D_DRIVEN;
+            b_val := b_val mod L3D_DRIVEN;
         end if;
 
         a'driver := a_val;
@@ -333,13 +333,13 @@ begin
         a_val := l3ds_weaken(a_val);
         b_val := l3ds_weaken(b_val);
 
-        if is_one(c) then
+        if is_uncertain(c) then
+            a_val := l3ds_set_unknown(a_val);
+            b_val := l3ds_set_unknown(b_val);
+        elsif is_one(c) then
             -- ctrl=1: rtranif0 blocks
             a_val := L3DS_Z;
             b_val := L3DS_Z;
-        elsif is_uncertain(c) then
-            a_val := l3ds_set_unknown(a_val);
-            b_val := l3ds_set_unknown(b_val);
         end if;
 
         a'driver := a_val;
@@ -373,12 +373,12 @@ begin
         a_val := b'other;
         b_val := a'other;
 
-        if is_zero(c) then
-            a_val := a_val mod L3D_DRIVEN;
-            b_val := b_val mod L3D_DRIVEN;
-        elsif is_uncertain(c) then
+        if is_uncertain(c) then
             a_val := (a_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
             b_val := (b_val mod L3D_DRIVEN) + L3D_UNCERTAIN;
+        elsif is_zero(c) then
+            a_val := a_val mod L3D_DRIVEN;
+            b_val := b_val mod L3D_DRIVEN;
         end if;
 
         a'driver := a_val;
@@ -404,13 +404,13 @@ begin
         a_val := l3ds_weaken(a_val);
         b_val := l3ds_weaken(b_val);
 
-        if is_zero(c) then
+        if is_uncertain(c) then
+            a_val := l3ds_set_unknown(a_val);
+            b_val := l3ds_set_unknown(b_val);
+        elsif is_zero(c) then
             -- ctrl=0: rtranif1 blocks
             a_val := L3DS_Z;
             b_val := L3DS_Z;
-        elsif is_uncertain(c) then
-            a_val := l3ds_set_unknown(a_val);
-            b_val := l3ds_set_unknown(b_val);
         end if;
 
         a'driver := a_val;

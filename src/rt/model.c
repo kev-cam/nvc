@@ -12877,8 +12877,9 @@ static void fused_block_build(rt_model_t *m)
    const unsigned count = m->fastclk_count;
    size_t hint = 192 + (size_t)count * 160;   // +64: second prologue
    if (hint > 0x300000) {   // one code page (4MB) bounds a blob
-      notef("accel-jit: NVC_FUSED_BLOCK — %u members exceed the block size "
-            "budget, not fusing", count);
+      if (getenv("NVC_ACCEL_JIT_DEBUG") != NULL)
+         notef("accel-jit: NVC_FUSED_BLOCK — %u members exceed the block "
+               "size budget, not fusing", count);
       return;
    }
 
@@ -13027,6 +13028,12 @@ static void fused_block_build(rt_model_t *m)
    unsigned nspliced = 0;
    for (unsigned i = 0; i < count; i++)
       nspliced += (fb->sites[i].state == SITE_SPLICE);
+
+   // Quiet by default, as the other fast-clk notes: the table is built in
+   // every simulation that runs past NVC_FAST_CLK_AUTO's time, and a note
+   // on stdout lands in the design's own output
+   if (getenv("NVC_ACCEL_JIT_DEBUG") == NULL)
+      return;
 
    notef("accel-jit: NVC_FUSED_BLOCK — fused %u/%u member(s), two-entry "
          "%u posedge-only + %u every-event%s%s", nplain, count,
@@ -15896,7 +15903,14 @@ static void sched_driver(rt_model_t *m, rt_nexus_t *n, uint64_t after,
              && !cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size))
             m->fastclk_comb[m->fastclk_probe_member] = 1;
       }
-      else if (cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size)) {
+      else if (cmp_bytes(value, value_ptr(n, &w->value), n->width * n->size)
+               && ((n->flags & NET_F_EFFECTIVE)
+                   || cmp_bytes(value, nexus_effective(n),
+                                n->width * n->size))) {
+         // (A deposit, `:=' in --std=2040, sets the effective value and not
+         // the driver: when it has made them differ, the driver's same value
+         // is a change to the signal, and must not be elided -- `x := 3;
+         // ... x <= 7;' with the driver holding 7 already left x at 3.)
          // Same value: the update itself is already elided; the ONLY
          // observables this branch produces are the forced empty delta
          // cycle and the 'ACTIVE marks.  When nothing in the design can
@@ -19510,12 +19524,40 @@ void model_interrupt(rt_model_t *m)
    jit_interrupt(m->jit, handle_interrupt_cb, m);
 }
 
+// The co-simulation driver's interrupt (cosim.c cosim_ctrl_c): as
+// model_interrupt, but the process the interrupt stops is aborted without
+// the "interrupted" fatal message -- the driver ends the run with its own
+// interrupted line.  (A "** Fatal: <t>: interrupted in process ..." came out
+// ahead of that line whenever the digital was running when the SIGINT came.)
+static void handle_interrupt_quiet_cb(jit_t *j, void *ctx)
+{
+   if (get_active_proc() != NULL)
+      jit_abort_with_status(EXIT_FAILURE);
+}
+
+void model_interrupt_quiet(rt_model_t *m)
+{
+   if (!relaxed_load(&m->force_stop))
+      relaxed_store(&m->interrupted, true);
+   model_stop(m);
+   jit_interrupt(m->jit, handle_interrupt_quiet_cb, m);
+}
+
 // True once an interrupt (model_interrupt) has stopped the model.  The model
 // is then also stopped (model_stopped), but the run did not end: the
 // co-simulation driver (cosim.c) reports it as interrupted, never as a stop.
 bool model_interrupted(rt_model_t *m)
 {
    return relaxed_load(&m->interrupted);
+}
+
+// The co-simulation driver (cosim.c) has taken the interrupt that stopped
+// the model, which it never enters again: the interrupt model_interrupt
+// left pending in the JIT is dropped, so that nothing run at the end of the
+// simulation repeats it, and a later SIGINT is a new one.
+void model_drop_interrupt(rt_model_t *m)
+{
+   jit_clear_interrupt(m->jit);
 }
 
 int model_exit_status(rt_model_t *m)
@@ -20597,6 +20639,7 @@ typedef struct {
                                // (STD_MX auto-connect); excluded from
                                // the member fold to keep exclude-self
                                // views honest
+   rt_watch_t   *watch;        // member: the watch on its signal
 } stitch_ep_t;
 
 typedef struct _rt_stitch_net {
@@ -20608,6 +20651,25 @@ typedef struct _rt_stitch_net {
    uint16_t       n_supply_pwr;
    stitch_ep_t    ep[];
 } rt_stitch_net_t;
+
+// A member's own contribution -- the fold of its real sources, the plug
+// left out -- can change while its resolved value does not: the plug's
+// rest-of-net view masks it (an X, or a stronger value).  No event fires
+// on the member signal then, so every view derived from the contribution
+// goes stale: two tri-state nets joined by a tran stayed x for good, each
+// net's initial X reaching the other through the views and the drivers'
+// later 0/1/Z never firing an event.  So the member nexus runs a copy of
+// its vtable whose update_driving calls the original, re-classifies the
+// member, and wakes the member's watch (stitch_event_cb, in the process
+// phase that follows, as an event would) when the contribution moved.
+typedef struct {
+   rt_nexus_vtable_t        vt;     // the copy the member nexus runs
+   const rt_nexus_vtable_t *orig;   // the vtable it wraps
+   rt_stitch_net_t         *net;
+   int                      epi;
+} stitch_hook_t;
+
+static ihash_t *g_stitch_hooks = NULL;   // member nexus -> stitch_hook_t
 
 static rt_stitch_net_t *g_stitch_nets = NULL;
 static int g_stitch_trace = -1;
@@ -21062,6 +21124,56 @@ static void stitch_update_views(rt_model_t *m, rt_stitch_net_t *net)
    }
 }
 
+// The member hook's update_driving (stitch_hook_t)
+static void stitch_hook_update_driving(rt_model_t *m, rt_nexus_t *n)
+{
+   stitch_hook_t *h = g_stitch_hooks == NULL
+      ? NULL : ihash_get(g_stitch_hooks, (uintptr_t)n);
+   if (unlikely(h == NULL)) {   // (a copy of a member's vtable on another nexus)
+      (*nexus_default_vtable.update_driving)(m, n);
+      return;
+   }
+   (*h->orig->update_driving)(m, n);
+
+   stitch_ep_t *ep = &(h->net->ep[h->epi]);
+   if (ep->watch == NULL || ep->watch->wakeable.pending)
+      return;   // a re-classification is due already
+   const stitch_ctr_t c = stitch_classify(h->net, ep);
+   if (c.val != ep->last.val || c.str != ep->last.str
+       || c.flags != ep->last.flags) {
+      if (stitch_trace())
+         fprintf(stderr, "#ST hook net=%p ep=%d (%u,%u,%u)->(%u,%u,%u)\n",
+                 (void *)h->net, h->epi, ep->last.val, ep->last.str,
+                 ep->last.flags, c.val, c.str, c.flags);
+      wakeup_one(m, &(ep->watch->wakeable));
+   }
+}
+
+// Put member endpoint i's nexus on its hook -- again after something
+// (add_source, force, release) set the nexus back on a plain vtable
+static void stitch_hook_install(rt_stitch_net_t *net, int i)
+{
+   stitch_ep_t *ep = &(net->ep[i]);
+   rt_nexus_t *n = ep->mnex;
+   if (!ep->is_member || n == NULL
+       || n->vtable->update_driving == stitch_hook_update_driving)
+      return;
+
+   if (g_stitch_hooks == NULL)
+      g_stitch_hooks = ihash_new(64);
+   stitch_hook_t *h = ihash_get(g_stitch_hooks, (uintptr_t)n);
+   if (h == NULL) {
+      h = xcalloc(sizeof(stitch_hook_t));
+      ihash_put(g_stitch_hooks, (uintptr_t)n, h);
+   }
+   h->net  = net;
+   h->epi  = i;
+   h->orig = n->vtable;
+   h->vt   = *(n->vtable);
+   h->vt.update_driving = stitch_hook_update_driving;
+   n->vtable = &(h->vt);
+}
+
 // Contributor event: O(1) counts transition, then refresh views.  The
 // moving endpoint's own view is unchanged by construction (its
 // excluded set did not move) — stitch_put's compare makes that free.
@@ -21081,6 +21193,8 @@ static void stitch_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
       stitch_ep_t *ep = &(net->ep[i]);
       if (ep->drv[0] != s && ep->drv[1] != s && ep->drv[2] != s)
          continue;
+      if (ep->is_member)
+         stitch_hook_install(net, i);
       stitch_ctr_t c = stitch_classify(net, ep);
       if (stitch_trace())
          fprintf(stderr, "#ST ev net=%p ep=%d (%u,%u,%u)->(%u,%u,%u)\n",
@@ -21243,8 +21357,16 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
          rt_watch_t *w = watch_new(m, stitch_event_cb, net,
                                    WATCH_EVENT, 1);
          model_set_event_cb(m, net->ep[i].drv[f], w);
+         if (net->ep[i].is_member && f == 0)
+            net->ep[i].watch = w;
       }
    }
+
+   // A member's contribution moves on its drivers, not only on its events
+   // (stitch_hook_t); after add_source, which put the nexus back on the
+   // default vtable
+   for (int i = 0; i < nep; i++)
+      stitch_hook_install(net, i);
 
    // Publish initial views
    stitch_update_views(m, net);
