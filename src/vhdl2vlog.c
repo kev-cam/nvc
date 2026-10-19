@@ -673,6 +673,11 @@ static const char *vlog_l3d_op(const char *fn, int *kind)
       {"l3d_nand","~&",0}, {"l3d_nor","~|",0}, {"l3d_xnor","~^",0},
       {"l3d_not","~",1}, {"is_zero","~",1}, {"l3d_not_l","~",1},
       {"is_one","",2}, {"to_integer","",2}, {"l3d_to_unsigned","",2},
+      // l3d_strengthen(x): strength-plane only (L/H -> 0/1, W/U -> X); the
+      // VALUE plane is untouched, so on the 2-state accel value bits it is
+      // the identity.  tgt-vhdl wraps every re-strengthened register
+      // update in it since iverilog 7a9566876 (2026-10-03).
+      {"l3d_strengthen","",2},
       {"unsigned_to_l3d","",2}, {"boolean_to_logic","",2}, {"to_logic3d","",2},
       {"unsigned_to_l3d_bit","",2}, {"l3d_to_bit","",2}, {"to_bit","",2},
       // width adjusters: Verilog's assignment context resizes -- emit the value
@@ -1776,10 +1781,60 @@ static tree_t level_test_of(tree_t e, bool *one)
    return NULL;
 }
 
+// tgt-vhdl's SV2VHDL_ICG2EN wake-shadow term, emitted beside each edge since
+// iverilog 7a9566876: `rising_edge(clk) or (is_one(clk) and not
+// is_one(v_icg2en_snap_clk))` (falling: is_zero of both).  The process
+// snapshots clk into v_icg2en_snap_clk at the bottom of every pass, so the
+// term fires exactly when clk rose while the process was not watching (a
+// wake-shadow close) -- in the interpreter.  On a cycle-based model whose
+// sync IS the posedge there is no shadow to close: the term adds nothing to
+// the edge it accompanies, so it is accepted as that edge.  The level test
+// must be on the SAME object as the edge and the negated test on a VARIABLE
+// named v_icg2en_snap*; anything else keeps declining.
+static bool wake_shadow_of(tree_t term, tree_t esig, bool pe)
+{
+   if (term == NULL || tree_kind(term) != T_FCALL || tree_params(term) < 2)
+      return false;
+   const char *fn = id_base(istr(tree_ident(term)));
+   if (strcasecmp(fn, "\"and\"") && strcasecmp(fn, "l3d_and"))
+      return false;
+   tree_t a = tree_value(tree_param(term, 0));
+   tree_t b = tree_value(tree_param(term, 1));
+   for (int swap = 0; swap < 2; swap++) {
+      tree_t lv = swap ? b : a, nt = swap ? a : b;
+      if (tree_kind(lv) != T_FCALL || tree_params(lv) < 1)
+         continue;
+      const char *lf = id_base(istr(tree_ident(lv)));
+      bool lone;
+      if (!strcasecmp(lf, "is_one")) lone = true;
+      else if (!strcasecmp(lf, "is_zero")) lone = false;
+      else continue;
+      if (lone != pe || !same_object(tree_value(tree_param(lv, 0)), esig))
+         continue;
+      if (tree_kind(nt) != T_FCALL || tree_params(nt) < 1)
+         continue;
+      const char *nf = id_base(istr(tree_ident(nt)));
+      if (strcasecmp(nf, "\"not\"") && strcasecmp(nf, "l3d_not"))
+         continue;
+      tree_t inner = tree_value(tree_param(nt, 0));
+      if (tree_kind(inner) != T_FCALL || tree_params(inner) < 1
+          || strcasecmp(id_base(istr(tree_ident(inner))), lf))
+         continue;
+      tree_t v = tree_value(tree_param(inner, 0));
+      if (tree_kind(v) != T_REF || !tree_has_ref(v)
+          || tree_kind(tree_ref(v)) != T_VAR_DECL
+          || strcasestr(istr(tree_ident(v)), "icg2en_snap") == NULL)
+         continue;
+      return true;
+   }
+   return false;
+}
+
 // Extract clock/reset edges from an if-condition: a single rising/falling_edge,
 // the VHDL-87 `clk'event and clk = '1'` idiom, or an OR of them (async-reset
-// flop, translated from `always @(posedge clk or negedge rst)`). Fills
-// sig[]/pe[] (pe = posedge), returns edge count or 0.
+// flop, translated from `always @(posedge clk or negedge rst)`), each edge
+// optionally accompanied by its icg2en wake-shadow term (wake_shadow_of).
+// Fills sig[]/pe[] (pe = posedge), returns edge count or 0.
 static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
 {
    if (test == NULL || max < 1) return 0;
@@ -1819,10 +1874,23 @@ static int edges_of(tree_t test, tree_t *sig, bool *pe, int max)
    // OR of two edge tests (boolean "or" or logic3d l3d_or)
    if (!strcasecmp(fn, "\"or\"") || !strcasecmp(fn, "l3d_or")) {
       if (tree_params(test) < 2) return 0;
-      int a = edges_of(tree_value(tree_param(test, 0)), sig, pe, max);
-      if (a == 0) return 0;
-      int b = edges_of(tree_value(tree_param(test, 1)), sig + a, pe + a, max - a);
-      if (b == 0) return 0;
+      tree_t lhs = tree_value(tree_param(test, 0));
+      tree_t rhs = tree_value(tree_param(test, 1));
+      int a = edges_of(lhs, sig, pe, max);
+      if (a == 0) {
+         // `<wake-shadow> or <edge>`: the term on the left of its edge
+         int b = edges_of(rhs, sig, pe, max);
+         return (b == 1 && wake_shadow_of(lhs, sig[0], pe[0])) ? 1 : 0;
+      }
+      int b = edges_of(rhs, sig + a, pe + a, max - a);
+      if (b == 0) {
+         // `<edges> or <wake-shadow>`: the term follows one of the edges
+         // already collected (left-assoc `e1 or w1 or e2 or w2`)
+         for (int i = 0; i < a; i++)
+            if (wake_shadow_of(rhs, sig[i], pe[i]))
+               return a;
+         return 0;
+      }
       return a + b;
    }
    return 0;
@@ -9064,6 +9132,80 @@ static bool r2_flush_memwr(r2_targets_t *ts)
 // tgt-vhdl's NBA delta guard: `if <boolvar> then <boolvar> := False; else
 // wait for 0 ns; end if;` — every arm holds only writes to the guard
 // variable, waits and nulls
+// A reference to a process VARIABLE whose name carries `frag`.
+static bool r2_var_named(tree_t t, const char *frag)
+{
+   return t != NULL && tree_kind(t) == T_REF && tree_has_ref(t)
+      && tree_kind(tree_ref(t)) == T_VAR_DECL
+      && strcasestr(istr(tree_ident(t)), frag) != NULL;
+}
+
+// tgt-vhdl NBA loopback idiom (iverilog 7a9566876, 2026-10-03): the shadow
+// pre-copies sit under `if not v_nba_loopback then ... end if;`, every pass
+// snapshots each wake input into v_icg2en_snap_<sig>, and after the commits
+//    v_nba_loopback := True;
+//    if (<each input> = <its snapshot>) then
+//       v_nba_loopback := False;  wait on <inputs>;
+//    end if;
+// re-runs the process WITHOUT re-reading the registers when an input moved
+// during the pass (a wake-shadow close: the shadows already hold the
+// committed values, which the signals themselves do not yet).  On a cycle
+// model every evaluation IS a fresh pass on committed registers, so the
+// guard is always-taken, the snapshots and the flag are interpreter-only
+// bookkeeping, and the close-if (waits + flag writes only) has no register
+// semantics.  Recognised by shape AND the variables' names.
+static tree_t r2_nba_loopback_guard(tree_t s)
+{
+   if (tree_conds(s) != 1 || !tree_has_value(tree_cond(s, 0)))
+      return NULL;
+   tree_t cv = tree_value(tree_cond(s, 0));
+   if (tree_kind(cv) != T_FCALL || tree_params(cv) < 1
+       || strcasecmp(id_base(istr(tree_ident(cv))), "\"not\""))
+      return NULL;
+   if (!r2_var_named(tree_value(tree_param(cv, 0)), "nba_loopback"))
+      return NULL;
+   return tree_cond(s, 0);
+}
+
+static bool r2_nba_loopback_close(tree_t s)
+{
+   const int nc = tree_conds(s);
+   bool saw_flag = false;
+   for (int i = 0; i < nc; i++) {
+      tree_t c = tree_cond(s, i);
+      const int n = tree_stmts(c);
+      for (int j = 0; j < n; j++) {
+         tree_t st = tree_stmt(c, j);
+         const tree_kind_t k = tree_kind(st);
+         if (k == T_WAIT || k == T_NULL)
+            continue;
+         if (k == T_VAR_ASSIGN
+             && r2_var_named(tree_target(st), "nba_loopback")) {
+            saw_flag = true;
+            continue;
+         }
+         return false;
+      }
+   }
+   return saw_flag;
+}
+
+// the shadow pre-copy  v_nba_r := r  -> an alias for the signal in the tree
+static bool r2_nba_precopy(tree_t s)
+{
+   tree_t vt = tree_target(s), vv = tree_value(s);
+   if (tree_kind(vt) != T_REF || tree_kind(vv) != T_REF
+       || !tree_has_ref(vv) || g_r2_nalias >= 16)
+      return false;
+   r2_alias_t *al = &g_r2_alias[g_r2_nalias++];
+   al->var = tree_ident(vt);
+   al->sig = tree_ident(vv);
+   al->sigdecl = tree_ref(vv);
+   al->committed = false;
+   al->wrote = false;
+   return true;
+}
+
 static bool r2_nba_init_guard(tree_t s)
 {
    const int nc = tree_conds(s);
@@ -9301,6 +9443,23 @@ static bool r2_process(tree_t p0, int pidx)
          tree_t s = tree_stmt(p, i);
          if (s == ifstmt || tree_kind(s) == T_WAIT)
             continue;
+         if (i < ifidx && tree_kind(s) == T_IF) {
+            // `if not v_nba_loopback then <pre-copies> end if;`
+            tree_t arm = r2_nba_loopback_guard(s);
+            if (arm == NULL) {
+               R2_DECLINE("proc-pre-if");
+               return false;
+            }
+            const int na = tree_stmts(arm);
+            for (int j = 0; j < na; j++) {
+               tree_t st = tree_stmt(arm, j);
+               if (tree_kind(st) != T_VAR_ASSIGN || !r2_nba_precopy(st)) {
+                  R2_DECLINE("nba-pre");
+                  return false;
+               }
+            }
+            continue;
+         }
          if (i > ifidx && tree_kind(s) == T_IF) {
             // the tgt-vhdl delta guard `if nba_init_run then nba_init_run
             // := False; else wait for 0 ns; end if;` between the edge-if
@@ -9321,25 +9480,22 @@ static bool r2_process(tree_t p0, int pidx)
                extra[nextra++] = tree_cond(s, 0);
                continue;
             }
+            if (r2_nba_loopback_close(s))
+               continue;
             R2_DECLINE("proc-extra-if");
             return false;
          }
          if (i < ifidx && tree_kind(s) == T_VAR_ASSIGN) {
             // pre-copy  v_nba_r := r
-            tree_t vt = tree_target(s), vv = tree_value(s);
-            if (tree_kind(vt) == T_REF && tree_kind(vv) == T_REF
-                && tree_has_ref(vv) && g_r2_nalias < 16) {
-               r2_alias_t *al = &g_r2_alias[g_r2_nalias++];
-               al->var = tree_ident(vt);
-               al->sig = tree_ident(vv);
-               al->sigdecl = tree_ref(vv);
-               al->committed = false;
-               al->wrote = false;
+            if (r2_nba_precopy(s))
                continue;
-            }
             R2_DECLINE("nba-pre");
             return false;
          }
+         if (i > ifidx && tree_kind(s) == T_VAR_ASSIGN
+             && (r2_var_named(tree_target(s), "icg2en_snap")
+                 || r2_var_named(tree_target(s), "nba_loopback")))
+            continue;   // snapshot / loopback flag: interpreter bookkeeping
          if (i > ifidx && tree_kind(s) == T_SIGNAL_ASSIGN) {
             // commit  r <= v_nba_r
             tree_t st = tree_target(s);
@@ -9381,7 +9537,10 @@ static bool r2_process(tree_t p0, int pidx)
       snprintf(n->spec, sizeof n->spec, "%s", vid(n->name));
       snprintf(n->g0, sizeof n->g0, "g0_%s", vid(n->name));
       type_t ty = tree_type(g_r2_alias[i].sigdecl);
-      n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
+      if (type_is_integer(ty) && !type_is_logic3d(ty))
+         n->width = 32;   // the integer-signal convention (r2_collect_cb)
+      else
+         n->width = type_const_bounds(ty) ? (int)type_width(ty) : -1;
    }
    // a process with no register target still owns its MEMORY writes (a
    // RAM's write port: VX_dp_ram writes only the shadow of the array);
