@@ -4764,6 +4764,21 @@ static int r2_width_or_operands(tree_t e)
       }
    }
    const int w = r2_width(e);
+   // A bare numeric_std `*` RENDERS at L'length+R'length: the binop emitter
+   // bumps r2_width's value to the operand sum whenever that is larger (see
+   // "bump mul width").  Mirror it here so r2_rendered_width (which ends in
+   // this helper) agrees with the emitted width.  r2_width under-reported a
+   // 20x20 product of two signed resize-widens as 32 (the sum ran only when
+   // r2_width was unconstrained), so the narrowing `resize(p, 16)` sized its
+   // temp at 32 and took bit 31 -- not bit 39 -- as the sign (ck65 nsr; the
+   // builder's fit truncated the 40-bit product into it).
+   if (w > 0 && tree_kind(e) == T_FCALL && tree_params(e) == 2
+       && strcmp(istr(tree_ident(e)), "\"*\"") == 0) {
+      const int wa = r2_width_or_operands(tree_value(tree_param(e, 0)));
+      const int wb = r2_width_or_operands(tree_value(tree_param(e, 1)));
+      if (wa > 0 && wb > 0 && wa + wb > w)
+         return wa + wb;
+   }
    if (w > 0)
       return w;
    if (tree_kind(e) == T_FCALL) {
@@ -9876,7 +9891,15 @@ bool vhdl2rtlil_module(const void *api_, tree_t block, const char *modname)
          R2_DECLINE("sig-width");
          goto declined;
       }
-      const int w = (int)type_width(ty);
+      // An INTEGER signal is the translator's `signed [31:0]` (r2_width and
+      // r2_collect_cb's hold temp both say 32) -- NOT type_width's scalar 1.
+      // Declared at 1 bit, the builder's width fit truncated the 32-bit hold
+      // temp into it on the sync assign, so `integer range 0 to 3` used as a
+      // dynamic memory index only ever addressed words 0/1 (ck60 F4 sigidx;
+      // before the fit it was a width-mismatch error that fell back to the
+      // text path).  logic3d is an integer subtype but genuinely one bit.
+      const int w = (type_is_integer(ty) && !type_is_logic3d(ty))
+         ? 32 : (int)type_width(ty);
       const bool is_r = is_reg(block, d);
       char init[R2_SPEC];
       const char *initbits = NULL;
