@@ -1,6 +1,8 @@
 ## Unreleased changes
 - PSL `next_e` and `next_e!` operators are now supported.
 - PSL `nondet` built-in function is now supported.
+- Fixed wrong VHDL assertion count when an assertion fails in a
+  resolution function (#1700).
 - The `--precompile` elaboration option which was deprecated in the last
   release has been removed.  The related `--with-system-cc` configure
   option has also been removed.

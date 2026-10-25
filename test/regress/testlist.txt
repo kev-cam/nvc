@@ -1264,3 +1264,4 @@ logic3dw2       normal,2040
 logic3dw3       normal,2040
 fuse1           normal,2040
 wait31          normal,2008
+issue1700       normal,2019
