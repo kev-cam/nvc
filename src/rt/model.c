@@ -3719,6 +3719,165 @@ static int aj_bit_base(type_t t)
 }
 
 // Collect distinct recovered-Verilog source files across the subtree.
+static char *aj_read_file(const char *path);
+
+// The Verilog module names of every scope in the subtree (accel_verilog_module
+// reads `module <name>` at each scope's recorded source line).
+static void aj_collect_modules(rt_scope_t *scope, char mods[][128],
+                               int *nmod, int max)
+{
+   tree_t r = aj_scope_ref(scope);
+   char buf[128];
+   if (r != NULL && accel_verilog_module(r, buf, sizeof buf)) {
+      bool dup = false;
+      for (int i = 0; i < *nmod; i++)
+         if (strcmp(mods[i], buf) == 0) { dup = true; break; }
+      if (!dup && *nmod < max)
+         snprintf(mods[(*nmod)++], 128, "%s", buf);
+   }
+   for (int ci = 0; ci < scope->children.count; ci++)
+      aj_collect_modules(scope->children.items[ci], mods, nmod, max);
+}
+
+// `module <name>` at the start of a line (after whitespace, an optional
+// lifetime qualifier); writes the name.  Not `endmodule`, not a comment.
+static bool aj_line_module_name(const char *line, char *out, size_t outsz)
+{
+   const char *p = line;
+   while (*p == ' ' || *p == '\t') p++;
+   if (strncmp(p, "module", 6) != 0 || !isspace((unsigned char)p[6]))
+      return false;
+   p += 6;
+   while (isspace((unsigned char)*p)) p++;
+   static const char *const lifetime[] = { "automatic", "static" };
+   for (size_t k = 0; k < ARRAY_LEN(lifetime); k++) {
+      const size_t l = strlen(lifetime[k]);
+      if (strncmp(p, lifetime[k], l) == 0 && isspace((unsigned char)p[l])) {
+         p += l;
+         while (isspace((unsigned char)*p)) p++;
+      }
+   }
+   size_t n = 0;
+   for (; n + 1 < outsz && (isalnum((unsigned char)p[n]) || p[n] == '_'
+                            || p[n] == '$'); n++)
+      out[n] = p[n];
+   out[n] = '\0';
+   return n > 0;
+}
+
+static bool aj_line_is_endmodule(const char *line)
+{
+   const char *p = line;
+   while (*p == ' ' || *p == '\t') p++;
+   return strncmp(p, "endmodule", 9) == 0
+      && !(isalnum((unsigned char)p[9]) || p[9] == '_');
+}
+
+// Stage only the subtree's modules out of a source file that also holds
+// others.  A vendor-style compile (vamos's vcs/xelab personalities, or any
+// flow that gives one file) puts the TESTBENCH in the same file as the DUT,
+// and the testbench is not synthesizable (`forever`, $value$plusargs, ...):
+// handed the whole file, yosys stops at the testbench and every subtree of
+// the design declines -- measured on Hazard3 and VeeR-EH1 through vamos,
+// 2026-11-01: zero installs, interpreter speed.  The file's text outside
+// module blocks (`timescale, defines, global functions) is kept; a module
+// block (its preceding `(* attribute *)` lines included) is dropped only
+// when it is in `drop`: the modules some scope OUTSIDE this subtree was
+// translated from and none inside it (the testbench, the enclosing SoC).
+// A module no scope claims is kept: an instance inside a generate block is
+// not visible as its own scope here, and dropping hazard3_branchcmp that
+// way lost the Hazard3 core ("Module ... is not part of the design").  Writes
+// <accel_dir>/ajt_<keyname>_<hash>.v and returns true with its path in
+// `out`; false (keep the original) when nothing would be dropped, or on any
+// read/write problem.
+static bool aj_trim_source(const char *path, const char *accel_dir,
+                           const char *keyname, char drop[][128], int ndrop,
+                           char *out, size_t outsz, int *kept, int *dropped)
+{
+   char *text = aj_read_file(path);
+   if (text == NULL)
+      return false;
+   const size_t n = strlen(text);
+   char *trimmed = xmalloc(n + 1);
+   size_t tn = 0, pend = 0;        // pend: start of pending attribute lines
+   bool in_mod = false, keep_mod = false;
+   *kept = *dropped = 0;
+   const char *p = text;
+   while (*p != '\0') {
+      const char *eol = strchr(p, '\n');
+      const size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
+      char name[128];
+      if (!in_mod) {
+         const char *q = p;
+         while (*q == ' ' || *q == '\t') q++;
+         if (q[0] == '(' && q[1] == '*') {
+            // an attribute line: decided with the module header that follows
+            if (pend == 0) pend = tn;
+            memcpy(trimmed + tn, p, len);
+            tn += len;
+         }
+         else if (aj_line_module_name(p, name, sizeof name)) {
+            keep_mod = true;
+            for (int i = 0; i < ndrop; i++)
+               if (strcmp(drop[i], name) == 0) { keep_mod = false; break; }
+            in_mod = true;
+            if (keep_mod) {
+               (*kept)++;
+               memcpy(trimmed + tn, p, len);
+               tn += len;
+            }
+            else {
+               (*dropped)++;
+               if (pend != 0) tn = pend;    // drop its attribute lines too
+            }
+            pend = 0;
+            if (aj_line_is_endmodule(p))     // `module x; endmodule` on one line
+               in_mod = false;
+         }
+         else {
+            pend = 0;
+            memcpy(trimmed + tn, p, len);
+            tn += len;
+         }
+      }
+      else {
+         if (keep_mod) {
+            memcpy(trimmed + tn, p, len);
+            tn += len;
+         }
+         if (aj_line_is_endmodule(p))
+            in_mod = false;
+      }
+      p += len;
+   }
+   trimmed[tn] = '\0';
+   free(text);
+   if (*dropped == 0 || *kept == 0) {
+      free(trimmed);
+      return false;
+   }
+   uint64_t h = 1469598103934665603ULL;
+   for (size_t i = 0; i < tn; i++) { h ^= (uint8_t)trimmed[i]; h *= 1099511628211ULL; }
+   snprintf(out, outsz, "%s/ajt_%s_%016llx.v", accel_dir, keyname,
+            (unsigned long long)h);
+   struct stat st;
+   bool ok = (stat(out, &st) == 0 && (size_t)st.st_size == tn);
+   if (!ok) {
+      char tmp[640];
+      snprintf(tmp, sizeof tmp, "%s.tmp.%d", out, (int)getpid());
+      FILE *f = fopen(tmp, "wb");
+      if (f != NULL) {
+         ok = fwrite(trimmed, 1, tn, f) == tn;
+         if (fclose(f) != 0 || !ok || rename(tmp, out) != 0) {
+            unlink(tmp);
+            ok = false;
+         }
+      }
+   }
+   free(trimmed);
+   return ok;
+}
+
 static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
                                int *nsrc, int max)
 {
@@ -8982,8 +9141,34 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       snprintf(srcs[0], sizeof srcs[0], "%s", vpath);
       nsrc = 1;
    }
-   else
+   else {
       aj_collect_sources(scope, srcs, &nsrc, 64);
+      // A file that also holds modules outside this subtree (the testbench,
+      // under a one-file compile) is staged trimmed to the subtree's modules.
+      static char mods_in[512][128], mods_all[512][128], drop[512][128];
+      int nin = 0, nall = 0, ndrop = 0;
+      aj_collect_modules(scope, mods_in, &nin, 512);
+      if (m->root != NULL)
+         aj_collect_modules(m->root, mods_all, &nall, 512);
+      for (int a = 0; a < nall; a++) {
+         bool inside = false;
+         for (int b = 0; b < nin && !inside; b++)
+            inside = strcmp(mods_all[a], mods_in[b]) == 0;
+         if (!inside && ndrop < 512)
+            snprintf(drop[ndrop++], 128, "%s", mods_all[a]);
+      }
+      for (int i = 0; i < nsrc && ndrop > 0; i++) {
+         char tpath[512];
+         int kept = 0, dropped = 0;
+         if (aj_trim_source(srcs[i], accel_dir, top0, drop, ndrop, tpath,
+                            sizeof tpath, &kept, &dropped)) {
+            notef("accel-jit: subtree '%s': staging %d of %d modules from %s "
+                  "(%d translated outside the subtree dropped) -> %s", top0,
+                  kept, kept + dropped, srcs[i], dropped, tpath);
+            snprintf(srcs[i], 512, "%s", tpath);
+         }
+      }
+   }
    if (nsrc == 0)
       return false;
 
