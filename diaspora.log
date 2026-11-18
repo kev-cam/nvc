@@ -1,0 +1,4 @@
+# diaspora.log - imports that were tried and did not work, and how they
+# went wrong.  Written by diaspora (github.com/kev-cam/diaspora): one block
+# per attempt, appended, never rewritten.  The verdicts are in
+# diaspora.ledger; `diaspora show <commit>` prints a commit's blocks.
