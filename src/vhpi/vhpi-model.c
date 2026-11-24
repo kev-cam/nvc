@@ -5586,12 +5586,9 @@ const vhpiCharT *nvc_vhpi_get_port_map(vhpiHandleT inst_handle)
  * Returns the type name (e.g. "LOGIC3DS", "STD_LOGIC", "INTEGER"),
  * or NULL if not found.  The returned string is statically allocated.
  */
-DLLEXPORT
-const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
-                                           const vhpiCharT *port_name)
+static type_t find_driver_type(vhpiHandleT inst_handle,
+                               const vhpiCharT *port_name)
 {
-   vhpi_clear_error();
-
    c_vhpiObject *obj = from_handle(inst_handle);
    if (obj == NULL) return NULL;
 
@@ -5621,19 +5618,122 @@ const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
       tree_t val = tree_value(d);
       if (tree_kind(val) == T_REF && tree_has_ref(val)) {
          tree_t port_decl = tree_ref(val);
-         if (tree_ident(port_decl) == port_id) {
-            /* Found it — return the type name */
-            type_t t = tree_type(d);
-            static char type_buf[256];
-            const char *tname = type_pp(t);
-            snprintf(type_buf, sizeof(type_buf), "%s",
-                     tname ? tname : "?");
-            return (const vhpiCharT *)type_buf;
-         }
+         if (tree_ident(port_decl) == port_id)
+            return tree_type(d);
       }
    }
 
    return NULL;
+}
+
+DLLEXPORT
+const vhpiCharT *nvc_vhpi_get_driver_type(vhpiHandleT inst_handle,
+                                           const vhpiCharT *port_name)
+{
+   vhpi_clear_error();
+
+   type_t t = find_driver_type(inst_handle, port_name);
+   if (t == NULL)
+      return NULL;
+
+   static char type_buf[256];
+   const char *tname = type_pp(t);
+   snprintf(type_buf, sizeof(type_buf), "%s", tname ? tname : "?");
+   return (const vhpiCharT *)type_buf;
+}
+
+/*
+ * NVC extension: the user-defined attributes of a port's implicit
+ * 'driver type, so a resolution-network generator can choose how a net
+ * of that type is resolved from the type itself, e.g.
+ *
+ *    attribute resolution : string;
+ *    attribute resolution of rf_air : subtype is "arena";
+ *
+ * Returns "NAME=value" lines (attribute names upper case, as nvc keeps
+ * identifiers), the type's own attributes first, then those of the types
+ * it is a subtype of; an attribute given at more than one level appears
+ * once per level, nearest first.  String values are given as their
+ * characters, integer and real literals as numbers; other values are left
+ * out.  Only attribute specifications in the design unit that declares
+ * the type are seen.  "" if the type has none; NULL if the port has no
+ * implicit 'driver.  The string is statically allocated.
+ */
+static void append_type_attrs(text_buf_t *tb, type_t type)
+{
+   if (!type_has_ident(type))
+      return;
+
+   ident_t simple = ident_rfrom(type_ident(type), '.');
+   tree_t unit = type_container(type);
+   if (unit == NULL)
+      return;
+
+   const int ndecls = tree_decls(unit);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(unit, i);
+      if (tree_kind(d) != T_ATTR_SPEC)
+         continue;
+      else if (tree_class(d) != C_TYPE && tree_class(d) != C_SUBTYPE)
+         continue;
+      else if (tree_subkind(d) != SPEC_EXACT || !tree_has_ident2(d))
+         continue;
+      else if (tree_ident2(d) != simple || !tree_has_value(d))
+         continue;
+
+      tree_t value = tree_value(d);
+      switch (tree_kind(value)) {
+      case T_STRING:
+         {
+            tb_printf(tb, "%s=", istr(tree_ident(d)));
+            const int nchars = tree_chars(value);
+            for (int j = 0; j < nchars; j++) {
+               ident_t rune = tree_ident(tree_char(value, j));
+               if (ident_char(rune, 0) == '\'')
+                  tb_append(tb, ident_char(rune, 1));
+            }
+            tb_append(tb, '\n');
+         }
+         break;
+      case T_LITERAL:
+         if (tree_subkind(value) == L_INT)
+            tb_printf(tb, "%s=%"PRIi64"\n", istr(tree_ident(d)),
+                      tree_ival(value));
+         else if (tree_subkind(value) == L_REAL)
+            tb_printf(tb, "%s=%.17g\n", istr(tree_ident(d)),
+                      tree_dval(value));
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+DLLEXPORT
+const vhpiCharT *nvc_vhpi_get_driver_type_attrs(vhpiHandleT inst_handle,
+                                                 const vhpiCharT *port_name)
+{
+   vhpi_clear_error();
+
+   type_t t = find_driver_type(inst_handle, port_name);
+   if (t == NULL)
+      return NULL;
+
+   static text_buf_t *tb = NULL;
+   if (tb == NULL)
+      tb = tb_new();
+   else
+      tb_rewind(tb);
+
+   for (int depth = 0; t != NULL && depth < 16; depth++) {
+      append_type_attrs(tb, t);
+      if (type_kind(t) == T_SUBTYPE)
+         t = type_base(t);
+      else
+         break;
+   }
+
+   return (const vhpiCharT *)tb_get(tb);
 }
 
 // Resolve an implicit-signal decl to runtime signals.  Scalar

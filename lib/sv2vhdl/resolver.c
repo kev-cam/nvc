@@ -113,6 +113,7 @@ typedef struct endpoint {
     int  is_signal;                /* 1 if this reads the net signal directly (no receiver) */
     char mode[8];                  /* static port mode: "in"/"out"/"inout"/"" */
     char kind[24];                 /* primitive entity, lowercased: "sv_alias".. */
+    char type_attrs[MAX_VAL];      /* the 'driver type's user attributes: "NAME=value" lines */
 } endpoint_t;
 
 /*
@@ -223,6 +224,56 @@ static int net_add_endpoint(net_info_t *net,
     safe_copy(ep->mode, mode ? mode : "", sizeof(ep->mode));
     safe_copy(ep->kind, kind ? kind : "", sizeof(ep->kind));
     return 0;
+}
+
+/*
+ * The user attributes of a port's 'driver type ("NAME=value" lines), through
+ * the nvc extension nvc_vhpi_get_driver_type_attrs: how the generator is to
+ * resolve a net can be said by its type, e.g.
+ *     attribute resolution of rf_air : subtype is "arena";
+ * Looked up at run time, so an nvc without the extension gives "".
+ */
+static void get_type_attrs(vhpiHandleT inst, const char *port_name,
+                           char *buf, size_t len)
+{
+    typedef const vhpiCharT *(*fn_t)(vhpiHandleT, const vhpiCharT *);
+    static fn_t fn = NULL;
+    static int looked = 0;
+    if (!looked) {
+        looked = 1;
+        fn = (fn_t)dlsym(RTLD_DEFAULT, "nvc_vhpi_get_driver_type_attrs");
+    }
+    buf[0] = '\0';
+    if (fn == NULL)
+        return;
+    const vhpiCharT *a = fn(inst, (const vhpiCharT *)port_name);
+    if (a != NULL)
+        safe_copy(buf, (const char *)a, len);
+}
+
+/* A pin whose 'driver type carries a RESOLUTION attribute */
+static int port_type_resolved(vhpiHandleT inst, const char *port_name)
+{
+    char attrs[MAX_VAL];
+    get_type_attrs(inst, port_name, attrs, sizeof(attrs));
+    return strncmp(attrs, "RESOLUTION=", 11) == 0
+        || strstr(attrs, "\nRESOLUTION=") != NULL;
+}
+
+static int inst_has_type_resolved_port(vhpiHandleT inst)
+{
+    vhpiHandleT piter = vhpi_iterator(vhpiPortDecls, inst);
+    if (!piter)
+        return 0;
+    int found = 0;
+    for (vhpiHandleT port = vhpi_scan(piter); port; port = vhpi_scan(piter)) {
+        const char *name = (const char *)vhpi_get_str(vhpiNameP, port);
+        if (!found && name && port_type_resolved(inst, name))
+            found = 1;
+        vhpi_release_handle(port);
+    }
+    vhpi_release_handle(piter);
+    return found;
 }
 
 /*
@@ -422,7 +473,11 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
                      entity_name ? entity_name : "?",
                      inst_ename);
 
-        if (!entity_name || !is_tran_entity(entity_name)) {
+        /* Any other component takes part through those of its pins whose
+         * 'driver type says how it resolves (a RESOLUTION attribute on the
+         * type, e.g. an antenna's arena pin): only those pins join nets */
+        const int by_type = !entity_name || !is_tran_entity(entity_name);
+        if (by_type && !inst_has_type_resolved_port(inst)) {
             vhpi_release_handle(inst);
             continue;
         }
@@ -474,6 +529,10 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
             if (drv_type)
                 safe_copy(port_etype, (const char *)drv_type,
                           sizeof(port_etype));
+            if (by_type && !port_type_resolved(inst, port_name)) {
+                vhpi_release_handle(port);
+                continue;
+            }
 
             char port_lower[MAX_NAME];
             safe_copy(port_lower, port_name, sizeof(port_lower));
@@ -518,8 +577,11 @@ static void scan_instances(vhpiHandleT region, const char *path_prefix,
                           sizeof(kind_lower));
                 for (char *c = kind_lower; *c; c++)
                     *c = tolower((unsigned char)*c);
-                net_add_endpoint(net, drv_ename, rcv_ename, port_etype,
-                                 mode_str, kind_lower);
+                if (net_add_endpoint(net, drv_ename, rcv_ename, port_etype,
+                                     mode_str, kind_lower) == 0)
+                    get_type_attrs(inst, port_name,
+                                   net->endpoints[net->n_endpoints - 1].type_attrs,
+                                   MAX_VAL);
                 indent();
                 resolver_printf("    port %s -> actual=%s net=%s init=%s",
                              port_name, actual, net_name,
@@ -1139,6 +1201,28 @@ static PyObject *build_net_dict(const net_info_t *net)
         if (ep->kind[0])
             PyDict_SetItemString(drv, "kind",
                                  PyUnicode_FromString(ep->kind));
+        if (ep->type_attrs[0]) {
+            /* {"RESOLUTION": "arena", ...}: the generator's choice by type */
+            PyObject *ta = PyDict_New();
+            char tmp[MAX_VAL];
+            safe_copy(tmp, ep->type_attrs, sizeof(tmp));
+            char *save = NULL;
+            for (char *line = strtok_r(tmp, "\n", &save); line;
+                 line = strtok_r(NULL, "\n", &save)) {
+                char *eq = strchr(line, '=');
+                if (eq == NULL)
+                    continue;
+                *eq = '\0';
+                /* nearest level first: keep the first value of a name */
+                if (PyDict_GetItemString(ta, line) == NULL) {
+                    PyObject *v = PyUnicode_FromString(eq + 1);
+                    PyDict_SetItemString(ta, line, v);
+                    Py_DECREF(v);
+                }
+            }
+            PyDict_SetItemString(drv, "type_attrs", ta);
+            Py_DECREF(ta);
+        }
         PyList_Append(drivers, drv);
         Py_DECREF(drv);
 

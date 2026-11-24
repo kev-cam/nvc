@@ -81,17 +81,21 @@ sv2vhdl_DATA = \
 	lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG \
 	lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG-body \
 	lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG \
-	lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG-body
+	lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG-body \
+	lib/sv2vhdl/SV2VHDL.ARENA_PKG \
+	lib/sv2vhdl/SV2VHDL.ARENA_PKG-body
 
 # Shared libraries installed alongside VHDL
 sv2vhdl_DATA += \
 	$(abs_top_builddir)/lib/sv2vhdl/libresolver.$(DLL_EXT) \
 	$(abs_top_builddir)/lib/sv2vhdl/libsv_math.$(DLL_EXT) \
-	$(abs_top_builddir)/lib/sv2vhdl/libsv_analog.$(DLL_EXT)
+	$(abs_top_builddir)/lib/sv2vhdl/libsv_analog.$(DLL_EXT) \
+	$(abs_top_builddir)/lib/sv2vhdl/libarena.$(DLL_EXT)
 
 # Python script is a source file - use dist_ so clean doesn't delete it
 dist_sv2vhdl_DATA = \
-	$(srcdir)/lib/sv2vhdl/sv2vhdl_resolver.py
+	$(srcdir)/lib/sv2vhdl/sv2vhdl_resolver.py \
+	$(srcdir)/lib/sv2vhdl/arena_ctl.py
 
 EXTRA_DIST += \
 	lib/sv2vhdl/logic3d_types_pkg.vhd \
@@ -109,6 +113,8 @@ EXTRA_DIST += \
 	lib/sv2vhdl/sv_math_pkg.vhd \
 	lib/sv2vhdl/sv_display_pkg.vhd \
 	lib/sv2vhdl/sv_analog_pkg.vhd \
+	lib/sv2vhdl/arena_pkg.vhd \
+	lib/sv2vhdl/arena.c \
 	lib/sv2vhdl/sv_math.c \
 	lib/sv2vhdl/sv_analog.c \
 	lib/sv2vhdl/resolver.c \
@@ -248,6 +254,11 @@ lib/sv2vhdl/SV2VHDL.SV_RTRANIF1: lib/sv2vhdl/SV2VHDL.SV_TRAN
 lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-BEHAVIORAL: lib/sv2vhdl/SV2VHDL.SV_TRAN
 lib/sv2vhdl/SV2VHDL.SV_RTRANIF1-STRENGTH: lib/sv2vhdl/SV2VHDL.SV_TRAN
 
+lib/sv2vhdl/SV2VHDL.ARENA_PKG: $(srcdir)/lib/sv2vhdl/arena_pkg.vhd @ifGNUmake@ | $(DRIVER)
+	$(nvc) --std=2040 -L lib/ --work=lib/sv2vhdl -a --relative=$(srcdir) $(srcdir)/lib/sv2vhdl/arena_pkg.vhd
+
+lib/sv2vhdl/SV2VHDL.ARENA_PKG-body: lib/sv2vhdl/SV2VHDL.ARENA_PKG
+
 # --- Shared library: libresolver.so ---
 
 PYTHON3_CONFIG ?= $$(which python3-config 2>/dev/null || which python3.10-config 2>/dev/null || echo python3-config)
@@ -273,6 +284,15 @@ $(abs_top_builddir)/lib/sv2vhdl/libsv_math.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/sv_
 	$(CC) $(SHLIB_LDFLAGS) $(SHLIB_CFLAGS) -Wall -O2 \
 	    -o $@ $< -lm
 
+# --- Shared library: libarena.so (VHPI plugin + arena_pkg's foreign library) ---
+
+$(abs_top_builddir)/lib/sv2vhdl/libarena.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/arena.c @ifGNUmake@ | $(DRIVER)
+	@mkdir -p $(abs_top_builddir)/lib/sv2vhdl
+	$(CC) $(SHLIB_LDFLAGS) $(SHLIB_CFLAGS) -Wall -O2 \
+	    -I$(top_srcdir)/src/vhpi \
+	    -o $@ $< \
+	    -L$(abs_top_builddir)/lib -lnvc -lpthread
+
 # --- Shared library: libsv_analog.so ---
 
 $(abs_top_builddir)/lib/sv2vhdl/libsv_analog.$(DLL_EXT): $(srcdir)/lib/sv2vhdl/sv_analog.c @ifGNUmake@ | $(DRIVER)
@@ -297,4 +317,5 @@ lib/sv2vhdl/SV2VHDL.SV_MATH_PKG: lib/ieee.08/IEEE.MATH_REAL lib/sv2vhdl/SV2VHDL.
 # sv_display_pkg.vhd also defines sv_strength_pkg, which uses logic3d_types_pkg
 lib/sv2vhdl/SV2VHDL.SV_DISPLAY_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.NUMERIC_STD lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG
 lib/sv2vhdl/SV2VHDL.SV_ANALOG_PKG: lib/ieee.08/IEEE.STD_LOGIC_1164 lib/ieee.08/IEEE.NUMERIC_STD
+lib/sv2vhdl/SV2VHDL.ARENA_PKG: lib/std.08/STD.STANDARD
 lib/sv2vhdl/SV2VHDL.SV_TRAN: lib/sv2vhdl/SV2VHDL.LOGIC3D_TYPES_PKG lib/sv2vhdl/SV2VHDL.LOGIC3DS_PKG

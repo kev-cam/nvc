@@ -134,6 +134,7 @@
   # NVC extension: port map and implicit type discovery for resolver plugin
   nvc_vhpi_get_port_map;
   nvc_vhpi_get_driver_type;
+  nvc_vhpi_get_driver_type_attrs;
 
   # Exported by VPI (IEEE 1364 standard)
   vpi_chk_error;
