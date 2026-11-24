@@ -74,6 +74,8 @@ typedef struct {
    unsigned        dyn_wait : 1;   // armed an event wait from the process
                                    // body (a dynamic wait statement), not
                                    // only from the reset block
+   unsigned        timed_wait : 1; // this activation suspended on a timeout
+                                   // longer than a delta (`wait for T`)
    rt_trigger_t   *trigger;
 } rt_wakeable_t;
 

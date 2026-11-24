@@ -12422,7 +12422,8 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
       proc->cur_count = 0;
    }
    else if (obj->trigger == NULL && obj->wait_state == 1 && obj->dyn_wait
-            && proc->cur_count == 0 && !obj->pending && !obj->delayed) {
+            && proc->cur_count == 0
+            && ((!obj->pending && !obj->delayed) || obj->timed_wait)) {
       // A process whose waits are dynamic (it arms events from its body)
       // suspended with an EMPTY wait set and no timeout: a bare `wait;` (or a
       // `wait until` naming no signals). It must never resume, but the
@@ -12431,8 +12432,13 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
       // wait;` re-ran the process from the top on the next clk edge). Static
       // waits (armed once in the reset block -- sensitivity lists, concurrent
       // assignments) never set dyn_wait and legitimately suspend with
-      // cur_count == 0; a timed suspend (the NBA `wait for 0 ns`) leaves
+      // cur_count == 0; a zero-delay suspend (the NBA `wait for 0 ns`) leaves
       // pending/delayed set. Both keep their registrations.
+      //
+      // The same holds for a suspend on a timeout alone that is longer than a
+      // delta (`wait on s; ... wait for 5 us;`): events on s during the 5 us
+      // must not resume the process (they cut the timed wait short and left a
+      // stale event-queue entry behind). timed_wait marks that suspend.
       for (unsigned i = 0; i < proc->wait_count; i++)
          clear_event_par(m, &(proc->wait_set[i]->pending), obj);
       free(proc->wait_set);
@@ -12443,6 +12449,7 @@ static inline void proc_static_wait_finalize(rt_model_t *m, rt_proc_t *proc)
          aj_fastclk_evict(m, obj, "wait-set emptied");
       direct_eval_uninstall(proc);
    }
+   obj->timed_wait = 0;
 }
 
 // NVC_EVAL_RESIDENCY=1: measure how much of the run "bounces from eval
@@ -20138,6 +20145,9 @@ void x_sched_process(int64_t delay)
       m->next_is_delta = true;
       return;
    }
+
+   if (delay > 0)
+      proc->wakeable.timed_wait = 1;
 
    deltaq_insert_proc(m, delay, proc);
 }
