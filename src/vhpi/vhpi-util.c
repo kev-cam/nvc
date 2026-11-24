@@ -286,6 +286,9 @@ vhpiFormatT vhpi_format_for_type(type_t type, const char **map_str)
    case T_INTEGER:
       return vhpiIntVal;
 
+   case T_PHYSICAL:
+      return vhpiLongIntVal;   // value in base units (TIME: fs), 64 bits
+
    case T_REAL:
       return vhpiRealVal;
 

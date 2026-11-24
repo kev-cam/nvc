@@ -77,6 +77,15 @@ bool x_stitch_net_register(int nep, sig_shared_t **drv_ss,
 void model_set_timeout_cb(rt_model_t *m, uint64_t when, rt_event_fn_t fn,
                           void *user);
 
+// Schedule hooks (arena federation): fn is called on thread 0 whenever a
+// waveform is scheduled on signal s -- the first nexus written, how many
+// elements, the value bytes (laid out as the nexus chain), and the absolute
+// time the transaction matures -- before it is queued.
+typedef void (*rt_sched_hook_fn_t)(void *ctx, rt_signal_t *s, rt_nexus_t *first,
+                                   int count, const void *values,
+                                   uint64_t when);
+void model_add_sched_hook(rt_signal_t *s, rt_sched_hook_fn_t fn, void *ctx);
+
 void call_with_model(rt_model_t *m, void (*cb)(void *), void *arg);
 
 rt_model_t *get_model(void);

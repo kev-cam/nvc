@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <float.h>
@@ -898,8 +899,49 @@ static PyObject *py_vhpi_get_generics(PyObject *self, PyObject *args)
             continue;
         }
 
-        /* Try reading as integer first */
         vhpiValueT val;
+
+        /* A TIME generic: "<n> fs" (physical values are not integers) */
+        vhpiHandleT ty = vhpi_handle(vhpiType, gen);
+        if (ty) {
+            vhpiHandleT bt = vhpi_handle(vhpiBaseType, ty);
+            vhpiHandleT t = bt ? bt : ty;
+            const char *tn = (const char *)vhpi_get_str(vhpiNameP, t);
+            const int tk = vhpi_get(vhpiKindP, t);
+            if (tk == vhpiPhysTypeDeclK && tn && !strcasecmp(tn, "TIME")) {
+                memset(&val, 0, sizeof(val));
+                val.format = vhpiObjTypeVal;   /* its own format, decoded below */
+                int64_t fs = 0;
+                int ok = vhpi_get_value(gen, &val) == 0;
+                if (ok) {
+                    switch (val.format) {
+                    case vhpiTimeVal:
+                        fs = ((int64_t)val.value.time.high << 32) | (uint32_t)val.value.time.low;
+                        break;
+                    case vhpiPhysVal:
+                        fs = ((int64_t)val.value.phys.high << 32) | (uint32_t)val.value.phys.low;
+                        break;
+                    case vhpiSmallPhysVal: fs = val.value.smallphys; break;
+                    case vhpiLongIntVal: fs = val.value.longintg; break;
+                    case vhpiIntVal: fs = val.value.intg; break;
+                    default: ok = 0; break;
+                    }
+                }
+                if (ok) {
+                    char tb[64];
+                    snprintf(tb, sizeof tb, "%lld fs", (long long)fs);
+                    PyDict_SetItemString(result, gname, PyUnicode_FromString(tb));
+                    if (bt) vhpi_release_handle(bt);
+                    vhpi_release_handle(ty);
+                    vhpi_release_handle(gen);
+                    continue;
+                }
+            }
+            if (bt) vhpi_release_handle(bt);
+            vhpi_release_handle(ty);
+        }
+
+        /* Try reading as integer first */
         memset(&val, 0, sizeof(val));
         val.format = vhpiIntVal;
         if (vhpi_get_value(gen, &val) == 0) {

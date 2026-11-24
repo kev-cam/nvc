@@ -6039,3 +6039,316 @@ void vhpi_call_foreign(vhpiHandleT handle, jit_scalar_t *args, tlab_t *tlab)
       jit_msg(NULL, DIAG_FATAL, "foreign function %s did not return a value",
               type_pp(tree_type(f->decl->tree)));
 }
+
+////////////////////////////////////////////////////////////////////////////
+// NVC extension: a port's 'driver as it is scheduled.  When the design
+// assigns p'driver <= v after d, the plugin learns v and now + d at once
+// (not d later): the value as doubles, every scalar subelement in
+// declaration order (reals as they are, integers and enumerations by
+// value; an array of records element by element), the layout arena_pkg's
+// fed_encode convention uses.  A record 'driver is a scope of field
+// signals at run time (an array of records: one array signal per field),
+// so one value is gathered from several signals; the pieces of one
+// assignment are delivered together, when a transaction for a different
+// time comes and at nvc_vhpi_sched_flush (the end of the deltas).
+
+typedef void (*nvc_vhpi_sched_cb_t)(void *ctx, int64_t when, const double *v,
+                                    int32_t n);
+
+typedef struct {
+   rt_signal_t *signal;
+   uint8_t     *image;     // the signal's data as projected
+   int          nelem;
+   uint32_t    *eoff;      // byte offset of each element
+   uint8_t     *esize;
+} sched_leaf_t;
+
+typedef struct {
+   sched_leaf_t        *leaves;
+   int                  nleaves;
+   int                  nelem, maxelem;
+   int                 *el_leaf;   // value element -> leaf, element there
+   int                 *el_idx;
+   uint8_t             *el_real;
+   double              *flat;
+   int64_t              pending;   // time of the gathered value, -1: none
+   nvc_vhpi_sched_cb_t  cb;
+   void                *ctx;
+} sched_watch_t;
+
+static sched_watch_t **sched_watches = NULL;
+static int n_sched_watches = 0;
+
+static bool sched_flatten(type_t t, uint8_t *real, int *n, int max)
+{
+   if (type_is_record(t)) {
+      type_t base = type_base_recur(t);
+      const int nf = type_fields(base);
+      for (int i = 0; i < nf; i++)
+         if (!sched_flatten(tree_type(type_field(base, i)), real, n, max))
+            return false;
+      return true;
+   }
+   else if (type_is_array(t)) {
+      type_t elem = type_elem(t);
+      const unsigned ew = type_width(elem), tw = type_width(t);
+      if (ew == 0 || tw % ew != 0)
+         return false;
+      for (unsigned i = 0; i < tw / ew; i++)
+         if (!sched_flatten(elem, real, n, max))
+            return false;
+      return true;
+   }
+   else if (type_is_scalar(t)) {
+      if (*n >= max)
+         return false;
+      real[(*n)++] = type_is_real(t);
+      return true;
+   }
+   return false;
+}
+
+static int sched_leaf(sched_watch_t *w, rt_signal_t *s)
+{
+   for (int i = 0; i < w->nleaves; i++)
+      if (w->leaves[i].signal == s)
+         return i;
+   w->leaves = xrealloc_array(w->leaves, w->nleaves + 1, sizeof(sched_leaf_t));
+   sched_leaf_t *l = &w->leaves[w->nleaves];
+   l->signal = s;
+   l->image = xmalloc(s->shared.size);
+   memcpy(l->image, s->shared.data, s->shared.size);
+   l->nelem = 0;
+   for (rt_nexus_t *n = &s->nexus; n != NULL; n = n->chain)
+      l->nelem += n->width;
+   l->eoff = xcalloc_array(l->nelem + 1, sizeof(uint32_t));
+   l->esize = xcalloc_array(l->nelem + 1, sizeof(uint8_t));
+   int e = 0;
+   for (rt_nexus_t *n = &s->nexus; n != NULL; n = n->chain)
+      for (unsigned i = 0; i < n->width; i++, e++) {
+         l->eoff[e] = n->offset + i * n->size;
+         l->esize[e] = n->size;
+      }
+   return w->nleaves++;
+}
+
+static void sched_add(sched_watch_t *w, int leaf, int idx, bool real)
+{
+   if (w->nelem == w->maxelem) {
+      w->maxelem = w->maxelem ? 2 * w->maxelem : 64;
+      w->el_leaf = xrealloc_array(w->el_leaf, w->maxelem, sizeof(int));
+      w->el_idx = xrealloc_array(w->el_idx, w->maxelem, sizeof(int));
+      w->el_real = xrealloc_array(w->el_real, w->maxelem, sizeof(uint8_t));
+   }
+   w->el_leaf[w->nelem] = leaf;
+   w->el_idx[w->nelem] = idx;
+   w->el_real[w->nelem] = real;
+   w->nelem++;
+}
+
+static bool sched_has_record(type_t t)
+{
+   while (type_is_array(t))
+      t = type_elem(t);
+   return type_is_record(t);
+}
+
+// The field `name` of a record at run time: a signal, or a child scope.
+static void sched_field(rt_scope_t *sc, ident_t name, rt_signal_t **sig,
+                        rt_scope_t **scope)
+{
+   *sig = NULL;
+   *scope = NULL;
+   for (int i = 0; i < sc->signals.count; i++) {
+      tree_t where = sc->signals.items[i]->where;
+      if (where != NULL && tree_ident(where) == name) {
+         *sig = sc->signals.items[i];
+         return;
+      }
+   }
+   const char *want = istr(name);
+   const size_t wl = strlen(want);
+   for (int i = 0; i < sc->children.count; i++) {
+      const char *cn = istr(sc->children.items[i]->name);
+      const size_t cl = strlen(cn);
+      if (cl >= wl && strcasecmp(cn + cl - wl, want) == 0
+          && (cl == wl || cn[cl - wl - 1] == '.' || cn[cl - wl - 1] == ':')) {
+         *scope = sc->children.items[i];
+         return;
+      }
+   }
+}
+
+// Lay out a value of type t held by signal sig (a leaf: a scalar or an
+// array of scalars) or scope sc (a record: a signal or scope per field; an
+// array of records: a scope per element, "<name>(k)").
+static bool sched_walk(sched_watch_t *w, type_t t, rt_signal_t *sig,
+                       rt_scope_t *sc)
+{
+   if (sig != NULL) {
+      uint8_t real[4096];
+      int n = 0;
+      if (!sched_flatten(t, real, &n, ARRAY_LEN(real)))
+         return false;
+      const int leaf = sched_leaf(w, sig);
+      if (n > w->leaves[leaf].nelem)
+         return false;
+      for (int e = 0; e < n; e++)
+         sched_add(w, leaf, e, real[e]);
+      return true;
+   }
+   if (sc == NULL)
+      return false;
+   if (type_is_record(t)) {
+      type_t base = type_base_recur(t);
+      const int nf = type_fields(base);
+      for (int i = 0; i < nf; i++) {
+         tree_t f = type_field(base, i);
+         rt_signal_t *fs;
+         rt_scope_t *fc;
+         sched_field(sc, tree_ident(f), &fs, &fc);
+         if (!sched_walk(w, tree_type(f), fs, fc))
+            return false;
+      }
+      return true;
+   }
+   if (type_is_array(t) && sched_has_record(t)) {
+      type_t elem = type_elem(t);
+      const unsigned ew = type_width(elem), tw = type_width(t);
+      if (ew == 0 || tw % ew != 0 || sc->children.count != (int)(tw / ew))
+         return false;
+      for (int k = 0; k < sc->children.count; k++)
+         if (!sched_walk(w, elem, NULL, sc->children.items[k]))
+            return false;
+      return true;
+   }
+   return false;
+}
+
+static void sched_deliver(sched_watch_t *w)
+{
+   if (w->pending < 0)
+      return;
+   for (int i = 0; i < w->nelem; i++) {
+      const sched_leaf_t *l = &w->leaves[w->el_leaf[i]];
+      const int e = w->el_idx[i];
+      const uint8_t *p = l->image + l->eoff[e];
+      double x = 0.0;
+      if (w->el_real[i] && l->esize[e] == 8)
+         memcpy(&x, p, 8);
+      else if (w->el_real[i] && l->esize[e] == 4) {
+         float f; memcpy(&f, p, 4); x = f;
+      }
+      else switch (l->esize[e]) {
+         case 1: x = *(const uint8_t *)p; break;
+         case 2: { int16_t v; memcpy(&v, p, 2); x = v; } break;
+         case 4: { int32_t v; memcpy(&v, p, 4); x = v; } break;
+         default: { int64_t v; memcpy(&v, p, 8); x = (double)v; } break;
+         }
+      w->flat[i] = x;
+   }
+   const int64_t when = w->pending;
+   w->pending = -1;
+   (*w->cb)(w->ctx, when, w->flat, w->nelem);
+}
+
+static void sched_hook(void *ctx, rt_signal_t *s, rt_nexus_t *n, int count,
+                       const void *values, uint64_t when)
+{
+   sched_watch_t *w = ctx;
+   if (w->pending >= 0 && (int64_t)when != w->pending)
+      sched_deliver(w);
+   sched_leaf_t *l = NULL;
+   for (int i = 0; i < w->nleaves && l == NULL; i++)
+      if (w->leaves[i].signal == s)
+         l = &w->leaves[i];
+   if (l == NULL)
+      return;
+   const uint8_t *vp = values;
+   for (; count > 0 && n != NULL; n = n->chain) {
+      const size_t nb = (size_t)n->width * n->size;
+      if (n->offset + nb <= s->shared.size)
+         memcpy(l->image + n->offset, vp, nb);
+      vp += nb;
+      count -= n->width;
+   }
+   w->pending = when;
+}
+
+// Watch instance inst_path's port `port`: cb gets each value scheduled on
+// its 'driver.  Returns the number of doubles in a value, 0 if the port has
+// no 'driver or its type cannot be laid out that way.
+DLLEXPORT
+int nvc_vhpi_sched_watch(const vhpiCharT *inst_path, const vhpiCharT *port,
+                         nvc_vhpi_sched_cb_t cb, void *ctx)
+{
+   vhpi_clear_error();
+
+   vhpiHandleT ih = vhpi_handle_by_name((const char *)inst_path, NULL);
+   if (ih == NULL) return 0;
+   c_vhpiObject *obj = from_handle(ih);
+   if (obj == NULL) return 0;
+   c_abstractRegion *r = is_abstractRegion(obj);
+   if (r == NULL) return 0;
+   rt_scope_t *scope = vhpi_get_scope_abstractRegion(r);
+   if (scope == NULL) return 0;
+
+   char up[256];
+   size_t k = 0;
+   for (; port[k] != '\0' && k < sizeof(up) - 1; k++)
+      up[k] = toupper((unsigned char)port[k]);
+   up[k] = '\0';
+   ident_t port_id = ident_new(up);
+
+   tree_t block = r->tree;
+   const int ndecls = tree_decls(block);
+   for (int j = 0; j < ndecls; j++) {
+      tree_t d = tree_decl(block, j);
+      if (tree_kind(d) != T_IMPLICIT_SIGNAL
+          || tree_subkind(d) != IMPLICIT_DRIVER || !tree_has_value(d))
+         continue;
+      tree_t val = tree_value(d);
+      if (tree_kind(val) != T_REF || !tree_has_ref(val)
+          || tree_ident(tree_ref(val)) != port_id)
+         continue;
+
+      // the 'driver at run time: one signal, or a scope of field signals
+      rt_signal_t *sig = find_signal(scope, d);
+      rt_scope_t *sc = NULL;
+      if (sig == NULL)
+         sched_field(scope, tree_ident(d), &sig, &sc);
+
+      sched_watch_t *w = xcalloc(sizeof(sched_watch_t));
+      w->pending = -1;
+      w->cb = cb;
+      w->ctx = ctx;
+      if (!sched_walk(w, tree_type(d), sig, sc) || w->nelem == 0) {
+         for (int i = 0; i < w->nleaves; i++) {
+            free(w->leaves[i].image);
+            free(w->leaves[i].eoff);
+            free(w->leaves[i].esize);
+         }
+         free(w->leaves); free(w->el_leaf); free(w->el_idx); free(w->el_real);
+         free(w);
+         return 0;
+      }
+      w->flat = xcalloc_array(w->nelem, sizeof(double));
+
+      sched_watches = xrealloc_array(sched_watches, n_sched_watches + 1,
+                                     sizeof(sched_watch_t *));
+      sched_watches[n_sched_watches++] = w;
+      for (int i = 0; i < w->nleaves; i++)
+         model_add_sched_hook(w->leaves[i].signal, sched_hook, w);
+      return w->nelem;
+   }
+
+   return 0;
+}
+
+// Deliver every gathered value now (the end of the deltas at this time).
+DLLEXPORT
+void nvc_vhpi_sched_flush(void)
+{
+   for (int i = 0; i < n_sched_watches; i++)
+      sched_deliver(sched_watches[i]);
+}

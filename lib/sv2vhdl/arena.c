@@ -60,7 +60,9 @@
 //                       VALUE  i64 time (fs), u32 what, u32 end, u32 n, n doubles
 //                              (what 0: the end's driver, 1..: a place field)
 //                       STATUS i64 now (fs; the deltas at now are complete),
-//                              i64 next (fs, -1: none), u32 npeers, then per
+//                              i64 next (fs, -1: none), i64 quiet (fs: none of
+//                              its ends changes before then, -1: no such
+//                              promise), u32 npeers, then per
 //                              simulation in rendezvous order u64 values sent
 //                              to it, u64 values received from it, i64 its
 //                              slack to it (fs, 0: none known)
@@ -77,6 +79,16 @@
 // arrives too late anyway (an end that jumped closer) stops the simulation.
 // Without delays the slack is 0 and the simulations keep together delta cycle
 // by delta cycle.
+//
+// Scheduled ahead.  A model that drives an end with  p'driver <= v after d
+// says v holds from now + d and that the end does not change before then.
+// libarena watches each local end's 'driver (nvc_vhpi_sched_watch), sends v
+// tagged now + d as soon as it is scheduled -- each receiver keeps it in its
+// copy of the waveform -- and reports the earliest such promise over its
+// ends (STATUS quiet): a peer's emissions are then bounded by that too, not
+// only by its next event, so the others run up to it + the slack without
+// waiting.  Taking a promise back (a later assignment for an earlier time,
+// or a value at a time that was promised quiet) stops the simulation.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -120,6 +132,7 @@ typedef struct {                        // a driver's history, by emission time
     uint32_t *n;
     double **v;
     int len, cap;
+    int trimmed;                        // older entries were dropped: the first one stands for them
 } hist_t;
 
 typedef struct {
@@ -138,7 +151,7 @@ typedef struct {
     uint64_t bytes_out, bytes_in;
     uint64_t sent, recv;                // values sent to it, received from it
     int have_status;                    // its last STATUS:
-    int64_t st_now, st_next;
+    int64_t st_now, st_next, st_quiet;
     uint64_t *st_sent, *st_recv;        // [npeers]
     int64_t *st_slack;                  // [npeers]: its slack to each simulation
     int64_t slack;                      // this simulation's slack to it (fs)
@@ -156,6 +169,10 @@ typedef struct {
     slot_t *local;                      // [nlocal]: the local ends' driver histories
     int64_t *dly;                       // [nlocal * dly_total]: path delays into the local ends (-1: unknown)
     int dly_total;
+    int *watched;                       // [nlocal]: its 'driver is watched as scheduled
+    int64_t *promise;                   // [nlocal]: no change before then (-1: none)
+    double **last;                      // [nlocal]: the last value sent
+    uint32_t *nlast;
 } net_t;
 
 typedef struct {
@@ -389,6 +406,7 @@ static void hist_add(hist_t *h, int64_t t, const double *v, uint32_t n, int64_t 
         memmove(h->n, h->n + drop, (h->len - drop) * sizeof(uint32_t));
         memmove(h->v, h->v + drop, (h->len - drop) * sizeof(double *));
         h->len -= drop;
+        h->trimmed = 1;
     }
     if (h->len == h->cap) {
         h->cap = h->cap ? 2 * h->cap : 16;
@@ -403,11 +421,13 @@ static void hist_add(hist_t *h, int64_t t, const double *v, uint32_t n, int64_t 
     h->len++;
 }
 
-static int hist_at(const hist_t *h, int64_t t)          // the entry in force at t (the first before any)
+// The entry in force at t; -1: nothing emitted by then (nothing is heard
+// from an end before its first emission reaches the listener).
+static int hist_at(const hist_t *h, int64_t t)
 {
     if (!h->len) return -1;
     int lo = 0, hi = h->len - 1;
-    if (h->t[0] > t) return 0;
+    if (h->t[0] > t) return h->trimmed ? 0 : -1;
     while (lo < hi) {                                   // last entry with time <= t
         int mid = (lo + hi + 1) / 2;
         if (h->t[mid] <= t) lo = mid;
@@ -523,6 +543,11 @@ void arena_attach(int32_t net, const char *band, int64_t blen, int32_t nlocal, c
     n->nlocal = nlocal;
     n->delayed = delayed;
     n->local = calloc(nlocal > 0 ? nlocal : 1, sizeof(slot_t));
+    n->watched = calloc(nlocal > 0 ? nlocal : 1, sizeof(int));
+    n->promise = malloc(sizeof(int64_t) * (nlocal > 0 ? nlocal : 1));
+    for (int j = 0; j < nlocal; j++) n->promise[j] = -1;
+    n->last = calloc(nlocal > 0 ? nlocal : 1, sizeof(double *));
+    n->nlast = calloc(nlocal > 0 ? nlocal : 1, sizeof(uint32_t));
     snprintf(n->band, sizeof n->band, "%.*s", (int)blen, band);
     snprintf(n->kick_name, sizeof n->kick_name, "%.*s", (int)klen, kick);
     const map_t *mp = NULL;
@@ -537,10 +562,9 @@ void arena_attach(int32_t net, const char *band, int64_t blen, int32_t nlocal, c
     join(net, mp);
 }
 
-static void broadcast(uint32_t what, uint32_t end, const double *v, int64_t n)
+static void broadcast_at(int64_t t, uint32_t what, uint32_t end, const double *v, int64_t n)
 {
     uint8_t hdr[20];
-    const int64_t t = (int64_t)now_fs();
     const uint32_t h[3] = { what, end, (uint32_t)n };
     memcpy(hdr, &t, 8);
     memcpy(hdr + 8, h, 12);
@@ -564,15 +588,134 @@ static void broadcast(uint32_t what, uint32_t end, const double *v, int64_t n)
     n_puts++;
 }
 
+static void broadcast(uint32_t what, uint32_t end, const double *v, int64_t n)
+{
+    broadcast_at((int64_t)now_fs(), what, end, v, n);
+}
+
+static void remember(net_t *nt, int32_t j, const double *v, uint32_t n)
+{
+    if (nt->nlast[j] != n) {
+        nt->last[j] = realloc(nt->last[j], (n ? n : 1) * sizeof(double));
+        nt->nlast[j] = n;
+    }
+    memcpy(nt->last[j], v, n * sizeof(double));
+}
+
+static int same_as_last(net_t *nt, int32_t j, const double *v, uint32_t n)
+{
+    return nt->last[j] && nt->nlast[j] == n && !memcmp(nt->last[j], v, n * sizeof(double));
+}
+
+// ---- scheduled ahead: a local end's 'driver as it is scheduled ----
+
+extern int nvc_vhpi_sched_watch(const vhpiCharT *inst_path, const vhpiCharT *port,
+                                void (*cb)(void *ctx, int64_t when, const double *v, int32_t n), void *ctx);
+extern void nvc_vhpi_sched_flush(void);
+static int n_scheduled = 0;             // values sent ahead of their time
+
+// Values sent ahead and not yet in effect, per local end, in time order.
+typedef struct sched_q { struct sched_q *next; int64_t t; uint32_t n; double v[]; } sched_q_t;
+static sched_q_t **ahead = NULL;        // [nlocal]
+
+static void scheduled_cb(void *ctx, int64_t when, const double *v, int32_t n)
+{
+    const int32_t j = (int32_t)(intptr_t)ctx;
+    if (fed_net < 0 || finished) return;
+    net_t *nt = &nets[fed_net];
+    if (nt->promise[j] >= 0 && when < nt->promise[j]) {
+        fprintf(stderr, "libarena: end %d was promised unchanged until %lld fs, but a value is now scheduled "
+                "for %lld fs (taking a scheduled transaction back is not allowed: use transport delay)\n", j,
+                (long long)nt->promise[j], (long long)when);
+        exit(2);
+    }
+    if (!ahead) ahead = calloc(nt->nlocal > 0 ? nt->nlocal : 1, sizeof(sched_q_t *));
+    sched_q_t **pp = &ahead[j], *prev = NULL;
+    while (*pp && (*pp)->t < when) { prev = *pp; pp = &(*pp)->next; }
+    nt->promise[j] = when;
+    if (*pp && (*pp)->t == when) {                      // the same time again: replace it
+        sched_q_t *old = *pp;
+        *pp = old->next;
+        free(old);
+    }
+    else {                                              // unchanged from what is in force by then:
+        const double *before = prev ? prev->v : nt->last[j];   // the promise alone goes in STATUS
+        const uint32_t nb = prev ? prev->n : nt->nlast[j];
+        if (before && nb == (uint32_t)n && !memcmp(before, v, n * sizeof(double))) return;
+    }
+    sched_q_t *q = malloc(sizeof(sched_q_t) + n * sizeof(double));
+    q->t = when;
+    q->n = (uint32_t)n;
+    memcpy(q->v, v, n * sizeof(double));
+    q->next = *pp;
+    *pp = q;
+    broadcast_at(when, 0, (uint32_t)j, v, n);
+    n_scheduled++;
+}
+
+// The generated resolver names each local end's instance and port: watch
+// its 'driver.  Without the nvc extension (or for a type it cannot lay out)
+// the end's values go out when they take effect, as before.
+void arena_watch(int32_t net, int32_t j, const char *inst, int64_t ilen, const char *port, int64_t plen)
+{
+    net_t *nt = get_net(net);
+    if (!is_fed(net) || !nt->delayed || j < 0 || j >= nt->nlocal || nt->watched[j]) return;
+    char ib[512], pb[128];
+    snprintf(ib, sizeof ib, "%.*s", (int)ilen, inst);
+    snprintf(pb, sizeof pb, "%.*s", (int)plen, port);
+    const int n = nvc_vhpi_sched_watch((const vhpiCharT *)ib, (const vhpiCharT *)pb, scheduled_cb, (void *)(intptr_t)j);
+    nt->watched[j] = n > 0 ? 1 : -1;
+    if (trace) fprintf(stderr, "arena: end %d (%s %s): %s\n", j, ib, pb,
+                       n > 0 ? "sent as scheduled" : "not watchable: sent when it takes effect");
+}
+
+// The earliest time any local end may change (-1: some end has no promise).
+static int64_t quiet_until(int64_t now)
+{
+    net_t *nt = &nets[fed_net];
+    int64_t q = -1;
+    for (int j = 0; j < nt->nlocal; j++) {
+        if (nt->watched[j] != 1 || nt->promise[j] <= now) return -1;
+        if (q < 0 || nt->promise[j] < q) q = nt->promise[j];
+    }
+    return q;
+}
+
 void arena_put(int32_t net, int32_t j, const double *v, int64_t n)
 {
     net_t *nt = get_net(net);
     if (j < 0 || j >= nt->nlocal) die("local end out of range%s", "");
-    if (nt->delayed) {
-        const int64_t now = (int64_t)now_fs();
-        hist_add(&nt->local[j].h, now, v, (uint32_t)n, now);
+    const int64_t now = (int64_t)now_fs();
+    if (nt->delayed) hist_add(&nt->local[j].h, now, v, (uint32_t)n, now);
+    if (!is_fed(net)) return;
+    if (nt->watched[j] == 1) {
+        sched_q_t *q = ahead ? ahead[j] : NULL;
+        while (q && q->t < now) {                       // (none should be left behind)
+            ahead[j] = q->next;
+            free(q);
+            q = ahead[j];
+        }
+        if (q && q->t == now) {                         // sent when it was scheduled
+            const int ok = q->n == (uint32_t)n && !memcmp(q->v, v, n * sizeof(double));
+            ahead[j] = q->next;
+            free(q);
+            if (!ok) {
+                fprintf(stderr, "libarena: end %d took effect at %lld fs with a value other than the one "
+                        "scheduled for then\n", j, (long long)now);
+                exit(2);
+            }
+            remember(nt, j, v, (uint32_t)n);
+            return;
+        }
+        if (same_as_last(nt, j, v, (uint32_t)n)) return;
+        if (nt->promise[j] > now) {
+            fprintf(stderr, "libarena: end %d changed at %lld fs, but was promised unchanged until %lld fs\n",
+                    j, (long long)now, (long long)nt->promise[j]);
+            exit(2);
+        }
     }
-    if (is_fed(net)) broadcast(0, (uint32_t)j, v, n);
+    remember(nt, j, v, (uint32_t)n);
+    broadcast(0, (uint32_t)j, v, n);
 }
 
 static hist_t *end_hist(int32_t net, int32_t g)
@@ -607,7 +750,7 @@ int64_t arena_next_after(int32_t net, int32_t g, int64_t t)
 {
     hist_t *h = end_hist(net, g);
     if (!h->len || h->t[h->len - 1] <= t) return -1;
-    if (h->t[0] > t) return h->len > 1 ? h->t[1] : -1;  // the first value counts as in force before it
+    if (h->t[0] > t) return h->trimmed ? (h->len > 1 ? h->t[1] : -1) : h->t[0];
     return h->t[hist_at(h, t) + 1];
 }
 
@@ -846,25 +989,26 @@ static void wait_any(void)              // until some peer has sent something
     n_waits++;
 }
 
-static void send_status(int64_t now, int64_t next)
+static void send_status(int64_t now, int64_t next, int64_t quiet)
 {
-    static int64_t last_now = -2, last_next = -2;
+    static int64_t last_now = -2, last_next = -2, last_quiet = -2;
     static uint64_t *last = NULL;
     static int64_t *last_slack = NULL;
-    const size_t sz = 20 + 24 * (size_t)npeers;
+    const size_t sz = 28 + 24 * (size_t)npeers;
     uint8_t *b = malloc(sz);
     memcpy(b, &now, 8);
     memcpy(b + 8, &next, 8);
+    memcpy(b + 16, &quiet, 8);
     uint32_t np = (uint32_t)npeers;
-    memcpy(b + 16, &np, 4);
+    memcpy(b + 24, &np, 4);
     for (int i = 0; i < npeers; i++) {
-        memcpy(b + 20 + 24 * i, &peers[i].sent, 8);
-        memcpy(b + 28 + 24 * i, &peers[i].recv, 8);
-        memcpy(b + 36 + 24 * i, &peers[i].slack, 8);
+        memcpy(b + 28 + 24 * i, &peers[i].sent, 8);
+        memcpy(b + 36 + 24 * i, &peers[i].recv, 8);
+        memcpy(b + 44 + 24 * i, &peers[i].slack, 8);
     }
     if (!last) last = calloc(2 * (size_t)(npeers > 0 ? npeers : 1), sizeof(uint64_t));
     if (!last_slack) last_slack = calloc((size_t)(npeers > 0 ? npeers : 1), sizeof(int64_t));
-    int same = now == last_now && next == last_next;
+    int same = now == last_now && next == last_next && quiet == last_quiet;
     for (int i = 0; i < npeers && same; i++)
         same = last[2 * i] == peers[i].sent && last[2 * i + 1] == peers[i].recv && last_slack[i] == peers[i].slack;
     if (!same) {
@@ -875,6 +1019,7 @@ static void send_status(int64_t now, int64_t next)
         }
         last_now = now;
         last_next = next;
+        last_quiet = quiet;
         for (int i = 0; i < npeers; i++) {
             last[2 * i] = peers[i].sent;
             last[2 * i + 1] = peers[i].recv;
@@ -888,15 +1033,16 @@ static void send_status(int64_t now, int64_t next)
 static void take_status(peer_t *p, msg_t *m)
 {
     uint32_t np;
-    if (m->len < 20) die("short status from %s", p->name);
+    if (m->len < 28) die("short status from %s", p->name);
     memcpy(&p->st_now, m->body, 8);
     memcpy(&p->st_next, m->body + 8, 8);
-    memcpy(&np, m->body + 16, 4);
-    if ((int)np != npeers || m->len < 20 + 24 * np) die("bad status from %s", p->name);
+    memcpy(&p->st_quiet, m->body + 16, 8);
+    memcpy(&np, m->body + 24, 4);
+    if ((int)np != npeers || m->len < 28 + 24 * np) die("bad status from %s", p->name);
     for (int i = 0; i < npeers; i++) {
-        memcpy(&p->st_sent[i], m->body + 20 + 24 * i, 8);
-        memcpy(&p->st_recv[i], m->body + 28 + 24 * i, 8);
-        memcpy(&p->st_slack[i], m->body + 36 + 24 * i, 8);
+        memcpy(&p->st_sent[i], m->body + 28 + 24 * i, 8);
+        memcpy(&p->st_recv[i], m->body + 36 + 24 * i, 8);
+        memcpy(&p->st_slack[i], m->body + 44 + 24 * i, 8);
     }
     p->have_status = 1;
 }
@@ -931,8 +1077,10 @@ static int quiescent(int64_t mynext, int64_t *T)
 //     sooner than they reach it (emitted + the slack to p);
 //   - and, since a third simulation r may have sent to p after r's last status,
 //     no sooner than r's time then + r's slack to p;
-// and what it emits arrives here the slack to p later: everything p could
-// send is known up to then.  *all := 0 while some peer has not reported yet.
+// -- but not before the promise it reported (STATUS quiet: what it has
+// scheduled ahead) -- and what it emits arrives here the slack to p later:
+// everything p could send is known up to then.  *all := 0 while some peer
+// has not reported yet.
 static int64_t unacked_emission(peer_t *p, uint64_t acked)   // of value number `acked` (0-based)
 {
     if (acked > p->ebase) {                             // forget those it has taken in
@@ -974,6 +1122,9 @@ static int64_t emit_bound(int *all)
             LOWER(r->st_now + r->st_slack[i]);
         }
 #undef LOWER
+        // what p has scheduled ahead: none of its ends changes before then,
+        // whatever it does meanwhile
+        if (lb >= 0 && p->st_quiet > lb) lb = p->st_quiet;
         if (lb >= 0 && (B < 0 || lb + p->slack < B)) B = lb + p->slack;
     }
     return B;
@@ -1001,6 +1152,7 @@ static void lkd_cb(const vhpiCbDataT *d)
     (void)d;
     if (finished || fed_net < 0) return;
     const int64_t now = (int64_t)now_fs();
+    nvc_vhpi_sched_flush();                             // what this time's deltas scheduled ahead
     for (;;) {
         int drv = 0, changed = 0;
         for (int i = 0; i < npeers; i++) {
@@ -1043,7 +1195,7 @@ static void lkd_cb(const vhpiCbDataT *d)
         // from any peer could still arrive (emit_bound) -- or, when everyone's
         // deltas are complete with nothing in flight, when it is the earliest
         // next event of all (needed where the slack is 0: zero delay).
-        send_status(now, mynext);
+        send_status(now, mynext, quiet_until(now));
         int all = 1;
         const int64_t bound = emit_bound(&all);
         if (all && mynext >= 0 && (bound < 0 || mynext < bound)) {
@@ -1080,10 +1232,10 @@ static void eos_cb(const vhpiCbDataT *d)
             bin += peers[i].bytes_in;
             bout += peers[i].bytes_out;
         }
-    fprintf(stderr, "libarena: %s in arena %s: %llu time steps, %llu deliveries, %llu values sent, %llu statuses, "
-            "%llu waits (%.3f s), %.1f MB out / %.1f MB in\n",
+    fprintf(stderr, "libarena: %s in arena %s: %llu time steps, %llu deliveries, %llu values sent (%d as scheduled), "
+            "%llu statuses, %llu waits (%.3f s), %.1f MB out / %.1f MB in\n",
             fed_name, arena_name, (unsigned long long)n_advances, (unsigned long long)n_delivers,
-            (unsigned long long)n_puts, (unsigned long long)n_status, (unsigned long long)n_waits, t_blocked,
+            (unsigned long long)n_puts, n_scheduled, (unsigned long long)n_status, (unsigned long long)n_waits, t_blocked,
             bout / 1e6, bin / 1e6);
 }
 

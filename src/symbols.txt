@@ -135,6 +135,8 @@
   nvc_vhpi_get_port_map;
   nvc_vhpi_get_driver_type;
   nvc_vhpi_get_driver_type_attrs;
+  nvc_vhpi_sched_watch;
+  nvc_vhpi_sched_flush;
 
   # Exported by VPI (IEEE 1364 standard)
   vpi_chk_error;

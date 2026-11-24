@@ -17553,6 +17553,36 @@ static inline void prop_commit(int tid)
    __atomic_store_n(&p->count, p->count + 1, __ATOMIC_RELEASE);
 }
 
+////////////////////////////////////////////////////////////////////////////
+// Schedule hooks (model_add_sched_hook): a plugin learns of a transaction
+// when it is scheduled, not when it matures.
+
+typedef struct {
+   rt_signal_t        *signal;
+   rt_sched_hook_fn_t  fn;
+   void               *ctx;
+} sched_hook_t;
+
+static sched_hook_t *g_sched_hooks = NULL;
+static int           g_n_sched_hooks = 0;
+
+void model_add_sched_hook(rt_signal_t *s, rt_sched_hook_fn_t fn, void *ctx)
+{
+   g_sched_hooks = xrealloc_array(g_sched_hooks, g_n_sched_hooks + 1,
+                                  sizeof(sched_hook_t));
+   g_sched_hooks[g_n_sched_hooks++] = (sched_hook_t){ s, fn, ctx };
+}
+
+static void call_sched_hooks(rt_model_t *m, rt_signal_t *s, rt_nexus_t *n,
+                             int count, const void *values, int64_t after)
+{
+   for (int i = 0; i < g_n_sched_hooks; i++) {
+      if (g_sched_hooks[i].signal == s)
+         (*g_sched_hooks[i].fn)(g_sched_hooks[i].ctx, s, n, count, values,
+                                m->now + after);
+   }
+}
+
 // Thread 0: apply one record — the sole site where split_nexus/sched_driver run.
 static void prop_apply(rt_model_t *m, prop_rec_t *r)
 {
@@ -17560,11 +17590,15 @@ static void prop_apply(rt_model_t *m, prop_rec_t *r)
    RT_LOCK(s->lock);   // clone_nexus asserts this; uncontended (sole propagator)
    if (r->scalar) {
       rt_nexus_t *n = split_nexus(m, s, r->offset, 1);
+      if (unlikely(g_n_sched_hooks > 0))
+         call_sched_hooks(m, s, n, 1, &r->sval, r->after);
       sched_driver(m, n, r->after, r->reject, &r->sval, r->proc);
    }
    else {
       rt_nexus_t *n = split_nexus(m, s, r->offset, r->count);
       uint8_t *vptr = r->heapval ? r->heapval : r->value;
+      if (unlikely(g_n_sched_hooks > 0))
+         call_sched_hooks(m, s, n, r->count, vptr, r->after);
       int count = r->count;
       for (; count > 0; n = n->chain) {
          count -= n->width;
@@ -20134,7 +20168,7 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
       // effect (same-value dedup, w->value/when freshness, active_delta,
       // next_is_delta) that pipe replay provides, while moving the dedup
       // and value copy off the serial propagate phase.
-      if (g_direct_sched) {
+      if (g_direct_sched && g_n_sched_hooks == 0) {
          rt_signal_t *s = container_of(ss, rt_signal_t, shared);
          if (after == 0 && s->n_nexus == 1 && s->nexus.width == 1
              && (s->nexus.flags & NET_F_FAST_DRIVER)) {
@@ -20172,6 +20206,9 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
    rt_model_t *m = get_model();
    rt_nexus_t *n = split_nexus(m, s, offset, 1);
 
+   if (unlikely(g_n_sched_hooks > 0))
+      call_sched_hooks(m, s, n, 1, &scalar, after);
+
    sched_driver(m, n, after, reject, &scalar, proc);
 }
 
@@ -20183,7 +20220,8 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
    if (unlikely(relaxed_load(&g_capture))) {
       // Worker-direct: see x_sched_waveform_s.  sched_driver's fast path
       // copies the (transient) value immediately, so no capture needed.
-      if (g_direct_sched && after == 0 && s->n_nexus == 1 && offset == 0
+      if (g_direct_sched && g_n_sched_hooks == 0 && after == 0
+          && s->n_nexus == 1 && offset == 0
           && count == (int32_t)s->nexus.width
           && (s->nexus.flags & NET_F_FAST_DRIVER)) {
          sched_driver(get_model(), &s->nexus, 0, reject, values,
@@ -20229,6 +20267,8 @@ void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
 
    rt_model_t *m = get_model();
    rt_nexus_t *n = split_nexus(m, s, offset, count);
+   if (unlikely(g_n_sched_hooks > 0))
+      call_sched_hooks(m, s, n, count, values, after);
    char *vptr = values;
    for (; count > 0; n = n->chain) {
       count -= n->width;

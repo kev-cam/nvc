@@ -33,6 +33,7 @@ VHPI access for Python-driven hierarchy exploration:
 """
 
 import os
+import re
 
 # Import VHPI bridge — available when running inside the simulator plugin
 try:
@@ -265,6 +266,11 @@ def _gen_band_arena_vhdl(net, idx, design_name, fix_ename, attrs):
     w("    procedure attach is")
     w("    begin")
     w(f"        arena_attach(NET, BAND, NL, kick'path_name, {1 if delayf else 0});")
+    if delayf:      # values scheduled ahead (p'driver <= v after d) go out at once
+        for j, d in enumerate(eps):
+            base = fix_ename(d["ename"])[:-len(".driver")]
+            inst, port = base.rsplit(".", 1)
+            w(f"        arena_watch(NET, {j}, \"{inst.lstrip('.')}\", \"{port}\");")
     w("    end procedure;")
     w("")
     pdecl = "".join(f"; p{k} : {vt}" for k, (_s, _e, vt) in enumerate(places))
@@ -406,14 +412,14 @@ def _gen_delayed_hear(w, n, places, vec, tm, delayf, pargs):
     w(f"                dl := {delayf}(gi, h{pargs});")
     w("                arena_slack(NET, i, h, dl);")
     w("                t := now - dl;")
+    w("                e := arena_next_after(NET, h, t);     -- its next emission reaches here at e + dl")
+    w("                if e >= 0 fs and e + dl - now < wk then")
+    w("                    wk := e + dl - now;")
+    w("                end if;")
     w("                if arena_len_at(NET, h, t) > 0 then")
     w("                    d(h) := fed_decode(arena_fetch_at(NET, h, t), d(h));")
-    w("                    e := arena_next_after(NET, h, t);")
-    w("                    if e >= 0 fs and e + dl - now < wk then")
-    w("                        wk := e + dl - now;")
-    w("                    end if;")
     w("                else")
-    w("                    have(h) := false;          -- nothing emitted yet")
+    w("                    have(h) := false;          -- nothing it emitted has reached here yet")
     w("                end if;")
     w("            end if;")
     w("        end loop;")
@@ -467,6 +473,8 @@ def _vhdl_generic_literal(v):
     if isinstance(v, float):
         s = "%.17e" % v
         return "(%s)" % s if s.startswith("-") else s
+    if isinstance(v, str) and re.fullmatch(r"-?[0-9]+ fs", v):     # a TIME generic
+        return "(%s)" % v
     return None
 
 

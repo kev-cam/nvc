@@ -34,6 +34,10 @@ package arena_pkg is
     -- arena at once), or its place field `what` (1, 2, ..: ARENA_PLACE order;
     -- moving is not an event).
     procedure arena_put(net, j : integer; v : real_vector);
+    -- Local end j is port `pin` of instance `inst` (path, '.'-separated):
+    -- libarena watches its 'driver and sends what is scheduled on it
+    -- (p'driver <= v after d) at once, tagged with when it takes effect.
+    procedure arena_watch(net, j : integer; inst, pin : string);
     procedure arena_place(net, j, what : integer; v : real_vector);
 
     -- The arena as it is now: every endpoint has a global index, the same in
@@ -49,8 +53,8 @@ package arena_pkg is
     impure function arena_fetch(net, k, what : integer) return real_vector;
 
     -- Delayed resolution: the driver of end g (global index, local ends too)
-    -- as it was emitted at time t (its value before its first emission: the
-    -- first one), and the first emission after t (-1 fs: none yet).
+    -- as it was emitted at time t (length 0: nothing emitted by then), and the
+    -- first emission after t (-1 fs: none yet).
     -- arena_slack: the resolver of local end j found the path from end g to
     -- take d (the shortest from another simulation's ends is the slack to it:
     -- how far this simulation may run ahead of it).
@@ -74,6 +78,8 @@ package body arena_pkg is
     procedure arena_get_at(net, g : integer; t : time; v : out real_vector) is begin end procedure;
     impure function arena_next_after(net, g : integer; t : time) return time is begin end function;
     procedure arena_slack(net, j, g : integer; d : time) is begin end procedure;
+    procedure arena_watch(net, j : integer; inst, pin : string) is begin end procedure;
+    attribute foreign of arena_watch [integer, integer, string, string] : procedure is "VHPIDIRECT arena_watch";
     attribute foreign of arena_len_at [integer, integer, time return integer] : function is "VHPIDIRECT arena_len_at";
     attribute foreign of arena_get_at [integer, integer, time, real_vector] : procedure is "VHPIDIRECT arena_get_at";
     attribute foreign of arena_next_after [integer, integer, time return time] : function is "VHPIDIRECT arena_next_after";
