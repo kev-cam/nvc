@@ -406,6 +406,7 @@ struct _jit_thread_local {
    volatile sig_atomic_t  jmp_buf_valid;
    jit_anchor_t          *anchor;
    eval_arena_t          *eval_arena;   // non-NULL: route __nvc_eval_alloc here
+   eval_arena_t          *parked_arena; // eval_arena, while jit_eval_arena_park
 };
 
 typedef struct _code_cache code_cache_t;

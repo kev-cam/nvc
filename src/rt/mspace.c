@@ -437,15 +437,39 @@ typedef struct _arena_block {
 struct _eval_arena {
    arena_block_t *head;
    arena_block_t *cur;
+   eval_arena_t  *link;     // all_arenas
 };
+
+// Every arena there is: an object in one may hold the only pointer to an
+// object in the collected heap (the state of a procedure a suspended
+// procedure called, a record with an access in it), so the collector scans
+// them as it scans the live TLABs.  Changed under arenas_lock, which the
+// collector takes before it stops the world.
+static eval_arena_t *all_arenas = NULL;
+static nvc_lock_t    arenas_lock = 0;
 
 eval_arena_t *eval_arena_new(void)
 {
-   return xcalloc(sizeof(eval_arena_t));
+   eval_arena_t *a = xcalloc(sizeof(eval_arena_t));
+
+   SCOPED_LOCK(arenas_lock);
+   a->link = all_arenas;
+   all_arenas = a;
+   return a;
 }
 
 void eval_arena_free(eval_arena_t *a)
 {
+   {
+      SCOPED_LOCK(arenas_lock);
+      for (eval_arena_t **p = &all_arenas; *p; p = &((*p)->link)) {
+         if (*p == a) {
+            *p = a->link;
+            break;
+         }
+      }
+   }
+
    for (arena_block_t *b = a->head, *tmp; b; b = tmp) {
       tmp = b->next;
       free(b);
@@ -496,6 +520,12 @@ void eval_arena_reset(eval_arena_t *a)
    a->cur = a->head;
    if (a->head != NULL)
       a->head->used = 0;
+}
+
+// Anything allocated since the last reset?
+bool eval_arena_used(const eval_arena_t *a)
+{
+   return a->head != NULL && (a->cur != a->head || a->head->used > 0);
 }
 
 __attribute__((always_inline))
@@ -556,6 +586,7 @@ static void mspace_gc(mspace_t *m)
    mask_init(&(state.markmask), m->maxlines);
 
    SCOPED_LOCK(m->lock);
+   SCOPED_LOCK(arenas_lock);
 
    stop_world(mspace_suspend_cb, &state);
 
@@ -599,6 +630,16 @@ static void mspace_gc(mspace_t *m)
       for (char *p = lt->tlab.data; p < lt->tlab.data + lt->tlab.alloc;
            p += sizeof(intptr_t))
          mspace_mark_root(m, *(intptr_t *)p, &state);
+   }
+
+   // The blocks after cur are left over from before the arena's last reset
+   for (eval_arena_t *a = all_arenas; a; a = a->link) {
+      for (arena_block_t *b = a->head; b; b = b->next) {
+         for (char *p = b->data; p < b->data + b->used; p += sizeof(intptr_t))
+            mspace_mark_root(m, *(intptr_t *)p, &state);
+         if (b == a->cur)
+            break;
+      }
    }
 
    while (state.worklist.count > 0) {

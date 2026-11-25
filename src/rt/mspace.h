@@ -72,6 +72,7 @@ eval_arena_t *eval_arena_new(void);
 void eval_arena_free(eval_arena_t *a);
 void *eval_arena_alloc(eval_arena_t *a, size_t size);
 void eval_arena_reset(eval_arena_t *a);
+bool eval_arena_used(const eval_arena_t *a);
 
 mptr_t mptr_new(mspace_t *m, const char *name);
 void mptr_free(mspace_t *m, mptr_t *ptr);

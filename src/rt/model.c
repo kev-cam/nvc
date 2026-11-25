@@ -958,6 +958,8 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
       rt_proc_t *p = scope->procs.items[i];
       mptr_free(m->mspace, &(p->privdata));
       tlab_release(p->tlab);
+      if (p->arena != NULL)
+         eval_arena_free(p->arena);
       free(p);
    }
    ACLEAR(scope->procs);
@@ -1466,6 +1468,46 @@ static void reset_property(rt_model_t *m, rt_prop_t *prop)
    thread->active_scope = NULL;
 }
 
+// A process that suspends inside a procedure keeps ("claims") the TLAB it ran
+// on, for what the procedure allocated has to be there when it resumes: its
+// state, the state of the procedures it called, its locals.  The eval arena,
+// where compiled code puts what does not fit a TLAB, is reset at every
+// evaluation of any process, so it cannot hold any of that:
+//  - an evaluation on a claimed TLAB runs with the arena parked, and what
+//    overflows goes to the collected heap, as it does when interpreted
+//  - what the claiming evaluation itself had put in the arena is claimed
+//    along with the TLAB, and the thread gets a new arena
+// (A procedure that looped over a wait, called another that waited, and
+// filled its TLAB, came back from the wait to a state that later evaluations
+// had written over.)
+static void proc_claim_tlab(rt_model_t *m, model_thread_t *thread,
+                            rt_proc_t *proc)
+{
+   TRACE("claiming TLAB for private use (used %u/%u)",
+         thread->tlab->alloc, thread->tlab->limit);
+   proc->tlab = thread->tlab;
+   thread->tlab = tlab_acquire(m->mspace);
+
+   eval_arena_t *arena = jit_eval_arena_swap(NULL);
+   if (arena != NULL && eval_arena_used(arena)) {
+      assert(proc->arena == NULL);
+      proc->arena = arena;
+      arena = eval_arena_new();
+   }
+   jit_eval_arena_swap(arena);
+}
+
+static void proc_release_tlab(rt_proc_t *proc)
+{
+   tlab_release(proc->tlab);
+   proc->tlab = NULL;
+
+   if (proc->arena != NULL) {
+      eval_arena_free(proc->arena);
+      proc->arena = NULL;
+   }
+}
+
 // Default process eval: run via JIT
 static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
 {
@@ -1510,25 +1552,30 @@ static void proc_eval_jit(rt_model_t *m, rt_proc_t *proc)
    // Explicit in-region call: this is the scheduler's process activation, which
    // runs inside the landing pad armed by model_run, so it skips the per-call
    // setjmp / state transitions / diag-hint churn.
+   const bool claimed = proc->tlab != NULL;
+   if (claimed)
+      jit_eval_arena_park(true);
+
    if (!jit_fastcall_inregion(m->jit, proc->handle, &result, state, context,
                               proc->tlab ?: thread->tlab))
       m->force_stop = true;
 
-   if (saved_arena != NULL)
-      jit_eval_arena_swap(saved_arena);   // restore the default arena
+   if (claimed)
+      jit_eval_arena_park(false);
 
-   if (proc->tlab != NULL && result.pointer == NULL) {
-      tlab_release(proc->tlab);
-      proc->tlab = NULL;
-   }
+   if (proc->tlab != NULL && result.pointer == NULL)
+      proc_release_tlab(proc);
    else if (proc->tlab == NULL && result.pointer != NULL) {
-      TRACE("claiming TLAB for private use (used %u/%u)",
-            thread->tlab->alloc, thread->tlab->limit);
-      proc->tlab = thread->tlab;
-      thread->tlab = tlab_acquire(m->mspace);
+      proc_claim_tlab(m, thread, proc);
    }
    else if (proc->tlab == NULL)
       tlab_reset(thread->tlab);
+
+   if (saved_arena != NULL) {
+      // Restore the default arena (the scratch arena is another one now if
+      // the process claimed it)
+      proc->scope->scratch = jit_eval_arena_swap(saved_arena);
+   }
 
    thread->active_obj = NULL;
    thread->active_scope = NULL;
@@ -1627,6 +1674,10 @@ static void proc_eval_direct(rt_model_t *m, rt_proc_t *proc)
 
    void *result_ptr;
 
+   const bool claimed = proc->tlab != NULL;
+   if (claimed)
+      jit_eval_arena_park(true);
+
    jit_thread_local_t *jthread = jit_thread_get();
    if (likely(jthread->jmp_buf_valid && jthread->state == JIT_RUNNING)) {
       // In-region: model_run's landing pad is armed; an abort longjmps
@@ -1645,15 +1696,13 @@ static void proc_eval_direct(rt_model_t *m, rt_proc_t *proc)
       result_ptr = result.pointer;
    }
 
-   if (proc->tlab != NULL && result_ptr == NULL) {
-      tlab_release(proc->tlab);
-      proc->tlab = NULL;
-   }
+   if (claimed)
+      jit_eval_arena_park(false);
+
+   if (proc->tlab != NULL && result_ptr == NULL)
+      proc_release_tlab(proc);
    else if (proc->tlab == NULL && result_ptr != NULL) {
-      TRACE("claiming TLAB for private use (used %u/%u)",
-            thread->tlab->alloc, thread->tlab->limit);
-      proc->tlab = thread->tlab;
-      thread->tlab = tlab_acquire(m->mspace);
+      proc_claim_tlab(m, thread, proc);
    }
    else if (proc->tlab == NULL)
       tlab_reset(thread->tlab);
@@ -12741,16 +12790,11 @@ static void fused_member_epilogue(rt_model_t *m, rt_proc_t *proc,
    // member (enforced at build and by unfuse-on-claim below) but the full
    // protocol is replicated so no semantics are silently dropped.
    if (unlikely(proc->tlab != NULL)) {
-      if (result_ptr == NULL) {
-         tlab_release(proc->tlab);
-         proc->tlab = NULL;
-      }
+      if (result_ptr == NULL)
+         proc_release_tlab(proc);
    }
    else if (unlikely(result_ptr != NULL)) {
-      TRACE("claiming TLAB for private use (used %u/%u)",
-            thread->tlab->alloc, thread->tlab->limit);
-      proc->tlab = thread->tlab;
-      thread->tlab = tlab_acquire(m->mspace);
+      proc_claim_tlab(m, thread, proc);
       // The block passes thread->tlab inline; a claimant needs its private
       // one -- demote this member to the generic fallback path
       fused_member_unfuse(m, proc);

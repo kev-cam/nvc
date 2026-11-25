@@ -132,6 +132,10 @@ jit_thread_local_t *jit_thread_local(void)
 void jit_eval_arena_enable(bool on)
 {
    jit_thread_local_t *thread = jit_thread_get();
+   if (thread->parked_arena != NULL) {
+      thread->eval_arena = thread->parked_arena;
+      thread->parked_arena = NULL;
+   }
    if (on && thread->eval_arena == NULL)
       thread->eval_arena = eval_arena_new();
    else if (!on && thread->eval_arena != NULL) {
@@ -158,9 +162,28 @@ bool jit_eval_arena_enabled(void)
    return jit_thread_get()->eval_arena != NULL;
 }
 
+void jit_eval_arena_park(bool park)
+{
+   jit_thread_local_t *thread = jit_thread_get();
+   if (park) {
+      if (thread->eval_arena != NULL) {
+         assert(thread->parked_arena == NULL);
+         thread->parked_arena = thread->eval_arena;
+         thread->eval_arena = NULL;
+      }
+   }
+   else if (thread->parked_arena != NULL) {
+      assert(thread->eval_arena == NULL);
+      thread->eval_arena = thread->parked_arena;
+      thread->parked_arena = NULL;
+   }
+}
+
 void jit_eval_arena_reset(void)
 {
    jit_thread_local_t *thread = jit_thread_get();
+   if (unlikely(thread->parked_arena != NULL))
+      jit_eval_arena_park(false);   // An evaluation that was aborted
    if (thread->eval_arena != NULL)
       eval_arena_reset(thread->eval_arena);
 }

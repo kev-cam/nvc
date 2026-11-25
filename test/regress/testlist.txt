@@ -1265,3 +1265,5 @@ logic3dw3       normal,2040
 fuse1           normal,2040
 wait31          normal,2008
 wait32          normal
+tlabwait1       normal,2008,$NVC_JIT_ASYNC=0
+tlabwait2       normal,2008,$NVC_JIT_ASYNC=0

@@ -122,6 +122,7 @@ struct _rt_proc {
    tlab_t        *tlab;
    rt_scope_t    *scope;
    mptr_t         privdata;
+   eval_arena_t  *arena;        // Claimed along with tlab (proc_claim_tlab)
    // Static-wait tracking: registered sensitivity set (built on the first
    // activation, entries then persist on the pending lists forever) and
    // the fingerprint used to verify later activations re-arm the same set.

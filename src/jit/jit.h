@@ -88,6 +88,10 @@ void jit_eval_arena_reset(void);
 typedef struct _eval_arena eval_arena_t;
 eval_arena_t *jit_eval_arena_swap(eval_arena_t *a);
 bool jit_eval_arena_enabled(void);
+// Park: until unparked (or the next jit_eval_arena_reset) what overflows a
+// TLAB goes to the collected heap, as with no arena.  For an evaluation whose
+// allocations outlive it: a process resumed inside a procedure.
+void jit_eval_arena_park(bool park);
 
 void *jit_mspace_alloc(size_t size) RETURNS_NONNULL;
 jit_stack_trace_t *jit_stack_trace(void);
