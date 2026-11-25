@@ -3653,7 +3653,9 @@ static void fork_checkpoint(rt_model_t *m)
 
 static tree_t aj_scope_ref(rt_scope_t *scope)
 {
-   if (scope->where == NULL || tree_decls(scope->where) == 0)
+   // a record signal has a scope of its own, whose tree is its declaration
+   if (scope->where == NULL || tree_kind(scope->where) != T_BLOCK
+       || tree_decls(scope->where) == 0)
       return NULL;
    tree_t hier = tree_decl(scope->where, 0);
    if (tree_kind(hier) != T_HIER)
