@@ -6763,6 +6763,48 @@ static bool aj_model_has_field(const char *dutc_text, const char *name)
    return hit;
 }
 
+// A pin carries its VHDL port name in lower case; the model's fields carry the
+// Verilog names as written.  A port with a capital in it (Chisel's
+// io_cmd_bits_inst_primaryInst) then had no field by its pin name and was left
+// out of the bridge without a word: of BMC's 52 inputs and 56 outputs, 10 and
+// 13 were connected and the model ran on zeros.  Give each such pin the
+// model's spelling, which every later use (field access, sm_output_order,
+// sm_extra_clocks) compares with.
+static void aj_pins_model_case(const char *dutc_text, aj_pin_t *pins, int npins)
+{
+   char *low = NULL;
+   int fixed = 0;
+   for (int i = 0; i < npins; i++) {
+      if (aj_model_has_field(dutc_text, pins[i].name))
+         continue;
+      if (low == NULL) {
+         const size_t n = strlen(dutc_text);
+         low = xmalloc(n + 1);
+         for (size_t k = 0; k <= n; k++)
+            low[k] = tolower((unsigned char)dutc_text[k]);
+      }
+      char lname[sizeof pins[i].name];
+      aj_lower(lname, pins[i].name, sizeof lname);
+      static const char *const fmt[] = {
+         "uint64_t _%s;", "unsigned __int128 _%s;", "uint32_t _%s[" };
+      for (int k = 0; k < (int)ARRAY_LEN(fmt); k++) {
+         char pat[96 + sizeof lname];
+         const int plen = snprintf(pat, sizeof pat, fmt[k], lname);
+         const char *hit = strstr(low, pat);
+         if (hit == NULL)
+            continue;
+         // the name sits before the pattern's last character
+         const size_t nl = strlen(lname);
+         memcpy(pins[i].name, dutc_text + (hit - low) + plen - 1 - nl, nl);
+         fixed++;
+         break;
+      }
+   }
+   if (fixed > 0)
+      notef("accel-jit: %d port name(s) taken in the model's spelling", fixed);
+   free(low);
+}
+
 // Emit the address-baked bridge .c around the generated model.
 // spec: post-link RE-emission — the link results (hoff/hin flags) and run mode
 // (VERIFY=0) are baked in as constants and every resolved branch is emitted
@@ -6777,6 +6819,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
 {
    char *dut_text = aj_read_file(dutc);
    if (!dut_text) return false;
+   aj_pins_model_case(dut_text, pins, npins);
    // sm_clock_late present? (extra-group commits from a pre-edge snapshot +
    // current inputs, at each gated clock's own value edge)
    const bool has_late = strstr(dut_text, "void sm_clock_late") != NULL;
@@ -7050,11 +7093,21 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
             continue;
          }
          int a_ = 0, b_ = 0;
-         if (sscanf(cm, "// %d x %d-bit", &a_, &b_) == 2) {
+         // sscanf takes the length of its whole string first: on the model's
+         // text (88 MB for a design of 8,600 registers) that was a pass over
+         // the rest of the file per register, 80 s of every run's start.
+         char cmb[64];
+         size_t cml = 0;
+         while (cml < sizeof cmb - 1 && cm[cml] != '\0' && cm[cml] != '\n') {
+            cmb[cml] = cm[cml];
+            cml++;
+         }
+         cmb[cml] = '\0';
+         if (sscanf(cmb, "// %d x %d-bit", &a_, &b_) == 2) {
             e.depth = a_;
             e.width = b_;
          }
-         else if (sscanf(cm, "// %d bits", &a_) == 1)
+         else if (sscanf(cmb, "// %d bits", &a_) == 1)
             e.width = a_;
          else { line = nl; continue; }
          if (nrd == maxrd) {
