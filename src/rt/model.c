@@ -2363,6 +2363,14 @@ static void aj_apply_stage2(rt_model_t *m)
          i++;
       }
    }
+   // What is left was armed just now and is applied by the next call, which
+   // is the end of the next delta cycle: ask for one.  Nothing else need be
+   // going on at that time -- a bench that is the design's only stimulus
+   // raises the clock and waits half a period -- and the publication then
+   // came with the next event, the clock's fall, where a process that reads
+   // the outputs as it lowers the clock saw the values of the edge before.
+   if (g_aj_stage2_n > 0)
+      m->next_is_delta = true;
 }
 // Per-thread: the chunk whose eval is running on THIS worker. Under
 // NVC_PARALLEL_PROCS each worker runs a different chunk, and the .so's bridge
@@ -6812,6 +6820,26 @@ static void aj_pins_model_case(const char *dutc_text, aj_pin_t *pins, int npins)
 // b_in/b_out tables) are SKIPPED — they exist and must not be disturbed. The
 // state layout (aj_cs_t) is emitted identically so the live chunk state
 // carries across the eval-pointer swap.
+// Does this model take its reset out of band?  gen_statemachine used to
+// strip a port named `rst` from inputs_t (marker sm_oob_reset = 1; no
+// marker in older models) and the bridge called sm_reset() while the pin
+// was high.  sm_reset() is the power-on state, so that also cleared every
+// memory and every register the design's own reset does not reach: a
+// baseband that loads its sine table once and resets before each packet
+// transmitted zeros.  A generator that keeps `rst` in inputs_t says so with
+// marker 0, and the pin is then bridged like any other.
+static bool aj_model_oob_reset(const char *dutc)
+{
+   char *text = aj_read_file(dutc);
+   if (text == NULL)
+      return true;
+   static const char mark[] = "const int sm_oob_reset = ";
+   const char *op = strstr(text, mark);
+   const bool oob = op == NULL || atol(op + sizeof mark - 1) != 0;
+   free(text);
+   return oob;
+}
+
 static bool aj_emit_bridge(const char *path, const char *dutc,
                            aj_pin_t *pins, int npins, aj_pin_t *clk,
                            aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk,
@@ -6878,9 +6906,11 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
      if (g0p != NULL)
         g0regs = atol(g0p + strlen("#define SM_GROUP0_REGS ")); }
 
-   // Out-of-band reset handshake. Reset is a TWO-SIDED protocol: gsm strips
-   // a port named `rst` from inputs_t and exports sm_oob_reset; the bridge
-   // diverts the same pin and drives sm_reset from RST (AJB[5]). Removing
+   // Out-of-band reset handshake. Reset is a TWO-SIDED protocol: an older
+   // gsm strips a port named `rst` from inputs_t and exports sm_oob_reset
+   // = 1; the bridge diverts the same pin and drives sm_reset from RST
+   // (AJB[5]).  A gsm that keeps `rst` as an input exports 0 and the caller
+   // has left the pin among the ordinary ones (aj_model_oob_reset).  Removing
    // either half alone is silent poison — 8c8e1c1ba took out one side and
    // 16/19 accelbench designs went wrong with both gates green. Marker
    // absent (older cached model) => skip the marker check; the kept-input
@@ -9796,6 +9826,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    int npins = 0;
    aj_pin_t clk = {0}, rst = {0};
    bool have_clk = false, have_rst = false;
+   const bool rst_oob = aj_model_oob_reset(dutc);
    const int nports = tree_ports(ent);
    for (int i = 0; i < nports; i++) {
       tree_t p = tree_port(ent, i);
@@ -9834,40 +9865,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          return false;
       }
       if (strcmp(lname, "clk") == 0) { clk = pin; have_clk = true; }
-      // NOTE: a port named "rst" used to be pulled out here and driven into
-      // `if(RST[0]&1) sm_reset(&S);`, i.e. the SPELLING of the port decided it
-      // was an active-HIGH synchronous whole-state reset.  That is wrong for an
-      // active-low or asynchronous reset that happens to be called `rst`, and
-      // it was silently wrong -- correct while the old size gate declined the
-      // design, wrong as soon as it was admitted (confirmed with
-      // NVC_ACCEL_VERIFY on a 20-line active-low design).
-      //
-      // It is also redundant: gen_statemachine already models resets IN THE
-      // NETLIST -- $adff carries arst_expr/arst_const, and a synchronous reset
-      // is just a mux on D like any other logic.  So `rst` is an ordinary
-      // bridged pin and the reset semantics come from the RTL, not the name.
-      // accel_reset() still calls sm_reset() once at install for initial state.
-      // A port literally named `rst` is driven out of band (AJB[5]) into
-      // sm_reset() rather than bridged as an ordinary input.  This is UGLY --
-      // the SPELLING of the port decides it is an active-HIGH synchronous
-      // whole-state reset, which is wrong for an active-low or asynchronous
-      // reset that happens to be called `rst` (see below) -- but it is one
-      // half of a TWO-SIDED protocol and must not be removed alone.
-      //
-      // gen_statemachine keeps `_rst` OUT of inputs_t (gen_statemachine.cpp
-      // :1315/2095/2452/3011/3124/3186 all skip `_clk`/`_rst`, and :2954
-      // documents the split), so the generated model has no field to receive
-      // it.  Dropping this line therefore does not make `rst` an ordinary
-      // pin -- it makes reset UNREACHABLE, and every design with a sync reset
-      // silently produces wrong values.  Measured: it broke 16 of the 19
-      // accelbench designs (e.g. deep_d8 Y=1609704590 vs interp 1241718724)
-      // while nvc's own test/accel and the ivtest gate both stayed green.
-      //
-      // The name-based rule is still a real latent bug (an active-low `rst`
-      // is mismodelled once admitted).  Fixing it means changing BOTH sides
-      // together: gen_statemachine must stop skipping `_rst` and model it as
-      // an ordinary input so the reset semantics come from the RTL.
-      else if (strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
+      // A port literally named `rst`: with a model that wants its reset out
+      // of band (aj_model_oob_reset: gen_statemachine left `_rst` out of
+      // inputs_t) the pin is diverted to AJB[5] and the bridge calls
+      // sm_reset() while it is high.  The two sides go together -- the
+      // bridge side alone taken out made reset unreachable and broke 16 of
+      // the 19 accelbench designs -- and aj_emit_bridge declines a model
+      // whose marker disagrees with what was done here.  With a model that
+      // keeps `_rst` as an input the pin is an ordinary one and the reset is
+      // the netlist's logic ($adff's arst, a synchronous reset's mux on D).
+      else if (rst_oob && strcmp(lname, "rst") == 0) { rst = pin; have_rst = true; }
       else if (npins < AJ_MAX_PINS) pins[npins++] = pin;
       else {
          notef("accel-jit: subtree '%s' exceeds %d boundary pins — leaving in nvc",
