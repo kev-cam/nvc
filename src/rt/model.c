@@ -2222,6 +2222,8 @@ struct _aj_chunk {
    // chunk's bridge with the link results (hoff/hin flags, VERIFY, clocking
    // mode) baked in as constants, compile it, and swap eval — the vtable
    // regenerated to reflect the object's current state.
+   bool             own_object;      // the model keeps state in its object
+                                     // (aj_model_own_object): one per instance
    char            *rs_bridge;       // original bridge .c path
    char            *rs_dutc;         // model .c the bridge #includes
    char            *rs_top;          // subtree name
@@ -3963,6 +3965,9 @@ static aj_chunk_t *aj_chunk_new(rt_model_t *m)
                                     sizeof(aj_chunk_t *));
    }
    aj_chunk_t *c = xcalloc(sizeof(aj_chunk_t));
+   // every output live until an install prunes some: a merged chunk never
+   // sets the mask, and its specialized object used to be handed all zeros
+   memset(c->live_out_mask, 0xff, sizeof c->live_out_mask);
    c->vtable.eval = aj_proc_eval;
    c->vtable.on_abort = proc_on_abort_default;
    m->aj_chunks[m->aj_chunk_count++] = c;
@@ -5567,6 +5572,70 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                            aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk,
                            bool spec);
 
+// The bridge format's version: part of the name of every compiled object
+// and bridge file that is not named by a hash of the bridge's text (the
+// specialized and the merged ones, and the fall-back name of the others).
+// Bump it whenever the emitted bridge text changes: those names do not see
+// the text, and an nvc of one format must not load an object of another, or
+// compile the other's bridge -- several builds usually share one cache.
+// v2: true edge-detect posedge + accel_set_clklast.  v9: the instance's path
+// is a table slot (AJ_TAG), which an nvc before it does not provide.
+#define AJ_BRIDGE_FORMAT "bridge-v9"
+
+// A model may keep state in the object itself, outside the state_t that
+// every instance has of its own: a GSM_GATED model its block-dirty bits,
+// boundary nets and previous values; a model with an ICG2EN-exported gated
+// clock the clock value it is handed in a global (which two chunks
+// evaluated in parallel would write under each other); a
+// GSM_ACTIVITY_CENSUS model the shadows and counts of its report.  Such an
+// object serves ONE instance of a simulation -- two would publish, or
+// count, what was computed for the other -- so it is named by the instance
+// as well as by its text.  (Every content-named object was, while the
+// bridge carried the instance's path; that is how these models came to
+// work with several instances.)  The markers are what gen_statemachine
+// writes at file scope for each: a new kind of state there needs one here.
+static bool aj_model_own_object(const char *dut_text)
+{
+   return strstr(dut_text, "static int _gd_init;") != NULL
+      || strstr(dut_text, "uint64_t sm_icg_clkval") != NULL
+      || strstr(dut_text, "static uint64_t _cns_shadow[") != NULL;
+}
+
+// The dead-output mask (sm_live_outputs) is the compiled object's, and one
+// object serves every instance of the same logic in the simulation: the cone
+// of an output may be skipped only if NO instance reads it.  The first
+// instance to load an object sets its mask and the others add theirs to it
+// (it was a copy each time: the last instance's readers decided for all).
+static void aj_apply_live_mask(void *dl, const uint64_t *mask)
+{
+   uint64_t *lom = dlsym(dl, "sm_live_outputs");
+   if (lom == NULL)
+      return;
+   // size-negotiated: newer gsm exports sm_live_outputs_words;
+   // absent symbol = legacy 4-word layout
+   const int *lw = dlsym(dl, "sm_live_outputs_words");
+   int nw = lw != NULL ? *lw : 4;
+   if (nw > 16) nw = 16;
+   if (nw < 1) nw = 4;
+
+   static uint64_t **seen = NULL;
+   static int nseen = 0, maxseen = 0;
+   bool first = true;
+   for (int i = 0; i < nseen && first; i++)
+      first = seen[i] != lom;
+   if (first) {
+      if (nseen == maxseen) {
+         maxseen = maxseen > 0 ? 2 * maxseen : 16;
+         seen = xrealloc_array(seen, maxseen, sizeof(uint64_t *));
+      }
+      seen[nseen++] = lom;
+      memcpy(lom, mask, (size_t)nw * 8);
+   }
+   else
+      for (int w = 0; w < nw; w++)
+         lom[w] |= mask[w];
+}
+
 // Post-link respecialization: the vtable-hacking principle applied to the
 // bridge — the eval pointer is mutable state, so once the link pass fixes the
 // handoff wiring, RE-EMIT the bridge with those results (and VERIFY=0) baked
@@ -5593,6 +5662,14 @@ static void aj_respecialize(rt_model_t *m)
       // spec bakes _coinc as a constant — a mode flip must miss the cache
       h = (h ^ (getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 5u : 9u))
          * 1099511628211ull;
+      // ... and the bridge's format: this hash is the whole name, and an
+      // object compiled by an nvc of another format is not this one's
+      for (const char *p = AJ_BRIDGE_FORMAT; *p; p++)
+         h = (h ^ (uint8_t)*p) * 1099511628211ull;
+      // ... and the instance, for a model that keeps state in its object
+      if (c->own_object)
+         for (const char *p = istr(c->scope->name); *p; p++)
+            h = (h ^ (uint8_t)*p) * 1099511628211ull;
       // Fold the model identity in: two CONFIGS can share top name and flag
       // vectors while binding different logic (rs_dutc is content-keyed), and
       // an unkeyed spec name would cache one config's spec under the other's.
@@ -5650,16 +5727,7 @@ static void aj_respecialize(rt_model_t *m)
       void (*ffa)(void *) = dlsym(dl, "accel_force_arm");
       if (ffa != NULL) c->force_arm_fn = ffa;
       // the specialized .so has its own sm_live_outputs — re-apply the mask
-      uint64_t *lom = dlsym(dl, "sm_live_outputs");
-      if (lom != NULL) {
-         // size-negotiated: newer gsm exports sm_live_outputs_words;
-         // absent symbol = legacy 4-word layout
-         const int *lw = dlsym(dl, "sm_live_outputs_words");
-         int nw = lw != NULL ? *lw : 4;
-         if (nw > 16) nw = 16;
-         if (nw < 1) nw = 4;
-         memcpy(lom, c->live_out_mask, (size_t)nw * 8);
-      }
+      aj_apply_live_mask(dl, c->live_out_mask);
       notef("accel-jit: respecialized '%s' (link results compiled in)",
             c->rs_top);
    }
@@ -6977,7 +7045,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          return false;
       }
 
-   FILE *f = fopen(path, "w");
+   // Written under a name of this process's own and renamed when complete:
+   // nobody, here or in another simulation on the same cache, reads it
+   // half-written.
+   char tmp_path[1024];
+   checked_sprintf(tmp_path, sizeof tmp_path, "%s.t%d", path, (int)getpid());
+   FILE *f = fopen(tmp_path, "w");
    if (!f) { free(dut_text); return false; }
 
    fprintf(f, "#define SM_NO_MAIN 1\n");
@@ -7223,10 +7296,19 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                aj_ao4_add_out(aj_ultimate_driver_nexus(n4, 0), chunk);
          }
    chunk->primary_ck = clk != NULL ? clk->sig : NULL;
-   // Slots after the per-pin table (array is sized 6+npins+4):
+   // Slots after the per-pin table (array is sized 6+npins+5):
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
    //   [6+npins+1] per-output handoff flags (set by aj_link_handoff post-install)
    //   [6+npins+2] aj_poke — packed chunk-to-chunk handoff (NVC_ACCEL_HANDOFF)
+   //   [6+npins+4] the instance's path, for the trace lines.  It was written
+   //               into the bridge as a literal, and the .so is named by a
+   //               hash of the bridge's text: the same design under another
+   //               path (a wrapper round the top, a second instance, the
+   //               other side of a link) was compiled again, model and all
+   //               -- 13 minutes of gcc for an 88 MB model, per path.
+   //               (Bridge format v9: an object that reads the slot must
+   //               not be loaded by an nvc that does not fill it.)
+   chunk->bindtab[6 + npins + 4] = (void *)istr(chunk->scope->name);
    if (!spec) {
       chunk->bindtab[6 + npins] = &g_aj_verify;
       chunk->hoff_flags = xcalloc(npins > 0 ? npins : 1);
@@ -7246,6 +7328,7 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    fprintf(f, "#define AJ_HOFF ((unsigned char*)AJB[%d])\n", 6 + npins + 1);
    fprintf(f, "#define AJ_POKE ((ajpoke_fn)AJB[%d])\n", 6 + npins + 2);
    fprintf(f, "#define AJ_HIN ((unsigned char*)AJB[%d])\n", 6 + npins + 3);
+   fprintf(f, "#define AJ_TAG ((const char*)AJB[%d])\n", 6 + npins + 4);
 
    fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n");
    fprintf(f, "static int g_dbg = -1;\n");
@@ -7874,12 +7957,14 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
       // of every extra clock BEFORE the advance.  Debug aid for gated-clock
       // first-edge divergence (VeeR free_l2clk): shows exactly which delta a
       // gated group's rise is observed in and whether its commit fires.
+      // N counts the evals of the compiled object, which the instances of
+      // the same logic share; each line names its instance (AJ_TAG).
       fprintf(f, "  static int _ckt=-2; if(_ckt==-2){ const char *e=getenv(\"NVC_ACCEL_CK_TRACE\"); _ckt=e?atoi(e):0; }\n");
-      fprintf(f, "  if(_ckt>0){ _ckt--; fprintf(stderr, \"[ckt %s] t=%%lld+%%u pe=%%d mask=0x%%x%s\"",
-              istr(chunk->scope->name), has_late ? " pend=0x%x" : "");
+      fprintf(f, "  if(_ckt>0){ _ckt--; fprintf(stderr, \"[ckt %%s] t=%%lld+%%u pe=%%d mask=0x%%x%s\"",
+              has_late ? " pend=0x%x" : "");
       for (int k = 0; k < nck; k++)
          fprintf(f, " \" %s=%%d/l%%d\"", extra_clk[k]);
-      fprintf(f, " \"\\n\", t, d, posedge, posedge_mask");
+      fprintf(f, " \"\\n\", AJ_TAG, t, d, posedge, posedge_mask");
       if (has_late)
          fprintf(f, ", (unsigned)aj_cs->late_pend");
       for (int k = 0; k < nck; k++)
@@ -7966,11 +8051,10 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
          fprintf(f, "    }\n");
          // CK_TRACE line B: post-scan/post-late state — fresh in._*, updated
          // ck_last[], fired bits and what remains pending.
-         fprintf(f, "    if(_ckt>0){ fprintf(stderr, \"[ckT %s] t=%%lld+%%u fired=0x%%x pend=0x%%x\"",
-                 istr(chunk->scope->name));
+         fprintf(f, "    if(_ckt>0){ fprintf(stderr, \"[ckT %%s] t=%%lld+%%u fired=0x%%x pend=0x%%x\"");
          for (int k = 0; k < nck; k++)
             fprintf(f, " \" %s=%%d/l%%d\"", extra_clk[k]);
-         fprintf(f, " \"\\n\", t, d, _fired, (unsigned)aj_cs->late_pend");
+         fprintf(f, " \"\\n\", AJ_TAG, t, d, _fired, (unsigned)aj_cs->late_pend");
          for (int k = 0; k < nck; k++)
             fprintf(f, ", (int)(in._%s>>%d)&1, (int)aj_cs->ck_last[%d]",
                  extra_clk_field[k], extra_clk_bit[k], k);
@@ -8003,19 +8087,19 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // output).  CK_TRACE is count-limited from t=0 and INDUMP/SMDUMP are
    // gated on `posedge` — which a dead-primary chunk NEVER raises — so none
    // of them can watch a same-instant capture mid-run.  This one can.
-   fprintf(f, "  { static int _evt=-2; if(_evt==-2){ const char *e="
-              "getenv(\"NVC_ACCEL_EVTRACE\");"
-              " _evt=(e && strstr(\"%s\", e))?1:0; }\n",
-           istr(chunk->scope->name));
+   // The choice is made at every call (a strstr, only when the variable is
+   // set): the object is shared by the instances of the same logic, so a
+   // static flag would be the first caller's answer for all of them.
+   fprintf(f, "  { static const char *_eve=(const char*)1; if(_eve==(const char*)1)"
+              " _eve=getenv(\"NVC_ACCEL_EVTRACE\");\n"
+              "    const int _evt = _eve && strstr(AJ_TAG, _eve);\n");
    if (nck > 0)   // posedge_mask/_chg/_fused exist only in multi-clock bridges
-      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %s] t=%%lld+%%u pe=%%d"
+      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %%s] t=%%lld+%%u pe=%%d"
                  " mask=0x%%x chg=%%d fused=%%d\","
-                 " t, d, posedge, posedge_mask, _chg, _fused);\n",
-              istr(chunk->scope->name));
+                 " AJ_TAG, t, d, posedge, posedge_mask, _chg, _fused);\n");
    else
-      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %s] t=%%lld+%%u"
-                 " pe=%%d\", t, d, posedge);\n",
-              istr(chunk->scope->name));
+      fprintf(f, "    if(_evt){ fprintf(stderr,\"[evt %%s] t=%%lld+%%u"
+                 " pe=%%d\", AJ_TAG, t, d, posedge);\n");
    { int nf = 0;
      for (int i = 0; i < npins && nf < 16; i++) {
         if (pins[i].width > 64 || !aj_model_has_field(dut_text, pins[i].name))
@@ -8372,8 +8456,18 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  bi, pp->name);
    }
    fprintf(f, "  }\n  return 0;\n}\n");
-   fclose(f);
+   const bool wok = !ferror(f);
    free(dut_text);
+   if (fclose(f) != 0 || !wok || rename(tmp_path, path) != 0) {
+      // errno is the failed close's or rename's; a write that failed
+      // earlier left none worth quoting
+      if (wok)
+         warnf("accel-jit: cannot write %s: %s", path, strerror(errno));
+      else
+         warnf("accel-jit: cannot write %s: a write failed", path);
+      unlink(tmp_path);
+      return false;
+   }
 
    if (!spec)
       notef("accel-jit: bridge %d inputs, %d outputs", bridged_in, bridged_out);
@@ -9578,8 +9672,6 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    char dutc[600], bridge[600], so[600];
    snprintf(dutc,   sizeof dutc,   "%s/aj_%s_%016llx.c", accel_dir, top,
             (unsigned long long)vhash);
-   snprintf(bridge, sizeof bridge, "%s/aj_%s_%016llx_bridge.c", accel_dir, top,
-            (unsigned long long)vhash);
 
    // TWO-TIER KEY.  The generated C above is keyed by vhash alone -- it is
    // derived from the LOGIC and is therefore portable: the same design yields
@@ -9600,9 +9692,8 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    uint64_t shash = vhash;
    // bridge-format version: bump when the emitted bridge TEXT changes so
    // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
-   // stale and re-emit+recompile from the cached synth .c.  v2: true
-   // edge-detect posedge + accel_set_clklast.
-   for (const char *p = "bridge-v8"; *p; p++)
+   // stale and re-emit+recompile from the cached synth .c (AJ_BRIDGE_FORMAT).
+   for (const char *p = AJ_BRIDGE_FORMAT; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
      if (cc == NULL) cc = "gcc -g -O3";
@@ -9620,6 +9711,10 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
 #endif
    }
    snprintf(so,     sizeof so,     "%s/aj_%s_%016llx.so", accel_dir, top,
+            (unsigned long long)shash);
+   // the bridge's fall-back name, like the object's: by the format as well,
+   // so that an nvc of another format has a file of its own
+   snprintf(bridge, sizeof bridge, "%s/aj_%s_%016llx_bridge.c", accel_dir, top,
             (unsigned long long)shash);
 
    // 2. synthesize the flattened model (gen_statemachine) — but only if this
@@ -9970,12 +10065,24 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // rs_top was only filled in after the dlopen below).
    chunk->rs_top  = xstrdup(top);
    notef("accel-jit: chunk '%s' scope %s", top, istr(scope->name));
-   chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 4, sizeof(void *));
+   chunk->bindtab = xcalloc_array(6 + (npins > 0 ? npins : 1) + 5, sizeof(void *));
    aj_build_fastclk(m, clk.sig, clk.data);
    // aj_emit_bridge writes the (now address-free) bridge .c and fills the per-run
    // address table in chunk->bindtab — both cheap; the gcc below is what we cache.
-   if (!aj_emit_bridge(bridge, dutc, pins, npins, &clk,
+   // The bridge is written and hashed under a name of this simulation's own,
+   // and is then given a name made of that hash, the object's: what is
+   // compiled is what was hashed, whatever other simulations on the same
+   // cache are doing.  It had one name, by the logic alone, that every
+   // simulation of the design rewrote: of two that start together (the
+   // sides of a federation, a parallel regression) one read it back while
+   // the other was rewriting it, hashed half a file, and compiled the whole
+   // model again under a name that nothing would ever ask for.
+   char bridge_own[640];
+   checked_sprintf(bridge_own, sizeof bridge_own, "%s.%d", bridge,
+                   (int)getpid());
+   if (!aj_emit_bridge(bridge_own, dutc, pins, npins, &clk,
                        have_rst ? &rst : NULL, m, chunk, false)) {
+      rename(bridge_own, bridge);   // if it was written: for whoever looks
       aj_accel_teardown(m);
       return false;
    }
@@ -9989,7 +10096,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // ever cross-hit.  The vhash-derived name stays the fallback when either
    // file is unreadable.
    {
-      char *bt2 = aj_read_file(bridge);
+      char *bt2 = aj_read_file(bridge_own);
       char *dt2 = aj_read_file(dutc);
       if (bt2 != NULL && dt2 != NULL) {
          uint64_t ch = 14695981039346656037ULL;
@@ -10039,11 +10146,27 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                              | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
          ch = (ch ^ isa2) * 1099511628211ULL;
 #endif
+         chunk->own_object = aj_model_own_object(dt2);
+         if (chunk->own_object) {
+            for (const char *p2 = istr(scope->name); *p2; p2++)
+               { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+            notef("accel-jit: '%s' keeps state in its object: one object "
+                  "per instance", top);
+         }
          snprintf(so, sizeof so, "%s/aj_%s_c%016llx.so", accel_dir, top,
                   (unsigned long long)ch);
+         snprintf(bridge, sizeof bridge, "%s/aj_%s_c%016llx_bridge.c",
+                  accel_dir, top, (unsigned long long)ch);
       }
       free(bt2);
       free(dt2);
+   }
+   // the same bytes, if another simulation got there first
+   if (rename(bridge_own, bridge) != 0) {
+      warnf("accel-jit: cannot write %s: %s", bridge, strerror(errno));
+      unlink(bridge_own);
+      aj_accel_teardown(m);
+      return false;
    }
    // Compile only if this exact (de-baked, content-only) .so is not already
    // cached. A logic change re-hashes -> a fresh .so; unchanged logic skips BOTH
@@ -10215,11 +10338,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                   pruned++;
                }
             }
-            { const int *lw2 = dlsym(dl, "sm_live_outputs_words");
-              int nw2 = lw2 != NULL ? *lw2 : 4;
-              if (nw2 > 16) nw2 = 16;
-              if (nw2 < 1) nw2 = 4;
-              memcpy(lom, chunk->live_out_mask, (size_t)nw2 * 8); }
+            aj_apply_live_mask(dl, chunk->live_out_mask);
             if (pruned > 0)
                notef("accel-jit: pruned %d unread output cone(s)", pruned);
          }
@@ -10926,7 +11045,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
         if (cc == NULL) cc = "gcc -g -O3";
         for (const char *p = cc; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
-        for (const char *p = "bridge-v8"; *p; p++)
+        for (const char *p = AJ_BRIDGE_FORMAT; *p; p++)
            { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
         struct utsname un;
         if (uname(&un) == 0)
@@ -10936,7 +11055,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       snprintf(dutc, sizeof dutc, "%s/aj_%s_%016llx.c", accel_dir, wname,
                (unsigned long long)vhash);
       snprintf(bridge, sizeof bridge, "%s/aj_%s_%016llx_bridge.c", accel_dir,
-               wname, (unsigned long long)vhash);
+               wname, (unsigned long long)shash);   // like its object
       snprintf(so, sizeof so, "%s/aj_%s_%016llx.so", accel_dir, wname,
                (unsigned long long)shash);
 
@@ -11039,7 +11158,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          chunk->merged = true;   // enables the negedge state flip
          chunk->scope  = g_aj_cands[i].scope;
          chunk->rs_top = xstrdup(wname);
-         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 4,
+         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 5,
                                         sizeof(void *));
          aj_build_fastclk(m, mp[0].sig, mp[0].data);
          if (!aj_emit_bridge(bridge, dutc, mp, nmp, &mp[0],
@@ -11204,7 +11323,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          chunk->merged = true;   // enables the negedge state flip
          chunk->scope  = g_aj_cands[gr->first].scope;
          chunk->rs_top = xstrdup(gr->wname);
-         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 4,
+         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 5,
                                         sizeof(void *));
          aj_build_fastclk(m, mp[0].sig, mp[0].data);
          if (!aj_emit_bridge(gr->bridge, gr->dutc, mp, nmp, &mp[0],
