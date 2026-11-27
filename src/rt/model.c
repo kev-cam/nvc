@@ -1753,10 +1753,12 @@ static void direct_eval_uninstall(rt_proc_t *proc)
    }
 }
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <time.h>
 
 #include "gsm_rtlil.h"
 
@@ -3939,7 +3941,15 @@ static bool aj_trim_source(const char *path, const char *accel_dir,
    return ok;
 }
 
-static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
+// Room for a source's path.  The longest is a subtree's emission under its
+// own name (aj_own_name): the cache directory (up to 511 characters),
+// aj_<entity>_subtree.v with an entity of up to 127, and the own tag.  It
+// must never be cut: the file is written under one copy of the name and read
+// back under another, and two copies cut at different lengths are two files
+// (at 512, the read-back was of the common name: the last run's emission).
+#define AJ_SRC_MAX 704
+
+static void aj_collect_sources(rt_scope_t *scope, char srcs[][AJ_SRC_MAX],
                                int *nsrc, int max)
 {
    tree_t r = aj_scope_ref(scope);
@@ -3949,7 +3959,7 @@ static void aj_collect_sources(rt_scope_t *scope, char srcs[][512],
       for (int i = 0; i < *nsrc; i++)
          if (strcmp(srcs[i], buf) == 0) { dup = true; break; }
       if (!dup && *nsrc < max)
-         snprintf(srcs[(*nsrc)++], 512, "%s", buf);
+         snprintf(srcs[(*nsrc)++], AJ_SRC_MAX, "%s", buf);
    }
    for (int ci = 0; ci < scope->children.count; ci++)
       aj_collect_sources(scope->children.items[ci], srcs, nsrc, max);
@@ -5572,11 +5582,12 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                            aj_pin_t *rst, rt_model_t *m, aj_chunk_t *chunk,
                            bool spec);
 
-// The bridge format's version: part of the name of every compiled object
-// and bridge file that is not named by a hash of the bridge's text (the
-// specialized and the merged ones, and the fall-back name of the others).
-// Bump it whenever the emitted bridge text changes: those names do not see
-// the text, and an nvc of one format must not load an object of another, or
+// The bridge format's version: part of every name of a compiled object or
+// bridge file that is not a hash of the bridge's text -- the fall-back
+// names, used when a file cannot be read back to be hashed, and the names
+// the specialized and the merged bridges are first written under.  Bump it
+// whenever the emitted bridge text changes: those names do not see the
+// text, and an nvc of one format must not load an object of another, or
 // compile the other's bridge -- several builds usually share one cache.
 // v2: true edge-detect posedge + accel_set_clklast.  v9: the instance's path
 // is a table slot (AJ_TAG), which an nvc before it does not provide.
@@ -5636,10 +5647,230 @@ static void aj_apply_live_mask(void *dl, const uint64_t *mask)
          lom[w] |= mask[w];
 }
 
+// What a compiled object is named by: a hash of the two texts that are
+// compiled, the bridge's and the model's, and of what compiles them.  The
+// same bytes under the same toolchain are the same object whoever asks, and
+// whatever changes the bytes -- a switch that changes the bridge, a mode of
+// the generator -- gives another.  Two things are taken out of the texts,
+// which carry the model's key and nothing else: the model's path where the
+// bridge #includes it, and the model's #line directives (the staged
+// source's path).  That was meant to let a model made again under another
+// key (a rebuilt generator: its mtime is in the key) find the object it had
+// -- ~40 minutes of gcc for an 86 MB EH2 model -- and it does not: the
+// generator also writes the staged source's path into the model's first
+// line and into the names of its auto-named nets.  Sets chunk->own_object
+// from the model's text and, for such a model, puts the instance into the
+// hash (see aj_model_own_object).  False if either file cannot be read: the
+// caller keeps the names it had.
+static bool aj_object_hash(const char *bridge_path, const char *dutc,
+                           aj_chunk_t *chunk, uint64_t *hash)
+{
+   char *bt = aj_read_file(bridge_path);
+   char *dt = aj_read_file(dutc);
+   const bool ok = bt != NULL && dt != NULL;
+   if (ok) {
+      uint64_t ch = 14695981039346656037ULL;
+      const size_t dlen = strlen(dutc);
+      for (const char *p = bt; *p; ) {
+         if (strncmp(p, dutc, dlen) == 0) {
+            for (const char *q = "@DUTC@"; *q; q++)
+               { ch ^= (uint8_t)*q; ch *= 1099511628211ULL; }
+            p += dlen;
+            continue;
+         }
+         ch ^= (uint8_t)*p++;
+         ch *= 1099511628211ULL;
+      }
+      for (const char *p = dt; *p; ) {
+         if ((p == dt || p[-1] == '\n') && strncmp(p, "#line", 5) == 0) {
+            while (*p && *p != '\n')
+               p++;
+            for (const char *q = "@L@"; *q; q++)
+               { ch ^= (uint8_t)*q; ch *= 1099511628211ULL; }
+            continue;
+         }
+         ch ^= (uint8_t)*p++;
+         ch *= 1099511628211ULL;
+      }
+      const char *cc = getenv("NVC_ACCEL_CC");
+      if (cc == NULL) cc = "gcc -g -O3";
+      for (const char *p = cc; *p; p++)
+         { ch ^= (uint8_t)*p; ch *= 1099511628211ULL; }
+      if (getenv("NVC_ACCEL_SMDUMP") != NULL)   // compiled with -DSM_DUMP
+         ch = (ch ^ 77u) * 1099511628211ULL;
+      struct utsname un;
+      if (uname(&un) == 0)
+         for (const char *p = un.machine; *p; p++)
+            { ch ^= (uint8_t)*p; ch *= 1099511628211ULL; }
+#if defined(__x86_64__)
+      // vector width actually used by the emitted code varies with the host
+      __builtin_cpu_init();
+      const unsigned isa = (__builtin_cpu_supports("avx512f") ? 4u : 0u)
+                         | (__builtin_cpu_supports("avx2")    ? 2u : 0u)
+                         | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
+      ch = (ch ^ isa) * 1099511628211ULL;
+#endif
+      chunk->own_object = aj_model_own_object(dt);
+      if (chunk->own_object)
+         for (const char *p = istr(chunk->scope->name); *p; p++)
+            { ch ^= (uint8_t)*p; ch *= 1099511628211ULL; }
+      *hash = ch;
+   }
+   free(bt);
+   free(dt);
+   return ok;
+}
+
+// The generator takes its modes from the environment -- GSM_GATED,
+// GSM_COMB_SPLIT, GSM_U32, GSM_ACTIVITY_CENSUS, ... -- and writes another
+// model for the same sources under each.  The model is cached under a key,
+// so every GSM_ variable that is set is part of the key: without them a
+// model written in one mode was served to a run in another (a gated model
+// to a run that asked for none, and the reverse).  In name order, so that
+// the key does not depend on the order they were set in; with none set the
+// key is what it was.  GSM_ICG2EN is left to the callers, which have always
+// folded it.  A variable is keyed by its text: where that names a file the
+// generator reads (GSM_ACTPROF, a profile that orders a gated model), what
+// the file holds is not in the key.
+static uint64_t aj_fold_gsm_env(uint64_t h)
+{
+   extern char **environ;
+   const char *set[64];
+   int n = 0;
+   for (char **e = environ; e != NULL && *e != NULL; e++) {
+      if (strncmp(*e, "GSM_", 4) != 0 || strncmp(*e, "GSM_ICG2EN=", 11) == 0)
+         continue;
+      if (n == (int)ARRAY_LEN(set))
+         break;
+      int at = n++;
+      for (; at > 0 && strcmp(set[at - 1], *e) > 0; at--)
+         set[at] = set[at - 1];
+      set[at] = *e;
+   }
+   for (int i = 0; i < n; i++) {
+      h = (h ^ (uint8_t)'+') * 1099511628211ULL;
+      for (const char *p = set[i]; *p; p++)
+         h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+   }
+   return h;
+}
+
+// What makes a file name this simulation's own: ".p<pid>-<8 hex digits>".
+// The process id is for whoever looks, the 32 random bits are what tells two
+// simulations apart: the cache may be one directory under several
+// containers, the simulator process 1 in each, or under a farm's machines.
+static const char *aj_own_tag(void)
+{
+   static char tag[40];
+   if (tag[0] == '\0') {
+      uint32_t r = 0;
+      FILE *f = fopen("/dev/urandom", "rb");
+      if (f != NULL) {
+         if (fread(&r, sizeof r, 1, f) != 1)
+            r = 0;
+         fclose(f);
+      }
+      r ^= (uint32_t)get_timestamp_ns() ^ ((uint32_t)getpid() * 2654435761u);
+      checked_sprintf(tag, sizeof tag, ".p%d-%08x", (int)getpid(),
+                      (unsigned)r);
+   }
+   return tag;
+}
+
+// A file that a simulation writes into the cache and then reads back -- a
+// subtree's emitted Verilog, a merge group's wrapper -- has a name of that
+// simulation's own while it is in use: the own tag goes in before the
+// extension (the synthesis tool goes by the extension).  The cache is
+// shared, and under one name for all a simulation read back what another
+// had just written there.  aj_own_release leaves the file under the common
+// name, whole, once it has been read for the last time: for whoever looks.
+static void aj_own_name(char *out, size_t sz, const char *name)
+{
+   const char *slash = strrchr(name, '/');
+   const char *dot = strrchr(name, '.');
+   if (dot == NULL || (slash != NULL && dot < slash))
+      dot = name + strlen(name);
+   snprintf(out, sz, "%.*s%s%s", (int)(dot - name), name, aj_own_tag(), dot);
+}
+
+static void aj_own_release(const char *own)
+{
+   const char *tag = aj_own_tag();
+   const size_t tl = strlen(tag);
+   char name[1024];
+   const char *at = NULL;
+   for (const char *p = own; (p = strstr(p, tag)) != NULL; p += tl)
+      if (p[tl] == '.' || p[tl] == '\0')
+         at = p;
+   if (at == NULL || strlen(own) >= sizeof name)
+      return;   // not a name of ours
+   snprintf(name, sizeof name, "%.*s%s", (int)(at - own), own, at + tl);
+   if (rename(own, name) != 0)
+      unlink(own);
+}
+
+// A simulation that is stopped gives nothing its common name, and the next
+// one has another tag: what it left under its own names would stay for
+// good, a new set for every stopped run.  Each simulation removes the
+// own-named files of nvc's (aj_...) that are a day old.  None should be
+// held that long: they are given up before the synthesis and the compiles,
+// which are what takes time, unless a source could not be staged.
+static void aj_own_sweep(const char *accel_dir)
+{
+   DIR *d = opendir(accel_dir);
+   if (d == NULL)
+      return;
+   const time_t now = time(NULL);
+   struct dirent *e;
+   while ((e = readdir(d)) != NULL) {
+      // aj_..., with aj_own_tag's form in it and then a dot or the end
+      bool own = false;
+      for (const char *p = e->d_name;
+           !own && strncmp(e->d_name, "aj_", 3) == 0
+              && (p = strstr(p, ".p")) != NULL; p += 2) {
+         const char *q = p + 2;
+         const size_t nd = strspn(q, "0123456789");
+         if (nd == 0 || q[nd] != '-')
+            continue;
+         q += nd + 1;
+         own = strspn(q, "0123456789abcdef") == 8
+            && (q[8] == '.' || q[8] == '\0');
+      }
+      if (!own)
+         continue;
+      char path[1024];
+      struct stat st;
+      snprintf(path, sizeof path, "%s/%s", accel_dir, e->d_name);
+      if (stat(path, &st) == 0 && S_ISREG(st.st_mode)
+          && now - st.st_mtime > 24 * 3600)
+         unlink(path);
+   }
+   closedir(d);
+}
+
+// The own name of a merge group's wrapper (sfx "") or of its members' text
+// in one file (sfx "_all"), and the two given up when the group is done with
+static void aj_merge_own(char *own, size_t sz, const char *accel_dir,
+                         const char *wname, const char *sfx)
+{
+   char name[560];
+   snprintf(name, sizeof name, "%s/%s%s.v", accel_dir, wname, sfx);
+   aj_own_name(own, sz, name);
+}
+
+static void aj_merge_release(const char *accel_dir, const char *wname)
+{
+   char own[600];
+   aj_merge_own(own, sizeof own, accel_dir, wname, "");
+   aj_own_release(own);
+   aj_merge_own(own, sizeof own, accel_dir, wname, "_all");
+   aj_own_release(own);
+}
+
 // Post-link respecialization: the vtable-hacking principle applied to the
 // bridge — the eval pointer is mutable state, so once the link pass fixes the
 // handoff wiring, RE-EMIT the bridge with those results (and VERIFY=0) baked
-// in as constants, compile it (cached by a hash of the flag vectors), and
+// in as constants, compile it (cached, as any object, by what is compiled), and
 // swap chunk->eval. The steady-state code is then straight-line for the
 // linked topology: no AJ_HOFF/AJ_HIN tests, no VERIFY deref, handoff-fed
 // input pins gone entirely (not even a memcmp). The chunk STATE (aj_cs_t) is
@@ -5662,8 +5893,9 @@ static void aj_respecialize(rt_model_t *m)
       // spec bakes _coinc as a constant — a mode flip must miss the cache
       h = (h ^ (getenv("NVC_ACCEL_CK_COINCIDENT") != NULL ? 5u : 9u))
          * 1099511628211ull;
-      // ... and the bridge's format: this hash is the whole name, and an
-      // object compiled by an nvc of another format is not this one's
+      // ... and the bridge's format: this hash is the whole of the fall-back
+      // name, and an object compiled by an nvc of another format is not
+      // this one's
       for (const char *p = AJ_BRIDGE_FORMAT; *p; p++)
          h = (h ^ (uint8_t)*p) * 1099511628211ull;
       // ... and the instance, for a model that keeps state in its object
@@ -5687,10 +5919,34 @@ static void aj_respecialize(rt_model_t *m)
       snprintf(specso, sizeof specso, "%s/aj_%s_spec_%016llx.so", dir, c->rs_top,
                (unsigned long long)h);
 
-      if (!aj_emit_bridge(specc, c->rs_dutc, c->rs_pins, c->rs_npins,
+      // Those are the names it falls back to.  They were its names, and they
+      // do not see the bridge's text: NVC_ACCEL_NO_XDET, NO_SETTLE, NO_FORCE,
+      // CK_LATE and LATE_SNAPIN each change it, and a run with one of them
+      // set loaded the object of a run without -- or, the two started
+      // together, compiled the other's text.  Like the object it replaces,
+      // this one is written and hashed under a name of this simulation's own
+      // and named by that hash (aj_object_hash).
+      char specc_own[640];
+      checked_sprintf(specc_own, sizeof specc_own, "%s%s", specc,
+                      aj_own_tag());
+      if (!aj_emit_bridge(specc_own, c->rs_dutc, c->rs_pins, c->rs_npins,
                           &c->rs_clk, c->rs_have_rst ? &c->rs_rst : NULL,
-                          m, c, true))
+                          m, c, true)) {
+         rename(specc_own, specc);   // if it was written: for whoever looks
          continue;
+      }
+      uint64_t ch;
+      if (aj_object_hash(specc_own, c->rs_dutc, c, &ch)) {
+         snprintf(specc,  sizeof specc,  "%s/aj_%s_spec_c%016llx_bridge.c",
+                  dir, c->rs_top, (unsigned long long)ch);
+         snprintf(specso, sizeof specso, "%s/aj_%s_spec_c%016llx.so", dir,
+                  c->rs_top, (unsigned long long)ch);
+      }
+      if (rename(specc_own, specc) != 0) {
+         warnf("accel-jit: cannot write %s: %s", specc, strerror(errno));
+         unlink(specc_own);
+         continue;
+      }
 
       if (getenv("NVC_ACCEL_NO_CACHE") != NULL || access(specso, F_OK) != 0) {
          const char *cc = getenv("NVC_ACCEL_CC");
@@ -7295,7 +7551,13 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
                  nx4++, n4 = n4->chain)
                aj_ao4_add_out(aj_ultimate_driver_nexus(n4, 0), chunk);
          }
-   chunk->primary_ck = clk != NULL ? clk->sig : NULL;
+   // (not again when the bridge is emitted for a respecialization: a
+   // chunk whose main clock group is empty is re-keyed below, at install
+   // only, to a clock that is live, and was set back to the dead one here
+   // -- wrong answers under NVC_ACCEL_CK_LATE, whose arming goes by the
+   // primary clock)
+   if (!spec)
+      chunk->primary_ck = clk != NULL ? clk->sig : NULL;
    // Slots after the per-pin table (array is sized 6+npins+5):
    //   [6+npins]   live pointer to g_aj_verify (value-edge clocking under VERIFY)
    //   [6+npins+1] per-output handoff flags (set by aj_link_handoff post-install)
@@ -7352,8 +7614,8 @@ static bool aj_emit_bridge(const char *path, const char *dutc,
    // NVC_ACCEL_NO_XDET: emit the ORIGINAL repack loop (no detection, no
    // accessors, so the model's poll disappears too). The A/B control for
    // measuring what the detection costs, and the escape hatch if it ever
-   // does. Clear the .so cache when toggling — the cache key is the DUT
-   // logic, not the bridge text.
+   // does. (The cache need not be cleared to toggle it: an object is named
+   // by a hash of the bridge's text.)
    const bool no_xdet = getenv("NVC_ACCEL_NO_XDET") != NULL;
    if (!no_xdet) {
       fprintf(f, "static int g_xdbg = -1;\n");
@@ -8549,8 +8811,10 @@ static bool aj_icg2en_match(const char *name)
 // cell, rtlil-final) is as deterministic as the synth output itself, so it
 // is remembered in a marker file next to the would-be dutc (same vhash key
 // -> source/tool/env changes invalidate it automatically).  The marker
-// stores the GSM_ALLOW_COMB value because that env flips comb-only
-// declines but is NOT part of the vhash; a mismatch ignores the marker.
+// stores the GSM_ALLOW_COMB value, which flips comb-only declines and was
+// not part of the vhash when markers began; a mismatch ignores the marker.
+// (It is part of the vhash now, with every other GSM_ variable:
+// aj_fold_gsm_env.)
 // Timeouts and abnormal exits never write one (load-dependent/transient).
 static void aj_decline_fingerprint(char *buf, size_t sz)
 {
@@ -9178,8 +9442,9 @@ static bool aj_uniquify_modules(const char *src, const char *dst,
    return true;
 }
 
-static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
-                                  tree_t ref, const char *accel_dir)
+static bool accel_install_subtree_1(rt_model_t *m, rt_scope_t *scope,
+                                    tree_t ref, const char *accel_dir,
+                                    char *emitted, size_t emitted_sz)
 {
    tree_t ent0 = (tree_kind(ref) == T_ARCH) ? tree_primary(ref) : ref;
    char top0[128];
@@ -9302,16 +9567,27 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    }
 
    // 1. gather the subtree's Verilog sources
-   static char srcs[64][512];
+   static char srcs[64][AJ_SRC_MAX];
    int nsrc = 0;
    bool walker_only = false;   // admitted on the RTLIL walker's word alone
    // VHDL->Verilog path: emit the whole subtree via vhdl2vlog (logic3d->2-state)
    // into one .v. Used when the original SV won't parse in yosys (sv2ghdl).
    if (getenv("NVC_ACCEL_FROM_VHDL")) {
-      char vpath[512];
+      // The emission is written, read back, hashed and (when it cannot be
+      // staged) synthesized under a name of this simulation's own, vown,
+      // and is left under the entity's name, vpath, once it has been read
+      // for the last time (staged, or this install over).  It was written
+      // under vpath to begin with, one name for every simulation on the
+      // cache: of two that start together with different designs under one
+      // entity name (two tests of a regression, each with its `dut`), one
+      // read back the other's text, keyed that, and ran the other's logic
+      // behind its own ports.
+      char vpath[AJ_SRC_MAX], vown[AJ_SRC_MAX];
       snprintf(vpath, sizeof vpath, "%s/aj_%s_subtree.v", accel_dir, top0);
-      FILE *vf = fopen(vpath, "w");
+      aj_own_name(vown, sizeof vown, vpath);
+      FILE *vf = fopen(vown, "w");
       if (vf == NULL) return false;
+      snprintf(emitted, emitted_sz, "%s", vown);
       ident_t seen[512];
       int nseen = 0;
       const bool ok = emit_subtree_v(scope, vf, seen, &nseen, 512);
@@ -9358,7 +9634,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
          const char *bigenv = getenv("NVC_ACCEL_MERGE_MAX_MEMBER");
          const long bigcap = bigenv ? atol(bigenv) : 2*1024*1024;
          struct stat vst;
-         if (stat(vpath, &vst) == 0 && vst.st_size > bigcap) {
+         if (stat(vown, &vst) == 0 && vst.st_size > bigcap) {
             notef("accel-jit: subtree '%s' emission oversized (%ld bytes) — "
                   "descending into children", top0, (long)vst.st_size);
             return false;
@@ -9366,7 +9642,14 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       }
       notef("accel-jit: emitted subtree '%s' -> %d modules -> %s",
             top0, nseen, vpath);
-      snprintf(srcs[0], sizeof srcs[0], "%s", vpath);
+      // NVC_ACCEL_TEST_EMIT_SLEEP=<s> holds a whole emission for <s> seconds
+      // before it is read back: the gate's hook for running two
+      // simulations into each other here (a second one emits another
+      // design under the same entity name meanwhile).
+      { const char *hold = getenv("NVC_ACCEL_TEST_EMIT_SLEEP");
+        if (hold != NULL && atoi(hold) > 0)
+           sleep(atoi(hold)); }
+      snprintf(srcs[0], sizeof srcs[0], "%s", vown);
       nsrc = 1;
    }
    else {
@@ -9393,7 +9676,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
             notef("accel-jit: subtree '%s': staging %d of %d modules from %s "
                   "(%d translated outside the subtree dropped) -> %s", top0,
                   kept, kept + dropped, srcs[i], dropped, tpath);
-            snprintf(srcs[i], 512, "%s", tpath);
+            snprintf(srcs[i], sizeof srcs[i], "%s", tpath);
          }
       }
    }
@@ -9510,12 +9793,16 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
             memset(gc, 0, sizeof(aj_mcand_t));
             gc->scope = scope;
             gc->ref   = ref;
-            char sfx[32], upath[600], utop[192];
+            // (the snapshot has an own name until the groups' text is made
+            // of it: aj_own_name, and phase 1 of aj_try_merge_install)
+            char sfx[32], uname[560], upath[600], utop[192];
             snprintf(sfx, sizeof sfx, "_g%d", g_aj_ncand - 1);
-            snprintf(upath, sizeof upath, "%s/aj_glu%d_subtree.v", accel_dir,
+            snprintf(uname, sizeof uname, "%s/aj_glu%d_subtree.v", accel_dir,
                      g_aj_ncand - 1);
+            aj_own_name(upath, sizeof upath, uname);
             if (!aj_uniquify_modules(srcs[0], upath, sfx, top_mod,
                                      utop, sizeof utop)) {
+               aj_own_release(upath);
                g_aj_ncand--;
                return false;
             }
@@ -9530,6 +9817,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                       || strstr(vtext, "negedge") != NULL);
                free(vtext);
                if (has_edge) {
+                  aj_own_release(upath);
                   g_aj_ncand--;
                   return false;
                }
@@ -9560,20 +9848,23 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       static aj_pin_t xpins[256];
       int nxp = 0;
       {
-         char sfx[32], upath[600], utop[192];
+         char sfx[32], uname[560], upath[600], utop[192];
          snprintf(sfx, sizeof sfx, "_c%d", g_aj_ncand - 1);
-         snprintf(upath, sizeof upath, "%s/aj_mrg%d_subtree.v", accel_dir,
+         snprintf(uname, sizeof uname, "%s/aj_mrg%d_subtree.v", accel_dir,
                   g_aj_ncand - 1);
+         aj_own_name(upath, sizeof upath, uname);   // as the glue's above
          // NVC_ACCEL_PIN_COMPLETE: inject census probe ports into a private
          // copy BEFORE uniquify — the content hash then forks the probed
          // top's module name from unprobed same-entity siblings, and every
          // downstream stage (wrapper pins, bridge ordinals, cache keys)
          // follows from c->pins + the emitted bytes automatically.
          const char *usrc = srcs[0];
-         char ppath[600];
+         char ppath[600] = "";
          if (getenv("NVC_ACCEL_PIN_COMPLETE") != NULL) {
-            snprintf(ppath, sizeof ppath, "%s/aj_pcp%d_subtree.v", accel_dir,
+            char pname[560];
+            snprintf(pname, sizeof pname, "%s/aj_pcp%d_subtree.v", accel_dir,
                      g_aj_ncand - 1);
+            aj_own_name(ppath, sizeof ppath, pname);
             nxp = aj_inject_probes(srcs[0], ppath, top_mod, scope,
                                    xpins, 256);
             if (nxp > 0) usrc = ppath;
@@ -9582,8 +9873,12 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
                usrc = srcs[0];
             }
          }
-         if (!aj_uniquify_modules(usrc, upath, sfx, top_mod,
-                                  utop, sizeof utop)) {
+         const bool uok = aj_uniquify_modules(usrc, upath, sfx, top_mod,
+                                              utop, sizeof utop);
+         if (ppath[0] != '\0')
+            aj_own_release(ppath);   // read, if it was written at all
+         if (!uok) {
+            aj_own_release(upath);
             g_aj_ncand--;
             return false;
          }
@@ -9642,6 +9937,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
            { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
      for (const char *p = icg ? icg : ""; *p; p++)
         { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; } }
+   vhash = aj_fold_gsm_env(vhash);   // ...and so does every other GSM_ mode
    // scoped NVC_ACCEL_ICG2EN: this chunk's child will run the rewrite —
    // key it separately from both the plain and the global-icg2en configs
    if (aj_icg2en_match(top_mod))
@@ -9659,7 +9955,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    }
    // Stage the HASHED bytes under the key so gen_statemachine reads exactly
    // what was hashed (see aj_stage_source).  A failed stage falls back to
-   // the shared-named source: correct in the single-process case.
+   // the source itself (an emission is under this simulation's own name).
    bool staged = true;
    for (int i = 0; i < nsrc; i++) {
       if (vtexts[i] == NULL
@@ -9668,6 +9964,14 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       free(vtexts[i]);
    }
    free(vtexts);
+   // Staged, the emission has been read for the last time, and gets its
+   // common name here and not when the install is over: what follows, the
+   // synthesis and the compile, is where a simulation is stopped (a job's
+   // time limit), and a stopped simulation gives nothing its common name.
+   if (staged && emitted[0] != '\0') {
+      aj_own_release(emitted);
+      emitted[0] = '\0';
+   }
 
    char dutc[600], bridge[600], so[600];
    snprintf(dutc,   sizeof dutc,   "%s/aj_%s_%016llx.c", accel_dir, top,
@@ -9690,9 +9994,9 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // Both became live hazards when the benchmark harnesses stopped wiping the
    // cache between runs.
    uint64_t shash = vhash;
-   // bridge-format version: bump when the emitted bridge TEXT changes so
-   // cached .so's (keyed on logic+toolchain+machine, NOT bridge text) go
-   // stale and re-emit+recompile from the cached synth .c (AJ_BRIDGE_FORMAT).
+   // bridge-format version (AJ_BRIDGE_FORMAT): this is the object's
+   // fall-back name, by logic, toolchain and machine and NOT by the bridge's
+   // text, so the format's version stands in for the text.
    for (const char *p = AJ_BRIDGE_FORMAT; *p; p++)
       { shash ^= (uint8_t)*p; shash *= 1099511628211ULL; }
    { const char *cc = getenv("NVC_ACCEL_CC");
@@ -9733,7 +10037,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       return false;
    }
    else {
-      char dir[512]; snprintf(dir, sizeof dir, "%s", srcs[0]);
+      char dir[AJ_SRC_MAX]; snprintf(dir, sizeof dir, "%s", srcs[0]);
       char *slash = strrchr(dir, '/');
       if (slash) *slash = '\0';
       else snprintf(dir, sizeof dir, ".");   // bare filename: sources rel to cwd
@@ -10078,88 +10382,29 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
    // the other was rewriting it, hashed half a file, and compiled the whole
    // model again under a name that nothing would ever ask for.
    char bridge_own[640];
-   checked_sprintf(bridge_own, sizeof bridge_own, "%s.%d", bridge,
-                   (int)getpid());
+   checked_sprintf(bridge_own, sizeof bridge_own, "%s%s", bridge,
+                   aj_own_tag());
    if (!aj_emit_bridge(bridge_own, dutc, pins, npins, &clk,
                        have_rst ? &rst : NULL, m, chunk, false)) {
       rename(bridge_own, bridge);   // if it was written: for whoever looks
       aj_accel_teardown(m);
       return false;
    }
-   // CONTENT-keyed .so name: identical bridge+model BYTES under the same
-   // toolchain reuse the compiled object across vhash namespaces.  An nvc
-   // rebuild flips the exe-mtime vhash fold: the synth re-runs and re-emits
-   // byte-identical C, but the vhash-derived .so name still recompiled —
-   // ~40 minutes of gcc per 86MB EH2 model, the dominant iteration tax.
-   // The bridge #includes the dutc BY ITS VHASH-NAMED PATH, so that path is
-   // masked out of the hash (replaced by a fixed token) or nothing would
-   // ever cross-hit.  The vhash-derived name stays the fallback when either
+   // CONTENT-keyed .so name (aj_object_hash): identical bridge+model BYTES
+   // under the same toolchain reuse the compiled object across vhash
+   // namespaces.  The vhash-derived name stays the fallback when either
    // file is unreadable.
    {
-      char *bt2 = aj_read_file(bridge_own);
-      char *dt2 = aj_read_file(dutc);
-      if (bt2 != NULL && dt2 != NULL) {
-         uint64_t ch = 14695981039346656037ULL;
-         const size_t dlen = strlen(dutc);
-         for (const char *p2 = bt2; *p2; ) {
-            if (strncmp(p2, dutc, dlen) == 0) {
-               for (const char *q2 = "@DUTC@"; *q2; q2++)
-                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
-               p2 += dlen;
-               continue;
-            }
-            ch ^= (uint8_t)*p2++;
-            ch *= 1099511628211ULL;
-         }
-         // #line directives embed the vhash-named staged .v path, so a
-         // re-synth after any rebuild yields byte-different C for the SAME
-         // logic and defeated every cross-rebuild content hit (measured:
-         // EH2's giant models recompiled after each binary touch despite
-         // the tier).  They are semantically irrelevant to the .so — mask
-         // whole #line lines out of the hash.
-         for (const char *p2 = dt2; *p2; ) {
-            if ((p2 == dt2 || p2[-1] == '\n')
-                && strncmp(p2, "#line", 5) == 0) {
-               while (*p2 && *p2 != '\n')
-                  p2++;
-               for (const char *q2 = "@L@"; *q2; q2++)
-                  { ch ^= (uint8_t)*q2; ch *= 1099511628211ULL; }
-               continue;
-            }
-            ch ^= (uint8_t)*p2++;
-            ch *= 1099511628211ULL;
-         }
-         const char *cc2 = getenv("NVC_ACCEL_CC");
-         if (cc2 == NULL) cc2 = "gcc -g -O3";
-         for (const char *p2 = cc2; *p2; p2++)
-            { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
-         if (getenv("NVC_ACCEL_SMDUMP") != NULL)
-            ch = (ch ^ 77u) * 1099511628211ULL;
-         struct utsname un2;
-         if (uname(&un2) == 0)
-            for (const char *p2 = un2.machine; *p2; p2++)
-               { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
-#if defined(__x86_64__)
-         __builtin_cpu_init();
-         const unsigned isa2 = (__builtin_cpu_supports("avx512f") ? 4u : 0u)
-                             | (__builtin_cpu_supports("avx2")    ? 2u : 0u)
-                             | (__builtin_cpu_supports("sse4.2")  ? 1u : 0u);
-         ch = (ch ^ isa2) * 1099511628211ULL;
-#endif
-         chunk->own_object = aj_model_own_object(dt2);
-         if (chunk->own_object) {
-            for (const char *p2 = istr(scope->name); *p2; p2++)
-               { ch ^= (uint8_t)*p2; ch *= 1099511628211ULL; }
+      uint64_t ch;
+      if (aj_object_hash(bridge_own, dutc, chunk, &ch)) {
+         if (chunk->own_object)
             notef("accel-jit: '%s' keeps state in its object: one object "
                   "per instance", top);
-         }
          snprintf(so, sizeof so, "%s/aj_%s_c%016llx.so", accel_dir, top,
                   (unsigned long long)ch);
          snprintf(bridge, sizeof bridge, "%s/aj_%s_c%016llx_bridge.c",
                   accel_dir, top, (unsigned long long)ch);
       }
-      free(bt2);
-      free(dt2);
    }
    // the same bytes, if another simulation got there first
    if (rename(bridge_own, bridge) != 0) {
@@ -10178,7 +10423,7 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       const char *cc = getenv("NVC_ACCEL_CC");
       if (!cc) cc = "gcc -g -O3";
       // NVC_ACCEL_SMDUMP: compile in sm_dump_comb (all internal nets) for the
-      // real-sim internal-net probe (see aj_emit_bridge). Clear the cache to toggle.
+      // real-sim internal-net probe (see aj_emit_bridge).
       const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
       snprintf(cmd, sizeof cmd,
                "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
@@ -10346,6 +10591,20 @@ static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
       }
    }
    return true;
+}
+
+static bool accel_install_subtree(rt_model_t *m, rt_scope_t *scope,
+                                  tree_t ref, const char *accel_dir)
+{
+   char emitted[AJ_SRC_MAX] = "";
+   const bool ok = accel_install_subtree_1(m, scope, ref, accel_dir, emitted,
+                                           sizeof emitted);
+   // NVC_ACCEL_FROM_VHDL: the subtree's text, written and read under a name
+   // of this simulation's own, goes under the entity's name now that
+   // nothing here reads it any more
+   if (emitted[0] != '\0')
+      aj_own_release(emitted);
+   return ok;
 }
 
 // Recursively scan scopes for acceleration .so files.
@@ -10611,6 +10870,13 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                   ? istr(g_aj_cands[i].scope->name) : "?");
    }
    bool *claimed = xcalloc_array(g_aj_ncand, sizeof(bool));
+   // Candidates that install on their own after all (too big for a group, a
+   // group of one, a group that could not be prepared): in this order, and
+   // when the loop below is through.  They were installed inside it, where
+   // an install's synthesis and compile ran with every candidate's snapshot
+   // still under its own name: a simulation stopped there left them all.
+   int *alone = xmalloc_array(g_aj_ncand, sizeof(int));
+   int nalone = 0;
    int gid = 0;
    for (int i = 0; i < g_aj_ncand; i++) {
       if (claimed[i] || g_aj_cands[i].is_glue) continue;
@@ -10628,7 +10894,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       if (stat(g_aj_cands[i].vpath, &vst) == 0 && vst.st_size > bigcap) {
          aj_mcand_t *c = &g_aj_cands[i];
          if (getenv("NVC_ACCEL_MERGE_NOFALLBACK") == NULL)
-            accel_install_subtree(m, c->scope, c->ref, accel_dir);
+            alone[nalone++] = i;
          else
             notef("accel-jit: oversized member '%s' stays interpreted "
                   "(NOFALLBACK)", c->top_mod);
@@ -10804,7 +11070,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       if (nmem < 2) {   // singleton: normal per-chunk install
          aj_mcand_t *c = &g_aj_cands[i];
          if (getenv("NVC_ACCEL_MERGE_NOFALLBACK") == NULL)
-            accel_install_subtree(m, c->scope, c->ref, accel_dir);
+            alone[nalone++] = i;
          else
             notef("accel-jit: singleton '%s' stays interpreted (NOFALLBACK)",
                   c->top_mod);
@@ -10814,7 +11080,10 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
       const bool have_rst = g_aj_cands[i].have_rst;
       char wname[64], wpath[600];
       snprintf(wname, sizeof wname, "aj_merged_%d", g);
-      snprintf(wpath, sizeof wpath, "%s/%s.v", accel_dir, wname);
+      // the wrapper, and the members' text below: written and read back
+      // under names of this simulation's own (aj_own_name), given up when
+      // the group is installed
+      aj_merge_own(wpath, sizeof wpath, accel_dir, wname, "");
 
       // ---- merged external pin table + wrapper emission -------------------
       int tot = 2;
@@ -10993,7 +11262,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
                if (strcmp(vps[s], vp) == 0) { dup = true; break; }
             if (!dup) vps[nvp++] = vp;
          }
-         snprintf(allpath, sizeof allpath, "%s/%s_all.v", accel_dir, wname);
+         aj_merge_own(allpath, sizeof allpath, accel_dir, wname, "_all");
          ok = aj_concat_dedup(vps, nvp, allpath);
          if (ok) {
             srcs[nsrc++] = allpath;
@@ -11019,6 +11288,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
               { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
         for (const char *p = icg ? icg : ""; *p; p++)
            { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; } }
+      vhash = aj_fold_gsm_env(vhash);   // ...and of the other GSM_ modes
       for (const char *p = wname; *p; p++)
          { vhash ^= (uint8_t)*p; vhash *= 1099511628211ULL; }
       char *mtexts[2] = { NULL, NULL };
@@ -11031,8 +11301,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          }
       }
       // Stage the HASHED bytes under the key (see aj_stage_source): what the
-      // key says is what gen_statemachine gets, even if a concurrent run with
-      // a different config rewrites the shared-named wrapper .v files.
+      // key says is what gen_statemachine gets, whatever other runs on the
+      // cache are doing.
       bool mstaged = ok && nsrc <= 2;
       for (int s = 0; s < nsrc && s < 2; s++) {
          if (mtexts[s] == NULL
@@ -11040,6 +11310,8 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             mstaged = false;
          free(mtexts[s]);
       }
+      if (mstaged)   // read for the last time: as a single chunk's emission
+         aj_merge_release(accel_dir, wname);
       uint64_t shash = vhash;
       { const char *cc = getenv("NVC_ACCEL_CC");
         if (cc == NULL) cc = "gcc -g -O3";
@@ -11151,88 +11423,29 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          continue;   // synthesis (parallel) + install run after the loop
       }
 
-      // ---- bridge + compile + install -------------------------------------
-      aj_chunk_t *chunk = NULL;
-      if (ok) {
-         chunk = aj_chunk_new(m);
-         chunk->merged = true;   // enables the negedge state flip
-         chunk->scope  = g_aj_cands[i].scope;
-         chunk->rs_top = xstrdup(wname);
-         chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 5,
-                                        sizeof(void *));
-         aj_build_fastclk(m, mp[0].sig, mp[0].data);
-         if (!aj_emit_bridge(bridge, dutc, mp, nmp, &mp[0],
-                             have_rst ? &mp[1] : NULL, m, chunk, false)) {
-            aj_accel_teardown(m);
-            ok = false;
-         }
-      }
-      if (ok && (getenv("NVC_ACCEL_NO_CACHE") != NULL
-                 || access(so, F_OK) != 0)) {
-         const char *cc = getenv("NVC_ACCEL_CC");
-         if (!cc) cc = "gcc -g -O3";
-         const char *smd = getenv("NVC_ACCEL_SMDUMP") ? "-DSM_DUMP" : "";
-         char cmd[8192];
-         snprintf(cmd, sizeof cmd,
-                  "%s %s -shared -fPIC -o '%s.t%d' '%s' && mv -f '%s.t%d' '%s'",
-                  cc, smd, so, (int)getpid(), bridge, so, (int)getpid(), so);
-         if (system(cmd) != 0 || access(so, F_OK) != 0) {
-            notef("accel-jit: MERGE compile failed for '%s'", wname);
-            aj_accel_teardown(m);
-            ok = false;
-         }
-      }
-      else if (ok)
-         notef("accel-jit: reusing cached .so for '%s' (logic unchanged)",
-               wname);
-      if (ok) {
-         void *dl = dlopen(so, RTLD_NOW);
-         void (*eval)(void *, void **) = dl ? dlsym(dl, "accel_eval") : NULL;
-         void (*reset)(void *)         = dl ? dlsym(dl, "accel_reset") : NULL;
-         unsigned long (*ssize)(void)  = dl ? dlsym(dl, "accel_state_size")
-                                            : NULL;
-         if (!eval || !reset || !ssize) {
-            notef("accel-jit: MERGE dlopen/dlsym failed for '%s'", wname);
-            if (dl) dlclose(dl);
-            aj_accel_teardown(m);
-            ok = false;
-         }
-         else {
-            chunk->eval  = eval;
-            chunk->reset = reset;
-            chunk->dl    = dl;
-            chunk->x_seen_fn   = dlsym(dl, "accel_x_seen");
-            chunk->x_info_fn   = dlsym(dl, "accel_x_info");
-            chunk->x_clear_fn  = dlsym(dl, "accel_x_clear");
-            chunk->set_clklast = dlsym(dl, "accel_set_clklast");
-   chunk->force_arm_fn = dlsym(dl, "accel_force_arm");
-            chunk->state = xcalloc(ssize());
-            chunk->rs_bridge = xstrdup(bridge);
-            chunk->rs_dutc   = xstrdup(dutc);
-            chunk->rs_pins   = xmalloc_array(nmp, sizeof(aj_pin_t));
-            memcpy(chunk->rs_pins, mp, nmp * sizeof(aj_pin_t));
-            chunk->rs_npins  = nmp;
-            chunk->rs_state_size = ssize();
-            g_aj_model = m;
-            chunk->reset(chunk->state);
-            for (int k = 0; k < nmem; k++)
-               if (!g_aj_cands[members[k]].is_glue)   // glue procs stay live
-                  aj_reroute(g_aj_cands[members[k]].scope, chunk);
-            if (getenv("NVC_ACCEL_NO_CKSUB") == NULL)
-               aj_subscribe_clocks(m, chunk);
-            notef("accel-jit: MERGE ACTIVE — '%s' (%d subtrees fused, %d "
-                  "internal edges) rerouted to one native model "
-                  "(accel installed)", wname, nmem, n_internal);
-         }
-      }
-      if (!ok)   // any failure: this group's members install individually
-         for (int k = 0; k < nmem; k++) {
-            aj_mcand_t *c = &g_aj_cands[members[k]];
-            if (c->is_glue) continue;   // glue never installs standalone
-            accel_install_subtree(m, c->scope, c->ref, accel_dir);
-         }
+      // ---- the group could not be prepared: its members install one by
+      // one.  (A second copy of phase 3 stood here, after the `continue`
+      // above and so with ok false: never run.)
+      aj_merge_release(accel_dir, wname);
+      for (int k = 0; k < nmem; k++)
+         if (!g_aj_cands[members[k]].is_glue)   // glue never installs standalone
+            alone[nalone++] = members[k];
       free(mp);
    }
+
+   // The candidates' snapshots have been read for the last time (the groups'
+   // text was made of them above): they get their common names before
+   // anything is synthesized or compiled, which is where a simulation is
+   // stopped.
+   for (int i = 0; i < g_aj_ncand; i++)
+      if (g_aj_cands[i].vpath != NULL)
+         aj_own_release(g_aj_cands[i].vpath);
+
+   for (int k = 0; k < nalone; k++) {
+      aj_mcand_t *c = &g_aj_cands[alone[k]];
+      accel_install_subtree(m, c->scope, c->ref, accel_dir);
+   }
+   free(alone);
 
    // ---- phase 2: parallel synthesis (NVC_ACCEL_MERGE_JOBS-way) -----------
    {
@@ -11326,10 +11539,40 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          chunk->bindtab = xcalloc_array(6 + (nmp > 0 ? nmp : 1) + 5,
                                         sizeof(void *));
          aj_build_fastclk(m, mp[0].sig, mp[0].data);
-         if (!aj_emit_bridge(gr->bridge, gr->dutc, mp, nmp, &mp[0],
+         // The bridge and the object are a single chunk's in this: written
+         // and hashed under a name of this simulation's own, then named by
+         // that hash (aj_object_hash).  They were named by the model's key,
+         // which does not see the bridge's text: NVC_ACCEL_NO_XDET,
+         // NO_SETTLE and NO_FORCE each change it, and a run with one of
+         // them set loaded the object of a run without.
+         char bridge_own[640];
+         checked_sprintf(bridge_own, sizeof bridge_own, "%s%s", gr->bridge,
+                         aj_own_tag());
+         if (!aj_emit_bridge(bridge_own, gr->dutc, mp, nmp, &mp[0],
                              have_rst ? &mp[1] : NULL, m, chunk, false)) {
+            rename(bridge_own, gr->bridge);   // if it was written
             aj_accel_teardown(m);
             ok = false;
+         }
+         else {
+            uint64_t ch;
+            if (aj_object_hash(bridge_own, gr->dutc, chunk, &ch)) {
+               if (chunk->own_object)
+                  notef("accel-jit: '%s' keeps state in its object: one "
+                        "object per instance", gr->wname);
+               snprintf(gr->so, sizeof gr->so, "%s/aj_%s_c%016llx.so",
+                        accel_dir, gr->wname, (unsigned long long)ch);
+               snprintf(gr->bridge, sizeof gr->bridge,
+                        "%s/aj_%s_c%016llx_bridge.c", accel_dir, gr->wname,
+                        (unsigned long long)ch);
+            }
+            if (rename(bridge_own, gr->bridge) != 0) {
+               warnf("accel-jit: cannot write %s: %s", gr->bridge,
+                     strerror(errno));
+               unlink(bridge_own);
+               aj_accel_teardown(m);
+               ok = false;
+            }
          }
       }
       if (ok && (getenv("NVC_ACCEL_NO_CACHE") != NULL
@@ -11378,6 +11621,14 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
             chunk->rs_pins   = xmalloc_array(nmp, sizeof(aj_pin_t));
             memcpy(chunk->rs_pins, mp, nmp * sizeof(aj_pin_t));
             chunk->rs_npins  = nmp;
+            // ...and the clock, which a respecialization (aj_respecialize)
+            // emits the bridge with again.  Left at zero, the group had no
+            // clock pin there, and the first eval after an
+            // NVC_ACCEL_HANDOFF link read the clock through a null pointer.
+            chunk->rs_clk    = mp[0];
+            chunk->rs_have_rst = have_rst;
+            if (have_rst)
+               chunk->rs_rst = mp[1];
             chunk->rs_state_size = ssize();
             g_aj_model = m;
             chunk->reset(chunk->state);
@@ -11412,6 +11663,7 @@ static void aj_try_merge_install(rt_model_t *m, const char *accel_dir)
          free(gr->wires);
       }
       free(gr->mp); free(gr->members);
+      aj_merge_release(accel_dir, gr->wname);   // if they were not staged
    }
    g_nmgrp = 0;
    free(claimed);
@@ -12271,6 +12523,7 @@ void accel_auto(rt_model_t *m)
       snprintf(accel_dir, sizeof(accel_dir), "%s", priv);
    }
    aj_mkdir_p(accel_dir);   // JIT writes aj_*.c/.so here; may not exist yet
+   aj_own_sweep(accel_dir);
 
    if (getenv("NVC_ACCEL_MERGE") != NULL && getenv("NVC_ACCEL_FROM_VHDL")) {
       // Task #53/#59: collect candidates, then install one merged chunk per
