@@ -1267,3 +1267,7 @@ wait31          normal,2008
 wait32          normal
 tlabwait1       normal,2008,$NVC_JIT_ASYNC=0
 tlabwait2       normal,2008,$NVC_JIT_ASYNC=0
+selfinst1       normal,2008
+selfinst2       normal,2008
+selfinst3       normal,2008
+selfinst4       normal,2008

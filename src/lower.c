@@ -91,6 +91,8 @@ typedef struct _lower_unit {
    lower_mode_t     mode;
    unsigned         deferred;
    lazy_cscope_t   *lazy_cscope;
+   lower_unit_t    *hidden;       // Instance whose actual is being lowered
+   hset_t          *hidden_refs;  // Declarations that actual names
 } lower_unit_t;
 
 typedef enum {
@@ -2608,14 +2610,56 @@ static vcode_reg_t lower_literal(tree_t lit)
    }
 }
 
+static void lower_hidden_ref_cb(tree_t t, void *ctx)
+{
+   if (tree_has_ref(t))
+      hset_insert((hset_t *)ctx, tree_ref(t));
+}
+
+static void lower_hide_instance(lower_unit_t *lu, lower_unit_t *inst,
+                                tree_t actual)
+{
+   // An actual in a port map is an expression of the scope that holds
+   // the instance, but it is lowered inside the instance, whose own
+   // declarations are searched first.  That is harmless as long as the
+   // two scopes declare different things.  They do not when an
+   // architecture instantiates itself or another architecture of its
+   // entity: the port declarations, and for the same architecture the
+   // signals too, are then registered in both scopes, and a name in the
+   // actual found the instance's object where it meant the one outside
+   // (a port was connected to itself).  So the declarations that the
+   // actual names are not looked up in INST while it is lowered.  What
+   // it does not name stays visible: the formal's type may depend on
+   // the instance's generics.
+   assert(lu->hidden == NULL);
+   lu->hidden = inst;
+   lu->hidden_refs = hset_new(16);
+   tree_visit_only(actual, lower_hidden_ref_cb, lu->hidden_refs, T_REF);
+}
+
+static void lower_unhide_instance(lower_unit_t *lu)
+{
+   hset_free(lu->hidden_refs);
+   lu->hidden_refs = NULL;
+   lu->hidden = NULL;
+}
+
 int lower_search_vcode_obj(void *key, lower_unit_t *scope, int *hops)
 {
+   lower_unit_t *hidden = NULL;
+
    *hops = 0;
    for (; scope != NULL; scope = scope->parent) {
-      const void *ptr = hash_get(scope->objects, key);
-      const int obj = (uintptr_t)ptr - 1;
-      if (obj != VCODE_INVALID_REG)
-         return obj;
+      if (scope->hidden != NULL && hset_contains(scope->hidden_refs, key))
+         hidden = scope->hidden;
+
+      // A scope that is passed over still counts as a hop
+      if (scope != hidden) {
+         const void *ptr = hash_get(scope->objects, key);
+         const int obj = (uintptr_t)ptr - 1;
+         if (obj != VCODE_INVALID_REG)
+            return obj;
+      }
       (*hops)++;
    }
 
@@ -11390,15 +11434,25 @@ static void lower_converter_body(lower_unit_t *lu, tree_t dst, tree_t src,
    vcode_type_t vconv = vtype_conversion();
    vcode_reg_t cf_reg = emit_param(vconv, vconv, ident_new("cf"));
 
+   // The source of an input conversion and the target of an output
+   // conversion are the actual
    vcode_reg_t target_reg;
    if (tree_kind(dst) == T_PORT_DECL)
       target_reg = lower_port_ref(lu, dst);
+   else if (dir == PORT_OUT) {
+      lower_hide_instance(lu, lu->parent, dst);
+      target_reg = lower_lvalue(lu, dst);
+      lower_unhide_instance(lu);
+   }
    else
       target_reg = lower_lvalue(lu, dst);
 
    vcode_reg_t in_reg;
-   if (dir == PORT_IN)
+   if (dir == PORT_IN) {
+      lower_hide_instance(lu, lu->parent, src);
       in_reg = lower_rvalue(lu, src);
+      lower_unhide_instance(lu);
+   }
    else
       in_reg = lower_driving_value(lu, src);
 
@@ -11800,7 +11854,9 @@ static void lower_inertial_actual_process(lower_unit_t *lu, object_t *obj)
                            lower_driver_field_cb, NULL);
    }
 
+   lower_hide_instance(lu, lu->parent, expr);
    build_wait(expr, lower_build_wait_cb, lu);
+   lower_unhide_instance(lu);
 
    emit_return(VCODE_INVALID_REG);
 
@@ -11810,7 +11866,10 @@ static void lower_inertial_actual_process(lower_unit_t *lu, object_t *obj)
                                    inertial, inertial, NULL);
 
    vcode_reg_t zero_time_reg = emit_const(vtype_time(), 0);
+
+   lower_hide_instance(lu, lu->parent, expr);
    vcode_reg_t value_reg = lower_rvalue(lu, expr);
+   lower_unhide_instance(lu);
 
    vcode_reg_t nets_reg;
    if (type_is_record(port_type))
@@ -11926,12 +11985,16 @@ static void lower_port_map(lower_unit_t *lu, tree_t block, tree_t map,
    if (value_kind == T_CONV_FUNC || value_kind == T_TYPE_CONV) {
       assert(value_reg == VCODE_INVALID_REG);
       tree_t p0 = tree_value(value);
+
+      // The ports of this instance are in its scope by now
+      lower_hide_instance(lu, lu, value);
       if (lower_is_signal_ref(p0)) {
          value_conv = p0;
          value_reg = lower_lvalue(lu, p0);
       }
       else
          value_reg = lower_rvalue(lu, value);
+      lower_unhide_instance(lu);
    }
 
    switch (tree_subkind(map)) {
